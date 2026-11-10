@@ -182,7 +182,7 @@ fn github_auth_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 fn door_clause(file: &SourceFile, out: &mut Vec<Finding>) {
-    if !contains_ignore_case(&file.raw, "authorization") {
+    if !contains_ignore_case(file.raw(), "authorization") {
         return;
     }
     for line in file.shipped_lines() {

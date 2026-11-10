@@ -372,6 +372,7 @@ fn retirement_discovered_during_abort_is_saved_before_any_further_observation() 
     let mut st = state(true);
     st.line = command.legacy_line().unwrap();
     st.native_prepare = Request::prepare(Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),
@@ -976,6 +977,63 @@ fn a_binding_without_its_preparation_never_bypasses_relaunch_recovery() {
 }
 
 #[test]
+fn a_safe_cancellation_retries_without_dispatch_but_unknown_keeps_its_operation() {
+    for proven in [true, false] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = options(world.path());
+        let mut st = state(true);
+        st.native = Some(super::super::native_act::Binding {
+            id: "ab".repeat(16),
+            capability: "cd".repeat(32),
+        });
+        retain_bound_preparation(&mut st);
+        let original = st.native_prepare.clone();
+        let (mut client, worker) = endpoint_with(move |line| {
+            if line.contains(" lease acquire ") || line.contains(" lease release ") {
+                "ERR busy\n".into()
+            } else if line.contains(" native-act prepare ") {
+                if proven {
+                    "OK native-act state=rollback-safe\n".into()
+                } else {
+                    "OK native-act state=unknown\n".into()
+                }
+            } else {
+                panic!("cancellation observation dispatches nothing else: {line}")
+            }
+        });
+        let result = relaunch(&opts, report(), &mut st, &mut client, SESSION, &Live);
+        let saved = load(&opts, SESSION).expect("the operation observation is saved");
+        if proven {
+            assert_eq!(
+                result.step,
+                super::super::native_restart::WAIT_CANCELLED_BEFORE_MUTATION
+            );
+            assert_eq!(outcome(&result.step), Outcome::Busy);
+            assert!(saved.native.is_none() && saved.native_prepare.is_empty());
+            assert_eq!(
+                saved.native_noexec_prepare.as_ref().unwrap().id,
+                "ab".repeat(16)
+            );
+        } else {
+            assert_eq!(result.step, "wait:native-recovery");
+            assert!(matches!(outcome(&result.step), Outcome::NotYet(_)));
+            assert!(saved.native.is_some() && saved.native_noexec_prepare.is_none());
+            assert_eq!(saved.native_prepare, original);
+        }
+        drop(client);
+        assert_eq!(
+            worker
+                .join()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains(" native-act prepare "))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn an_unadmitted_prepare_ends_a_crash_record_and_leaves_a_completed_rollback_exiting() {
     use super::super::native_act::{NativePlan, Request};
     // A crash plan alone; a completed forward's own rollback; and a crash plan after that forward
@@ -1038,6 +1096,7 @@ fn an_unadmitted_prepare_ends_a_crash_record_and_leaves_a_completed_rollback_exi
         });
         let result = relaunch(&opts, report(), &mut st, &mut client, SESSION, &Live);
         assert_eq!(result.step, super::super::native_restart::WAIT_UNADMITTED);
+        assert_eq!(outcome(&result.step), Outcome::Busy);
         assert!(st.native_prepare.is_empty() && st.native.is_none());
         assert_eq!(st.native_completed_prepare, kept);
         if rollback {
@@ -1823,6 +1882,7 @@ fn a_native_act_is_this_hosts_only_by_its_epoch() {
         "nothing stamped is never asked"
     )));
     st.native_completed_prepare = Some(Box::new(super::super::native_act::Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         asked: None,
         id: "12".repeat(16),

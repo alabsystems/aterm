@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "trust-exec-policy"
+version = "0.13.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Native final-exec policy attributes; no admission or installed-policy authority"
+
+[dependencies]
+libc = "0.2"
+
+[package.metadata.aterm-vendor]
+upstream = "https://github.com/alabsystems/trust"
+commit = "cae6f4b58466174749dde6f0d7d0bbf1fcc5e052"
+subdir = "crates/trust-exec-policy"

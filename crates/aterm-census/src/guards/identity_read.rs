@@ -70,7 +70,7 @@ fn identity_read(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             }
         }
     }
-    for (rel, manifest) in &tree.corpus.manifests {
+    for (rel, manifest) in tree.corpus.manifests() {
         if rel == STAMP_PACKAGE {
             continue;
         }

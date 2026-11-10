@@ -392,6 +392,7 @@ fn make_prepare(
         ..rollback.clone()
     };
     Some(Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         asked: None,
         id: id.into(),
@@ -1418,6 +1419,7 @@ mod tests {
             .supervisor_authority(crate::metrics::now_us())
             .revision();
         let prepare = Prepare {
+            receipt_mode: None,
             rejection_domain: None,
             asked: None,
             id: "ab".repeat(16),

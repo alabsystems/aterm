@@ -87,6 +87,26 @@ pub fn arm(state_dir: &Path, log: Option<&Path>) {
     let _ = (state_dir, log);
 }
 
+/// Arm the real release state and offer one authenticated pre-freeze seal to this process's
+/// first identity call. The call still rechecks every root, fact and status before adoption;
+/// a changed offer is ignored and the current inputs are hashed instead.
+pub(crate) fn arm_prefrozen(state_dir: &Path, log: Option<&Path>, handed: Option<&Path>) {
+    #[cfg(target_os = "macos")]
+    {
+        let mut process = sealed();
+        process.arm(state_dir.join("inputs-seal"));
+        // An earlier cheap gate may have taken an unpersisted process-local seal. The exact
+        // pre-freeze path must exercise the handed record's own recheck, not merely observe that
+        // an independently held identity happens to match it.
+        process.seal = None;
+        process.saved = None;
+        process.begin(handed.map(Path::to_path_buf), None);
+        process.log = log.map(Path::to_path_buf);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (state_dir, log, handed);
+}
+
 /// The file that holds this process's seal once it is kept, which a child is handed as
 /// [`SEAL_ENV`]; `None` before then, when nothing armed or handed persistence, and off macOS.
 #[must_use]
@@ -97,6 +117,23 @@ pub fn handed_path() -> Option<PathBuf> {
     }
     #[cfg(not(target_os = "macos"))]
     {
+        None
+    }
+}
+
+/// The kept seal prepared under `state_dir` when it authenticates `expected` for this
+/// machine's resolved input roots. The caller may hand this file to another process; that
+/// process still rechecks every root, fact and status before it adopts the seal.
+#[must_use]
+pub(crate) fn prefrozen_seal(state_dir: &Path, expected: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let roots = machine_roots().ok()?;
+        matching_kept(state_dir, expected, &roots)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state_dir, expected);
         None
     }
 }
@@ -542,6 +579,20 @@ fn load(path: &Path) -> Option<Seal> {
         && seal.facts.complete()
         && seal.identity == identity_of(&seal.digest, &seal.facts))
     .then_some(seal)
+}
+
+/// Locate one internally valid kept seal for the resolved root set. This deliberately does
+/// not recheck the roots: the receiving process does that through [`Process::identity`] before
+/// it adopts or persists the seal.
+#[cfg(any(test, target_os = "macos"))]
+fn matching_kept(state_dir: &Path, expected: &str, roots: &[Root]) -> Option<PathBuf> {
+    if !aterm_codec::hex::is_lower(expected, 64) {
+        return None;
+    }
+    let path = state_dir.join("inputs-seal").join(kept_name(roots));
+    load(&path)
+        .is_some_and(|seal| seal.identity == expected)
+        .then_some(path)
 }
 
 /// Keep `seal` at `path`: written whole (0600) in a private directory, or not at all.
@@ -2244,6 +2295,52 @@ mod tests {
         std::fs::write(&path, "not = [a seal").unwrap();
         assert_eq!(load(&path), None);
         assert_eq!(load(&dir.join("absent.toml")), None);
+    }
+
+    /// A pre-freeze's kept seal is located by its authenticated identity, handed to the real
+    /// cutter, rechecked without opening an input, and persisted under the real release state.
+    /// A changed input rejects that handed record and is hashed anew. NEGATIVE CONTROL: using
+    /// the handed seal without [`Seal::recheck_by_stat`] would retain the old identity.
+    #[cfg(unix)]
+    #[test]
+    fn a_prefrozen_seal_is_adopted_by_step_one_only_after_its_recheck() {
+        let mut bench = Bench::new();
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prepared_state = temp.path().join("prepared");
+        let real_state = temp.path().join("real");
+        let prepared_dir = prepared_state.join("inputs-seal");
+        let real_dir = real_state.join("inputs-seal");
+        let roots = vec![("inputs".to_string(), bench.root.clone())];
+
+        let mut preparation = process(None, Some(&prepared_dir));
+        let identity = bench.ask(&mut preparation).unwrap();
+        let handed = matching_kept(&prepared_state, &identity, &roots).expect("prepared seal");
+        assert_eq!(Some(handed.clone()), preparation.saved);
+        assert!(matching_kept(&prepared_state, &"0".repeat(64), &roots).is_none());
+
+        bench.said.clear();
+        let opened = bench.opened;
+        let mut step_one = process(Some(&handed), Some(&real_dir));
+        assert_eq!(bench.ask(&mut step_one).unwrap(), identity);
+        assert_eq!(bench.opened, opened, "the adoption only stats its inputs");
+        assert_eq!(bench.events(), [("adopted".to_string(), 10)]);
+        assert_eq!(
+            step_one.saved.as_deref().and_then(Path::parent),
+            Some(real_dir.as_path()),
+            "step 1 persists the rechecked record in the real state"
+        );
+
+        std::fs::write(
+            bench.root.join("lib/std.rlib"),
+            b"changed after preparation",
+        )
+        .unwrap();
+        bench.said.clear();
+        let changed_state = temp.path().join("changed/inputs-seal");
+        let mut changed = process(Some(&handed), Some(&changed_state));
+        let changed_identity = bench.ask(&mut changed).unwrap();
+        assert_ne!(changed_identity, identity);
+        assert_eq!(bench.events(), [("hashed".to_string(), 10)]);
     }
 
     #[cfg(unix)]

@@ -428,8 +428,8 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
     );
     let bottom = row_text(&app, wid, footer_row(&app, wid));
     assert!(
-        bottom.contains("\u{2298} off") && !bottom.contains("\u{25cc}"),
-        "bottom rule draws `\u{2298} off`, never stale pending `\u{25cc}`: {bottom:?}"
+        bottom.chars().all(|c| c == '\u{2500}'),
+        "the bottom rule is Claude's own, never a stale pending `\u{25cc}`: {bottom:?}"
     );
 }
 
@@ -504,7 +504,11 @@ fn a_double_click_on_on_leaves_the_harness_on() {
             autopilot(&app, session).1,
             AutopilotView::MasterOff | AutopilotView::AgentOff(_)
         ));
-        let at = super::gesture_tests::hit(&app, wid, super::Chip::Autopilot);
+        assert!(
+            !super::gesture_tests::painted(&app, wid, super::Chip::Autopilot),
+            "under its off switch no chip stands: the switch is the one way back"
+        );
+        let at = on_switch(&app, wid);
         let first = a_minute_ago();
         click_at_when(&mut app, wid, at, first);
         assert!(
@@ -2433,4 +2437,139 @@ fn glass_selection_and_key_walk_do_not_rebuild_leaf_plan_without_chrome_spans() 
         0,
         "evicting stale glass selection with no split chrome spans builds no VisibleLeafPlan"
     );
+}
+
+/// THE SWITCH OFF LEAVES THE SWITCH ALONE (2026-11-09, owner): under the master switch off, or
+/// the agent's own, a Claude Code pane wears no harness glass but the switch: the top rule is
+/// Claude's own `─` but for ` ○ off ` and its label (no lockup, no goal), line D is Claude's own
+/// rule (no Autopilot chip, no permission light, no facts), and no chip, fact or card is laid.
+/// CONTROL: with the harness on the same pane draws the lockup, the chip, the light and the facts.
+#[test]
+fn under_the_switch_off_the_only_harness_glass_is_the_switch() {
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
+    let ours = |app: &App| {
+        let lights = &app.windows[&wid].claude_lights;
+        (lights.hits.len(), lights.fact_hits.len())
+    };
+    let row = |app: &App, r: usize| row_text(app, wid, r);
+    let d = footer_row(&app, wid);
+    assert!(
+        top_rule(&app, wid).contains("claude"),
+        "CONTROL: the lockup"
+    );
+    assert!(
+        row(&app, d).contains(WHOLE_FACTS),
+        "CONTROL: line D's facts"
+    );
+    assert!(
+        super::gesture_tests::painted(&app, wid, super::Chip::Autopilot)
+            && super::gesture_tests::painted(&app, wid, super::gesture_tests::MODE),
+        "CONTROL: the chip and the permission light"
+    );
+    for (what, off) in [
+        ("master", MASTER_OFF),
+        ("agent", "[harness.claude]\nenabled = false\n"),
+    ] {
+        policy(&mut app, off);
+        draw_claude(&app, session, BYPASS);
+        frame(&mut app, wid);
+        let b = switch(&app, wid).unwrap_or_else(|| panic!("{what}: the switch stands"));
+        assert!(b.face.is_off(), "{what}: {:?}", b.face);
+        let top = top_rule(&app, wid);
+        let label = b.label.clone().expect("the switch's label");
+        let mut rest: Vec<char> = top.chars().collect();
+        // The face, its label and the blank that closes it.
+        rest[b.cols.start..=label.end].fill('\u{2500}');
+        assert!(
+            rest.iter().all(|&c| c == '\u{2500}'),
+            "{what}: the top rule is Claude's own but for the switch: {top:?}"
+        );
+        assert!(top.contains(OFF_SWITCH), "{what}: {top:?}");
+        assert!(
+            row(&app, d).chars().all(|c| c == '\u{2500}'),
+            "{what}: line D is Claude's own rule: {:?}",
+            row(&app, d)
+        );
+        assert_eq!(
+            row(&app, d + 1),
+            BYPASS,
+            "{what}: Claude's mode row as Claude drew it"
+        );
+        assert_eq!(ours(&app), (0, 0), "{what}: no chip, light or fact is laid");
+        assert!(
+            app.windows[&wid].claude_card.lines().next().is_none()
+                && app.windows[&wid]
+                    .claude_card
+                    .banner_edits()
+                    .next()
+                    .is_none(),
+            "{what}: no card and no banner"
+        );
+        assert_eq!(
+            super::drawn::Drawn::SwitchOnly,
+            app.windows[&wid]
+                .claude_lights
+                .drawn_chip(session, 0, |_| false),
+            "{what}: `chrome` says switch-only"
+        );
+    }
+    policy(&mut app, "[harness]\n");
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    assert_eq!(switch(&app, wid).map(|b| b.face), Some(HarnessSwitch::On));
+    assert!(
+        row(&app, d).contains(WHOLE_FACTS)
+            && super::gesture_tests::painted(&app, wid, super::Chip::Autopilot),
+        "on again: the glass comes back: {:?}",
+        row(&app, d)
+    );
+}
+
+/// WITH NO HOST, THE SWITCH OFF LEAVES NOTHING OF THE HARNESS: a window with no control socket
+/// has no host to turn the harness on, so under `[harness] enabled = false` (or the agent's own
+/// switch off) a Claude Code pane is Claude's own, no switch, lockup, fact, light or card.
+/// Control: the same pane with the policy on wears the unhosted glass.
+#[test]
+fn with_no_host_the_switch_off_leaves_nothing_of_the_harness() {
+    let (mut app, wid, session, _reader) = app();
+    assert!(app.apply_term_resize(wid, 24, 120));
+    publish_facts(&app, session);
+    set_program(&app, session, Some("claude"));
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    assert!(app.harness.is_none(), "no host");
+    let d = footer_row(&app, wid);
+    assert!(
+        row_text(&app, wid, d).contains(WHOLE_FACTS),
+        "CONTROL: the unhosted glass's facts: {:?}",
+        row_text(&app, wid, d)
+    );
+    for (what, off) in [
+        ("master", MASTER_OFF),
+        ("agent", "[harness.claude]\nenabled = false\n"),
+    ] {
+        policy(&mut app, off);
+        draw_claude(&app, session, BYPASS);
+        frame(&mut app, wid);
+        assert!(
+            switch(&app, wid).is_none(),
+            "{what}: no switch with no host"
+        );
+        let top = top_rule(&app, wid);
+        assert!(
+            top.chars().all(|c| c == '\u{2500}'),
+            "{what}: the top rule is Claude's own: {top:?}"
+        );
+        assert!(
+            row_text(&app, wid, d).chars().all(|c| c == '\u{2500}'),
+            "{what}: line D is Claude's own rule: {:?}",
+            row_text(&app, wid, d)
+        );
+        let lights = &app.windows[&wid].claude_lights;
+        assert_eq!(
+            (lights.hits.len(), lights.fact_hits.len()),
+            (0, 0),
+            "{what}: no chip, light or fact is laid"
+        );
+    }
 }

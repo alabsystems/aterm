@@ -442,9 +442,9 @@ fn forge_pull_reason(
 }
 
 /// Why a dev selection pulls [`Check::Forge`], if it does. A touched package is read from the
-/// fork policy or absorbed-crate registry; an unreadable registry pulls Forge fail-closed so its
-/// own diagnostic is the verdict. Explicit individual checks and release selections run exactly
-/// what they name.
+/// fork policy or absorbed-crate registry. Changes to the notary itself also pull its real
+/// attestation; an unreadable registry pulls Forge fail-closed so its own diagnostic is the
+/// verdict. Explicit individual checks and release selections run exactly what they name.
 #[must_use]
 pub fn forge_pull(
     wanted: &[Check],
@@ -455,7 +455,13 @@ pub fn forge_pull(
     forge_pull_reason(
         wanted,
         alone,
-        || aterm_census::scan_set::fork_packages(root),
+        || {
+            let mut packages = aterm_census::scan_set::fork_packages(root)?;
+            // Provenance policy is itself an input to the attestation. A
+            // reviewed first-party roster change must run its real notary.
+            packages.push("aterm-forge".into());
+            Ok(packages)
+        },
         touches,
     )
 }
@@ -663,6 +669,19 @@ pub fn list_table() -> String {
 mod tests {
     use super::*;
     use crate::scope::Scope;
+
+    #[test]
+    fn new_independent_exclusion_provenance_changes_still_pull_the_real_attestation() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets the test manifest directory"),
+        )
+        .join("../..");
+        assert_eq!(
+            forge_pull(&DEV, false, &root, |package| package == "aterm-forge"),
+            Some("aterm-forge".into()),
+            "a narrow provenance-policy change must not hide the notary's verdict"
+        );
+    }
 
     #[test]
     fn a_dev_selection_touching_a_fork_pulls_forge_and_nothing_weaker_does() {

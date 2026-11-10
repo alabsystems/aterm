@@ -610,6 +610,13 @@ fn claude_app() -> (App, WindowId, u64, crate::harness_host::HostHandle) {
     (app, wid, session, host)
 }
 
+/// Name [`claude_app`]'s foreground group's program Claude Code.
+fn claude_named(app: &App, session: u64) {
+    let entry = app.pool.get(session).expect("session");
+    let mut timeline = entry.ctx.timeline.lock().unwrap();
+    timeline.set_program(4242, Some("claude".into()));
+}
+
 fn feed(app: &App, session: u64, bytes: &[u8]) {
     let term = app.pool.get(session).expect("session").term.clone();
     term_lock(&term).process(bytes);
@@ -835,35 +842,24 @@ fn a_click_on_a_row_acts_and_a_click_off_the_card_closes_it() {
     let (x, y) = app.frame_cell_centre(wid, (0, 0));
     assert!(app.autopilot_menu_press(wid, true, x, y, Instant::now()));
     assert!(app.autopilot_menu.is_none());
+    // Claude Code's top rule carries the switch, so its pane is left bare under the switch off
+    // (`App::pane_bare`; a program the timeline does not name keeps its `⊘ off` chip).
+    claude_named(&app, session);
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
     frame(&mut app, wid);
+    assert!(
+        app.open_front_autopilot_menu().is_err(),
+        "under the switch off no chip stands, and no menu opens from one"
+    );
+    assert!(app.autopilot_menu.is_none());
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\n"),
+    );
+    frame(&mut app, wid);
     app.open_front_autopilot_menu().unwrap();
     frame(&mut app, wid);
-    assert!(
-        app.autopilot_menu_controls()
-            .iter()
-            .any(|l| l.contains("text=\"harness off in Settings\""))
-    );
-    assert!(press_row(&mut app, "autopilot-menu/mode/cruise"));
-    assert!(
-        app.autopilot_menu.is_some(),
-        "a disabled row keeps the card"
-    );
-    assert_eq!(
-        app.pool
-            .get(session)
-            .unwrap()
-            .ctx
-            .meta
-            .lock()
-            .unwrap()
-            .autopilot
-            .as_deref(),
-        Some("off"),
-        "nothing written"
-    );
     assert!(press_row(&mut app, "autopilot-menu/settings"));
     assert!(app.autopilot_menu.is_none());
     host.shutdown_and_join();
@@ -1519,56 +1515,20 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
     let closed = app.grid_a11y_tree(wid, None).unwrap();
     assert!(menu_nodes(&closed).is_empty(), "closed: no menu node");
     assert_eq!(crate::a11y_tree::menu_item_for(closed.focus), None);
+    // Claude Code's top rule carries the switch, so its pane is left bare under the switch off
+    // (`App::pane_bare`; a program the timeline does not name keeps its `⊘ off` chip).
+    claude_named(&app, session);
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
     frame(&mut app, wid);
-    app.open_front_autopilot_menu().unwrap();
+    assert!(
+        app.open_front_autopilot_menu().is_err(),
+        "under the switch off no chip stands, and no menu opens from one"
+    );
     frame(&mut app, wid);
     let off = app.grid_a11y_tree(wid, None).unwrap();
-    let menu = off
-        .nodes
-        .iter()
-        .find(|(_, n)| n.role() == Role::Menu)
-        .map(|(_, n)| n.clone())
-        .expect("the menu is published");
-    assert!(
-        menu.label().unwrap().ends_with(", harness off in Settings"),
-        "{:?}",
-        menu.label()
-    );
-    let items: Vec<_> = menu
-        .children()
-        .iter()
-        .map(|id| (*id, node(&off, *id)))
-        .collect();
-    let (settings, rest) = items.split_last().unwrap();
-    assert_eq!(settings.1.label(), Some("Harness settings"));
-    assert!(!settings.1.is_disabled());
-    for (_, n) in rest {
-        assert!(n.is_disabled(), "{:?}", n.label());
-        assert!(!n.supports_action(Action::Click), "{:?}", n.label());
-        assert_ne!(n.toggled(), Some(Toggled::True), "nothing checked");
-    }
-    app.on_accessibility_action(
-        wid,
-        ActionRequest {
-            context: None,
-            action: Action::Click,
-            target_tree: TreeId::ROOT,
-            target_node: rest[0].0,
-            data: None,
-        },
-    );
-    assert!(
-        app.autopilot_menu.is_some(),
-        "a disabled row keeps the card"
-    );
-    assert_eq!(
-        pair(&app, session).0.as_deref(),
-        Some("land"),
-        "nothing written"
-    );
+    assert!(menu_nodes(&off).is_empty(), "off: no menu node");
 }
 
 /// The open menu's items as window `wid` publishes them (`App::grid_a11y_tree`):

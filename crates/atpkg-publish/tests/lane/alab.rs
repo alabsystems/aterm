@@ -855,6 +855,7 @@ fn a_signing_run_needs_a_packer_that_can_pack_before_any_build() {
 #[test]
 fn the_newest_signed_release_is_the_newest_published_vxyz_carrying_its_signature() {
     let rel = |tag: &str, draft: bool, pre: bool, signed: bool| atpkg_publish::host::Release {
+        published_at: None,
         tag: tag.into(),
         draft,
         prerelease: pre,

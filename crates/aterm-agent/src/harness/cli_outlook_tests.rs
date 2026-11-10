@@ -51,10 +51,22 @@ fn seeded(tmp: &Tmp, env: &Env) {
     env.accounts_store()
         .transact(now, &mut note, |state| {
             state.active = Some("me".into());
-            let (mut events, _) =
-                accounts::note_reading_held(state, "me", &read("me", 580, now), now);
+            let (mut events, _) = accounts::note_reading_held(
+                state,
+                "me",
+                &read("me", 580, now),
+                now,
+                accounts::ReadingOwner::Unobserved,
+            );
             events.extend(
-                accounts::note_reading_held(state, "alt1", &read("alt1", 310, now - 3 * H), now).0,
+                accounts::note_reading_held(
+                    state,
+                    "alt1",
+                    &read("alt1", 310, now - 3 * H),
+                    now,
+                    accounts::ReadingOwner::Unobserved,
+                )
+                .0,
             );
             Ok(events)
         })

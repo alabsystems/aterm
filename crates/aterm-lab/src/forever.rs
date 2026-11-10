@@ -9453,7 +9453,7 @@ fn run_check(
         (Some(d), _) if ending => {
             let windows: Vec<(Chain, &surfaces::Window)> =
                 tabs.iter().map(|t| (t.chain, &t.seen.window)).collect();
-            let v = surfaces::judge_end(d, &windows, h.name());
+            let v = surfaces::judge_end(d, &windows);
             println!("forever {} END {}: {}", h.name(), v.word(), v.why());
             all.push((Scenario::End, v));
         }

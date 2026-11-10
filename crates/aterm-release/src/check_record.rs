@@ -52,7 +52,11 @@ pub const RUN_LEVEL: &str = "verify";
 const SCHEMA: u32 = 1;
 const KEY_DOMAIN: &str = "aterm-release-check-v1";
 const SEAL_DOMAIN: &str = "aterm-release-seal-dir-v1";
-const MAX_RECORD_BYTES: u64 = 1024 * 1024;
+/// The largest record written or read. A record lists what its check read (its input items),
+/// which for a whole-tree check is every file of the tree: an archive merge that puts the whole
+/// workspace in the release input made a 1.3 MB `fmt` record a 1 MiB cap refused to read back.
+/// The bound stops a runaway file, not a large tree; [`write`] holds a record to it too.
+const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 /// A record made only to hand the immediately preceding hop's item receipts to its verifier.
 /// Its rows were not re-keyed on the tree the record names and cannot seed another hop.
 const CANDIDATE_RUN_PREFIX: &str = "candidates-from-";
@@ -223,6 +227,9 @@ pub struct CheckRecord {
     /// rows are the finer content receipts which may cross only to the immediately next hop.
     #[serde(default)]
     pub lint_packages: Vec<LintPackage>,
+    /// Deterministic source-reader input snapshots, validated again by the next preflight.
+    #[serde(default)]
+    pub input_items: Vec<aterm_verify::input_content::Proof>,
 }
 
 /// H(check, tree, seal[, U]): what a record answers for.
@@ -350,25 +357,22 @@ pub fn input_missing(root: &Path, tree: &str, seal: &str) -> Result<Vec<String>,
     Ok(missing)
 }
 
-/// Bounded package successes from one completed preflight. These are candidates only: the
-/// verifier reconstructs the current package's complete key before carrying any of them.
-pub fn input_lint_candidates(
+/// Successful source items from a completed A19 check; every reader validates its own key.
+pub fn input_item_candidates(
     root: &Path,
     tree: &str,
     seal: &str,
-) -> Result<aterm_verify::lint_content::Passed, String> {
-    let mut passed = aterm_verify::lint_content::Passed::new();
-    if let Read::Record(record) = read(&path(root, tree, seal, "lint", None))?
-        && answers(&record, "lint", tree, seal, None)
-        && record.outcome == OK
-    {
-        for package in record.lint_packages {
-            if let Some(proof) = package.proof() {
-                passed.insert(proof.spec.clone(), proof);
-            }
+) -> Result<Vec<aterm_verify::input_content::Proof>, String> {
+    let mut items = Vec::new();
+    for check in aterm_verify::release_input::CHECKS {
+        if let Read::Record(record) = read(&path(root, tree, seal, check.name(), None))?
+            && answers(&record, check.name(), tree, seal, None)
+            && record.outcome == OK
+        {
+            items.extend(record.input_items);
         }
     }
-    Ok(passed)
+    Ok(items)
 }
 
 /// The records of bundle check `check` in `seal_dir`, one per executable: each U and
@@ -1124,6 +1128,7 @@ pub fn carry_hop(
                     acceptance: None,
                     binaries: candidates,
                     lint_packages: Vec::new(),
+                    input_items: Vec::new(),
                 };
                 candidate.binaries.sort_by(|a, b| a.spec.cmp(&b.spec));
                 let _ = keep(&current_at, &candidate)?;
@@ -1175,6 +1180,7 @@ pub fn carry_hop(
                     acceptance: None,
                     binaries: Vec::new(),
                     lint_packages: packages,
+                    input_items: Vec::new(),
                 };
                 let _ = keep(&current_at, &candidate)?;
             }
@@ -1302,8 +1308,20 @@ pub fn accept_in(
 }
 
 fn write(at: &Path, record: &CheckRecord) -> Result<(), String> {
+    write_within(at, record, MAX_RECORD_BYTES)
+}
+
+/// [`write`] under `max`: a record [`read`] could not read back is never written.
+fn write_within(at: &Path, record: &CheckRecord, max: u64) -> Result<(), String> {
     let text =
         aterm_toml::to_string(record).map_err(|e| format!("serialize {}: {e}", at.display()))?;
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > max {
+        return Err(format!(
+            "write {}: the record is {} bytes, over the {max}-byte bound its reader holds",
+            at.display(),
+            text.len()
+        ));
+    }
     crate::durable::write_atomic_durable(at, text.as_bytes(), 0o600)
         .map_err(|e| format!("write {}: {e}", at.display()))
 }
@@ -1344,6 +1362,7 @@ pub struct RunEvents {
     pub binaries: Vec<Binary>,
     /// Each workspace package's last `lint-package-finished` event.
     pub lint_packages: Vec<LintPackage>,
+    pub input_items: Vec<aterm_verify::input_content::Proof>,
     /// Lines too long to read: what they said is not known.
     pub too_long: usize,
     /// `verify-event:` lines whose JSON does not parse: what they said is not known.
@@ -1369,6 +1388,7 @@ pub fn events(at: &Path) -> std::io::Result<RunEvents> {
     let mut run = RunEvents::default();
     let mut binaries: Vec<Binary> = Vec::new();
     let mut lint_packages: Vec<LintPackage> = Vec::new();
+    let mut input_items = aterm_verify::input_content::Collector::default();
     let partial = crate::release_status::event_lines(file, |line| {
         let json = match line {
             crate::release_status::Line::Verify(json) => json,
@@ -1384,6 +1404,15 @@ pub fn events(at: &Path) -> std::io::Result<RunEvents> {
         };
         if event["schema"].as_u64() != Some(1) {
             return;
+        }
+        match input_items.observe(&event) {
+            Ok(Some(proof)) => {
+                run.input_items
+                    .retain(|item| item.check != proof.check || item.item != proof.item);
+                run.input_items.push(proof);
+            }
+            Err(_) => run.garbled += 1,
+            Ok(None) => {}
         }
         match event["event"].as_str() {
             Some("measure-driver") => {
@@ -1684,6 +1713,7 @@ fn record(
         acceptance: None,
         binaries: Vec::new(),
         lint_packages: Vec::new(),
+        input_items: Vec::new(),
     }
 }
 
@@ -1813,6 +1843,12 @@ pub fn write_run(
                 lint_finished = true;
                 r.lint_packages.clone_from(&events.lint_packages);
             }
+            r.input_items = events
+                .input_items
+                .iter()
+                .filter(|item| item.check == name)
+                .cloned()
+                .collect();
             records.push((
                 path_in_seal_dir(&seal_path, name, u),
                 r,
@@ -1992,6 +2028,42 @@ mod tests {
 
     fn u(n: u8) -> String {
         format!("{n:02x}").repeat(32)
+    }
+
+    /// A record as large as a whole-tree check's (over the old 1 MiB cap) is written and read
+    /// back; one over the bound its reader holds is never written.
+    ///
+    /// NEGATIVE CONTROL: with the old 1 MiB `MAX_RECORD_BYTES` the read fails with "file exceeds
+    /// bound", the refusal of 0.193.0's step 1 on a 1.3 MB `fmt` record.
+    #[test]
+    fn a_whole_tree_record_reads_back_and_an_unreadable_one_is_never_written() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let at = dir.path().join("fmt.toml");
+        let facts_log = dir.path().join("run.log");
+        let facts = RunFacts {
+            commit: COMMIT,
+            tree: TREE,
+            seal: "seal",
+            executable: None,
+            log: &facts_log,
+            run: RUN,
+            asked: &[],
+            content: None,
+        };
+        let mut big = record(&facts, (0, "sha"), "fmt", "ok", None);
+        big.rows = (0..40_000)
+            .map(|n| format!("ok crates/member-{n:05}/src/lib.rs {}", u(7)))
+            .collect();
+        write(&at, &big).unwrap();
+        assert!(std::fs::metadata(&at).unwrap().len() > 1024 * 1024);
+        match read(&at).unwrap() {
+            Read::Record(back) => assert_eq!(back.rows.len(), 40_000),
+            _ => panic!("the record it wrote did not read back"),
+        }
+        let small = dir.path().join("over.toml");
+        let refused = write_within(&small, &big, 1024).unwrap_err();
+        assert!(refused.contains("over the 1024-byte bound"), "{refused}");
+        assert!(!small.exists());
     }
 
     fn finished(check: &str, outcome: &str) -> aterm_json::Value {
@@ -2175,26 +2247,71 @@ mod tests {
     }
 
     #[test]
+    fn input_items_round_trip_bounded_events_and_reject_missing_parts() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(&f.root).unwrap();
+        let at = f.root.join("input-events");
+        let mut ctx = aterm_verify::Ctx::new(
+            f.root.clone(),
+            aterm_verify::Scope::workspace(),
+            aterm_verify::EnvSnapshot::default(),
+            f.root.join("scratch"),
+        );
+        ctx.carry_context = Some("c".repeat(64));
+        ctx.events = Some(aterm_verify::event_log::EventLog::open(&at).unwrap());
+        let proof = aterm_verify::input_content::Proof::new(
+            &ctx,
+            "census",
+            "many-inputs",
+            (0..1000)
+                .map(|i| ("file".into(), format!("file-{i}"), "a".repeat(64)))
+                .collect(),
+        )
+        .unwrap();
+        aterm_verify::input_content::event(&ctx, &proof, false);
+        let complete = events(&at).unwrap();
+        assert!(complete.whole());
+        assert_eq!(
+            complete.input_items.as_slice(),
+            std::slice::from_ref(&proof)
+        );
+        let text = std::fs::read_to_string(&at).unwrap();
+        std::fs::write(
+            &at,
+            text.lines().skip(1).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let incomplete = events(&at).unwrap();
+        assert!(!incomplete.whole());
+        assert!(incomplete.input_items.is_empty());
+    }
+
+    #[test]
     fn input_package_candidates_require_a_matching_successful_a19_record() {
         let f = Fixture::new();
         let mut events = all_ok();
-        let good = lint_package("good", 1, OK);
-        events.lint_packages = vec![good.clone(), lint_package("red", 2, FAIL)];
+        let good = aterm_verify::input_content::Proof {
+            check: "lint".into(),
+            item: "good".into(),
+            key: u(1),
+            inputs: Vec::new(),
+        };
+        events.input_items = vec![good.clone()];
         f.write("input", "", 0, &events);
-        let carried = input_lint_candidates(&f.root, TREE, "input").unwrap();
-        assert_eq!(carried.keys().cloned().collect::<Vec<_>>(), ["good"]);
+        let carried = input_item_candidates(&f.root, TREE, "input").unwrap();
+        assert_eq!(carried.as_slice(), std::slice::from_ref(&good));
         assert!(
-            crate::input_record::previous_lint(&f.root, "base")
+            crate::input_record::previous_items(&f.root, "base")
                 .unwrap()
                 .is_empty()
         );
         crate::input_record::attempted(&f.root, "base", TREE, "input").unwrap();
         assert_eq!(
-            crate::input_record::previous_lint(&f.root, "base").unwrap(),
+            crate::input_record::previous_items(&f.root, "base").unwrap(),
             carried
         );
         assert!(
-            crate::input_record::previous_lint(&f.root, "another-base")
+            crate::input_record::previous_items(&f.root, "another-base")
                 .unwrap()
                 .is_empty()
         );
@@ -2203,36 +2320,36 @@ mod tests {
         begin_run(&f.root, &interrupted).unwrap();
         crate::input_record::attempted(&f.root, "base", interrupted.tree, "input").unwrap();
         assert!(
-            crate::input_record::previous_lint(&f.root, "base")
+            crate::input_record::previous_items(&f.root, "base")
                 .unwrap()
                 .is_empty(),
             "a newer begun attempt cannot revive the preceding tree's green packages"
         );
         crate::input_record::attempted(&f.root, "base", TREE, "input").unwrap();
         assert!(
-            input_lint_candidates(&f.root, TREE, "different seal")
+            input_item_candidates(&f.root, TREE, "different seal")
                 .unwrap()
                 .is_empty()
         );
         let red = RunEvents {
             finished: vec![finished("lint", FAIL)],
-            lint_packages: vec![good],
+            input_items: vec![good],
             ..RunEvents::default()
         };
         f.write("input", "", 1, &red);
         assert!(
-            input_lint_candidates(&f.root, TREE, "input")
+            input_item_candidates(&f.root, TREE, "input")
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            crate::input_record::previous_lint(&f.root, "base")
+            crate::input_record::previous_items(&f.root, "base")
                 .unwrap()
                 .is_empty()
         );
         f.end("input", "", 0, Ok(&events)).unwrap();
         assert!(
-            input_lint_candidates(&f.root, TREE, "input")
+            input_item_candidates(&f.root, TREE, "input")
                 .unwrap()
                 .is_empty(),
             "saved red stays red"
@@ -2901,6 +3018,7 @@ mod tests {
             acceptance: None,
             binaries,
             lint_packages: Vec::new(),
+            input_items: Vec::new(),
         };
         let keep_record = |record: &CheckRecord| {
             let at = path(&f.root, &record.tree, SEAL, &record.check, None);

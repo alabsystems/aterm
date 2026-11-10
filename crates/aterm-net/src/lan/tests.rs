@@ -120,6 +120,7 @@ fn completed_exchange_survives_reset_but_never_revives_a_withdrawn_proof() {
 #[test]
 fn bounded_fleet_listener_applies_link_policy_before_tls() {
     use crate::fleet::{self, FleetOp, FleetScope, FleetSecret, Listening};
+    use aterm_uds::stop::Stop;
     use std::{
         io::{Read, Write},
         sync::{Arc, atomic::AtomicUsize},
@@ -137,10 +138,10 @@ fn bounded_fleet_listener_applies_link_policy_before_tls() {
         }
         let listener = listener.unwrap();
         let address = listener.local_addr().unwrap();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let delivered = Arc::new(AtomicUsize::new(0));
         let server = {
-            let running = running.clone();
+            let stop = stop.clone();
             let delivered = delivered.clone();
             thread::spawn(move || {
                 fleet::serve_lan_within(
@@ -154,7 +155,7 @@ fn bounded_fleet_listener_applies_link_policy_before_tls() {
                         per_source: 2,
                         lifetime: within,
                     },
-                    &running,
+                    &stop,
                     within,
                     move |served, _| {
                         delivered.fetch_add(1, Ordering::SeqCst);
@@ -196,7 +197,7 @@ fn bounded_fleet_listener_applies_link_policy_before_tls() {
             channel.stream().read_exact(&mut answer).unwrap();
             assert_eq!(answer, [42]);
         }
-        running.store(false, Ordering::Release);
+        stop.set();
         server.join().unwrap();
         assert_eq!(admitted, scope == Scope::Loopback);
         assert_eq!(delivered.load(Ordering::SeqCst), usize::from(admitted));

@@ -29,6 +29,35 @@ pub mod keys;
 pub mod owned;
 pub mod secret;
 
+/// A table rule's refusal of an owner write: the collection, row, column and
+/// rule, never a value. It is portable metadata independent of a live table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub collection: &'static str,
+    pub pk: String,
+    pub column: String,
+    pub rule: String,
+}
+
+impl Refused {
+    /// The rule with the column it stops, as a grid problem reads it.
+    pub fn problem_rule(&self) -> String {
+        format!("{}.{}: {}", self.collection, self.column, self.rule)
+    }
+}
+
+impl From<Refused> for crate::Error {
+    fn from(refused: Refused) -> Self {
+        Self::new(&format!(
+            "{}.{}: row {}: {}",
+            refused.collection,
+            refused.column,
+            keys::safe_key(&refused.pk),
+            refused.rule
+        ))
+    }
+}
+
 /// The format word a stored schema row carries.
 pub const FORMAT: &str = "att/1";
 /// The reserved collection holding each collection's schema row.

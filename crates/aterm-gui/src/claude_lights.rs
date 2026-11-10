@@ -632,7 +632,7 @@ impl OverChips {
     /// What [`App::claude_glass_at`] found.
     pub(crate) const fn of_glass(at: Option<&(u64, GlassAt)>) -> Self {
         match at {
-            None | Some((_, GlassAt::Mark)) => Self::No,
+            None => Self::No,
             Some((_, GlassAt::Chip(None) | GlassAt::Label)) => Self::Gap,
             Some((
                 _,
@@ -864,15 +864,6 @@ pub(crate) struct TitleHit {
     pub(crate) session: u64,
 }
 
-/// One top line's lockup the last frame put on the glass.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MarkHit {
-    pub(crate) frame_row: usize,
-    pub(crate) term_row: usize,
-    pub(crate) cols: std::ops::Range<usize>,
-    pub(crate) session: u64,
-}
-
 /// What of the harness's glass is under a pixel ([`App::claude_glass_at`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GlassAt {
@@ -880,8 +871,6 @@ pub(crate) enum GlassAt {
     Chip(Option<Chip>),
     /// The top rule's harness switch (`border_toggles`), as the paint drew it.
     Switch(crate::autopilot::HarnessSwitch),
-    /// A top line's lockup (`mark_hits`).
-    Mark,
     /// A top line's harness label (`border_toggles`): a hover shows the CLI's whole build in the
     /// label's slot, only where the label shortens it (`label_whole`); every press on it is
     /// swallowed.
@@ -898,7 +887,7 @@ const fn part_of(glass: GlassAt) -> Option<crate::claude_footer::HoverAt> {
     match glass {
         GlassAt::Label => Some(crate::claude_footer::HoverAt::Label),
         GlassAt::Upgrade => Some(crate::claude_footer::HoverAt::Arrow),
-        GlassAt::Chip(_) | GlassAt::Switch(_) | GlassAt::Mark | GlassAt::Fact(..) => None,
+        GlassAt::Chip(_) | GlassAt::Switch(_) | GlassAt::Fact(..) => None,
     }
 }
 
@@ -956,13 +945,9 @@ pub(crate) struct WindowLights {
     pub(crate) part_hover: Option<(u64, crate::claude_footer::HoverAt)>,
     /// The rules' title slots the last frame drew ([`TitleHit`]).
     pub(crate) title_hits: Vec<TitleHit>,
-    /// The lockups the last paint put on top lines ([`MarkHit`]).
-    pub(crate) mark_hits: Vec<MarkHit>,
-    /// The session whose top line's lockup the pointer rests on ([`App::track_claude_light_hover`]).
-    pub(crate) mark_hover: Option<u64>,
     /// The card or banner hit under the pointer: `(session, is_link, is_front)`.
     pub(crate) glass_hit_hover: Option<(u64, bool, bool)>,
-    /// The window pixel the last motion put the pointer on while it hovered a switch or a lockup.
+    /// The window pixel the last motion put the pointer on while it hovered the glass.
     glass_hover_px: Option<(f64, f64)>,
     /// The grid the lists were laid.
     drawn_at: Option<crate::app_mouse::GlassGrid>,
@@ -1280,13 +1265,12 @@ pub(crate) fn lights_now() -> Instant {
 }
 
 /// The pointer's hover on the glass: a chip or fact, a quota chart column, a switch, a top
-/// line's part, a lockup.
+/// line's part, a card or banner hit.
 type GlassHover = (
     Option<(u64, Target)>,
     Option<(u64, u8, usize)>,
     Option<u64>,
     Option<(u64, crate::claude_footer::HoverAt)>,
-    Option<u64>,
     Option<(u64, bool, bool)>,
 );
 
@@ -1298,7 +1282,6 @@ impl WindowLights {
             self.quota_column,
             self.switch_hover,
             self.part_hover,
-            self.mark_hover,
             self.glass_hit_hover,
         )
     }
@@ -1326,7 +1309,7 @@ impl WindowLights {
 
     /// A digest of where the last paint laid what a pointer hit-tests ([`App::claude_glass_at`] and
     /// [`App::claude_glass_hit_at`]): the chips' cells, the switches with their labels and arrows,
-    /// the facts, the lockups and the card/banner hits.
+    /// the facts and the card/banner hits.
     fn places(&self, card_hits: u64, focused: Option<u64>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1350,10 +1333,6 @@ impl WindowLights {
         self.fact_hits.len().hash(&mut h);
         for f in &self.fact_hits {
             (f.frame_row, f.term_row, f.cols, f.session, f.fact, f.part).hash(&mut h);
-        }
-        self.mark_hits.len().hash(&mut h);
-        for m in &self.mark_hits {
-            (m.frame_row, m.term_row, &m.cols, m.session).hash(&mut h);
         }
         h.finish()
     }
@@ -1423,7 +1402,6 @@ impl WindowLights {
         self.border_toggles.clear();
         self.title_hits.clear();
         self.fact_hits.clear();
-        self.mark_hits.clear();
         self.footers.clear();
         self.selection_painted = true;
         if self.fitted.iter().any(|f| !f.used) {
@@ -1797,7 +1775,6 @@ impl WindowLights {
         (u64::from(supervised)
             | u64::from(turning.is_some()) << 1
             | u64::from(self.switch_lit(session)) << 2
-            | u64::from(self.mark_hovered(session)) << 3
             | (self.top_hover(session) as u64) << 5
             | u64::from(turning == Some(false)) << 4)
             ^ refused.rotate_left(8)
@@ -1809,12 +1786,7 @@ impl WindowLights {
         &mut self.drawn_at
     }
 
-    /// Whether the pointer rests on `session`'s top line's lockup.
-    pub(crate) fn mark_hovered(&self, session: u64) -> bool {
-        self.mark_hover == Some(session)
-    }
-
-    /// The window pixel the pointer last hovered a switch or a lockup at, while it does.
+    /// The window pixel the pointer last hovered the glass at, while it does.
     pub(crate) fn glass_hover_px(&self) -> Option<(f64, f64)> {
         self.glass_hover_px
     }
@@ -4011,7 +3983,6 @@ impl App {
             if prev_hover.is_some()
                 | ws.claude_lights.switch_hover.take().is_some()
                 | ws.claude_lights.part_hover.take().is_some()
-                | ws.claude_lights.mark_hover.take().is_some()
                 | ws.claude_lights.quota_column.take().is_some()
                 | ws.claude_lights.glass_hover_px.take().is_some()
             {
@@ -4174,12 +4145,11 @@ impl App {
         let over = at.and_then(|(session, glass)| match glass {
             GlassAt::Chip(chip) => Some((session, Target::Chip(chip?))),
             GlassAt::Fact(fact, _) => Some((session, Target::Fact(fact))),
-            GlassAt::Switch(_) | GlassAt::Mark | GlassAt::Label | GlassAt::Upgrade => None,
+            GlassAt::Switch(_) | GlassAt::Label | GlassAt::Upgrade => None,
         });
         let switch =
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
         let part = at.and_then(|(session, glass)| Some((session, part_of(glass)?)));
-        let mark = at.and_then(|(session, glass)| (glass == GlassAt::Mark).then_some(session));
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -4205,10 +4175,6 @@ impl App {
             lights.part_hover = None;
             gone = true;
         }
-        if lights.mark_hover.is_some() && lights.mark_hover != mark {
-            lights.mark_hover = None;
-            gone = true;
-        }
         if lights.glass_hit_hover.is_some() && lights.glass_hit_hover != glass_hit {
             lights.glass_hit_hover = glass_hit;
             cursor_gone = true;
@@ -4216,7 +4182,6 @@ impl App {
         if lights.hover.is_none()
             && lights.switch_hover.is_none()
             && lights.part_hover.is_none()
-            && lights.mark_hover.is_none()
             && lights.glass_hit_hover.is_none()
         {
             lights.glass_hover_px = None;
@@ -4306,12 +4271,11 @@ impl App {
         let over = at.and_then(|(session, glass)| match glass {
             GlassAt::Chip(chip) => Some((session, Target::Chip(chip?))),
             GlassAt::Fact(fact, _) => Some((session, Target::Fact(fact))),
-            GlassAt::Switch(_) | GlassAt::Mark | GlassAt::Label | GlassAt::Upgrade => None,
+            GlassAt::Switch(_) | GlassAt::Label | GlassAt::Upgrade => None,
         });
         let switch =
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
         let part = at.and_then(|(session, glass)| Some((session, part_of(glass)?)));
-        let mark = at.and_then(|(session, glass)| (glass == GlassAt::Mark).then_some(session));
         let column = over
             .filter(|(_, t)| *t == Target::Fact(Fact::Account))
             .and_then(|_| self.quota_column_at(wid, x, y));
@@ -4322,17 +4286,13 @@ impl App {
         if ws.selecting {
             return OverChips::No;
         }
-        ws.claude_lights.glass_hover_px = (over.is_some()
-            || switch.is_some()
-            || part.is_some()
-            || mark.is_some()
-            || glass_hit.is_some())
-        .then_some((x, y));
+        ws.claude_lights.glass_hover_px =
+            (over.is_some() || switch.is_some() || part.is_some() || glass_hit.is_some())
+                .then_some((x, y));
         ws.claude_lights.glass_hit_hover = glass_hit;
         if ws.claude_lights.hover != over
             || ws.claude_lights.switch_hover != switch
             || ws.claude_lights.part_hover != part
-            || ws.claude_lights.mark_hover != mark
             || ws.claude_lights.quota_column != column
         {
             let had_fact = ws
@@ -4343,7 +4303,6 @@ impl App {
             ws.claude_lights.quota_column = column;
             ws.claude_lights.switch_hover = switch;
             ws.claude_lights.part_hover = part;
-            ws.claude_lights.mark_hover = mark;
             redraw(ws);
             if had_fact || over.is_some_and(|(_, t)| t.fact().is_some()) {
                 self.note_fact_readings(wid);
@@ -4356,10 +4315,7 @@ impl App {
     pub(crate) fn claude_glass_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, GlassAt)> {
         let ws = self.windows.get(&wid)?;
         let lights = &ws.claude_lights;
-        if lights.hits.is_empty()
-            && lights.border_toggles.is_empty()
-            && lights.fact_hits.is_empty()
-            && lights.mark_hits.is_empty()
+        if lights.hits.is_empty() && lights.border_toggles.is_empty() && lights.fact_hits.is_empty()
         {
             return None;
         }
@@ -4384,22 +4340,16 @@ impl App {
                 && !self.chrome_owns_terminal_cell(wid, b.term_row, col)
         }) {
             Some((b.session, GlassAt::Label))
-        } else if let Some(h) = lights.fact_hits.iter().find(|h| {
-            h.frame_row == row
-                && (h.cols.0..h.cols.1).contains(&col)
-                && !self.chrome_owns_terminal_cell(wid, h.term_row, col)
-        }) {
-            Some((h.session, GlassAt::Fact(h.fact, h.restores)))
         } else {
             lights
-                .mark_hits
+                .fact_hits
                 .iter()
-                .find(|m| {
-                    m.frame_row == row
-                        && m.cols.contains(&col)
-                        && !self.chrome_owns_terminal_cell(wid, m.term_row, col)
+                .find(|h| {
+                    h.frame_row == row
+                        && (h.cols.0..h.cols.1).contains(&col)
+                        && !self.chrome_owns_terminal_cell(wid, h.term_row, col)
                 })
-                .map(|m| (m.session, GlassAt::Mark))
+                .map(|h| (h.session, GlassAt::Fact(h.fact, h.restores)))
         }?;
         (!self.chrome_overlay_at(wid, x, y)).then_some(hit)
     }
@@ -4718,8 +4668,7 @@ impl App {
             GlassAt::Fact(fact, restores) => {
                 self.press_visible_claude_fact(wid, session, fact, restores)
             }
-            // The label is hover only: its press, and its release, go nowhere. The lockup's is the
-            // pane's, as before the rule wore one.
+            // The label is hover only: its press, and its release, go nowhere.
             GlassAt::Label => {
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
@@ -4727,7 +4676,6 @@ impl App {
                 }
                 true
             }
-            GlassAt::Mark => false,
         }
     }
 
@@ -4980,6 +4928,10 @@ impl App {
             return;
         }
         let (_, view, _) = self.session_autopilot(session);
+        // Under a switch holding the harness off no chip is drawn where the top rule's switch
+        // stands (it is the one way back, `App::pane_bare`); where it cannot stand (a program
+        // the timeline does not name) the chip is the way back and presses the switch; with no
+        // host the chip opens the page.
         let Some(want) = view.next() else {
             match crate::autopilot::HarnessSwitch::of(view) {
                 Some(face) => {
@@ -8162,21 +8114,43 @@ mod gesture_tests {
                 crate::app_config::HarnessPolicy::read(text),
             )
         };
+        // The switch stands for an agent the timeline names.
+        app.pool
+            .get(session)
+            .expect("session")
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_program(PGID, Some("claude".into()));
         app.harness_policy = policy("[harness]\nenabled = false\n");
         frame(&mut app, wid);
-        rename(&mut app, "off chip");
-        click(&mut app, wid, Chip::Autopilot);
+        rename(&mut app, "off switch");
+        assert!(
+            !painted(&app, wid, Chip::Autopilot),
+            "under the switch off no Autopilot chip stands"
+        );
+        let off = app.windows[&wid]
+            .claude_lights
+            .border_toggles
+            .first()
+            .map(|b| (b.frame_row, b.cols.start + b.cols.len() / 2))
+            .expect("the off switch");
+        let (x, y) = px_of(&app, wid, off);
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
         assert!(
             app.inline_rename_edit(wid).is_none(),
-            "the off chip: closed"
+            "the off switch: closed"
         );
-        assert_eq!(pinned(&app).as_deref(), Some("off chip"), "and committed");
+        assert_eq!(pinned(&app).as_deref(), Some("off switch"), "and committed");
         assert_eq!(
             app.focused_session_id(wid),
             Some(session),
-            "`⊘ off`: nothing came to the front"
+            "`○ off`: nothing came to the front"
         );
-        assert_eq!(autopilot(&app, session).0, None, "`⊘ off`: no word written");
+        assert_eq!(autopilot(&app, session).0, None, "`○ off`: no word written");
         app.harness_policy = policy("[harness]\n");
         app.switch_tab_in(wid, 0);
         frame(&mut app, wid);
@@ -8384,161 +8358,6 @@ mod gesture_tests {
             narrowest(3),
             narrowest(2),
             narrowest(1)
-        );
-    }
-
-    /// The record the harness switch's refused write posted for `key`.
-    fn switch_write_said(app: &App, key: &str) -> Option<String> {
-        let want = format!("harness.switch-save.{key}");
-        app.messages
-            .log()
-            .records()
-            .rfind(|r| r.key.as_deref() == Some(want.as_str()))
-            .map(|r| r.detail.join(" "))
-    }
-
-    #[test]
-    fn under_the_master_switch_off_the_autopilot_chip_turns_it_on() {
-        use crate::native_settings::SettingsRoute;
-        let (mut app, wid, session, mut reader) = wider_app();
-        let _host = host(&mut app);
-        let policy = |text: &str| {
-            crate::harness_policy_cell::HarnessPolicyCell::new(
-                crate::app_config::HarnessPolicy::read(text),
-            )
-        };
-        app.harness_policy = policy("[harness]\nenabled = false\n");
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        let chip = hit(&app, wid, Chip::Autopilot);
-        assert_eq!(
-            (cell_at(&app, wid, chip).ch, cell_at(&app, wid, chip).fg),
-            ('\u{2298}', quiet_ink(&app, wid))
-        );
-        let (x, y) = px_of(&app, wid, chip);
-        app.on_cursor_moved(wid, x, y);
-        frame(&mut app, wid);
-        let text = row_text(&app, wid, chip.0);
-        assert!(
-            text.contains("\u{2298} off")
-                && text.contains(
-                    "harness off in Settings \u{b7} click: turn the harness on \u{b7} \
-                     right-click: more"
-                ),
-            "{text:?}"
-        );
-        assert_eq!(
-            switch_write_said(&app, "harness.enabled"),
-            None,
-            "control: no write yet"
-        );
-        let tabs = app.windows[&wid].tab_set.len();
-        super::SWITCHES_LET_GO.with(|n| n.set(0));
-        click(&mut app, wid, Chip::Autopilot);
-        let said =
-            switch_write_said(&app, "harness.enabled").expect("the master switch's write was made");
-        assert!(said.contains("harness.enabled = true"), "{said:?}");
-        assert_eq!(
-            super::SWITCHES_LET_GO.with(std::cell::Cell::get),
-            1,
-            "`◌ turning on` was armed, and the refusal let it go"
-        );
-        assert!(
-            app.native_settings_route_view_target(SettingsRoute::Harness)
-                .is_none(),
-            "Settings ▸ Harness stays shut"
-        );
-        assert_eq!(app.windows[&wid].tab_set.len(), tabs, "no tab opened");
-        assert_eq!(
-            autopilot(&app, session),
-            (None, AutopilotView::MasterOff),
-            "no word written"
-        );
-        assert!(pty(&mut reader, 0).is_empty());
-        app.harness_policy = policy("[harness]\n");
-        frame(&mut app, wid);
-        super::switch_tests::later(&mut app, wid, session);
-        click(&mut app, wid, Chip::Autopilot);
-        assert_eq!(
-            autopilot(&app, session),
-            (Some(Autopilot::Land), AutopilotView::Land),
-            "the click wrote the word"
-        );
-        assert_eq!(app.windows[&wid].tab_set.len(), tabs, "no tab opened");
-        assert_eq!(
-            app.focused_session_id(wid),
-            Some(session),
-            "Claude's tab stays in front"
-        );
-        assert!(pty(&mut reader, 0).is_empty());
-    }
-
-    #[test]
-    fn under_the_agents_switch_off_the_autopilot_chip_turns_it_on() {
-        use crate::harness_screen::HarnessFocus;
-        use crate::native_settings::SettingsRoute;
-        let (mut app, wid, session, _reader) = wider_app();
-        let _host = host(&mut app);
-        publish_facts(&app, session);
-        app.pool
-            .get(session)
-            .expect("session")
-            .ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .set_program(PGID, Some("claude".into()));
-        let landed = |app: &App| {
-            app.native_settings_route_view_target(SettingsRoute::Harness)
-                .map(|(_, _, _, state)| state.harness_focus)
-        };
-        let front = |app: &mut App| {
-            app.switch_tab_in(wid, 0);
-            draw_claude(app, session, BYPASS);
-            frame(app, wid);
-        };
-        assert!(app.open_harness_settings(wid, HarnessFocus::Top));
-        assert_eq!(landed(&app), Some(HarnessFocus::Top));
-        app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
-            crate::app_config::HarnessPolicy::read("[harness.claude]\nenabled = false\n"),
-        );
-        front(&mut app);
-        assert_eq!(
-            autopilot(&app, session),
-            (None, AutopilotView::AgentOff(aterm_phase::Program::Claude))
-        );
-        super::SWITCHES_LET_GO.with(|n| n.set(0));
-        click(&mut app, wid, Chip::Autopilot);
-        assert!(
-            switch_write_said(&app, "harness.claude.enabled").is_some(),
-            "Claude Code's own switch was written"
-        );
-        assert_eq!(
-            switch_write_said(&app, "harness.enabled"),
-            None,
-            "not the master's"
-        );
-        assert_eq!(autopilot(&app, session).0, None, "no word written");
-        assert_eq!(landed(&app), None, "⊘ off: no page raised");
-        assert_eq!(
-            app.focused_session_id(wid),
-            Some(session),
-            "⊘ off: Claude's tab stays in front"
-        );
-        frame(&mut app, wid);
-        click(&mut app, wid, Chip::Autopilot);
-        assert_eq!(
-            super::SWITCHES_LET_GO.with(std::cell::Cell::get),
-            1,
-            "one write for a double click"
-        );
-        let last = app.windows[&wid].tab_set.len() - 1;
-        app.switch_tab_in(wid, last);
-        assert_eq!(
-            landed(&app),
-            Some(HarnessFocus::Top),
-            "⊘ off: no page landed"
         );
     }
 

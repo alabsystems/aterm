@@ -221,7 +221,7 @@ pub use vault_memo::{
     trusted_commons_log_now,
 };
 pub(crate) use vault_memo::{
-    local_recipient_denied_under, observe_commons_now, observe_commons_quiet,
+    local_recipient_denied_under, observe_commons_now, observe_commons_quiet, state_standing_in,
     trusted_commons_log_under,
 };
 #[cfg(test)]
@@ -2261,10 +2261,8 @@ pub fn config(paths: &Paths) -> crate::Result<Option<Config>> {
 /// As [`config`], or the held envelope cannot be read.
 pub(crate) fn config_whole(paths: &Paths) -> crate::Result<Option<Config>> {
     config_with(paths, |pin| {
-        Ok(
-            fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)?
-                .map_or_else(Vec::new, |bytes| chain_cache::parsed(bytes).chain(pin)),
-        )
+        Ok(chain_cache::held(&paths.cache_file())?
+            .map_or_else(Vec::new, |parsed| parsed.chain(pin)))
     })
 }
 
@@ -2561,11 +2559,30 @@ fn read_state(paths: &Paths) -> crate::Result<Option<State>> {
 /// reader that keeps what it read while this stands takes none of its answer from those fields
 /// ([`vault_memo::desk_inputs`], aterm-agent's `fleet_log::LocalLog`): of the file's readers,
 /// only [`status`] answers with `heard`, and only the receipts' own projections with a receipt.
+/// The file is read only where it shows another stamp than the one it was last read under in
+/// this process ([`vault_memo::state_standing_in`]): one `lstat` while it stands.
 ///
 /// # Errors
 /// `state.toml` cannot be read.
 pub fn state_standing(paths: &Paths) -> crate::Result<Option<[u8; 32]>> {
-    Ok(read_state(paths)?.map(|state| sha256(ordinary_state(&state, false).as_bytes())))
+    vault_memo::state_standing_in(paths, None)
+}
+
+/// [`state_standing`], and from the same read of `state.toml` when the vault last heard this Mac
+/// where the state holds it in ([`Stored::In`]), as [`status`]'s [`Membership::In`] gives it
+/// where a vault is configured: what [`vault_memo`]'s memos stamp the file by.
+///
+/// # Errors
+/// `state.toml` cannot be read.
+pub(super) fn state_standing_heard(
+    paths: &Paths,
+) -> crate::Result<Option<([u8; 32], Option<u64>)>> {
+    Ok(read_state(paths)?.map(|state| {
+        (
+            sha256(ordinary_state(&state, false).as_bytes()),
+            (state.membership == Stored::In).then_some(state.heard),
+        )
+    }))
 }
 
 fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
@@ -3804,11 +3821,11 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
     let Some(identity) = read_identity(paths)? else {
         return Ok(None);
     };
-    let Some(bytes) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)? else {
+    let Some(held_vault) = chain_cache::held(&paths.cache_file())? else {
         return Ok(None);
     };
     let (envelope, pinned, verdict) = envelope::verify_for_reader(
-        bytes.as_slice(),
+        held_vault.bytes(),
         &config.name,
         &pin,
         &config.followed,
@@ -4566,27 +4583,26 @@ fn names_of(report: &Report) -> Vec<String> {
 
 fn floor(paths: &Paths, state: &State, name: &str, config: &Config) -> Option<Floor> {
     let pin = config.signer?;
-    let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
-        .ok()
-        .flatten();
-    let verified = |bytes: SecretBytes| {
-        envelope::verify_for_reader(bytes.as_slice(), name, &pin, &config.followed, None)
+    let cached = chain_cache::held(&paths.cache_file()).ok().flatten();
+    let verified = |parsed: &chain_cache::Parsed| {
+        envelope::verify_for_reader(parsed.bytes(), name, &pin, &config.followed, None)
             .ok()
             .map(|(envelope, _, _)| envelope)
     };
     if state.membership != Stored::None {
         let Some(digest) = state.digest else {
-            return Some(Floor::below(&verified(cached?)?));
+            return Some(Floor::below(&verified(cached.as_deref()?)?));
         };
         let held = cached
-            .and_then(|bytes| envelope::parse(bytes.as_slice()).ok())
+            .as_deref()
+            .and_then(|parsed| parsed.envelope().ok())
             .filter(|cached| cached.digest() == digest);
         return Some(match held {
-            Some(held) => Floor::of(&held),
+            Some(held) => Floor::of(held),
             None => Floor::version(state.seq, digest),
         });
     }
-    Some(Floor::of(&verified(cached?)?))
+    Some(Floor::of(&verified(cached.as_deref()?)?))
 }
 
 fn pin_gives_way(config: &Config) -> bool {
@@ -4596,10 +4612,10 @@ fn pin_gives_way(config: &Config) -> bool {
 }
 
 fn cached_chain(paths: &Paths, pin: &[u8; 32]) -> Vec<[u8; 32]> {
-    fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
+    chain_cache::held(&paths.cache_file())
         .ok()
         .flatten()
-        .map_or_else(Vec::new, |bytes| chain_cache::parsed(bytes).chain(pin))
+        .map_or_else(Vec::new, |parsed| parsed.chain(pin))
 }
 
 fn chain_keys(envelope: &Envelope) -> Vec<[u8; 32]> {
@@ -9036,15 +9052,10 @@ fn admin_text_here(
     let Some(pin) = config.signer else {
         return Ok(None);
     };
-    let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)?
+    let cached = chain_cache::held(&paths.cache_file())?
         .ok_or_else(|| Error::new("no cached vault to check approval"))?;
-    let (envelope, _, _) = envelope::verify_for_reader(
-        cached.as_slice(),
-        &config.name,
-        &pin,
-        &config.followed,
-        None,
-    )?;
+    let (envelope, _, _) =
+        envelope::verify_for_reader(cached.bytes(), &config.name, &pin, &config.followed, None)?;
     if envelope.seq != state.seq || Some(envelope.digest()) != state.digest {
         return Err(Error::new("the cached vault is not the recorded version"));
     }
@@ -12712,8 +12723,8 @@ fn admin_open_with_candidates_started(
     let verifies = |bytes: &[u8]| {
         envelope::verify_for_reader(bytes, &config.name, &pin, &config.followed, None).is_ok()
     };
-    let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)?
-        .map(|bytes| bytes.as_slice().to_vec())
+    let cached = chain_cache::held(&paths.cache_file())?
+        .map(|parsed| parsed.bytes().to_vec())
         .filter(|bytes| verifies(bytes));
     let mut primary_reachable = true;
     // Every read here names this Mac's recipient, as sync's do: a server's heard history then
@@ -16619,7 +16630,9 @@ mod tests {
         };
         let cached = |endorsement: [u8; 64]| {
             let bytes = signed(opened.seq() + 1, vec![(key, endorsement)], &opened.seed);
-            std::fs::write(admin.cache_file(), bytes).expect("cached");
+            // As every writer of the held vault does: a rename over it, so the read after it
+            // meets a new file's stamp ([`chain_cache::held`]).
+            crate::fsx::write_atomic(&admin.cache_file(), &bytes, 0o600).expect("cached");
             pinned(&admin)
         };
         let config = cached([7; 64]);

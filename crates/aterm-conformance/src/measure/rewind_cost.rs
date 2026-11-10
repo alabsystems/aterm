@@ -55,7 +55,10 @@ pub enum CostRow {
     /// blocks, up to the plan's last look and [`THROUGHPUT_SPEND_SECS`]. Dropped input
     /// fails at once.
     Throughput { bytes: usize, min_milli: u64 },
-    /// One idle pane, `pairs` ABBA pairs (off, on, on, off), each take a fresh instance: passes when the on arm's median resident size is at most `max_extra_bytes` over the off arm's and, on a bundle that records by default (one more instance with no `temporal_recording` key says), at most [`APP_IDLE_TARGET_BYTES`] ([`idle_verdict`]). Each take's app memory ([`Settled::read`]) is reported beside it and judges nothing.
+    /// One idle pane, at most `pairs` ABBA blocks, each arm a fresh instance. After at least
+    /// two blocks (or the full cap if smaller), stop only when every possible completion of
+    /// the capped sample gives the same [`idle_verdict`]. Reports the observed medians and
+    /// the completion bounds separately. App memory judges only a default-recording bundle.
     IdleRss { pairs: u32, max_extra_bytes: u64 },
     /// `panes` panes each draining `bytes` at once: passes when recording on adds at most `max_extra_bytes` of resident size over recording off and the pool holds no more than its limit.
     BusyRss {
@@ -603,10 +606,109 @@ pub fn idle_verdict(
     )
 }
 
+/// An exact decision about the capped idle-RSS medians. The lower median has one-based rank
+/// `cap.div_ceil(2)`. No independence or distribution assumption is needed: every unobserved
+/// reading may be anywhere in `0..=u64::MAX`. At least four readings per arm (two whole ABBA
+/// blocks) are required, or the whole sample when its cap is smaller. `None` means keep taking
+/// complete blocks; invalid and incomplete prefixes cannot pass.
+#[must_use]
+pub fn idle_decision(
+    off: &[u64],
+    on: &[u64],
+    on_app: &[u64],
+    cap: usize,
+    max_extra: u64,
+    records_by_default: bool,
+) -> Option<ShapeVerdict> {
+    if cap == 0
+        || !cap.is_multiple_of(2)
+        || off.len() != on.len()
+        || on.len() != on_app.len()
+        || !on.len().is_multiple_of(2)
+        || on.len() < cap.min(4)
+    {
+        return None;
+    }
+    let rank = cap.div_ceil(2);
+    let (off_lo, off_hi) = super::decision::completion(off, cap, rank)?;
+    let (on_lo, on_hi) = super::decision::completion(on, cap, rank)?;
+    let (app_lo, app_hi) = super::decision::completion(on_app, cap, rank)?;
+    if on_hi.saturating_sub(off_lo) <= max_extra
+        && (!records_by_default || app_hi <= APP_IDLE_TARGET_BYTES)
+    {
+        Some(ShapeVerdict::Pass)
+    } else if on_lo.saturating_sub(off_hi) > max_extra
+        || (records_by_default && app_lo > APP_IDLE_TARGET_BYTES)
+    {
+        Some(ShapeVerdict::Fail)
+    } else {
+        None
+    }
+}
+
+struct IdleReadings {
+    off: Vec<u64>,
+    on: Vec<u64>,
+    off_app: Vec<u64>,
+    on_app: Vec<u64>,
+    verdict: ShapeVerdict,
+}
+
+/// This acquisition loop is shared by the live instrument and callback-driven negative controls.
+fn run_idle_plan(
+    pairs: u32,
+    max_extra: u64,
+    by_default: bool,
+    mut sample: impl FnMut(usize, bool) -> Result<(u64, u64), CouldNotRun>,
+) -> Result<IdleReadings, CouldNotRun> {
+    let cap = usize::try_from(pairs)
+        .ok()
+        .and_then(|p| p.checked_mul(2))
+        .filter(|&n| n > 0)
+        .ok_or_else(|| CouldNotRun::Refused("idle RSS requires a positive sample cap".into()))?;
+    let mut readings = IdleReadings {
+        off: Vec::new(),
+        on: Vec::new(),
+        off_app: Vec::new(),
+        on_app: Vec::new(),
+        verdict: ShapeVerdict::Fail,
+    };
+    for block in 0..pairs as usize {
+        for record in [false, true, true, false] {
+            let (rss, app) = sample(block, record)?;
+            if record {
+                &mut readings.on
+            } else {
+                &mut readings.off
+            }
+            .push(rss);
+            if record {
+                &mut readings.on_app
+            } else {
+                &mut readings.off_app
+            }
+            .push(app);
+        }
+        if let Some(verdict) = idle_decision(
+            &readings.off,
+            &readings.on,
+            &readings.on_app,
+            cap,
+            max_extra,
+            by_default,
+        ) {
+            readings.verdict = verdict;
+            return Ok(readings);
+        }
+    }
+    could_not_run("idle RSS reached its cap without a completion decision")
+}
+
 /// Measure one row.
 /// # Errors
 /// [`CouldNotRun`] when an instance did not start, a request failed, a drain never reported,
-/// the recording writer ended, or required status counters are unavailable.
+/// the recording writer ended, required status counters are unavailable, or an idle-RSS
+/// sample cap is zero or overflows.
 pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
     measure_with_control(rig, row, false)
 }
@@ -752,44 +854,70 @@ fn measure_with_control(
             max_extra_bytes,
         } => {
             let by_default = Take::records_by_default(rig, budget)?;
-            let (mut off, mut on) = (Vec::new(), Vec::new());
-            let (mut off_app, mut on_app) = (Vec::new(), Vec::new());
-            for _ in 0..pairs {
-                for record in [false, true, true, false] {
-                    let started = std::time::Instant::now();
-                    let take = Take::launch(rig, record, budget)?;
-                    eprintln!(
-                        "measure setup: idle_rss record={record} launch_s={:.6}",
-                        started.elapsed().as_secs_f64()
-                    );
-                    let took = take.settled(RssScene::Idle)?;
-                    if record { &mut on } else { &mut off }.push(took.rss);
-                    if record { &mut on_app } else { &mut off_app }.push(took.app);
-                }
-            }
+            let mut sample = 0;
+            let IdleReadings {
+                off,
+                on,
+                off_app,
+                on_app,
+                verdict,
+            } = run_idle_plan(pairs, max_extra_bytes, by_default, |block, record| {
+                sample += 1;
+                let mut phases = super::instance::Phases::new(format!(
+                    "row=idle_rss block={block} record={record} sample={sample}"
+                ));
+                let started = std::time::Instant::now();
+                let take = Take::launch(rig, record, budget)?;
+                phases.end("launch_first_quiet");
+                eprintln!(
+                    "measure setup: idle_rss record={record} launch_s={:.6}",
+                    started.elapsed().as_secs_f64()
+                );
+                let took = take.settled(RssScene::Idle)?;
+                phases.end("quiet_sample");
+                eprintln!(
+                    "measure-sample: {}",
+                    aterm_json::json!({
+                        "schema": 1, "measurement": "idle-rss", "block": block,
+                        "recording": record, "rss_bytes": took.rss, "app_bytes": took.app,
+                        "seconds": started.elapsed().as_secs_f64(),
+                    })
+                );
+                drop(take);
+                phases.end("stop");
+                Ok((took.rss, took.app))
+            })?;
             let on_median = median(&on);
             let on_app_median = median(&on_app);
             Ok(CostReport {
                 line: format!(
-                    "COST idle_rss pairs={pairs} off_bytes={off:?} on_bytes={on:?} \
+                    "COST idle_rss pairs={} planned_pairs={pairs} stopping_samples_per_arm={} \
+                     decision=all_completions completion_extra_bytes={:?} completion_app_bytes={:?} \
+                     off_bytes={off:?} on_bytes={on:?} \
                      off_median_bytes={} on_median_bytes={on_median} extra_bytes={} \
                      max_extra_bytes={max_extra_bytes} off_app_bytes={off_app:?} \
                      on_app_bytes={on_app:?} off_app_median_bytes={} \
                      on_app_median_bytes={} records_by_default={by_default} \
                      app_target_bytes={APP_IDLE_TARGET_BYTES} app_target_met={}",
+                    on.len() / 2,
+                    on.len(),
+                    {
+                        let cap = pairs as usize * 2;
+                        let (off_lo, off_hi) =
+                            super::decision::completion(&off, cap, cap.div_ceil(2))
+                                .expect("validated cap");
+                        let (on_lo, on_hi) = super::decision::completion(&on, cap, cap.div_ceil(2))
+                            .expect("validated cap");
+                        (on_lo.saturating_sub(off_hi), on_hi.saturating_sub(off_lo))
+                    },
+                    super::decision::completion(&on_app, pairs as usize * 2, pairs as usize),
                     median(&off),
                     added_bytes(&off, &on),
                     median(&off_app),
                     on_app_median,
                     on_app_median <= APP_IDLE_TARGET_BYTES,
                 ),
-                disposition: judged(idle_verdict(
-                    &off,
-                    &on,
-                    &on_app,
-                    max_extra_bytes,
-                    by_default,
-                )),
+                disposition: judged(verdict),
             })
         }
         CostRow::BusyRss {
@@ -952,6 +1080,124 @@ const fn verdict(pass: bool) -> ShapeVerdict {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_sampling_stops_only_when_every_remaining_reading_is_harmless() {
+        use super::*;
+        let mut calls = 0;
+        let pass = run_idle_plan(3, 8, true, |_, on| {
+            calls += 1;
+            Ok((100 + u64::from(on), 10))
+        })
+        .unwrap();
+        assert_eq!((calls, pass.verdict), (8, ShapeVerdict::Pass));
+        calls = 0;
+        let fail = run_idle_plan(3, 8, true, |_, on| {
+            calls += 1;
+            Ok((100 + 9 * u64::from(on), 10))
+        })
+        .unwrap();
+        assert_eq!((calls, fail.verdict), (8, ShapeVerdict::Fail));
+        calls = 0;
+        let borderline = run_idle_plan(3, 8, false, |block, on| {
+            calls += 1;
+            Ok((
+                if on {
+                    9
+                } else if block == 0 {
+                    0
+                } else {
+                    100
+                },
+                10,
+            ))
+        })
+        .unwrap();
+        assert_eq!((calls, borderline.verdict), (12, ShapeVerdict::Pass));
+        // Replacing completion bounds with the prefix's median would fail this at block two.
+        let off = [0, 0, 100, 100];
+        let on = [9; 4];
+        assert_eq!(
+            idle_verdict(&off, &on, &[10; 4], 8, false),
+            ShapeVerdict::Fail
+        );
+        assert_eq!(idle_decision(&off, &on, &[10; 4], 6, 8, false), None);
+        let mut full_off = off.to_vec();
+        full_off.extend([100, 100]);
+        assert_eq!(
+            idle_verdict(&full_off, &[9; 6], &[10; 6], 8, false),
+            ShapeVerdict::Pass
+        );
+        assert_eq!(
+            idle_decision(&[100; 2], &[101; 2], &[10; 2], 6, 8, false),
+            None
+        );
+        assert!(run_idle_plan(0, 8, false, |_, _| panic!("invalid cap sampled")).is_err());
+        assert!(run_idle_plan(3, 8, false, |_, _| could_not_run("missing reading")).is_err());
+        assert_eq!(
+            idle_decision(
+                &[100; 4],
+                &[101; 4],
+                &[APP_IDLE_TARGET_BYTES + 1; 4],
+                6,
+                8,
+                true
+            ),
+            Some(ShapeVerdict::Fail)
+        );
+        assert_eq!(
+            idle_decision(
+                &[100; 4],
+                &[101; 4],
+                &[APP_IDLE_TARGET_BYTES + 1; 4],
+                6,
+                8,
+                false
+            ),
+            Some(ShapeVerdict::Pass)
+        );
+    }
+
+    #[test]
+    fn idle_decisions_agree_with_every_binary_completion_including_a_late_regression() {
+        use super::*;
+        // Enumerate all 4,096 paired six-reading samples over {0, 9}.
+        for off_bits in 0..64 {
+            for on_bits in 0..64 {
+                let values = |bits| {
+                    (0..6)
+                        .map(|i| if bits & (1 << i) == 0 { 0 } else { 9 })
+                        .collect::<Vec<_>>()
+                };
+                let off = values(off_bits);
+                let on = values(on_bits);
+                let at_cap = idle_verdict(&off, &on, &[10; 6], 8, false);
+                if let Some(early) = idle_decision(&off[..4], &on[..4], &[10; 4], 6, 8, false) {
+                    assert_eq!(early, at_cap);
+                }
+                assert_eq!(
+                    idle_decision(&off, &on, &[10; 6], 6, 8, false),
+                    Some(at_cap)
+                );
+            }
+        }
+        // The last two blocks reverse a favorable first block; minimum and bounds both matter.
+        assert_eq!(
+            idle_decision(&[100; 2], &[100; 2], &[10; 2], 6, 8, false),
+            None
+        );
+        assert_eq!(
+            idle_decision(
+                &[100; 6],
+                &[100, 100, 109, 109, 109, 109],
+                &[10; 6],
+                6,
+                8,
+                false
+            ),
+            Some(ShapeVerdict::Fail)
+        );
+    }
+
     use super::*;
 
     #[test]

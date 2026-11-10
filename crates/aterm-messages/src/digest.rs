@@ -259,8 +259,6 @@ pub fn report_local(
     offset_at: &dyn Fn(i64) -> Option<i64>,
     now_unix_ms: u64,
 ) -> Vec<String> {
-    use crate::center::Outcome;
-    use crate::log::{LogState, Retired};
     use crate::words::{clock_words, day_heading, local_day};
     let offset_for = |ms: u64| offset_at(i64::try_from(ms / 1000).unwrap_or(i64::MAX)).unwrap_or(0);
     let today = local_day(now_unix_ms, offset_for(now_unix_ms));
@@ -301,41 +299,7 @@ pub fn report_local(
                 out.push(format!("{name} ({})", records.len()));
             }
             for r in records.into_iter().take(shown) {
-                let mark = if r.severity >= Severity::Warn {
-                    "warning: "
-                } else {
-                    ""
-                };
-                out.push(format!("  {}  {mark}{}", r.id, r.title));
-                let when = said(r.stamp.unix_ms);
-                match &r.state {
-                    LogState::Posted => out.push(format!("      since  {when}")),
-                    LogState::Retired(how) => {
-                        let at = r
-                            .retired_unix_ms
-                            .map_or_else(String::new, |ms| format!(" {}", said(ms)));
-                        let word = match how {
-                            Retired::Resolved(Outcome::Ok) => "fixed".to_string(),
-                            Retired::Resolved(Outcome::Warn) => "ended unfixed".to_string(),
-                            Retired::Evicted => "filed (list full)".to_string(),
-                            Retired::Superseded { .. } => "shown as a message".to_string(),
-                            Retired::Unseen => "aged out".to_string(),
-                            Retired::Answered { label } => format!("answered {label}"),
-                            other => other.as_word().to_string(),
-                        };
-                        out.push(format!("      since  {when} \u{00b7} {word}{at}"));
-                    }
-                }
-                if let Some(why) = r.detail.first() {
-                    out.push(format!("      why    {why}"));
-                }
-                if let Some(then) = r.detail.get(1).filter(|_| {
-                    r.is_live()
-                        || r.filed_exception()
-                        || matches!(r.retired(), Some(Retired::Resolved(Outcome::Warn)))
-                }) {
-                    out.push(format!("      then   {then}"));
-                }
+                push_report_record(r, &said, out);
             }
         };
     if matches!(
@@ -359,4 +323,53 @@ pub fn report_local(
         section("Filed", filed, shown, &mut out);
     }
     out
+}
+
+fn push_report_record(
+    r: &crate::log::LogRecord,
+    said: &dyn Fn(u64) -> String,
+    out: &mut Vec<String>,
+) {
+    use crate::center::Outcome;
+    use crate::log::{LogState, Retired};
+
+    let mark = if r.severity >= Severity::Warn {
+        "warning: "
+    } else {
+        ""
+    };
+    out.push(format!("  {}  {mark}{}", r.id, r.title));
+    let when = said(r.stamp.unix_ms);
+    match &r.state {
+        LogState::Posted => out.push(format!("      since  {when}")),
+        LogState::Retired(how) => {
+            let at = r
+                .retired_unix_ms
+                .map_or_else(String::new, |ms| format!(" {}", said(ms)));
+            let word = match how {
+                Retired::Resolved(Outcome::Ok) => "fixed".to_string(),
+                Retired::Resolved(Outcome::Warn) => "ended unfixed".to_string(),
+                Retired::Evicted => "filed (list full)".to_string(),
+                Retired::Superseded { .. } => "shown as a message".to_string(),
+                Retired::Unseen => "aged out".to_string(),
+                Retired::Answered { label } => format!("answered {label}"),
+                other => other.as_word().to_string(),
+            };
+            out.push(format!("      since  {when} \u{00b7} {word}{at}"));
+        }
+    }
+    if let Some(why) = r.detail.first() {
+        out.push(format!("      why    {why}"));
+    }
+    let show_action = r.is_live()
+        || r.filed_exception()
+        || matches!(r.retired(), Some(Retired::Resolved(Outcome::Warn)));
+    if show_action {
+        if let Some(then) = r.detail.get(1) {
+            out.push(format!("      then   {then}"));
+        }
+        for more in r.detail.iter().skip(2) {
+            out.push(format!("      detail {more}"));
+        }
+    }
 }

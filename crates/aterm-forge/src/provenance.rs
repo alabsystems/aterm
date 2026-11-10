@@ -64,6 +64,16 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
           from the third-party ratchet.",
     },
     FirstPartyVendored {
+        dir: "vendor/trust-exec-policy",
+        upstream: "Trust crates/trust-exec-policy at cae6f4b58466; the manifest's \
+          [package.metadata.aterm-vendor] records the full commit and path",
+        why: "Original Andrew Yates code: the maintained native final-exec policy leaf. \
+          Its Rust sources, README, lockfile and retained licences are exact upstream \
+          (vendor/trust-exec-policy/README.aterm.md); the standalone manifest only adds \
+          this provenance record. A path dependency keeps public clones hermetic. \
+          This does not exempt its registry dependencies from the third-party ratchet.",
+    },
+    FirstPartyVendored {
         dir: "vendor/trust-resource-controller",
         upstream: "Trust crates/trust-resource-controller at 5db4b0acbd29; the manifest's \
           [package.metadata.aterm-vendor] records the repository and commit",

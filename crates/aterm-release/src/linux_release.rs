@@ -391,7 +391,8 @@ const SSH_OPTIONS: [&str; 14] = [
 const WORKER_SCRIPT: &str = r#"main() {
 set -eu
 umask 077
-repo=$1 commit=$2 version=$3 build=$4 arch=$5
+repo=$1 commit=$2 version=$3 build=$4 arch=$5 source=$6
+trap 'rm -f -- "$source"' EXIT
 case "$repo" in
 "~/"*) repo=$HOME/${repo#"~/"} ;;
 esac
@@ -407,6 +408,9 @@ work="$run/src"
 out="$run/out"
 cd "$repo"
 git fetch --quiet origin
+git fetch --quiet "$source" refs/aterm-release/reserved
+[ "$(git rev-parse FETCH_HEAD)" = "$commit" ] || exit 1
+rm -f -- "$source"
 git worktree add --quiet --detach "$work" "$commit"
 trap 'cd "$repo" && git worktree remove --force "$work" >/dev/null 2>&1 || true' EXIT
 git -C "$work" submodule update --init --quiet vendor/astream
@@ -418,6 +422,102 @@ printf '%s\n' "$out"
 }
 main "$@" </dev/null
 "#;
+
+/// Transfer only the reservation's delta above R. The worker first fetches R
+/// from its ordinary private origin; the reserved commit needs no remote ref
+/// and no ledger claim. Validate the advertised bundle head before sending it.
+fn worker_source_bundle(
+    repo: &Path,
+    commit: &str,
+) -> Result<(aterm_tempfile::TempDir, PathBuf), String> {
+    use crate::ledger::{GitCli, RESERVED_REF, git_ok, rev_parse};
+    let git = GitCli::new(repo);
+    if rev_parse(&git, RESERVED_REF).map_err(|e| e.to_string())? != commit {
+        return Err("Linux source transfer does not name this release's reservation".into());
+    }
+    let parent = rev_parse(&git, &format!("{commit}^1")).map_err(|e| e.to_string())?;
+    let dir = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
+    let path = dir.path().join("source.bundle");
+    git_ok(
+        &git,
+        &[
+            "bundle",
+            "create",
+            path.to_str().ok_or("non-UTF8 source bundle path")?,
+            RESERVED_REF,
+            &format!("^{parent}"),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let heads = git_ok(&git, &["bundle", "list-heads", path.to_str().unwrap()])
+        .map_err(|e| e.to_string())?
+        .stdout_utf8();
+    if heads.trim() != format!("{commit} {RESERVED_REF}") {
+        return Err("Linux source bundle does not advertise exactly the reserved commit".into());
+    }
+    Ok((dir, path))
+}
+
+struct RemoteSource {
+    destination: String,
+    path: String,
+}
+
+impl RemoteSource {
+    fn send(destination: &str, bundle: &Path) -> Result<Self, String> {
+        let output = command("ssh").args(SSH_OPTIONS)
+            .args(["-a", "-x", "--", destination,
+                "umask 077; mkdir -p ~/.cache/aterm-linux-worker; mktemp ~/.cache/aterm-linux-worker/source-XXXXXX"])
+            .output().map_err(|e| format!("prepare private Linux source transfer: {e}"))?;
+        if !output.status.success() {
+            return Err("could not create the Linux worker's private source file".into());
+        }
+        let path = String::from_utf8(output.stdout)
+            .map_err(|e| e.to_string())?
+            .trim()
+            .to_string();
+        if !path.starts_with('/')
+            || !shell_word(&path, "/")
+            || !path.contains("/aterm-linux-worker/source-")
+        {
+            return Err("Linux worker did not acknowledge a private source file".into());
+        }
+        let remote = Self {
+            destination: destination.to_string(),
+            path,
+        };
+        let copied = command("scp")
+            .args(SSH_OPTIONS)
+            .args(["-q", "--"])
+            .arg(bundle)
+            .arg(format!("{}:{}", remote.destination, remote.path))
+            .status()
+            .map_err(|e| format!("send private Linux source bundle: {e}"))?;
+        if !copied.success() {
+            return Err("could not send the Linux worker's private source bundle".into());
+        }
+        Ok(remote)
+    }
+}
+
+impl Drop for RemoteSource {
+    fn drop(&mut self) {
+        // The worker removes it after import; also clean a failed SSH/scp run.
+        let _ = command("ssh")
+            .args(SSH_OPTIONS)
+            .args([
+                "-a",
+                "-x",
+                "--",
+                &self.destination,
+                "rm",
+                "-f",
+                "--",
+                &self.path,
+            ])
+            .status();
+    }
+}
 
 fn shell_word(value: &str, extra: &str) -> bool {
     !value.is_empty()
@@ -507,7 +607,14 @@ impl Worker {
         })
     }
 
-    fn run(&self, directory: &Path, version: &str, build: u64, commit: &str) -> Result<(), String> {
+    fn run(
+        &self,
+        repo: &Path,
+        directory: &Path,
+        version: &str,
+        build: u64,
+        commit: &str,
+    ) -> Result<(), String> {
         let target = target(&self.target)?;
         check_identity(version, build, commit)?;
         let name = target.asset_name(version);
@@ -522,6 +629,8 @@ impl Worker {
             );
             return Ok(());
         }
+        let (_bundle_dir, bundle) = worker_source_bundle(repo, commit)?;
+        let remote_source = RemoteSource::send(&self.destination, &bundle)?;
         for stale in [&name, &receipt, &verifier, &verifier_receipt] {
             match fs::remove_file(directory.join(stale)) {
                 Ok(()) => println!(
@@ -547,6 +656,7 @@ impl Worker {
             .args(["bash", "-l", "-s", "--", &self.repository, commit, version])
             .arg(build.to_string())
             .arg(arch)
+            .arg(&remote_source.path)
             .stdin(aterm_uds::spawnfd::Stdio::piped())
             .stdout(aterm_uds::spawnfd::Stdio::piped())
             .spawn()
@@ -936,10 +1046,16 @@ impl Handoff {
     }
 
     /// Run every declared [`Worker`] whose pair is not in the handoff directory yet.
-    pub fn run_workers(&self, version: &str, build: u64, commit: &str) -> Result<(), String> {
+    pub fn run_workers(
+        &self,
+        repo: &Path,
+        version: &str,
+        build: u64,
+        commit: &str,
+    ) -> Result<(), String> {
         private_directory(&self.directory)?;
         for worker in &self.workers {
-            worker.run(&self.directory, version, build, commit)?;
+            worker.run(repo, &self.directory, version, build, commit)?;
         }
         Ok(())
     }
@@ -1494,6 +1610,95 @@ fn build_bootstrap_verifier(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// NEGATIVE CONTROL: the worker cannot resolve the reserved commit from
+    /// origin; only the private delta bundle makes that exact object available.
+    #[test]
+    fn a_worker_imports_the_unclaimed_reservation_without_a_remote_ref() {
+        fn git(repo: &Path, args: &[&str]) -> String {
+            let out = command("git")
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-C",
+                ])
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+        let dir = scratch();
+        let source = dir.path().join("source");
+        let worker = dir.path().join("worker");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        fs::write(source.join("payload"), "R").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-qm", "R"]);
+        git(
+            &source,
+            &[
+                "clone",
+                "-q",
+                source.to_str().unwrap(),
+                worker.to_str().unwrap(),
+            ],
+        );
+        fs::write(source.join("payload"), "reserved bytes").unwrap();
+        git(&source, &["commit", "-qam", "reserved"]);
+        let commit = git(&source, &["rev-parse", "HEAD"]);
+        git(
+            &source,
+            &["update-ref", crate::ledger::RESERVED_REF, &commit],
+        );
+        assert!(
+            !command("git")
+                .arg("-C")
+                .arg(&worker)
+                .args(["cat-file", "-e", &commit])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(worker_source_bundle(&source, &"f".repeat(40)).is_err());
+        let (_bundle_dir, bundle) = worker_source_bundle(&source, &commit).unwrap();
+        let before = git(
+            &worker,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        git(
+            &worker,
+            &[
+                "fetch",
+                "-q",
+                bundle.to_str().unwrap(),
+                crate::ledger::RESERVED_REF,
+            ],
+        );
+        assert_eq!(git(&worker, &["rev-parse", "FETCH_HEAD"]), commit);
+        assert_eq!(
+            git(&worker, &["show", &format!("{commit}:payload")]),
+            "reserved bytes"
+        );
+        assert_eq!(
+            before,
+            git(
+                &worker,
+                &["for-each-ref", "--format=%(refname) %(objectname)"]
+            )
+        );
+    }
 
     fn scratch() -> aterm_tempfile::TempDir {
         aterm_tempfile::Builder::new()

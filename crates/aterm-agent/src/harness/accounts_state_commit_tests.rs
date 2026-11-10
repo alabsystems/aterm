@@ -19,7 +19,7 @@ fn observe(store: &Store, usage: bool) -> Recorded {
             store,
             &captured,
             "session",
-            &who,
+            (&who, &crate::harness::observe::Observation::Unread),
             &UsageSaid {
                 at: NOW,
                 day: NOW.div_euclid(DAY),
@@ -34,7 +34,7 @@ fn observe(store: &Store, usage: bool) -> Recorded {
             store,
             &captured,
             "session",
-            &who,
+            (&who, &crate::harness::observe::Observation::Unread),
             &crate::harness::upgrade::StandingWall {
                 at: NOW.unsigned_abs(),
                 until: Some((NOW + HOUR).unsigned_abs()),
@@ -422,6 +422,7 @@ fn a_pathless_writer_does_not_recover_roster_bound_authority() {
             id: "a".repeat(32),
             plan: Some(Plan {
                 source_policy: None,
+                outbox: None,
                 fleet: None,
                 local_logins: false,
                 roster_path: Some(path.to_str().unwrap().into()),
@@ -604,6 +605,7 @@ fn recovery_chooses_the_scope_current_after_acquiring_the_lock() {
                 std::fs::write(&path, "").unwrap();
                 let make_plan = |bound: bool| Plan {
                     source_policy: None,
+                    outbox: None,
                     fleet: None,
                     local_logins: false,
                     roster_path: bound.then(|| {

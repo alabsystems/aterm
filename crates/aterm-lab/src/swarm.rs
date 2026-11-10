@@ -128,7 +128,13 @@ pub fn simulate_tap_wall_step(
         born: Some(now - 10),
         key: None,
     };
-    let _ = accounts::note_reading_held(state, from_label, &tap_read, now);
+    let _ = accounts::note_reading_held(
+        state,
+        from_label,
+        &tap_read,
+        now,
+        accounts::ReadingOwner::Unobserved,
+    );
     let advice = match policy {
         CandidatePolicy::Production => {
             let me = accounts::Me {

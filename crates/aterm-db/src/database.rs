@@ -14,6 +14,8 @@ use aterm_codec::hex;
 use aterm_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) mod legacy;
+
 /// Maximum retained operations in one initial database generation.
 pub const MAX_RECORDS: usize = 20_000;
 /// Largest local atomic write set.
@@ -313,7 +315,7 @@ impl Command {
                     if let Some(v) = &value {
                         match collection {
                             "machines" => crate::machines::validate(key, v)?,
-                            "emails" => crate::fleet_db::validate_email_record(key, v)?,
+                            "emails" => legacy::validate_email_record(key, v)?,
                             "mailboxes" | "email-addresses" | "phones" => {
                                 crate::contacts::validate(collection, v)?
                             }
@@ -471,6 +473,7 @@ impl History {
     /// Empty history for a dataset with no authority stream: every member can derive its root
     /// key, so a control certificate proves nothing and [`History::insert`] keeps one as inert
     /// evidence, a causal node what a replica wrote after seeing it can still rest on.
+    #[cfg(unix)]
     pub(crate) fn without_authority(root: [u8; 32]) -> Self {
         Self {
             no_authority: true,
@@ -523,6 +526,7 @@ impl History {
     }
     /// A record already in this replica's journal. An earlier build kept a control record outside
     /// the writer quotas, so counting it now would refuse the whole folder, its rekey included.
+    #[cfg(unix)]
     pub(crate) fn replay(&mut self, opened: Opened) -> Result<bool> {
         if opened.control {
             self.retain(opened)
@@ -587,6 +591,7 @@ impl History {
             .iter()
             .map(|(id, (_, reason))| (id, reason.as_str()))
     }
+    #[cfg(unix)]
     pub(crate) fn is_refused(&self, id: &Digest) -> bool {
         self.refused.contains_key(id)
     }

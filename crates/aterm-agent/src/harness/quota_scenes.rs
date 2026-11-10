@@ -100,7 +100,13 @@ impl Fx {
             born: None,
             key: None,
         };
-        let _ = accounts::note_reading_held(&mut self.state, label, &read, at);
+        let _ = accounts::note_reading_held(
+            &mut self.state,
+            label,
+            &read,
+            at,
+            accounts::ReadingOwner::Unobserved,
+        );
         self.fig(label, at, five, week);
     }
 

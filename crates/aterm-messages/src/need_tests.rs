@@ -971,8 +971,9 @@ fn only_the_owners_dismiss_reads_as_a_decline_for_its_span() {
 #[test]
 fn the_exceptions_report_ranks_warnings_first_and_drops_a_fixed_entrys_action() {
     let now = t0();
+    let extra = "/usr/bin/git runs before the managed git";
     let mut c = fresh(now);
-    c.post(fda(), stamp(0), now);
+    c.post(fda().line(extra), stamp(0), now);
     c.post(own_work("tab 1"), stamp(1), now);
     let mut file: Vec<String> = Vec::new();
     let mut replay = |c: &mut MessageCenter| {
@@ -995,6 +996,10 @@ fn the_exceptions_report_ranks_warnings_first_and_drops_a_fixed_entrys_action() 
         titles[1].contains("macOS keeps asking") && !titles[1].contains("warning"),
         "{open:#?}"
     );
+    assert!(
+        open.iter().any(|l| l == &format!("      detail {extra}")),
+        "{open:#?}"
+    );
 
     assert_eq!(c.resolve_digest_prefix("privacy", Outcome::Ok, now), 1);
     let log = replay(&mut c);
@@ -1008,12 +1013,16 @@ fn the_exceptions_report_ranks_warnings_first_and_drops_a_fixed_entrys_action() 
         "{filed:#?}"
     );
     assert!(
+        !filed.iter().any(|l| l.trim_start().starts_with("detail")),
+        "{filed:#?}"
+    );
+    assert!(
         !filed.iter().any(|l| l.contains("resolved-ok")),
         "{filed:#?}"
     );
 
     let mut c = fresh(now);
-    c.post(fda(), stamp(0), now);
+    c.post(fda().line(extra), stamp(0), now);
     assert_eq!(c.resolve_digest_prefix("privacy", Outcome::Warn, now), 1);
     let mut log = MessageLog::empty();
     log.replay_all(
@@ -1029,6 +1038,27 @@ fn the_exceptions_report_ranks_warnings_first_and_drops_a_fixed_entrys_action() 
     assert!(
         filed.iter().any(|l| l.trim_start().starts_with("then")),
         "{filed:#?}"
+    );
+    assert!(
+        filed.iter().any(|l| l == &format!("      detail {extra}")),
+        "{filed:#?}"
+    );
+
+    let mut c = fresh(now);
+    c.post(fda().line(extra), stamp(0), now);
+    assert_eq!(c.file_digest(stamp(1), now), 1);
+    let mut log = MessageLog::empty();
+    log.replay_all(
+        c.drain_new_for_persist()
+            .iter()
+            .filter_map(|l| LogLine::decode(&l.encode()).ok()),
+    );
+    let dismissed = crate::exceptions_report(&log, crate::ReportScope::Filed, 0, 0);
+    assert!(
+        dismissed
+            .iter()
+            .any(|l| l == &format!("      detail {extra}")),
+        "{dismissed:#?}"
     );
 
     // Across 2026-11-01 fall-back (PDT UTC-7 -> PST UTC-8 at 09:00Z):

@@ -7,6 +7,7 @@ use super::*;
 use aterm_net::fleet::{FleetEvent, Listening, read_key_file, serve_with_handshake};
 use aterm_net::fleet_member::{Issuer, read_peers, serve_book, serve_join};
 use aterm_uds::private_file::{remove_private, write_private};
+use aterm_uds::stop::Stop;
 use std::cell::{Cell, RefCell};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
@@ -1079,8 +1080,9 @@ impl Said {
 /// A fleet listener served in process, which so must finish each handshake: it gives each one
 /// [`HANG`] ([`serve_with_handshake`]).
 struct Listener {
-    running: Arc<AtomicBool>,
-    round: Arc<AtomicBool>,
+    stop: Arc<Stop>,
+    /// The serving round's own stop: a refusal under `rereads` ends that round alone.
+    round: Arc<std::sync::Mutex<Arc<Stop>>>,
     serving: Option<std::thread::JoinHandle<TcpListener>>,
 }
 
@@ -1154,8 +1156,8 @@ impl Listener {
     ) -> Self {
         let _ = aterm_uds::keep_out_of_children(&listener);
         let port = listener.local_addr().unwrap().port();
-        let running = Arc::new(AtomicBool::new(true));
-        let round = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
+        let round = Arc::new(std::sync::Mutex::new(Arc::new(Stop::new())));
         let node = member::read_node_identity(state).expect("a node key it can read");
         let issuer = Arc::new(Issuer {
             node: member::node_id(state).unwrap(),
@@ -1170,10 +1172,13 @@ impl Listener {
         let mut first = true;
         let state = state.to_path_buf();
         let serving = std::thread::spawn({
-            let (running, round) = (Arc::clone(&running), Arc::clone(&round));
+            let (stop, round) = (Arc::clone(&stop), Arc::clone(&round));
             move || loop {
-                round.store(true, Ordering::Release);
-                if !running.load(Ordering::Acquire) {
+                // The round's stop is in place before the listener's is read, so a stop set
+                // after that read finds this round's.
+                let this_round = Arc::new(Stop::new());
+                *round.lock().unwrap() = Arc::clone(&this_round);
+                if stop.is_set() {
                     break listener;
                 }
                 if !std::mem::take(&mut first)
@@ -1192,11 +1197,11 @@ impl Listener {
                 };
                 let (issuer, claim, rows) = (Arc::clone(&issuer), claim.clone(), rows.clone());
                 let (state, secret) = (state.clone(), listening.secret.clone());
-                let refused = Arc::clone(&round);
+                let refused = Arc::clone(&this_round);
                 serve_with_handshake(
                     &listener,
                     &listening,
-                    &round,
+                    &this_round,
                     HANG,
                     move |served, op| {
                         let proof = served.peer_node().cloned();
@@ -1240,7 +1245,7 @@ impl Listener {
                     },
                     move |event: FleetEvent| {
                         if rereads && matches!(event, FleetEvent::Refused { .. }) {
-                            refused.store(false, Ordering::Release);
+                            refused.set();
                         }
                     },
                 );
@@ -1250,7 +1255,7 @@ impl Listener {
             }
         });
         Self {
-            running,
+            stop,
             round,
             serving: Some(serving),
         }
@@ -1261,8 +1266,8 @@ impl Listener {
     }
 
     fn stop(&mut self) -> Option<TcpListener> {
-        self.running.store(false, Ordering::Release);
-        self.round.store(false, Ordering::Release);
+        self.stop.set();
+        self.round.lock().unwrap().set();
         self.serving.take()?.join().ok()
     }
 }
@@ -2215,14 +2220,14 @@ fn a_join_passes_over_an_older_member_that_records_none() {
         per_source: 4,
         lifetime: HANG,
     };
-    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(Stop::new());
     let serving_older = std::thread::spawn({
-        let running = Arc::clone(&running);
+        let stop = Arc::clone(&stop);
         move || {
             serve_with_handshake(
                 &listener,
                 &listening,
-                &running,
+                &stop,
                 HANG,
                 |served, _| {
                     served.answer(|stream| {
@@ -2244,8 +2249,7 @@ fn a_join_passes_over_an_older_member_that_records_none() {
         ..Opts::default()
     };
     let joined = join(&newcomer.places, &opts, &code);
-    running.store(false, Ordering::Release);
-    let _ = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, older_port));
+    stop.set();
     let _ = serving_older.join();
     ok(joined);
     assert_eq!(

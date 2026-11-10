@@ -52,6 +52,8 @@ fn ev(t: u64, kind: Kind, account: Pk) -> Event {
         src: Source::CliOutput,
         why: None,
         to: None,
+        tab: None,
+        harness: None,
     }
 }
 
@@ -1927,4 +1929,115 @@ fn a_seen_read_lets_go_of_the_journal_writer_before_it_reads_the_claims() {
     );
     assert!(read.unwrap().is_some());
     assert!(asked.get(), "the claims ring was read");
+}
+
+/// A tab's sighting as the harness notes it (`docs/DESIGN-account-discovery-2026-11-09.md`):
+/// the observed account, where its login was read, the tab and the harness.
+fn seen_event(t: u64, why: &str) -> Event {
+    Event {
+        src: Source::Profile,
+        why: Word::new(why),
+        tab: Word::new("0a1b2c3d"),
+        harness: Word::new("claude"),
+        ..ev(t, Kind::Seen, pk("unicorn.m15.2@proton.example"))
+    }
+}
+
+/// A `seen` keeps its tab and harness through the spool line and the batch value, and both
+/// readers take it back whole.
+/// NEGATIVE CONTROL: with `encode` dropping `x`, the line reads back without its tab:
+/// `` left: Some(Event { … tab: None … }) right: Some(Event { … tab: Some(0a1b2c3d) … }) ``.
+#[test]
+fn seen_round_trips_with_x_and_h() {
+    let event = seen_event(1_790_000_000, "first");
+    let mut buf = [0; MAX_EVENT];
+    let n = event.encode(&mut buf).unwrap();
+    let line = std::str::from_utf8(&buf[..n]).unwrap();
+    assert!(line.contains("\"x\":\"0a1b2c3d\""), "{line}");
+    assert!(line.contains("\"h\":\"claude\""), "{line}");
+    assert_eq!(Event::from_line(&buf[..n]), Some(event));
+    assert_eq!(Event::from_value(&event.to_value()), Some(event));
+    assert_eq!(
+        aterm_json::to_vec(&event.to_value()).unwrap(),
+        buf[..n].to_vec(),
+        "the value and the line are one canonical encoding"
+    );
+}
+
+/// The widest `seen` a harness makes (a ten-digit time, the longest CLI word, a 16-byte harness
+/// word, a reason and the believed account's `to`) fits [`MAX_EVENT`].
+/// NEGATIVE CONTROL: with `MAX_EVENT` cut to 160, `` the widest seen fits ``.
+#[test]
+fn seen_widest_fits_192() {
+    let widest = Event {
+        cli: Word::new("codex-alab").unwrap(),
+        harness: Word::new("codex-alab-agent"),
+        src: Source::VaultToken,
+        why: Word::new("changed"),
+        ..seen_event(9_999_999_999, "changed")
+    };
+    let mut buf = [0; MAX_EVENT];
+    assert!(widest.encode(&mut buf).is_some(), "the widest seen fits");
+    let wrong = Event {
+        kind: Kind::WrongAccount,
+        to: Some(pk("brontosaurus.m22@proton.example")),
+        ..widest
+    };
+    assert!(
+        wrong.encode(&mut buf).is_some(),
+        "the widest wrong-account fits"
+    );
+}
+
+/// A tab and a harness ride only on the kinds about one tab's run: a quota reading that names a
+/// tab, as a modified peer could write it, is refused whole.
+/// NEGATIVE CONTROL: with the `names_tab` check in `from_value` removed, the quota with `x`
+/// reads: `` left: Some(Event { kind: Quota, … }) right: None ``.
+#[test]
+fn x_refused_on_quota() {
+    let mut value = quota(1_790_000_000, pk("ann@example.test"), Window::Week, 120).to_value();
+    set(&mut value, "x", json!("0a1b2c3d"));
+    assert_eq!(Event::from_value(&value), None);
+    let mut value = ev(1_790_000_000, Kind::Auth, pk("ann@example.test")).to_value();
+    set(&mut value, "h", json!("claude"));
+    assert_eq!(Event::from_value(&value), None);
+    // A tab id is 8 hex digits, never another word.
+    let mut value = seen_event(1_790_000_000, "first").to_value();
+    set(&mut value, "x", json!("tab-0001"));
+    assert_eq!(Event::from_value(&value), None);
+}
+
+/// A first sighting or a changed account goes out on the flusher's next pass; an hourly refresh
+/// of the same sighting waits for the routine flush.
+/// NEGATIVE CONTROL: with `Event::sharp` ignoring `why`, the refresh is sharp:
+/// `` assertion failed: !seen_event(1, "seen").sharp() ``.
+#[test]
+fn seen_is_sharp_on_a_first_sighting_and_not_on_a_refresh() {
+    assert!(seen_event(1, "first").sharp());
+    assert!(seen_event(1, "changed").sharp());
+    assert!(!seen_event(1, "seen").sharp());
+    assert!(!Kind::Seen.sharp(), "the kind alone is not sharp");
+}
+
+/// THE DEAD LOGIN BUG: a login ended at an auth wall, and the same tab's next sighting of its
+/// profile (which still names the account) is no sign-in word: the account stays `ended`, and
+/// a sighting alone states none. A real sign-in afterwards says `in`.
+/// NEGATIVE CONTROL: with `Kind::Seen` folded as `in`, `` left: "in" right: "ended" ``.
+#[test]
+fn a_sighting_never_says_signed_in_over_an_ended_login() {
+    let account = pk("unicorn.m15.2@proton.example");
+    let word = |facts: &Facts| facts.signin.as_ref().map(|s| (s.state, s.t));
+    let mut facts = Facts::default();
+    facts.fold(&seen_event(90, "first"));
+    assert_eq!(word(&facts), None, "a sighting alone");
+    facts.fold(&ev(100, Kind::LoginEnded, account));
+    facts.fold(&seen_event(200, "seen"));
+    facts.fold(&seen_event(300, "first"));
+    assert_eq!(word(&facts), Some(("ended", 100)));
+    assert_eq!(
+        facts.used, 300,
+        "the sighting still dates the account's use"
+    );
+    facts.fold(&ev(400, Kind::SignedIn, account));
+    assert_eq!(word(&facts), Some(("in", 400)));
 }

@@ -3259,6 +3259,8 @@ fn a_spawned_shell_runs_in_the_ui_tier_and_nothing_it_starts_does() {
     };
     // SAFETY: `getpriority` reads a role; no pointers.
     let role = |pid: i32| unsafe { libc::getpriority(PRIO_DARWIN_ROLE, pid as libc::id_t) };
+    aterm_uds::deadline::execd(child, std::path::Path::new("/bin/sleep"));
+    aterm_uds::deadline::execd(program.pid, std::path::Path::new("/bin/sleep"));
     let seen_bands =
         [shell.pid, child, program.pid].map(|pid| (role(pid), main_thread_priority(pid)));
     // SAFETY: the child calls only `setpriority` and `_exit`, both async-signal-safe.

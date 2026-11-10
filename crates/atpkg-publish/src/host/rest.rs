@@ -779,6 +779,7 @@ fn release_of(object: &Value) -> Result<Release, HostError> {
         tag: tag.to_string(),
         draft,
         prerelease,
+        published_at: object["published_at"].as_str().map(str::to_string),
         assets,
     })
 }

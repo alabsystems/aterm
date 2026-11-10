@@ -559,13 +559,14 @@ fn brew_preamble_text(cmd: &str, message: &str) -> &'static str {
     if message.contains("unknown subcommand:") {
         return brew_help_text(cmd);
     }
-    // Subcommand-parser errors (scope and depends_on forms)
-    // print the resolved subcommand's help; token-level
-    // errors print the parent's.
+    // Subcommand-parser errors (scope, conflicts, named-arg
+    // arity, depends_on forms) print the resolved
+    // subcommand's help; token-level errors (invalid option)
+    // print the parent's.
     let sub_named = message
         .strip_prefix("Error: Invalid usage: The `")
         .and_then(|rest| rest.split('`').next());
-    let sub_from_argv = if message.starts_with("Error: Invalid usage: `--") {
+    let sub_from_argv = if message.starts_with("Error: Invalid usage:") {
         CURRENT_ARGS.with(|cell| {
             let argv = cell.borrow();
             let mut it = argv.iter().skip(1).take_while(|a| a.as_str() != "--");
@@ -614,11 +615,12 @@ pub(super) fn usage_preamble_for(cmd: &str, message: &str) {
     }
     let blank = if message.starts_with("Error: Invalid usage:") {
         true
-    } else if message.starts_with("Error: invalid option:")
-        || message.starts_with("Error: ambiguous option:")
-    {
+    } else if message.starts_with("Error: invalid option:") {
         false
     } else {
+        // Brew prints no help preamble for ambiguous options
+        // (its InvalidOption rescue in parser.rb does not see
+        // them), nor for other errors.
         return;
     };
     PREAMBLE_DONE.with(|cell| cell.set(true));
@@ -639,6 +641,225 @@ pub(super) fn usage_preamble(message: &str) {
 pub(super) fn usage_failed(cmd: &str, message: &str) -> ExitCode {
     usage_preamble_for(cmd, message);
     failed(message)
+}
+
+/// Brew's OptionParser dedicates one switch to the paired
+/// `--formula`/`--formulae` and `--cask`/`--casks` spellings,
+/// so a prefix matching only a pair is unambiguous.
+fn switch_canonical(long: &str) -> &str {
+    match long {
+        "formulae" => "formula",
+        "casks" => "cask",
+        other => other,
+    }
+}
+
+fn jaro(s1: &[char], s2: &[char]) -> f64 {
+    let (s1, s2) = if s1.len() > s2.len() {
+        (s2, s1)
+    } else {
+        (s1, s2)
+    };
+    let (len1, len2) = (s1.len(), s2.len());
+    let range = if len2 > 3 { len2 / 2 - 1 } else { 0 };
+    let mut flags1 = vec![false; len1];
+    let mut flags2 = vec![false; len2];
+    let mut m = 0f64;
+    for i in 0..len1 {
+        let last = i + range;
+        let mut j = i.saturating_sub(range);
+        while j <= last && j < len2 {
+            if !flags2[j] && s1[i] == s2[j] {
+                flags2[j] = true;
+                flags1[i] = true;
+                m += 1.0;
+                break;
+            }
+            j += 1;
+        }
+    }
+    let mut t = 0f64;
+    let mut k = 0usize;
+    for i in 0..len1 {
+        if flags1[i] {
+            let mut j = k;
+            let mut index = j;
+            while j < len2 {
+                index = j;
+                j += 1;
+                if flags2[index] {
+                    break;
+                }
+            }
+            k = j;
+            if s1[i] != s2[index] {
+                t += 1.0;
+            }
+        }
+    }
+    let t = (t / 2.0).floor();
+    if m == 0.0 {
+        0.0
+    } else {
+        (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
+    }
+}
+
+fn jaro_winkler(str1: &str, str2: &str) -> f64 {
+    let c1: Vec<char> = str1.chars().collect();
+    let c2: Vec<char> = str2.chars().collect();
+    let j = jaro(&c1, &c2);
+    if j > 0.7 {
+        let mut prefix = 0usize;
+        for ch in &c1 {
+            if prefix < 4 && c2.get(prefix) == Some(ch) {
+                prefix += 1;
+            } else {
+                break;
+            }
+        }
+        j + (prefix as f64 * 0.1 * (1.0 - j))
+    } else {
+        j
+    }
+}
+
+fn levenshtein(str1: &str, str2: &str) -> usize {
+    let c1: Vec<char> = str1.chars().collect();
+    let c2: Vec<char> = str2.chars().collect();
+    let (n, m) = (c1.len(), c2.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut d: Vec<usize> = (0..=m).collect();
+    let mut x = 0usize;
+    for (idx, char1) in c1.iter().enumerate() {
+        let mut i = idx + 1;
+        for j in 0..m {
+            let cost = usize::from(*char1 != c2[j]);
+            x = (d[j + 1] + 1).min(i + 1).min(d[j] + cost);
+            d[j] = i;
+            i = x;
+        }
+        d[m] = x;
+    }
+    x
+}
+
+/// Ruby did_you_mean's SpellChecker#correct, then optparse's
+/// order-preserving intersection with the candidate list.
+fn spell_corrections(input: &str, dictionary: &[String]) -> Vec<String> {
+    let normalize = |s: &str| s.to_lowercase().replace('@', "");
+    let normalized = normalize(input);
+    let threshold = if normalized.chars().count() > 3 {
+        0.834
+    } else {
+        0.77
+    };
+    let mut words: Vec<&String> = dictionary
+        .iter()
+        .filter(|w| jaro_winkler(&normalize(w), &normalized) >= threshold)
+        .filter(|w| w.as_str() != input)
+        .collect();
+    words.sort_by(|a, b| {
+        jaro_winkler(a, &normalized)
+            .partial_cmp(&jaro_winkler(b, &normalized))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    words.reverse();
+    let lev_threshold = (normalized.chars().count() as f64 * 0.25).ceil() as usize;
+    let mut corrections: Vec<&String> = words
+        .iter()
+        .copied()
+        .filter(|c| levenshtein(&normalize(c), &normalized) <= lev_threshold)
+        .collect();
+    if corrections.is_empty() {
+        corrections = words
+            .iter()
+            .copied()
+            .filter(|w| {
+                let w = normalize(w);
+                let length = normalized.chars().count().min(w.chars().count());
+                levenshtein(&w, &normalized) < length
+            })
+            .take(1)
+            .collect();
+    }
+    dictionary
+        .iter()
+        .filter(|cand| corrections.contains(cand))
+        .cloned()
+        .collect()
+}
+
+/// Whether brew's run of this command appends did-you-mean
+/// suggestions to option errors. In brew this depends on
+/// whether DidYouMean::SpellChecker happens to be loaded when
+/// the parser fails (optparse checks `defined?`), which is a
+/// per-command load-order artifact; the set below is the
+/// oracle-observed split (brew 7.0.13, `--verbosee` probe).
+/// Silent commands include link, unlink, tap, untap, log,
+/// cat, migrate, completions, trust, untrust, analytics,
+/// developer, alias and unalias.
+fn option_suggestions(cmd: &str) -> bool {
+    // Developer/maintainer commands load the formula
+    // machinery at parse time and do suggest (livecheck,
+    // bottle verified against the oracle).
+    if BREW_DEVELOPER_COMMANDS.contains(&cmd) || BREW_MAINTAINER_COMMANDS.contains(&cmd) {
+        return true;
+    }
+    matches!(
+        cmd,
+        "install"
+            | "uninstall"
+            | "remove"
+            | "rm"
+            | "reinstall"
+            | "upgrade"
+            | "up"
+            | "outdated"
+            | "info"
+            | "abv"
+            | "search"
+            | "-S"
+            | "desc"
+            | "deps"
+            | "uses"
+            | "leaves"
+            | "missing"
+            | "pin"
+            | "unpin"
+            | "cleanup"
+            | "autoremove"
+            | "fetch"
+            | "home"
+            | "homepage"
+            | "options"
+            | "tab"
+            | "doctor"
+            | "dr"
+            | "config"
+            | "bundle"
+            | "list"
+            | "ls"
+            | "gist-logs"
+            | "postinstall"
+            | "post_install"
+    )
+}
+
+/// The `\nDid you mean?  …` suffix Ruby's optparse appends to
+/// invalid/ambiguous option errors (empty when no correction).
+fn did_you_mean_suffix(typed_name: &str, dictionary: &[String]) -> String {
+    let corrections = spell_corrections(typed_name, dictionary);
+    if corrections.is_empty() {
+        String::new()
+    } else {
+        format!("\nDid you mean?  {}", corrections.join("\n               "))
+    }
 }
 
 fn from_install(_prefix: &Prefix, _args: &[String], r: Result<(), InstallError>) -> ExitCode {
@@ -788,6 +1009,126 @@ fn expand_user_alias(args: &[String]) -> Vec<String> {
     args
 }
 
+/// Token-level OptionParser errors for a known brew command
+/// abrew does not run natively: brew's parser reports
+/// invalid/ambiguous options (mined from the command's
+/// recorded help) before any work, so they precede the
+/// not-native refusal. `None` when every option token is
+/// one brew knows (or an unambiguous abbreviation of one).
+fn known_command_token_error(
+    cmd: &str,
+    typed_rest: &[String],
+    extra_longs: &[&str],
+) -> Option<InstallError> {
+    let mut longs: Vec<String> = Vec::new();
+    let mut shorts: Vec<char> = Vec::new();
+    let mut note = |tok: &str| {
+        if let Some(long) = tok.strip_prefix("--") {
+            let long = long.split(['=', '[']).next().unwrap_or(long);
+            if !long.is_empty() && !longs.iter().any(|k| k == long) {
+                longs.push(long.to_string());
+            }
+        } else if tok.len() == 2 && tok.starts_with('-') {
+            let c = tok.chars().nth(1).unwrap();
+            if !shorts.contains(&c) {
+                shorts.push(c);
+            }
+        }
+    };
+    let mut found = false;
+    {
+        for (_, text) in help_texts::TEXTS
+            .iter()
+            .filter(|(name, _)| *name == cmd)
+            .chain(
+                help_texts::PREAMBLES
+                    .iter()
+                    .filter(|(name, _)| *name == cmd || name.starts_with(&format!("{cmd}."))),
+            )
+        {
+            found = true;
+            for line in text.lines() {
+                let line = line.trim_start();
+                if !line.starts_with('-') {
+                    continue;
+                }
+                for tok in line.split(|c: char| c == ',' || c.is_whitespace()) {
+                    if tok.starts_with('-') {
+                        note(tok);
+                    }
+                }
+            }
+        }
+        for tok in [
+            "--verbose",
+            "--quiet",
+            "--debug",
+            "--help",
+            "-v",
+            "-q",
+            "-d",
+            "-h",
+        ] {
+            note(tok);
+        }
+    }
+    if !found {
+        return None;
+    }
+    // Disabled switches are hidden from help but present in
+    // brew's parser registry (its suggestion dictionary).
+    for name in extra_longs {
+        let long = name.trim_start_matches('-');
+        let long = long.strip_prefix("[no-]").unwrap_or(long);
+        if !longs.iter().any(|k| k == long) {
+            longs.push(long.to_string());
+        }
+        if name.contains("[no-]") {
+            let no_form = format!("no-{long}");
+            if !longs.contains(&no_form) {
+                longs.push(no_form);
+            }
+        }
+    }
+    for arg in typed_rest.iter().take_while(|a| a.as_str() != "--") {
+        if let Some(long) = arg.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or(long);
+            if longs.iter().any(|k| k == name) {
+                continue;
+            }
+            let mut switches: Vec<&str> = Vec::new();
+            for k in longs.iter().filter(|k| k.starts_with(name)) {
+                let c = switch_canonical(k);
+                if !switches.contains(&c) {
+                    switches.push(c);
+                }
+            }
+            let suffix = if option_suggestions(cmd) {
+                did_you_mean_suffix(name, &longs)
+            } else {
+                String::new()
+            };
+            if switches.len() > 1 {
+                return Some(InstallError::Failed(format!(
+                    "Error: ambiguous option: --{name}{suffix}"
+                )));
+            }
+            if switches.is_empty() {
+                return Some(InstallError::Failed(format!(
+                    "Error: invalid option: {arg}{suffix}"
+                )));
+            }
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            for c in arg[1..].chars() {
+                if !shorts.contains(&c) {
+                    return Some(InstallError::Failed(format!("Error: invalid option: -{c}")));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn shell_fast_path(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -892,6 +1233,11 @@ fn native_args(
     {
         return Err(InstallError::Failed(message));
     }
+    // `brew update` parses its options in shell (cmd/update.sh)
+    // with its own left-to-right rules: cmd_update owns them.
+    if disabled_cmd == "update" {
+        return Ok((None, rest.to_vec()));
+    }
     const TRUSTED_TAP: Option<&str> = Some("the default trusted-tap behaviour");
     const NO_REPLACEMENT: Option<&str> = None;
     // Tuples are (display name, kind, replacement, alternate
@@ -956,6 +1302,17 @@ fn native_args(
         _ => &[],
     };
     for (name, kind, replacement, alt) in disabled {
+        // Brew's parser consumes a disabled flag's value
+        // before the odisabled check: a bare flag with no
+        // following token is its missing-argument error.
+        if *kind == "flag"
+            && let Some(pos) = rest.iter().position(|a| a == name)
+            && pos + 1 == rest.len()
+        {
+            return Err(InstallError::Failed(format!(
+                "Error: missing argument: {name}"
+            )));
+        }
         let present = if *kind == "flag" {
             has_flag_eq(rest, name)
         } else if let Some(base) = name.strip_prefix("--[no-]") {
@@ -1182,7 +1539,24 @@ fn native_args(
         // of subcommand resolution (brew OptionParser).
         const SERVICE_SWITCHES: &[&str] = &["--all", "--json", "--no-wait", "--keep"];
         const SERVICE_FLAGS: &[&str] = &["--file", "--max-wait", "--sudo-service-user"];
-        {
+        let services_expanded: Vec<String> = {
+            // OptionParser abbreviation: a unique long prefix
+            // resolves to its switch; ambiguous/invalid tokens
+            // carry brew's errors (with did-you-mean suffixes).
+            const SERVICE_DICT: &[&str] = &[
+                "all",
+                "json",
+                "no-wait",
+                "keep",
+                "file",
+                "max-wait",
+                "sudo-service-user",
+                "verbose",
+                "quiet",
+                "debug",
+                "help",
+            ];
+            let service_dict: Vec<String> = SERVICE_DICT.iter().map(|s| (*s).to_string()).collect();
             let mut args = rest
                 .iter()
                 .take_while(|arg| arg.as_str() != "--")
@@ -1195,6 +1569,38 @@ fn native_args(
                     Some((name, _)) => (name, true),
                     None => (arg.as_str(), false),
                 };
+                let resolved: String = if let Some(long) = name.strip_prefix("--") {
+                    if service_dict.iter().any(|k| k == long) {
+                        name.to_string()
+                    } else {
+                        let mut switches: Vec<&str> = Vec::new();
+                        for known in service_dict.iter().filter(|k| k.starts_with(long)) {
+                            let c = switch_canonical(known);
+                            if !switches.contains(&c) {
+                                switches.push(c);
+                            }
+                        }
+                        match switches.len() {
+                            1 => format!("--{}", switches[0]),
+                            // Brew's services parser emits no
+                            // did-you-mean suffix (verified
+                            // against `services list --jsonn`).
+                            0 => {
+                                return Err(InstallError::Failed(format!(
+                                    "Error: invalid option: {arg}"
+                                )));
+                            }
+                            _ => {
+                                return Err(InstallError::Failed(format!(
+                                    "Error: ambiguous option: --{long}"
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    name.to_string()
+                };
+                let name = resolved.as_str();
                 if SERVICE_SWITCHES.contains(&name) {
                     if has_value {
                         return Err(InstallError::Failed(format!(
@@ -1208,15 +1614,43 @@ fn native_args(
                         )));
                     }
                 } else if !matches!(
-                    arg.as_str(),
-                    "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d"
+                    name,
+                    "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d" | "--help" | "-h"
                 ) {
                     return Err(InstallError::Failed(format!(
                         "Error: invalid option: {arg}"
                     )));
                 }
             }
-        }
+            // Expand validated abbreviations for the scoped
+            // checks below (the generic expansion later in this
+            // fn would otherwise be the first to see them).
+            let mut expanded: Vec<String> = rest.to_vec();
+            for tok in expanded.iter_mut() {
+                let Some(long) = tok
+                    .strip_prefix("--")
+                    .map(|l| l.split('=').next().unwrap_or(l).to_string())
+                else {
+                    continue;
+                };
+                if service_dict.iter().any(|k| k == &long) {
+                    continue;
+                }
+                let mut switches: Vec<&str> = Vec::new();
+                for known in service_dict.iter().filter(|k| k.starts_with(&long)) {
+                    let c = switch_canonical(known);
+                    if !switches.contains(&c) {
+                        switches.push(c);
+                    }
+                }
+                if switches.len() == 1 {
+                    *tok = tok.replacen(&long, switches[0], 1);
+                }
+            }
+            drop(service_dict);
+            expanded
+        };
+        let rest: &[String] = &services_expanded;
         let mut first_positional = None;
         {
             let mut args = rest.iter().take_while(|arg| arg.as_str() != "--");
@@ -1331,6 +1765,7 @@ fn native_args(
         // Token-level OptionParser errors first: a switch brew's
         // bundle parser never declared is invalid (or ambiguous
         // as a prefix), ahead of conflicts and scope checks.
+        let mut bundle_expanded: Vec<String> = rest.to_vec();
         {
             const BUNDLE_LONGS: &[&str] = &[
                 "all",
@@ -1382,8 +1817,7 @@ fn native_args(
             const BUNDLE_EXTS: &[&str] = &[
                 "mas", "vscode", "go", "cargo", "uv", "flatpak", "winget", "krew", "npm",
             ];
-            let known_long = |name: &str| -> Option<bool> {
-                // Some(true): known; Some(false): ambiguous prefix; None: unknown.
+            let bundle_dict: Vec<String> = {
                 let mut generated: Vec<String> = Vec::new();
                 for ext in BUNDLE_EXTS {
                     generated.push((*ext).to_string());
@@ -1391,20 +1825,25 @@ fn native_args(
                     generated.push(format!("no-cleanup-{ext}"));
                     generated.push(format!("no-dump-{ext}"));
                 }
-                let all = BUNDLE_LONGS
+                BUNDLE_LONGS
                     .iter()
                     .map(|s| (*s).to_string())
-                    .chain(generated);
-                let mut prefix_matches = 0usize;
-                for known in all {
-                    if known == name {
-                        return Some(true);
-                    }
-                    if known.starts_with(name) {
-                        prefix_matches += 1;
+                    .chain(generated)
+                    .collect()
+            };
+            let known_long = |name: &str| -> Option<bool> {
+                // Some(true): known; Some(false): ambiguous prefix; None: unknown.
+                if bundle_dict.iter().any(|k| k == name) {
+                    return Some(true);
+                }
+                let mut switches: Vec<&str> = Vec::new();
+                for known in bundle_dict.iter().filter(|k| k.starts_with(name)) {
+                    let c = switch_canonical(known);
+                    if !switches.contains(&c) {
+                        switches.push(c);
                     }
                 }
-                match prefix_matches {
+                match switches.len() {
                     0 => None,
                     1 => Some(true),
                     _ => Some(false),
@@ -1440,12 +1879,14 @@ fn native_args(
                         Some(true) => {}
                         Some(false) => {
                             return Err(InstallError::Failed(format!(
-                                "Error: ambiguous option: --{name}"
+                                "Error: ambiguous option: --{name}{}",
+                                did_you_mean_suffix(name, &bundle_dict)
                             )));
                         }
                         None => {
                             return Err(InstallError::Failed(format!(
-                                "Error: invalid option: {arg}"
+                                "Error: invalid option: {arg}{}",
+                                did_you_mean_suffix(name, &bundle_dict)
                             )));
                         }
                     }
@@ -1459,7 +1900,35 @@ fn native_args(
                     )));
                 }
             }
+            // Expand the validated abbreviations so the bundle
+            // handlers below see canonical spellings.
+            for tok in bundle_expanded.iter_mut() {
+                let Some(long) = tok.strip_prefix("--") else {
+                    continue;
+                };
+                let (name, value) = match long.split_once('=') {
+                    Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                    None => (long.to_string(), None),
+                };
+                if bundle_dict.iter().any(|k| k == &name) {
+                    continue;
+                }
+                let mut switches: Vec<&str> = Vec::new();
+                for known in bundle_dict.iter().filter(|k| k.starts_with(&name)) {
+                    let c = switch_canonical(known);
+                    if !switches.contains(&c) {
+                        switches.push(c);
+                    }
+                }
+                if switches.len() == 1 {
+                    *tok = match value {
+                        Some(v) => format!("--{}={v}", switches[0]),
+                        None => format!("--{}", switches[0]),
+                    };
+                }
+            }
         }
+        let rest: &[String] = &bundle_expanded;
         // Brew's bundle type toggles: each enabled spelling
         // conflicts with the disabled, no-cleanup and no-dump
         // forms, registered in type order (extensions in
@@ -1994,6 +2463,10 @@ fn native_args(
                 "-t",
                 "--multiple",
                 "--json",
+                "--installed-on-request",
+                "--no-installed-on-request",
+                "--poured-from-bottle",
+                "--built-from-source",
             ],
             0,
             usize::MAX,
@@ -2172,7 +2645,12 @@ fn native_args(
         "--taps" => (&[], 0, 0, false),
         "analytics" => (&[], 0, 1, false),
         "nodenv-sync" | "pyenv-sync" | "rbenv-sync" => (&[], 0, 0, false),
-        "doctor" | "dr" => (&["--quiet", "-q", "--list-checks"], 0, usize::MAX, false),
+        "doctor" | "dr" => (
+            &["--quiet", "-q", "--list-checks", "--json"],
+            0,
+            usize::MAX,
+            false,
+        ),
         "shellenv" => (&[], 0, usize::MAX, false),
         "on" | "off" | "status" | "--version" | "-v" | "formulae" | "casks" | "config"
         | "update" => (&[], 0, 0, false),
@@ -2190,7 +2668,13 @@ fn native_args(
             0,
             false,
         ),
-        _ => return Err(unknown()),
+        _ => {
+            let extra: Vec<&str> = disabled.iter().map(|(name, _, _, _)| *name).collect();
+            if let Some(error) = known_command_token_error(cmd, typed_rest, &extra) {
+                return Err(error);
+            }
+            return Err(unknown());
+        }
     };
     let flag_ok = |arg: &str| {
         // Brew's parser carries the global switches on every
@@ -2276,6 +2760,25 @@ fn native_args(
                 }
             }
         }
+        // Subcommand parents record their full option lists in
+        // the parser preambles (the canonical help is a short
+        // summary), e.g. `services list --json`.
+        for (_, text) in help_texts::PREAMBLES
+            .iter()
+            .filter(|(name, _)| *name == cmd || name.starts_with(&format!("{cmd}.")))
+        {
+            for line in text.lines() {
+                let line = line.trim_start();
+                if !line.starts_with('-') {
+                    continue;
+                }
+                for tok in line.split(|c: char| c == ',' || c.is_whitespace()) {
+                    if tok.starts_with('-') {
+                        note(tok, &mut longs, &mut shorts);
+                    }
+                }
+            }
+        }
         for tok in [
             "--verbose",
             "--quiet",
@@ -2332,9 +2835,14 @@ fn native_args(
                 if native_long(name) || known_longs.iter().any(|k| k == name) {
                     return None;
                 }
-                let mut candidates = known_longs.iter().filter(|k| k.starts_with(name));
+                // Alias-paired spellings (--formula/--formulae)
+                // are one switch, so count distinct switches.
+                let mut candidates = known_longs
+                    .iter()
+                    .filter(|k| k.starts_with(name))
+                    .map(|k| switch_canonical(k));
                 let only = candidates.next()?;
-                if candidates.next().is_some() || !native_long(only) {
+                if candidates.any(|c| c != only) || !native_long(only) {
                     return None;
                 }
                 Some(match value {
@@ -2517,19 +3025,30 @@ fn native_args(
         if let Some(long) = offender.strip_prefix("--") {
             let name = long.split('=').next().unwrap_or(long);
             if !known_longs.iter().any(|k| k == name) {
-                let expansions = known_longs.iter().filter(|k| k.starts_with(name)).count();
+                let mut switches: Vec<&str> = Vec::new();
+                for k in known_longs.iter().filter(|k| k.starts_with(name)) {
+                    let c = switch_canonical(k);
+                    if !switches.contains(&c) {
+                        switches.push(c);
+                    }
+                }
                 let typed_name = typed_offender
                     .strip_prefix("--")
                     .and_then(|t| t.split('=').next())
                     .unwrap_or(name);
-                if expansions > 1 {
+                let suffix = if option_suggestions(cmd) {
+                    did_you_mean_suffix(typed_name, &known_longs)
+                } else {
+                    String::new()
+                };
+                if switches.len() > 1 {
                     return Err(InstallError::Failed(format!(
-                        "Error: ambiguous option: --{typed_name}"
+                        "Error: ambiguous option: --{typed_name}{suffix}"
                     )));
                 }
-                if expansions == 0 {
+                if switches.is_empty() {
                     return Err(InstallError::Failed(format!(
-                        "Error: invalid option: {typed_offender}"
+                        "Error: invalid option: {typed_offender}{suffix}"
                     )));
                 }
             }
@@ -2562,6 +3081,16 @@ fn native_args(
         return Err(InstallError::Failed(format!(
             "Error: Invalid usage: unknown subcommand: `{sub}`"
         )));
+    }
+    // Subcommands of these parents take no named arguments;
+    // brew's parser arity error precedes native scope checks.
+    if (matches!(cmd, "completions" | "developer")
+        || (cmd == "analytics" && ops.first().is_some_and(|s| s == "state")))
+        && ops.len() > 1
+    {
+        return Err(InstallError::Failed(
+            "Error: Invalid usage: This command does not take named arguments.".to_string(),
+        ));
     }
     // Abrew records no analytics to toggle.
     if cmd == "analytics" && ops.iter().any(|s| matches!(s.as_str(), "on" | "off")) {
@@ -2751,6 +3280,26 @@ fn native_args(
         let list_conflicts: &[(&str, &str)] = &[
             ("--multiple", "--cask"),
             ("--pinned", "--multiple"),
+            ("--cask", "--installed-on-request"),
+            ("--versions", "--installed-on-request"),
+            ("--multiple", "--installed-on-request"),
+            ("--pinned", "--installed-on-request"),
+            ("-l", "--installed-on-request"),
+            ("--cask", "--no-installed-on-request"),
+            ("--versions", "--no-installed-on-request"),
+            ("--multiple", "--no-installed-on-request"),
+            ("--pinned", "--no-installed-on-request"),
+            ("-l", "--no-installed-on-request"),
+            ("--cask", "--poured-from-bottle"),
+            ("--versions", "--poured-from-bottle"),
+            ("--multiple", "--poured-from-bottle"),
+            ("--pinned", "--poured-from-bottle"),
+            ("-l", "--poured-from-bottle"),
+            ("--cask", "--built-from-source"),
+            ("--versions", "--built-from-source"),
+            ("--multiple", "--built-from-source"),
+            ("--pinned", "--built-from-source"),
+            ("-l", "--built-from-source"),
             ("--versions", "-1"),
             ("--multiple", "-1"),
             ("--pinned", "-1"),
@@ -3102,6 +3651,43 @@ fn deps_brewfile_admission(rest: &[String]) -> Result<(), InstallError> {
 fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
     let unsupported =
         || InstallError::Unsupported("bundle arguments or Brewfile rows are not native".to_owned());
+    // Brew's bundle subcommands mostly declare
+    // `named_args :none`; the parser's arity error precedes
+    // native scope checks (but follows option conflicts,
+    // which native_args has already raised by this point).
+    {
+        let mut operands: Vec<&str> = Vec::new();
+        let mut it = rest.iter().peekable();
+        let mut literal = false;
+        while let Some(arg) = it.next() {
+            let arg = arg.as_str();
+            if literal {
+                operands.push(arg);
+                continue;
+            }
+            match arg {
+                "--" => literal = true,
+                "--file" | "--jobs" | "--upgrade-formulae" | "--upgrade-formula" => {
+                    it.next();
+                }
+                _ if arg.starts_with('-') && arg.len() > 1 => {}
+                _ => operands.push(arg),
+            }
+        }
+        let sub_none = match operands.first().copied() {
+            None => true, // bare bundle is install
+            Some(
+                "install" | "upgrade" | "check" | "list" | "cleanup" | "dump" | "edit" | "env"
+                | "sh",
+            ) => true,
+            _ => false,
+        };
+        if sub_none && operands.len() > usize::from(!operands.is_empty()) {
+            return Err(InstallError::Failed(
+                "Error: Invalid usage: This command does not take named arguments.".to_string(),
+            ));
+        }
+    }
     match rest.first().map(String::as_str) {
         Some("status") if rest.len() == 1 => Ok(None),
         // Direct abrew's bare `bundle remove` removes the legacy
@@ -3116,6 +3702,7 @@ fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, In
         },
         Some("install" | "upgrade") | None => brewfile_args(rest.get(1..).unwrap_or(&[]), false),
         Some("check") => brewfile_args(rest.get(1..).unwrap_or(&[]), true),
+        Some("env") => bundle_env_args(rest.get(1..).unwrap_or(&[])),
         Some("list") => bundle_list_args(rest.get(1..).unwrap_or(&[])),
         Some("cleanup") => {
             if rest.iter().any(|a| a == "--install") {
@@ -3305,6 +3892,48 @@ fn brewfile_args(
         {
             // Space-form values ride along untouched.
             let _ = it.next();
+        } else {
+            return Err(unsupported());
+        }
+    }
+    let text = bundle::read_brewfile(file.as_deref()).map_err(InstallError::Failed)?;
+    let (entries, skipped) = bundle::parse_brewfile(&text);
+    if !skipped.is_empty() {
+        return Err(unsupported());
+    }
+    Ok(Some(entries))
+}
+
+/// `brew bundle env` admission: like check's Brewfile read,
+/// with env's own switches.
+fn bundle_env_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
+    let unsupported =
+        || InstallError::Unsupported("bundle arguments or Brewfile rows are not native".to_owned());
+    let mut file = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--file" && file.is_none() {
+            file = Some(std::path::PathBuf::from(
+                it.next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(unsupported)?,
+            ));
+        } else if let Some(path) = arg.strip_prefix("--file=").filter(|s| !s.is_empty())
+            && file.is_none()
+        {
+            file = Some(std::path::PathBuf::from(path));
+        } else if matches!(
+            arg.as_str(),
+            "--check"
+                | "--no-secrets"
+                | "--install"
+                | "--verbose"
+                | "-v"
+                | "--quiet"
+                | "-q"
+                | "--debug"
+                | "-d"
+        ) {
         } else {
             return Err(unsupported());
         }
@@ -3616,7 +4245,10 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             }
         }
     }
-    let (prepared, admitted) = match native_args(cmd, rest) {
+    // Admission sees the typed tokens (it canonicalizes kind
+    // switches itself) so option errors report `--formulae`
+    // as typed, not the canonical `--formula`.
+    let (prepared, admitted) = match native_args(cmd, raw_rest) {
         Ok(pair) => pair,
         Err(error) => return from_install(prefix, args, Err(error)),
     };
@@ -3756,9 +4388,10 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         .iter()
         .any(|s| matches!(s.as_str(), "--dry-run" | "-n"));
     let read_only = (cmd == "bundle"
-        && rest
-            .first()
-            .is_some_and(|s| matches!(s.as_str(), "check" | "status" | "dump")))
+        && rest.first().is_some_and(|s| {
+            matches!(s.as_str(), "check" | "status" | "dump")
+                || (s == "env" && !rest.iter().any(|a| a == "--install"))
+        }))
         || (cmd == "tap" && rest.is_empty())
         || dry_run;
     if matches!(cmd, "install" | "upgrade" | "reinstall" | "fetch") && !dry_run {
@@ -3768,9 +4401,10 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         }
     }
     if cmd == "bundle"
-        && !rest
-            .first()
-            .is_some_and(|s| matches!(s.as_str(), "check" | "status" | "remove" | "dump"))
+        && !rest.first().is_some_and(|s| {
+            matches!(s.as_str(), "check" | "status" | "remove" | "dump")
+                || (s == "env" && !rest.iter().any(|a| a == "--install"))
+        })
         && let Some(entries) = &prepared
     {
         let api0 = api::Api::new(prefix.clone());
@@ -3907,7 +4541,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "reinstall" => cmd_reinstall(prefix, &api, args, rest),
         "upgrade" => cmd_upgrade(prefix, &api, args, rest),
         "outdated" => cmd_outdated(prefix, &api, rest),
-        "update" => cmd_update(prefix, &api),
+        "update" => cmd_update(prefix, &api, args, rest),
         "cleanup" => cmd_cleanup(prefix, &api, rest),
         "autoremove" => cmd_autoremove(prefix, &api, rest),
         "pin" => {
@@ -5198,6 +5832,39 @@ mod admission_tests {
         ));
         let (_, rest) = native_args("deps", &argv(&["--os", "linux", "--tre", "wget"])).unwrap();
         assert_eq!(rest, argv(&["--os", "linux", "--tree", "wget"]));
+        // Alias pairs are one switch: --form expands.
+        let (_, rest) = native_args("info", &argv(&["--form", "wget"])).unwrap();
+        assert_eq!(rest, argv(&["--formula", "wget"]));
+        let failed = |cmd: &str, args: &[&str]| match native_args(cmd, &argv(args)) {
+            Err(InstallError::Failed(m)) => m,
+            other => panic!("expected usage failure for {cmd} {args:?}, got {other:?}"),
+        };
+        // Ruby optparse + did_you_mean suffixes, oracle-verified.
+        assert_eq!(
+            failed("install", &["--for", "wget"]),
+            "Error: ambiguous option: --for\nDid you mean?  force"
+        );
+        assert_eq!(
+            failed("info", &["--jsonn", "wget"]),
+            "Error: invalid option: --jsonn\nDid you mean?  json"
+        );
+        assert_eq!(
+            failed("info", &["--caskk", "wget"]),
+            "Error: invalid option: --caskk\nDid you mean?  cask\n               casks"
+        );
+        assert_eq!(
+            failed("info", &["--bogus-zz", "wget"]),
+            "Error: invalid option: --bogus-zz"
+        );
+        // Subcommand-parent option lists come from the recorded
+        // parser preambles.
+        assert!(native_args("services", &argv(&["list", "--jso"])).is_ok());
+        // bundle check then goes on to read a Brewfile; the
+        // abbreviation must at least not be a native refusal.
+        assert!(!matches!(
+            native_args("bundle", &argv(&["check", "--verb"])),
+            Err(InstallError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -5395,9 +6062,17 @@ mod admission_tests {
             failed("options", &["--command=install"]),
             "Error: Calling the `--command` flag is disabled! There is no replacement."
         );
+        // `brew update` parses in shell: admission admits and
+        // cmd_update owns --merge/unknown-option ordering.
+        assert!(native_args("up", &argv(&["--merge"])).is_ok());
+        assert!(native_args("update", &argv(&["--bogus"])).is_ok());
         assert_eq!(
-            failed("up", &["--merge"]),
-            "Error: Calling the `--merge` switch is disabled! There is no replacement."
+            failed("list", &["--versions", "--installed-on-request"]),
+            "Error: Invalid usage: Options --versions and --installed-on-request are mutually exclusive."
+        );
+        assert_eq!(
+            failed("list", &["--cask", "--poured-from-bottle"]),
+            "Error: Invalid usage: Options --cask and --poured-from-bottle are mutually exclusive."
         );
         assert_eq!(
             failed("install", &["--env=std", "acl"]),
@@ -5502,6 +6177,28 @@ mod admission_tests {
         assert_eq!(
             failed("services", &["frobnicate"]),
             "Error: Invalid usage: unknown subcommand: `frobnicate`"
+        );
+        // Subcommands declaring no named args: brew's arity
+        // error, not a native refusal (r335).
+        assert_eq!(
+            failed("bundle", &["list", "foo"]),
+            "Error: Invalid usage: This command does not take named arguments."
+        );
+        assert_eq!(
+            failed("bundle", &["install", "foo"]),
+            "Error: Invalid usage: This command does not take named arguments."
+        );
+        assert_eq!(
+            failed("completions", &["link", "foo"]),
+            "Error: Invalid usage: This command does not take named arguments."
+        );
+        assert_eq!(
+            failed("developer", &["on", "foo"]),
+            "Error: Invalid usage: This command does not take named arguments."
+        );
+        assert_eq!(
+            failed("analytics", &["state", "foo"]),
+            "Error: Invalid usage: This command does not take named arguments."
         );
         assert_eq!(
             failed("services", &["--file=x"]),

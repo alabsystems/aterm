@@ -17,8 +17,9 @@
 //! password is the login address's own `password` cell, so the emails table and the mailbox
 //! never hold one fact twice.
 
+#[cfg(unix)]
+use super::Registry;
 use super::{
-    Registry,
     registry::{ADDRESS, AddressHolder, AddressIndex, MAILBOX},
     secret::{Journal, Surface},
 };
@@ -507,6 +508,7 @@ pub fn reveal_in<T>(
 ///
 /// # Errors
 /// The registry is not declared here or its log does not read.
+#[cfg(unix)]
 pub fn sign_in_mailboxes(registry: &Registry) -> Result<Vec<Mailbox>> {
     sign_in_read(registry).map(|(found, _)| found)
 }
@@ -516,6 +518,7 @@ pub fn sign_in_mailboxes(registry: &Registry) -> Result<Vec<Mailbox>> {
 ///
 /// # Errors
 /// The registry is not declared here or its log does not read.
+#[cfg(unix)]
 pub fn sign_in_read(registry: &Registry) -> Result<(Vec<Mailbox>, AddressIndex)> {
     let view = crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY).view()?;
     let addresses = view.project(&ADDRESS);
@@ -546,6 +549,7 @@ pub fn login_mailbox(index: &AddressIndex, login: &str) -> Option<String> {
 /// # Errors
 /// The registry is not declared here, its log does not read, a key is unavailable, or the
 /// journal fails.
+#[cfg(unix)]
 pub fn reveal<T>(
     registry: &Registry,
     journal: &Journal,
@@ -572,6 +576,7 @@ pub fn reveal<T>(
 ///
 /// # Errors
 /// The registry, key or journal is unavailable. Withholds incomplete or changed bindings.
+#[cfg(unix)]
 pub fn reveal_bound<T>(
     registry: &Registry,
     journal: &Journal,

@@ -366,24 +366,6 @@ mod tests {
         assert_eq!(invoking_shell_from(None, None), None);
     }
 
-    /// Poll until `pid` answers `want`, bounded: `Command::spawn` does not promise the
-    /// child has exec'd (macOS's `posix_spawn` path returns first).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn await_exec(pid: u32, want: &str) {
-        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        loop {
-            if process_exe_name(pid).as_deref() == Some(want) {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "pid {pid} never came up as {want:?} within a minute — the spawn or the exec \
-                 failed, which is not what this case is about"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
     /// The pid reader names this test binary and a spawned `sleep` by executable, and
     /// answers `None` for a pid nobody has.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -404,7 +386,7 @@ mod tests {
             .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("/bin/sleep");
-        await_exec(child.id(), "sleep");
+        aterm_uds::deadline::execd(child.id() as i32, std::path::Path::new("/bin/sleep"));
         let name = process_exe_name(child.id());
         let _ = child.kill();
         let _ = child.wait();

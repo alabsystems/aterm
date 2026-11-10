@@ -4770,6 +4770,8 @@ fn record_session<R>(
         roster_path: &path,
         row,
         who,
+        // The pool's login writer proves identity under its own lock: the believed row.
+        seen: &super::observe::Observation::Unread,
     };
     let mut recorded = None;
     seat.store(session.cli).transact_pool_logins_within(

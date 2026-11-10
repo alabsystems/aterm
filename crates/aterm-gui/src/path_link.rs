@@ -93,37 +93,69 @@ fn looks_like_path(path: &str) -> bool {
         .is_some_and(|(_, ext)| !ext.is_empty() && ext.chars().all(char::is_alphanumeric))
 }
 
-/// Find a plain-text file citation covering column `col` of `chars`.
-pub(crate) fn find_path_span(chars: &[char], col: usize) -> Option<PathSpan> {
-    let at = *chars.get(col)?;
+/// Find a plain-text file citation covering column `col` through indexed cells.
+pub(crate) fn find_path_span(
+    n: usize,
+    col: usize,
+    char_at: impl Fn(usize) -> char,
+) -> Option<PathSpan> {
+    if col >= n {
+        return None;
+    }
+    let at = char_at(col);
     let in_token = |ch: char| ch == WIDE_CONTINUATION || !(is_delimiter(ch) || ch.is_control());
     if !in_token(at) {
         return None;
     }
+    let bytes = |ch: char| {
+        if ch == WIDE_CONTINUATION {
+            0
+        } else {
+            ch.len_utf8()
+        }
+    };
+    let mut utf8_len = bytes(at);
     let mut start = col;
-    while start > 0 && in_token(chars[start - 1]) {
+    while start > 0 {
+        let ch = char_at(start - 1);
+        if !in_token(ch) {
+            break;
+        }
         start -= 1;
+        if col - start >= MAX_TOKEN_CELLS {
+            return None;
+        }
+        utf8_len += bytes(ch);
     }
-    let mut end = col;
-    while end < chars.len() && in_token(chars[end]) {
+    let mut end = col + 1;
+    while end < n {
+        let ch = char_at(end);
+        if !in_token(ch) {
+            break;
+        }
         end += 1;
+        if end - start > MAX_TOKEN_CELLS {
+            return None;
+        }
+        utf8_len += bytes(ch);
     }
-    if end - start > MAX_TOKEN_CELLS {
-        return None;
-    }
-    while start < end && chars[start] == WIDE_CONTINUATION {
+    while start < end && char_at(start) == WIDE_CONTINUATION {
         start += 1;
     }
-    while end > start && is_trailing_punct(chars[end - 1]) {
+    while end > start && is_trailing_punct(char_at(end - 1)) {
         end -= 1;
+        utf8_len -= 1;
     }
     if !(start..end).contains(&col) {
         return None;
     }
-    let token: String = chars[start..end]
-        .iter()
-        .filter(|ch| **ch != WIDE_CONTINUATION)
-        .collect();
+    let mut token = String::with_capacity(utf8_len);
+    for i in start..end {
+        let ch = char_at(i);
+        if ch != WIDE_CONTINUATION {
+            token.push(ch);
+        }
+    }
     if token.contains("://") {
         return None;
     }
@@ -131,8 +163,11 @@ pub(crate) fn find_path_span(chars: &[char], col: usize) -> Option<PathSpan> {
     if !looks_like_path(path) {
         return None;
     }
+    let path_bytes = path.len();
+    token.truncate(path_bytes);
+    token.shrink_to_fit();
     Some(PathSpan {
-        path: path.to_string(),
+        path: token,
         line,
         col: col_no,
         start,
@@ -647,3 +682,7 @@ pub(crate) fn line_col_offset(text: &str, line: u32, col: Option<u32>) -> usize 
 #[cfg(test)]
 #[path = "path_link_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "path_lookup_tests.rs"]
+mod lookup_tests;

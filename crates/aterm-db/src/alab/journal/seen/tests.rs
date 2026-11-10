@@ -175,6 +175,8 @@ fn ev(t: u64, kind: Kind, account: Pk) -> Event {
         src: Source::CliOutput,
         why: None,
         to: None,
+        tab: None,
+        harness: None,
     }
 }
 
@@ -323,4 +325,16 @@ fn a_live_claim_is_a_use_and_a_lapsed_one_says_nothing() {
         Some(vec![(b, "lease".to_owned())]),
         "the lapsed row is no claim"
     );
+}
+
+/// A sighting states no sign-in word to the window's reader either, so one Mac's `ended` is not
+/// read as `in` by a later `seen`; a login that ended does state its word.
+/// NEGATIVE CONTROL: with `Kind::Seen` giving `in` in `event_state`, `` left: Some("in") right:
+/// None ``.
+#[test]
+fn a_sighting_states_no_sign_in_word() {
+    let ann = account("ann@example.test");
+    assert_eq!(event_state(&ev(1, Kind::Seen, ann)), None);
+    assert_eq!(event_state(&ev(1, Kind::LoginEnded, ann)), Some("ended"));
+    assert_eq!(event_state(&ev(1, Kind::SignedIn, ann)), Some("in"));
 }

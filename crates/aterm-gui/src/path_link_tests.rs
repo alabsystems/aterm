@@ -10,8 +10,12 @@ fn chars(s: &str) -> Vec<char> {
     s.chars().collect()
 }
 
+fn span_in(cells: &[char], col: usize) -> Option<PathSpan> {
+    find_path_span(cells.len(), col, |i| cells[i])
+}
+
 fn span_at(row: &str, col: usize) -> Option<(String, Option<u32>, Option<u32>)> {
-    find_path_span(&chars(row), col).map(|s| (s.path, s.line, s.col))
+    span_in(&chars(row), col).map(|s| (s.path, s.line, s.col))
 }
 
 fn some(
@@ -120,7 +124,7 @@ fn unicode_names_and_wide_glyphs_stay_one_citation() {
     cells.extend("件/a.rs:2".chars());
     cells.insert(5, WIDE_CONTINUATION);
     for col in 2..cells.len() {
-        let span = find_path_span(&cells, col).expect("one token");
+        let span = span_in(&cells, col).expect("one token");
         assert_eq!(span.path, "文件/a.rs", "{col}");
         assert_eq!((span.start, span.end), (2, cells.len() - 1));
     }
@@ -338,7 +342,7 @@ fn a_symlink_is_resolved_to_its_target_and_a_link_to_a_directory_is_refused() {
     let s = Scratch::new();
     std::os::unix::fs::symlink(s.root.join("src/foo.rs"), s.root.join("link.rs")).unwrap();
     std::os::unix::fs::symlink(s.root.join("src/sub"), s.root.join("dirlink.rs")).unwrap();
-    let span = find_path_span(&chars("link.rs:2"), 0).unwrap();
+    let span = span_in(&chars("link.rs:2"), 0).unwrap();
     let target = PathTarget::resolve(&span, &s.bases(), None).unwrap();
     assert_eq!(
         target.path,
@@ -419,7 +423,7 @@ fn the_caption_names_the_file_where_it_is_never_relative_to_a_directory() {
     let s = Scratch::new();
     let other = Scratch::new();
     let file = s.root.join("src/foo.rs");
-    let span = |row: &str| find_path_span(&chars(row), 0).expect("a citation");
+    let span = |row: &str| span_in(&chars(row), 0).expect("a citation");
     let here = PathTarget::resolve(&span("src/foo.rs:12"), &s.bases(), None).unwrap();
     assert_eq!(here.path, file);
     assert_eq!(here.shown, format!("{}:12", plain_text(&file)));
@@ -642,7 +646,7 @@ fn only_a_shell_alone_or_an_identified_agent_runs_here() {
 fn a_look_not_back_in_time_is_no_link_yet_and_its_answer_is_kept() {
     let s = Scratch::new();
     let looks = Looks::new(Duration::ZERO);
-    let span = find_path_span(&chars("src/foo.rs:2"), 0).expect("a citation");
+    let span = span_in(&chars("src/foo.rs:2"), 0).expect("a citation");
     assert!(
         looks.target(&span, &s.bases(), None).is_none(),
         "the look is not back: no link yet"
@@ -771,8 +775,9 @@ fn no_path_link_ever_reaches_open_url_external() {
         }
         let cells = chars(&row);
         for col in 0..cells.len() {
-            let url = crate::find_url_span(&cells, col).map(|(url, _, _)| url);
-            let path = find_path_span(&cells, col)
+            let url = crate::find_url_span(cells.len(), col, |i| cells[i])
+                .map(|span| cells[span].iter().collect::<String>());
+            let path = span_in(&cells, col)
                 .and_then(|span| PathTarget::resolve(&span, &s.bases(), None).ok());
             if let Some(target) = &path {
                 assert!(target.path.starts_with(&s.root), "{row:?} @ {col}");

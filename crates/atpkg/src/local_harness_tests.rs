@@ -145,6 +145,26 @@ fn current_observation_is_positive_absence_then_checked_identity_without_reselec
 }
 
 #[test]
+fn managed_current_without_a_local_receipt_is_a_foreign_cas_predecessor() {
+    let w = World::new("local-harness-managed-current");
+    let lock = w.lock();
+    let managed = w.layout.build_dir(PROGRAM, 7);
+    std::fs::create_dir_all(managed.join("bin")).unwrap();
+    crate::store::mark_build_ready(&managed).unwrap();
+    std::os::unix::fs::symlink(&managed, w.layout.program_current(PROGRAM)).unwrap();
+    assert_eq!(
+        observe_current(&lock, PROGRAM).unwrap(),
+        CurrentLocal::Foreign(7)
+    );
+    let staged = stage(&lock, &w.authority(), &w.artifact).unwrap();
+    select_current(&lock, &staged, ExpectedCurrent::Build(7)).unwrap();
+    assert_eq!(
+        observe_current(&lock, PROGRAM).unwrap(),
+        CurrentLocal::Selected(staged.identity())
+    );
+}
+
+#[test]
 fn observation_never_converts_foreign_incomplete_or_changed_current_to_absence() {
     for fault in [
         "foreign",

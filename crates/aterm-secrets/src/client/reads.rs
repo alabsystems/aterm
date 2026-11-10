@@ -13,8 +13,8 @@
 //! a step that writes ends it, and the next read makes another.
 
 use super::{
-    Config, Paths, State, chain_cache, config_with, envelope, fsx, load_records_for, load_state,
-    log_entries, pin_gives_way, read_identity, retained_history, source_bound,
+    Config, Paths, State, chain_cache, config_with, load_records_for, load_state, log_entries,
+    pin_gives_way, read_identity, retained_history, source_bound,
 };
 use crate::Result;
 use crate::age::Identity;
@@ -149,12 +149,7 @@ impl<'a> Reads<'a> {
     /// The vault file's bytes, and what they parse to.
     pub(super) fn vault(&self) -> Result<Option<&chain_cache::Parsed>> {
         self.vault
-            .get_or_init(|| {
-                Ok(
-                    fsx::read_private(&self.paths.cache_file(), envelope::MAX_ENVELOPE)?
-                        .map(chain_cache::parsed),
-                )
-            })
+            .get_or_init(|| chain_cache::held(&self.paths.cache_file()))
             .as_ref()
             .map(|vault| vault.as_deref())
             .map_err(Clone::clone)

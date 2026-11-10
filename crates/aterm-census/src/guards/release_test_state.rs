@@ -6,7 +6,7 @@
 //! it does not claim to follow arbitrary calls through a test's dependency graph.
 
 use super::rules::PRODUCT;
-use super::{Bound, Finding, Rule, Tree, brace_close, hits, literal, token};
+use super::{Bound, Finding, Rule, SourceFile, Tree, brace_close, hits, literal, token};
 
 pub(super) const RELEASE_TEST_STATE: Rule = Rule {
     id: "release-test-state",
@@ -25,12 +25,17 @@ fn check(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         }
         let lexed = file.lexed();
         let code = &lexed.code;
-        let shipped = file.shipped_code();
+        // Whether the file is test code is asked once, its blanked lines when a `fn` first needs
+        // them, and each `fn`'s line is counted on from the one before.
+        let held = test_files.holds(&file.rel);
+        let mut blanked: Option<Blanked<'_>> = None;
+        let mut lines = LineOf::new(code);
         for at in hits(code, "fn", Bound::Word) {
-            let line = code[..at].matches('\n').count() + 1;
             let attr_start = code[..at].rfind([';', '{', '}']).map_or(0, |i| i + 1);
-            let is_test = test_files.holds(&file.rel)
-                || shipped.as_bytes().get(at) == Some(&b' ')
+            let is_test = held
+                || blanked
+                    .get_or_insert_with(|| Blanked::of(file))
+                    .at(at, &mut lines)
                 || code[attr_start..at].contains("#[test]");
             if !is_test {
                 continue;
@@ -89,10 +94,69 @@ fn check(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                 && !compact.contains(".state=");
             if (direct_marker && !injected_marker) || home_release || live_admission || real_record
             {
+                let line = lines.at(at);
                 out.push(file.finding(RELEASE_TEST_STATE.id, line,
                     "test reads ambient release state or scheduling context; inject its home/state, Machine or Record".into()));
             }
         }
+    }
+}
+
+/// Which offsets of a file's CODE view its shipped view ([`SourceFile::shipped_code`]) holds a
+/// blank at.
+enum Blanked<'a> {
+    /// A CODE view without a `\r`: its shipped view is itself with each test-only line blanked,
+    /// byte for byte, so the line of an offset that holds no blank says. Each flag is the
+    /// file's own: whether that line ships.
+    Lines(&'a [bool]),
+    /// Any other CODE view: the shipped view itself, whose lines `str::lines` cut short of a
+    /// `\r`.
+    View(String),
+}
+
+impl<'a> Blanked<'a> {
+    fn of(file: &'a SourceFile) -> Self {
+        if file.lexed().code.contains('\r') {
+            Self::View(file.shipped_code())
+        } else {
+            Self::Lines(file.shipped_flags())
+        }
+    }
+
+    /// Does the shipped view hold a blank at `at`, a `fn` keyword's offset in the CODE view?
+    fn at(&self, at: usize, lines: &mut LineOf<'_>) -> bool {
+        match self {
+            Self::Lines(flags) => !flags.get(lines.at(at) - 1).copied().unwrap_or(true),
+            Self::View(view) => view.as_bytes().get(at) == Some(&b' '),
+        }
+    }
+}
+
+/// The 1-based line of each offset of a text, asked in rising order: each count goes on from
+/// the offset asked before.
+struct LineOf<'a> {
+    text: &'a [u8],
+    from: usize,
+    line: usize,
+}
+
+impl<'a> LineOf<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text: text.as_bytes(),
+            from: 0,
+            line: 1,
+        }
+    }
+
+    /// The line of `at`, no earlier than any offset asked before.
+    fn at(&mut self, at: usize) -> usize {
+        self.line += self.text[self.from..at]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        self.from = at;
+        self.line
     }
 }
 
@@ -107,7 +171,7 @@ fn injects(code: &str, text: &str, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guards::tests::run;
+    use crate::guards::tests::{run, spots};
 
     #[test]
     fn ambient_adapters_are_red_and_injected_values_are_green() {
@@ -152,5 +216,19 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// A `fn` only a test build compiles is a test's without a `#[test]` of its own, with `\n`
+    /// or `\r\n` line ends alike, and the same `fn` shipped is none.
+    #[test]
+    fn a_helper_in_a_test_module_is_a_test() {
+        let helper = "fn helper() { let r = std::env::var_os(\"ATERM_RELEASE_RUN\").is_some(); }";
+        let gated = format!("fn shipped() {{}}\n\n#[cfg(test)]\nmod tests {{\n    {helper}\n}}\n");
+        for source in [gated.clone(), gated.replace('\n', "\r\n")] {
+            let found = run(&RELEASE_TEST_STATE, &[("crates/a/src/lib.rs", &source)]);
+            assert_eq!(spots(&found), ["crates/a/src/lib.rs:5"], "{source:?}");
+        }
+        let shipped = format!("fn shipped() {{}}\n\n{helper}\n");
+        assert!(run(&RELEASE_TEST_STATE, &[("crates/a/src/lib.rs", &shipped)]).is_empty());
     }
 }

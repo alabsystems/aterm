@@ -417,6 +417,7 @@ fn spec_xref_closure() {
         "DbImportAtomic",
         "DbAccountPlan",
         "DbProposalConditional",
+        "DbPublicationChain",
         "DbEntryAdmission",
         "DbEntryProvenance",
         "DbHostCarry",
@@ -436,6 +437,7 @@ fn spec_xref_closure() {
         "AccountSourceRetirement",
         "AccountPublicationPhases",
         "AccountSyncCleanup",
+        "AccountPublicationOutbox",
         "AccountFleetCommit",
         "AccountProviderCommit",
     ] {

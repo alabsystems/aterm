@@ -80,6 +80,8 @@ fn widest(t: u64) -> Event {
         src: Source::SessionUsage,
         why: None,
         to: None,
+        tab: None,
+        harness: None,
     }
 }
 

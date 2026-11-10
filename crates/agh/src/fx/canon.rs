@@ -595,6 +595,9 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
                     row.source, row.into, row.expected_oid
                 );
             }
+            for oid in batch.object_ids() {
+                let _ = write!(text, "\nimport {oid}");
+            }
             text
         }
         GitOp::LsRemote {
@@ -1152,6 +1155,23 @@ mod tests {
         assert_eq!(first, request("/two", &expected, true));
         assert_ne!(first, request("/one", &"b".repeat(40), true));
         assert_ne!(first, request("/one", &expected, false));
+        let import = super::git_request(&GitRun::fetch_batch(
+            &slug,
+            std::path::Path::new("/one"),
+            FetchBatch::objects(vec![expected.clone()]).unwrap(),
+            true,
+        ));
+        assert_ne!(
+            first, import,
+            "publishing refs and importing objects are distinct requests"
+        );
+        let other = super::git_request(&GitRun::fetch_batch(
+            &slug,
+            std::path::Path::new("/two"),
+            FetchBatch::objects(vec!["b".repeat(40)]).unwrap(),
+            true,
+        ));
+        assert_ne!(import, other);
     }
 
     #[test]

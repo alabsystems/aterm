@@ -51,6 +51,12 @@ impl Sink for Glue {
             let _ = spool.append(&event);
         }
     }
+
+    fn observed(&self, login: &journal::ObservedLogin) {
+        // The registry's `account-obs` rows: a thread of its own, installed only where this
+        // process holds a lab (`crate::alab_observed`).
+        crate::alab_observed::take_up(login);
+    }
 }
 
 /// The journal event a harness note is, when every word is in the journal's vocabulary.
@@ -84,7 +90,11 @@ fn event(note: &Note) -> Option<Event> {
         src: Source::parse(note.src)?,
         why: word(note.why, Word::new)?,
         to: word(note.to.as_ref().map(journal::Key::as_str), Pk::new)?,
+        tab: word(note.tab.as_ref().map(journal::Tab::as_str), Word::new)?,
+        harness: word(note.harness, Word::new)?,
     })
+    // Only a kind about one tab's run names a tab or a harness, as every reader admits it.
+    .filter(|event| (event.tab.is_none() && event.harness.is_none()) || event.kind.names_tab())
 }
 
 static GLUE: OnceLock<Glue> = OnceLock::new();
@@ -273,6 +283,8 @@ mod tests {
             src: "session-usage",
             why: None,
             to: None,
+            tab: None,
+            harness: None,
         };
         let shapes = [
             base,
@@ -305,6 +317,25 @@ mod tests {
                 why: Some("reset-failed"),
                 ..base
             },
+            // A tab's sighting, with its tab and harness and the believed account of a
+            // wrong-account beside it.
+            journal::seen_note(
+                Cli::Codex,
+                account,
+                journal::Tab::of("machine", "s-41a2"),
+                "codex-alab-agent",
+                journal::ObservedSrc::VaultToken,
+                journal::SeenWhy::Changed,
+                9_999_999_999,
+            ),
+            journal::wrong_account_note(
+                Cli::Claude,
+                account,
+                journal::Key::new("ac-fedcba9876543210"),
+                journal::Tab::of("machine", "s-41a2"),
+                journal::ObservedSrc::Profile,
+                9_999_999_999,
+            ),
         ];
         let mut buf = [0; aterm_db::alab::journal::event::MAX_EVENT];
         for note in &shapes {
@@ -361,6 +392,8 @@ mod tests {
             src: "cli-output",
             why: None,
             to: None,
+            tab: None,
+            harness: None,
         };
         assert!(record(&spool, &state, &[note]).is_err());
         assert!(
@@ -413,6 +446,8 @@ mod tests {
             src: "cli-output",
             why: None,
             to: None,
+            tab: None,
+            harness: None,
         };
         assert!(event(&zero_time).is_none());
         let over_pct = Note {
@@ -446,6 +481,8 @@ mod tests {
             src: "rollout",
             why: None,
             to: None,
+            tab: None,
+            harness: None,
         };
         assert_eq!(event(&reading).unwrap().sub, Word::new("0123456789ab"));
         let probe = Note {
@@ -503,6 +540,8 @@ mod tests {
             src: "signin-flow",
             why: None,
             to: None,
+            tab: None,
+            harness: None,
         };
         let spooled = scratch
             .path()

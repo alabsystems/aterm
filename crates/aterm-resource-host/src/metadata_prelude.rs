@@ -18,6 +18,10 @@ use plan::ExecPlan;
 
 const VERB: &str = "__resource-metadata-exec-v1";
 const MAX_PLAN: usize = 65536;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "metadata_prelude/footprint_tests.rs"]
+mod footprint_tests;
 fn refused() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -125,6 +129,16 @@ impl Owner {
         targets: &[u32],
         deadline: Instant,
     ) -> io::Result<(Self, spawnfd::Command)> {
+        #[cfg(target_os = "macos")]
+        if command.get_footprint_limit().is_some() {
+            // This private plan does not serialize final-exec memory policy.
+            // Refuse rather than silently applying it to the prelude or losing
+            // it when the selected image replaces that trusted helper.
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "metadata prelude cannot transfer final footprint policy",
+            ));
+        }
         let target = (3..=130)
             .find(|fd| !targets.contains(fd))
             .ok_or_else(refused)? as i32;

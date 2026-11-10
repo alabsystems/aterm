@@ -163,7 +163,7 @@ fn dead_needles(tree: &Tree<'_>) -> Vec<Finding> {
         }
         if !unseen
             .iter()
-            .any(|(needle, _, _)| file.raw.contains(needle))
+            .any(|(needle, _, _)| file.raw().contains(needle))
         {
             continue;
         }

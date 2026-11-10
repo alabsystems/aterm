@@ -419,10 +419,10 @@ fn memoized<T>(probe: impl Fn() -> RepoRead, sweep: impl FnOnce(&RepoRead) -> T)
 
 /// THE READ MEMO ([`read_memo`]) KNOWS A READ BY ITS WHOLE KEY: with no memo held a read runs its
 /// `git` every time; held, a read runs once, counted as missed, and the same read is then answered
-/// with that output without running, while a read in another folder or fed other input runs its
-/// own, and one a signal ended is not kept. The key reads a fed input without moving the file's
-/// offset, so the `git` it feeds still reads all of it. Under [`read_memo::Memo::checking`] an
-/// answer runs its `git` again. While a memo is held a second is refused, and the one held still
+/// with that output without running, while a read in another folder, fed other input or of
+/// another index runs its own, and one a signal ended is not kept. The key reads a fed input
+/// without moving the file's offset, so the `git` it feeds still reads all of it. Under
+/// [`read_memo::Memo::checking`] an answer runs its `git` again. While a memo is held a second is refused, and the one held still
 /// answers. NEGATIVE CONTROLS: a checked answer its `git` no longer gives panics; a dropped memo
 /// answers nothing.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -444,7 +444,7 @@ fn the_read_memo_knows_a_read_by_its_whole_key() {
         refused: None,
     };
     let read = |dir: &str, feed: Option<&std::fs::File>| {
-        read_memo::read(Path::new(dir), &["status"], &reads, false, true, feed)
+        read_memo::read(Path::new(dir), &["status"], &reads, false, true, feed, None)
     };
     let said = |text: &str| Output {
         status: ExitStatus::from_raw(0),
@@ -472,6 +472,28 @@ fn the_read_memo_knows_a_read_by_its_whole_key() {
         through(read("/b", None), || run(said("b"))),
         Ok(said("b")),
         "a read in another folder runs its own"
+    );
+    let through_index = |runs: &dyn Fn() -> Result<Output, ()>| {
+        let key = read_memo::read(
+            Path::new("/a"),
+            &["status"],
+            &reads,
+            false,
+            true,
+            None,
+            Some(Path::new("/i")),
+        );
+        through(key, runs)
+    };
+    assert_eq!(
+        through_index(&|| run(said("i"))),
+        Ok(said("i")),
+        "a read of another index runs its own"
+    );
+    assert_eq!(
+        through_index(&not_run),
+        Ok(said("i")),
+        "a read of that index, answered from memory"
     );
     let one = open_git_stdin_feed(&tmp.path().join("one"), b"one\n").expect("one");
     let two = open_git_stdin_feed(&tmp.path().join("two"), b"two\n").expect("two");
@@ -507,15 +529,15 @@ fn the_read_memo_knows_a_read_by_its_whole_key() {
     );
     assert_eq!(
         runs.get(),
-        8,
+        9,
         "each read the memo could not answer ran its git"
     );
-    assert_eq!(memo.missed(), 6, "the reads the memo could not answer");
+    assert_eq!(memo.missed(), 7, "the reads the memo could not answer");
     assert_eq!(
         memo.checking(|| through(read("/a", None), || run(said("a")))),
         Ok(said("a"))
     );
-    assert_eq!(runs.get(), 9, "a checked answer runs its git again");
+    assert_eq!(runs.get(), 10, "a checked answer runs its git again");
     let differs = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         memo.checking(|| through(read("/a", None), || run(said("not a"))))
     }));
@@ -525,7 +547,7 @@ fn the_read_memo_knows_a_read_by_its_whole_key() {
         Ok(said("a")),
         "past the checks, answered without running"
     );
-    assert_eq!(memo.missed(), 6, "a checked answer is no miss");
+    assert_eq!(memo.missed(), 7, "a checked answer is no miss");
     let nested = std::panic::catch_unwind(read_memo::on);
     assert!(nested.is_err(), "a second memo on this thread is refused");
     assert_eq!(
@@ -3008,4 +3030,285 @@ fn worktree_branch_reads_attached_short_branch_flags() {
         worktree_branch(&["-Breset-attached", "../wt"]),
         Some("reset-attached".to_string())
     );
+}
+
+/// A probe's reads in `home`, each within [`PROBE_LIMIT`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn reads_in(home: &Path) -> Reads<'_> {
+    Reads {
+        deadline: Cell::new(Instant::now() + PROBE_LIMIT),
+        each: Some(PROBE_LIMIT),
+        home,
+        xdg: None,
+        cut: Cell::new(false),
+        starts: Cell::new(0),
+        held: None,
+        refused: None,
+    }
+}
+
+/// Set the modification time of `path`, a file or a folder, to `at`: an explicit time asks only
+/// that it be this user's, not open for writing.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn dated(path: &Path, at: std::time::SystemTime) {
+    std::fs::File::open(path)
+        .and_then(|file| file.set_modified(at))
+        .unwrap_or_else(|e| panic!("date {}: {e}", path.display()));
+}
+
+/// A checkout whose index was written in the same second as every file it lists, as a clone's
+/// is, is read through a private copy of its index ([`private_index`]) that the one refresh wrote
+/// later than every file: a second read takes the same copy, not written again, and gives the same
+/// answer. A moved index (a file staged) is copied again, its earlier copy let go, and the staged
+/// file is in the next answer.
+/// NEGATIVE CONTROL: naming the copy by the index's path alone (`format!("{id}.index")`) answers
+/// the read after the staging from the earlier copy (`the staged file at the next read`); a copy
+/// judged let go at every read (`copy.stands()` false) answers none of them (`answered by the
+/// copy`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_racily_clean_checkout_is_read_through_its_refreshed_private_index() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), false);
+    for n in 0..20 {
+        std::fs::write(work.join(format!("file{n}.txt")), format!("{n}\n")).expect("file");
+    }
+    scratch_git(&work, &["add", "."]);
+    scratch_git(&work, &["commit", "-q", "-m", "files"]);
+    let second = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for name in scratch_git(&work, &["ls-files"]).lines() {
+        dated(&work.join(name), second + Duration::from_millis(100));
+    }
+    dated(
+        &work.join(".git/index"),
+        second + Duration::from_millis(500),
+    );
+    let reads = reads_in(tmp.path());
+    let table = aterm_sysprobe::volumes::table();
+
+    let (status, _) = work_status(&work, &table, &reads).expect("a read");
+    assert_eq!(status, "", "a clean checkout");
+    assert_eq!(
+        index_seam::copy_answered(),
+        Some(true),
+        "answered by the copy"
+    );
+    let copy = private_index(&work, &reads).expect("a private index");
+    let written = std::fs::metadata(&copy.path).expect("the copy");
+    assert!(
+        written.modified().expect("its time") > second + Duration::from_secs(1),
+        "the refresh wrote the copy later than every file it lists"
+    );
+    let (again, _) = work_status(&work, &table, &reads).expect("a read");
+    assert_eq!(again, status, "the same answer");
+    assert_eq!(index_seam::copy_answered(), Some(true), "again by the copy");
+    let still = private_index(&work, &reads).expect("a private index");
+    assert_eq!(still.path, copy.path, "the same copy");
+    assert_eq!(
+        std::fs::metadata(&still.path).expect("the copy").ino(),
+        written.ino(),
+        "not written again"
+    );
+
+    std::fs::write(work.join("new.txt"), "new\n").expect("new");
+    scratch_git(&work, &["add", "new.txt"]);
+    let (staged, _) = work_status(&work, &table, &reads).expect("a read");
+    assert_eq!(staged, "A  new.txt\0", "the staged file at the next read");
+    assert_eq!(index_seam::copy_answered(), Some(true), "by the new copy");
+    assert!(!copy.path.exists(), "the earlier copy let go");
+    assert!(!reads.cut.get(), "every read ended within its limit");
+}
+
+/// A file rewritten at its length inside the second its index was written, its time put back, is
+/// a change the private index still finds (the repository says `core.trustctime=false`, so the
+/// file's stat data alone matches the index's): the copy keeps the index's modification time, so
+/// the refresh checks that racy file's contents as a status of the repository's own index does.
+/// NEGATIVE CONTROL: copying without the source's modification time (no `set_modified`) reads
+/// the checkout clean (`an edit inside the index's second`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn an_edit_inside_the_index_s_own_second_is_read_through_the_private_index() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), false);
+    scratch_git(&work, &["config", "core.trustctime", "false"]);
+    let a = work.join("a.txt");
+    let second = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    dated(&a, second + Duration::from_millis(100));
+    scratch_git(&work, &["add", "a.txt"]);
+    std::fs::write(&a, "two\n").expect("an edit at its length");
+    dated(&a, second + Duration::from_millis(100));
+    dated(
+        &work.join(".git/index"),
+        second + Duration::from_millis(500),
+    );
+    let reads = reads_in(tmp.path());
+    let table = aterm_sysprobe::volumes::table();
+    let (status, _) = work_status(&work, &table, &reads).expect("a read");
+    assert!(
+        private_index(&work, &reads).is_some(),
+        "read through a private index"
+    );
+    assert_eq!(status, " M a.txt\0", "an edit inside the index's second");
+}
+
+/// Another read's sweep ([`sweep_private_indexes`]) keeps a temporary just written, though it
+/// carries its source index's modification time from years before, and lets go of an earlier copy
+/// of its own index.
+/// NEGATIVE CONTROL: aging a temporary by its modification time (`entry.metadata().and_then(|meta|
+/// meta.modified())`) lets go of it (`another read's temporary, mid-refresh`), and now and then one
+/// of the two private-index tests above, run together, reads an index refreshed from nothing.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_sweep_keeps_another_read_s_temporary_dated_as_its_source() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let folder = tmp.path();
+    let temporary = folder.join("bbbb-0123456789abcdef.7.0.tmp");
+    let lock = folder.join("bbbb-0123456789abcdef.7.0.tmp.lock");
+    let earlier = folder.join("aaaa-fedcba9876543210.index");
+    let source = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for path in [&temporary, &lock, &earlier] {
+        std::fs::write(path, b"DIRC").expect("a file");
+        dated(path, source);
+    }
+    sweep_private_indexes(folder, "aaaa", "aaaa-0123456789abcdef.index");
+    assert!(temporary.exists(), "another read's temporary, mid-refresh");
+    assert!(lock.exists(), "another read's refresh lock, mid-refresh");
+    assert!(!earlier.exists(), "its own index's earlier copy");
+}
+
+/// An index whose last change is younger than the settle is read as it stands, no copy of it kept:
+/// a second change inside the same tick of the filesystem's clock could leave it the stamp a kept
+/// copy is named by ([`aterm_uds::private_file::stamp_settled`]). The answer is the same.
+/// NEGATIVE CONTROL: with no settle, the same index is copied.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn an_index_changed_within_the_settle_is_read_as_it_stands() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), false);
+    std::fs::write(work.join("b.txt"), "x\n").expect("b.txt");
+    let reads = reads_in(tmp.path());
+    let table = aterm_sysprobe::volumes::table();
+    {
+        let _settle = index_seam::set_settle(Duration::from_secs(60 * 60));
+        assert!(
+            private_index(&work, &reads).is_none(),
+            "an index changed within the settle"
+        );
+        let (status, _) = work_status(&work, &table, &reads).expect("a read");
+        assert_eq!(status, "?? b.txt\0", "read as it stands");
+    }
+    assert!(
+        private_index(&work, &reads).is_some(),
+        "CONTROL: with no settle, it is copied"
+    );
+    let (status, _) = work_status(&work, &table, &reads).expect("a read");
+    assert_eq!(status, "?? b.txt\0", "CONTROL: the same answer");
+}
+
+/// A copy let go between its handing out and its status ([`PrivateIndex::stands`], as another
+/// read's sweep may) leaves git no index, which it reads as an empty one: the answer is read from
+/// the repository's own index instead. NEGATIVE CONTROL: a copy judged to stand regardless
+/// (`copy.stands()` true) answers every tracked file deleted and untracked (`the repository's own
+/// answer`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_copy_let_go_before_its_status_is_answered_from_the_repository_s_own_index() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), false);
+    std::fs::write(work.join("a.txt"), "two\n").expect("an edit");
+    let reads = reads_in(tmp.path());
+    let table = aterm_sysprobe::volumes::table();
+    let _hook = index_seam::set_before_status(|copy| {
+        std::fs::remove_file(copy).expect("let the copy go");
+    });
+    let (status, _) = work_status(&work, &table, &reads).expect("a read");
+    assert_eq!(status, " M a.txt\0", "the repository's own answer");
+    assert_eq!(index_seam::copy_answered(), Some(false), "not the copy's");
+}
+
+/// A checkout whose index carries git's untracked cache (`core.untrackedCache`) with a folder
+/// record written in the index's own second, so a status of it looks in that folder again, is read
+/// through a copy that keeps no untracked cache: a file made in that folder in that second, its
+/// folder's time put back as a same-second change leaves it, is named as the repository's own
+/// status names it. NEGATIVE CONTROL: keeping the cache in the copy (no `core.untrackedCache=false`
+/// in the refresh) answers the checkout clean (`the new file`), since the copy written later trusts
+/// the folder's record.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_folder_the_untracked_cache_would_look_in_again_is_looked_in() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), false);
+    scratch_git(&work, &["config", "core.untrackedCache", "true"]);
+    scratch_git(&work, &["config", "core.trustctime", "false"]);
+    let folder = work.join("d");
+    std::fs::create_dir_all(&folder).expect("d");
+    std::fs::write(work.join(".gitignore"), "*.log\n").expect(".gitignore");
+    std::fs::write(folder.join("kept.txt"), "kept\n").expect("kept.txt");
+    scratch_git(&work, &["add", ".gitignore", "d/kept.txt"]);
+    scratch_git(&work, &["commit", "-q", "-m", "ignore"]);
+    std::fs::write(folder.join("old.log"), "old\n").expect("old.log");
+    let second = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    dated(&folder, second + Duration::from_millis(100));
+    scratch_git(&work, &["status", "--porcelain"]);
+    assert!(
+        std::fs::read(work.join(".git/index"))
+            .expect("index")
+            .windows(4)
+            .any(|w| w == b"UNTR"),
+        "CONTROL: the index carries the untracked cache"
+    );
+    std::fs::remove_file(folder.join("old.log")).expect("old.log gone");
+    std::fs::write(folder.join("new.txt"), "new\n").expect("new.txt");
+    dated(&folder, second + Duration::from_millis(100));
+    dated(
+        &work.join(".git/index"),
+        second + Duration::from_millis(500),
+    );
+    let reads = reads_in(tmp.path());
+    let table = aterm_sysprobe::volumes::table();
+    let (status, _) = work_status(&work, &table, &reads).expect("a read");
+    assert_eq!(
+        index_seam::copy_answered(),
+        Some(true),
+        "answered by the copy"
+    );
+    assert_eq!(status, "?? d/new.txt\0", "the new file");
+}
+
+/// A sparse checkout's file outside its patterns, present when the copy is refreshed and then
+/// removed, is no deletion: the copy keeps its skip-worktree bit as the repository's index does
+/// (`sparse.expectFilesOutsideOfPatterns`), and a status clears it for a present file only as it
+/// reads. NEGATIVE CONTROL: a refresh that clears it (no such setting) answers ` D out/f1`
+/// (`still clean`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_file_outside_a_sparse_checkout_s_patterns_keeps_its_skip_worktree_bit() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), false);
+    for dir in ["in", "out"] {
+        std::fs::create_dir_all(work.join(dir)).expect("dir");
+        std::fs::write(work.join(dir).join("f1"), format!("{dir}\n")).expect("f1");
+    }
+    scratch_git(&work, &["add", "."]);
+    scratch_git(&work, &["commit", "-q", "-m", "two folders"]);
+    scratch_git(&work, &["sparse-checkout", "set", "--cone", "in"]);
+    assert!(
+        !work.join("out/f1").exists(),
+        "CONTROL: the file outside the patterns left the working tree"
+    );
+    std::fs::create_dir_all(work.join("out")).expect("out");
+    std::fs::write(work.join("out/f1"), "out\n").expect("a stray copy, as committed");
+    let reads = reads_in(tmp.path());
+    let table = aterm_sysprobe::volumes::table();
+    let (status, _) = work_status(&work, &table, &reads).expect("a read");
+    assert_eq!(status, "", "clean, the stray file as committed");
+    std::fs::remove_file(work.join("out/f1")).expect("the stray copy gone");
+    let (status, _) = work_status(&work, &table, &reads).expect("a read");
+    assert_eq!(
+        index_seam::copy_answered(),
+        Some(true),
+        "answered by the copy"
+    );
+    assert_eq!(status, "", "still clean");
 }

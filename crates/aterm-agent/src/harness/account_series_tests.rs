@@ -51,7 +51,8 @@ fn reading(five: u32, week: u32, at: i64) -> TapRead {
 /// The tap's branch as `harness_host::tap_step` runs it: the store's transaction, then the
 /// series' rows from what it committed and the figures and keys the record holds after.
 fn tap(dir: &Path, state: &mut State, read: &TapRead, now: i64) -> Noted {
-    let (events, held_back) = accounts::note_reading_held(state, "me", read, now);
+    let (events, held_back) =
+        accounts::note_reading_held(state, "me", read, now, accounts::ReadingOwner::Unobserved);
     let acct = state.accounts.get("me").cloned().unwrap_or_default();
     note_committed(
         dir,
@@ -242,8 +243,13 @@ fn series_appends_only_recorded_readings() {
         acct.keyed_at = Some(moved + 100);
     }
     let held = moved + 110;
-    let (events, held_back) =
-        accounts::note_reading_held(&mut state.clone(), "me", &reading(450, 600, held), held);
+    let (events, held_back) = accounts::note_reading_held(
+        &mut state.clone(),
+        "me",
+        &reading(450, 600, held),
+        held,
+        accounts::ReadingOwner::Unobserved,
+    );
     let committed = Committed {
         five_hour: None,
         seven_day: None,

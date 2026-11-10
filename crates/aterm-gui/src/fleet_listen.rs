@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use aterm_net::fleet::{FleetEvent, FleetOp, FleetScope};
 use aterm_types::MutexExt as _;
+use aterm_uds::stop::Stop;
 
 use crate::app_config::FleetConfig;
 
@@ -1040,8 +1041,8 @@ struct FleetDesk {
     standing: Standing,
     /// The line that said where it stands ([`noted_move`]).
     said: String,
-    /// The serving generation's flag: cleared to stop it.
-    stop: Option<Arc<AtomicBool>>,
+    /// The serving generation's stop.
+    stop: Option<Arc<Stop>>,
     /// The mesh is on (`aterm_types::mesh_switch::MESH`, read once as the listener starts): the
     /// node service is the one listener per Mac, and a window serves no port of its own.
     mesh: bool,
@@ -1146,7 +1147,7 @@ fn move_fleet(mut desk: std::sync::MutexGuard<'_, FleetDesk>, wanted: Option<Wan
     desk.wanted = wanted;
     desk.generation = desk.generation.wrapping_add(1);
     if let Some(stop) = desk.stop.take() {
-        stop.store(false, Ordering::Release);
+        stop.set();
     }
     if needs_thread && desk.started && !ensure_fleet_listener_thread(&mut desk) {
         return;
@@ -1527,7 +1528,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                 return;
             }
         };
-        let Some(running) = arm_generation(generation) else {
+        let Some(stop) = arm_generation(generation) else {
             return;
         };
         let node = read_node_key();
@@ -1535,15 +1536,15 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
         let watching = std::thread::Builder::new()
             .name("aterm-fleet-watch".to_owned())
             .spawn({
-                let (running, rekeyed, secret) =
-                    (Arc::clone(&running), Arc::clone(&rekeyed), secret.clone());
+                let (stop, rekeyed, secret) =
+                    (Arc::clone(&stop), Arc::clone(&rekeyed), secret.clone());
                 let proved = node
                     .as_ref()
                     .map(|node| (node.node().to_owned(), node.key()));
                 move || {
                     watch_fleet_generation(
                         (generation, addr),
-                        (&running, &rekeyed),
+                        (&stop, &rekeyed),
                         (&secret, proved),
                     );
                 }
@@ -1560,8 +1561,8 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
         stand_fleet(generation, Standing::Listening, &serving.line(addr));
         // The heartbeat's dial hints come from this process's one `_alab._tcp` browse.
         crate::network_moved::hear_alab_tcp(&[]);
-        let sharing = share_units(addr, &running);
-        let serving_generation = Arc::clone(&running);
+        let sharing = share_units(addr, &stop);
+        let serving_generation = Arc::clone(&stop);
         let join_secret = Arc::new(secret.clone());
         let listening = aterm_net::fleet::Listening {
             secret,
@@ -1591,7 +1592,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                 Arc::new(|| denied_under(denied_nodes_now().as_deref(), window_log().as_deref())),
             ),
             members_ask(),
-            &running,
+            &stop,
             within,
             move |served, op| {
                 let peer = served.peer_addr();
@@ -1709,7 +1710,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
             },
             fleet_event,
         );
-        let stopped_itself = running.swap(false, Ordering::AcqRel);
+        let stopped_itself = stop.set();
         // Its port is free before a next generation binds it.
         if let Some(sharing) = sharing {
             let _ = sharing.join();
@@ -1733,16 +1734,13 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
 /// archives ([`atpkg::peers::share`]) on the fleet listener's IP at
 /// [`atpkg::peers::DEFAULT_PORT`], each connection from a fleet member's LAN address alone
 /// ([`unit_members`], read again at most every [`aterm_net::fleet::KEY_READ_EVERY`]), until
-/// `running` is cleared; `aterm pkg serve-units --off` stops it. It opens only once the fleet
+/// `stop` is set; `aterm pkg serve-units --off` stops it. It opens only once the fleet
 /// listener listens in this process, so macOS's firewall has already ruled on this app's
 /// incoming connections and asks nothing new. `None` where atpkg is inert, no store resolves,
 /// or the fleet's guard refuses the address ([`aterm_net::loopback::check`]: an isolated debug
 /// drive's loopback, and every address of a private aterm's, since the port is the person's).
 #[cfg(unix)]
-fn share_units(
-    listen: SocketAddr,
-    running: &Arc<AtomicBool>,
-) -> Option<std::thread::JoinHandle<()>> {
+fn share_units(listen: SocketAddr, stop: &Arc<Stop>) -> Option<std::thread::JoinHandle<()>> {
     if !atpkg::manager_enabled() {
         return None;
     }
@@ -1755,7 +1753,7 @@ fn share_units(
         );
         return None;
     }
-    let running = Arc::clone(running);
+    let stop = Arc::clone(stop);
     let spawned = std::thread::Builder::new()
         .name("aterm-fleet-units".to_owned())
         .spawn(move || {
@@ -1766,7 +1764,7 @@ fn share_units(
                 &layout,
                 &atpkg::peers::Share {
                     listen: at,
-                    running: &running,
+                    stop: &stop,
                     members: &unit_members,
                     refresh: aterm_net::fleet::KEY_READ_EVERY,
                     note: &|line| note_fleet(line, false),
@@ -2256,7 +2254,7 @@ fn own_host_from(
 fn share_book<S: std::io::Write>(
     stream: &mut S,
     peer: Option<SocketAddr>,
-    (addr, current): (SocketAddr, &AtomicBool),
+    (addr, ended): (SocketAddr, &Stop),
 ) -> std::io::Result<()> {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return Err(std::io::Error::other("a book read with no state directory"));
@@ -2268,7 +2266,7 @@ fn share_book<S: std::io::Write>(
         &state,
         peer,
         (&denied, log.as_deref()),
-        (addr, current),
+        (addr, ended),
     )
 }
 
@@ -2281,14 +2279,14 @@ fn share_book_at<S: std::io::Write>(
     state: &std::path::Path,
     peer: Option<SocketAddr>,
     (denied, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
-    (addr, current): (SocketAddr, &AtomicBool),
+    (addr, ended): (SocketAddr, &Stop),
 ) -> std::io::Result<()> {
     use aterm_net::fleet_member::{
         read_node_id, read_node_identity, self_entry_while, serve_book_with_log,
     };
-    let ended = || std::io::Error::other("the fleet listener generation ended");
-    if !current.load(Ordering::Acquire) {
-        return Err(ended());
+    let gone = || std::io::Error::other("the fleet listener generation ended");
+    if ended.is_set() {
+        return Err(gone());
     }
     let now_ms = aterm_time::unix_millis();
     let own = read_node_identity(state)
@@ -2300,13 +2298,13 @@ fn share_book_at<S: std::io::Write>(
                 state,
                 &me,
                 (&host, addr.port(), aterm_stamp::app_version()),
-                current,
+                ended,
             )
         })
         .transpose()?
         .flatten();
-    if !current.load(Ordering::Acquire) {
-        return Err(ended());
+    if ended.is_set() {
+        return Err(gone());
     }
     let node = || {
         read_node_id(state)
@@ -2645,7 +2643,7 @@ fn read_node_key() -> Option<aterm_net::fleet::NodeIdentity> {
 #[cfg(unix)]
 fn watch_fleet_generation(
     (generation, addr): (u64, SocketAddr),
-    (running, rekeyed): (&Arc<AtomicBool>, &AtomicBool),
+    (stop, rekeyed): (&Arc<Stop>, &AtomicBool),
     (secret, proved): (
         &aterm_net::fleet::FleetSecret,
         Option<(String, aterm_net::fleet::NodeKey)>,
@@ -2677,10 +2675,10 @@ fn watch_fleet_generation(
         every,
         crate::network_moved::watch(),
     );
-    while wait_fleet_tick(generation, &mut revision) && running.load(Ordering::Acquire) {
+    while wait_fleet_tick(generation, &mut revision) && !stop.is_set() {
         if node_job_running_now() {
             rekeyed.store(true, Ordering::Release);
-            running.store(false, Ordering::Release);
+            stop.set();
             note_fleet(
                 "fleet listener: systems.alab.aterm-node started; handing over the fleet port",
                 false,
@@ -2706,7 +2704,7 @@ fn watch_fleet_generation(
                 }
                 if let Some(woke) = heartbeat.due_when_free(now, busy) {
                     say_heartbeat_woke("fleet listener", woke);
-                    spawn_member_heartbeat(addr, secret.clone(), (running, &hb_in_flight));
+                    spawn_member_heartbeat(addr, secret.clone(), (stop, &hb_in_flight));
                 }
                 continue;
             }
@@ -2715,7 +2713,7 @@ fn watch_fleet_generation(
             Err(error) => error.to_string(),
         };
         rekeyed.store(true, Ordering::Release);
-        running.store(false, Ordering::Release);
+        stop.set();
         note_fleet(
             &format!("fleet listener: {why}; every fleet connection is cut and the key read again"),
             false,
@@ -2739,7 +2737,7 @@ fn initial_heartbeat_anchor(every: Duration) -> Option<std::time::Instant> {
 fn spawn_member_heartbeat(
     addr: SocketAddr,
     secret: aterm_net::fleet::FleetSecret,
-    (current, in_flight): (&Arc<AtomicBool>, &Arc<AtomicBool>),
+    (ended, in_flight): (&Arc<Stop>, &Arc<AtomicBool>),
 ) {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return;
@@ -2770,7 +2768,7 @@ fn spawn_member_heartbeat(
         &state,
         addr,
         secret,
-        (current, in_flight),
+        (ended, in_flight),
         (denied, log, crate::network_moved::alab_tcp()),
     );
 }
@@ -2816,18 +2814,18 @@ type HeartbeatReach = (
 /// (`aterm_net::fleet_member`'s `note_place`), the state root this process's member desk reads
 /// it under (`aterm_secrets::home_lan::home_net`), each marked logged only where the round ran
 /// under the vault's membership log (`log`): a process that reads no vault (under a private state
-/// root, [`vault_under`]) has none, so nothing it hears admits anyone. A generation that is no
-/// longer `current` stops at the next exchange boundary and cannot supersede a newer generation.
+/// root, [`vault_under`]) has none, so nothing it hears admits anyone. A generation whose stop
+/// (`ended`) is set stops at the next exchange boundary and cannot supersede a newer generation.
 #[cfg(unix)]
 fn spawn_member_heartbeat_at(
     state: &std::path::Path,
     addr: SocketAddr,
     secret: aterm_net::fleet::FleetSecret,
-    (current, in_flight): (&Arc<AtomicBool>, &Arc<AtomicBool>),
+    (ended, in_flight): (&Arc<Stop>, &Arc<AtomicBool>),
     (denied, log, browse): HeartbeatReach,
 ) {
     use aterm_net::fleet_member::{Registration, heartbeat_members_while, read_node_identity};
-    if !current.load(Ordering::Acquire) {
+    if ended.is_set() {
         return;
     }
     let Some(me) = read_node_identity(state).ok().flatten() else {
@@ -2843,7 +2841,7 @@ fn spawn_member_heartbeat_at(
         return;
     }
     let flag = Arc::clone(in_flight);
-    let current = Arc::clone(current);
+    let ended = Arc::clone(ended);
     let state = state.to_path_buf();
     let reg = Registration {
         node: me.node().to_owned(),
@@ -2883,10 +2881,10 @@ fn spawn_member_heartbeat_at(
                 &reg,
                 within,
                 (log.as_deref(), &denied, &hints),
-                &current,
+                &ended,
             ) {
                 Ok(answered) => {
-                    if !current.load(Ordering::Acquire) {
+                    if ended.is_set() {
                         return;
                     }
                     // Each answer proved its node to this Mac, and the round noted it in the
@@ -2900,7 +2898,7 @@ fn spawn_member_heartbeat_at(
                     {
                         let keyring = aterm_net::fleet_member::Keyring::read(&state);
                         for done in &answered {
-                            if !current.load(Ordering::Acquire) {
+                            if ended.is_set() {
                                 return;
                             }
                             let peer = aterm_net::fleet_member::Peer {
@@ -2995,14 +2993,14 @@ fn wait_fleet_tick(generation: u64, revision: &mut u64) -> bool {
     desk.generation == generation
 }
 
-fn arm_generation(generation: u64) -> Option<Arc<AtomicBool>> {
+fn arm_generation(generation: u64) -> Option<Arc<Stop>> {
     let mut desk = FLEET_DESK.lock_or_recover();
     if desk.generation != generation {
         return None;
     }
-    let running = Arc::new(AtomicBool::new(true));
-    desk.stop = Some(Arc::clone(&running));
-    Some(running)
+    let stop = Arc::new(Stop::new());
+    desk.stop = Some(Arc::clone(&stop));
+    Some(stop)
 }
 
 fn stand_fleet(generation: u64, standing: Standing, line: &str) {
@@ -3324,7 +3322,7 @@ mod tests {
         .unwrap();
         let descriptor = state.path().join("fleet-self-entry");
         let committed = std::fs::read(&descriptor).unwrap();
-        let current = AtomicBool::new(true);
+        let ended = Stop::new();
         let within = aterm_spec::wait::MUST_HAPPEN;
         let (waiting, waited) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
@@ -3337,13 +3335,13 @@ mod tests {
                         state.path(),
                         None,
                         (&[], None),
-                        ("127.0.0.1:7100".parse().unwrap(), &current),
+                        ("127.0.0.1:7100".parse().unwrap(), &ended),
                     )
                 });
                 (result, response)
             });
             waited.recv_timeout(within).unwrap();
-            current.store(false, Ordering::Release);
+            ended.set();
             drop(held);
             let (result, response) = worker.join().unwrap();
             assert!(result.is_err());
@@ -4262,7 +4260,7 @@ mod tests {
         // 2. A member (`m7`) dials the issuer its book names over `FleetOp::Facts`.
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let port = listener.local_addr().unwrap().port();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let holder_state = holder_dir.path().to_path_buf();
         let listening = Listening {
             secret: secret.clone(),
@@ -4273,7 +4271,7 @@ mod tests {
             per_source: 4,
             lifetime: aterm_spec::wait::MUST_HAPPEN,
         };
-        let server_running = Arc::clone(&running);
+        let server_stop = Arc::clone(&stop);
         let server = std::thread::spawn(move || {
             aterm_net::fleet::serve_offering_with_ask_within(
                 &listener,
@@ -4283,7 +4281,7 @@ mod tests {
                     Arc::new(|| Arc::new(aterm_net::fleet::Denied::default())),
                 ),
                 None,
-                &server_running,
+                &server_stop,
                 aterm_spec::wait::MUST_HAPPEN,
                 move |served, op| {
                     assert_eq!(op, FleetOp::Facts);
@@ -4381,8 +4379,7 @@ mod tests {
         .expect_err("spoofed holder key must be refused");
         assert!(spoof_err.contains("ERR key-mismatch"), "{spoof_err}");
 
-        running.store(false, Ordering::Release);
-        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        stop.set();
         let _ = server.join();
 
         let stored = read_pushed_facts(holder_dir.path());

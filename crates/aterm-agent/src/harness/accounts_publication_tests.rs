@@ -61,6 +61,7 @@ impl Fixture {
             wake: Some(false),
             fleet: None,
             source_policy: None,
+            outbox: None,
         }
     }
 

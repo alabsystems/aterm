@@ -6082,7 +6082,7 @@ pub mod trustd {
     /// says what holds the socket and who holds its leases as it starts and once a minute, and
     /// marks the wait where a ceiling reads it ([`aterm_toolchain::waits`]); it looks every
     /// [`LOOK_EVERY`]. An interrupt (SIGINT, SIGTERM or SIGHUP, [`aterm_toolchain::interrupt`])
-    /// or `stop` ends it within a nap, and `--no-wait` ([`named_lock::Wait::No`]) answers at once.
+    /// or `stop` ends it within a nap, and `--no-wait` ([`aterm_toolchain::named_lock::Wait::No`]) answers at once.
     ///
     /// # Errors
     /// What held the socket when `--no-wait` would not wait or the wait was interrupted, and

@@ -2125,8 +2125,7 @@ impl CellExtras {
         self.hyperlink_scratch = coords;
     }
 
-    /// The current hyperlink upper bound (for the invariant tests).
-    #[cfg(test)]
+    /// Conservative upper bound on hyperlink-bearing entries; zero rules links out.
     #[must_use]
     pub(crate) const fn hyperlink_upper_bound(&self) -> usize {
         self.hyperlink_upper_bound

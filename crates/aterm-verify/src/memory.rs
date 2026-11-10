@@ -1340,6 +1340,29 @@ pub fn need(
     }
 }
 
+/// Pooled compiles keep their peaks under their compiler width. Read that same history
+/// when it exists; an unseen width retains the ordinary conservative estimate. In
+/// particular, a pooled peak must never lower an unpooled run's claim.
+#[must_use]
+pub(crate) fn need_for_jobs(
+    records: &Records,
+    plain: &Records,
+    spec: &StageSpec,
+    key: &Key,
+    physical: Option<u64>,
+    jobs: Option<u32>,
+) -> StageNeed {
+    let pooled = crate::compile_width::record_key(key.clone(), jobs);
+    let key = if jobs.is_some()
+        && (records.learned(&pooled).is_some() || records.elsewhere(&pooled).is_some())
+    {
+        &pooled
+    } else {
+        key
+    };
+    need(records, plain, spec, key, physical)
+}
+
 /// THE RUN'S MEMORY BOOK: where its stages' peaks are kept, and the machine they are claimed on,
 /// read once as the run begins.
 #[derive(Debug)]
@@ -1419,13 +1442,14 @@ impl Book {
 
     /// What `spec`, its record kept under `key`, claims ([`need`]).
     #[must_use]
-    pub fn need(&self, spec: &StageSpec, key: &Key) -> StageNeed {
-        need(
+    pub fn need(&self, spec: &StageSpec, key: &Key, jobs: Option<u32>) -> StageNeed {
+        need_for_jobs(
             &self.records(),
             &self.plain_records(),
             spec,
             key,
             self.physical,
+            jobs,
         )
     }
 

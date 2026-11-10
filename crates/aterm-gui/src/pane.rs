@@ -151,6 +151,47 @@ impl PaneTree {
         self.root.map(&mut |session| map(*session))
     }
 
+    /// Whether `root` has the exact same split topology, ratios, and terminal sessions as `self`.
+    #[must_use]
+    pub(crate) fn matches_projected<T: Copy>(
+        &self,
+        root: &SplitTree<T>,
+        session_of: &impl Fn(T) -> Option<u64>,
+    ) -> bool {
+        fn eq_tree<T: Copy>(
+            a: &PaneNode,
+            b: &SplitTree<T>,
+            session_of: &impl Fn(T) -> Option<u64>,
+        ) -> bool {
+            match (a, b) {
+                (SplitTree::Leaf(session), SplitTree::Leaf(view)) => {
+                    session_of(*view) == Some(*session)
+                }
+                (
+                    SplitTree::Split {
+                        axis: axis_a,
+                        ratio: ratio_a,
+                        first: first_a,
+                        second: second_a,
+                    },
+                    SplitTree::Split {
+                        axis: axis_b,
+                        ratio: ratio_b,
+                        first: first_b,
+                        second: second_b,
+                    },
+                ) => {
+                    axis_a == axis_b
+                        && ratio_a == ratio_b
+                        && eq_tree(first_a, first_b, session_of)
+                        && eq_tree(second_a, second_b, session_of)
+                }
+                _ => false,
+            }
+        }
+        eq_tree(&self.root, root, session_of)
+    }
+
     #[must_use]
     pub(crate) const fn is_zoomed(&self) -> bool {
         self.zoomed

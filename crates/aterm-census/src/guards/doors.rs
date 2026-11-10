@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::graph::{attribute, fn_name, fn_name_at};
 use super::rules::{CENSUS_CRATE, PRODUCT, use_leaves};
 use super::{Bound, Finding, Line, Rule, SourceFile, Tree, calls, has, hits, is_word};
+use crate::lex::Lexed;
 
 /// Product source this crate does not own: the census spells every name its
 /// rules ban, in its tables and its planted cases.
@@ -267,16 +268,39 @@ pub(super) const DEVTOOLS_DOOR: Rule = Rule {
 };
 
 fn devtools_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let mut needles = vec![DEVTOOLS_RUNNER, "DevToolsSecurity", "devtools_"];
+    // `devtools_` stands for the runner too, whose name holds it.
+    let mut needles = vec!["DevToolsSecurity", "devtools_"];
     needles.extend(DEVTOOLS_TOOL_WORDS);
     needles.extend(AUTHZ_NAMES);
     needles.extend(AUTHZ_LITERALS);
     let definition = format!("fn {DEVTOOLS_RUNNER}");
     for file in product(tree) {
-        if tree.corpus.test_code().holds(&file.rel) || !file.mentions(&needles) {
+        if !file.mentions(&needles) || tree.corpus.test_code().holds(&file.rel) {
             continue;
         }
         let home = file.rel == DEVTOOLS_HOME;
+        // Each reason a line can give is one its file's views spell: a reason they do not
+        // is left unasked, and a file that spells none is left unread.
+        let Lexed { code, text } = file.lexed();
+        let names: Vec<&str> = AUTHZ_NAMES
+            .iter()
+            .copied()
+            .filter(|n| code.contains(n))
+            .collect();
+        let literals: Vec<&str> = AUTHZ_LITERALS
+            .iter()
+            .copied()
+            .filter(|l| text.contains(l))
+            .collect();
+        let tool = text.contains("DevToolsSecurity")
+            || DEVTOOLS_TOOL_WORDS.iter().any(|w| text.contains(w))
+            || text.contains("devtools_");
+        let runner = code.contains(DEVTOOLS_RUNNER);
+        let path_const = code.contains(DEVTOOLS_PATH_CONST);
+        let path = text.contains(DEVTOOLS_PATH);
+        if names.is_empty() && literals.is_empty() && !tool && !runner && !path_const && !path {
+            continue;
+        }
         let shipped: BTreeSet<usize> = file.shipped_lines().map(|l| l.no).collect();
         for at in attribute(file) {
             let line = at.line;
@@ -285,22 +309,22 @@ fn devtools_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             }
             let func = at.func.unwrap_or("-");
             let worker = file.rel == DEVTOOLS_FLOW && func == DEVTOOLS_WORKER;
-            let why = if let Some(name) =
-                AUTHZ_NAMES.iter().find(|n| has(line.code, n, Bound::Word))
-            {
+            let why = if let Some(name) = names.iter().find(|n| has(line.code, n, Bound::Word)) {
                 Some(format!("names `{name}`"))
-            } else if let Some(lit) = AUTHZ_LITERALS.iter().find(|l| line.text.contains(*l)) {
+            } else if let Some(lit) = literals.iter().find(|l| line.text.contains(*l)) {
                 Some(format!("asks for `{lit}`"))
-            } else if builds_a_process(line.code) && names_the_tool(line.text) {
+            } else if tool && builds_a_process(line.code) && names_the_tool(line.text) {
                 Some("builds a process from DevToolsSecurity".to_string())
-            } else if has(line.code, DEVTOOLS_RUNNER, Bound::Word)
+            } else if runner
+                && has(line.code, DEVTOOLS_RUNNER, Bound::Word)
                 && !has(line.code, &definition, Bound::Word)
                 && !worker
             {
                 Some(format!(
                     "names `{DEVTOOLS_RUNNER}` in `{func}`, not the gesture worker"
                 ))
-            } else if has(line.code, DEVTOOLS_PATH_CONST, Bound::Word)
+            } else if path_const
+                && has(line.code, DEVTOOLS_PATH_CONST, Bound::Word)
                 && !(home && path_const_allowed(line, func))
             {
                 Some(if home {
@@ -311,13 +335,15 @@ fn devtools_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                 } else {
                     format!("`{DEVTOOLS_PATH_CONST}` outside the consent module")
                 })
-            } else {
+            } else if path {
                 bare_path(
                     line.text,
                     (home && has(line.code, DEVTOOLS_PATH_CONST, Bound::Word))
                         || (file.rel == ELEVATION
                             && squeeze_code(line.text) == ELEVATION_PATH_LINE),
                 )
+            } else {
+                None
             };
             if let Some(why) = why {
                 out.push(file.finding(DEVTOOLS_DOOR.id, line.no, why));
@@ -606,9 +632,21 @@ fn fence_findings(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
     gate_macro_findings(tree, out);
     let test_code = tree.corpus.test_code();
-    let needles: Vec<&str> = FENCES.iter().map(|f| f.name).collect();
     for file in tree.corpus.under(&[GUI_SRC]) {
-        if test_code.holds(&file.rel) || !file.mentions(&needles) {
+        // A line names a fence only where its file may (a gate's transition in its one file,
+        // an App function anywhere) and its code spells it: the other fences are left unread,
+        // and so is a file that spells none it may name.
+        let may: Vec<&Fence> = FENCES
+            .iter()
+            .filter(|f| f.gate.is_none_or(|only| only == file.rel))
+            .collect();
+        let needles: Vec<&str> = may.iter().map(|f| f.name).collect();
+        if !file.mentions(&needles) || test_code.holds(&file.rel) {
+            continue;
+        }
+        let code = &file.lexed().code;
+        let named: Vec<&Fence> = may.into_iter().filter(|f| code.contains(f.name)).collect();
+        if named.is_empty() {
             continue;
         }
         let shipped: BTreeSet<usize> = file.shipped_lines().map(|l| l.no).collect();
@@ -618,7 +656,7 @@ fn fence_findings(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                 continue;
             }
             let func = at.func.unwrap_or("-");
-            let crossed = FENCES.iter().find(|fence| {
+            let crossed = named.iter().find(|fence| {
                 // A gate transition is named in its one file as any word: a
                 // call, a path taken as a value (`let f = PermissionGate::accepted;`)
                 // or a macro's argument.
@@ -725,6 +763,11 @@ fn gate_macro_findings(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         .collect();
     for file in product(tree) {
         if !file.mentions(&["macro"]) || !file.mentions(&transitions) {
+            continue;
+        }
+        // A macro and a transition its body names are spelt in the code itself.
+        let lexed = &file.lexed().code;
+        if !lexed.contains("macro") || !transitions.iter().any(|t| lexed.contains(t)) {
             continue;
         }
         let code = file.shipped_code();
@@ -2091,7 +2134,9 @@ fn core_signal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         if !file.mentions(&["SIG"]) && !file.mentions(CORE_WORDS) {
             continue;
         }
-        for line in file.lines() {
+        // A line sends a signal by name only where its code spells `SIG`, and has a shape only
+        // where its text holds a core word: only those lines are read.
+        for line in lines_holding(file, &["SIG"], CORE_WORDS) {
             let sends = calls(line.code).iter().any(|c| SENDERS.contains(c));
             let named = CORE_SIGNALS
                 .iter()
@@ -2104,7 +2149,7 @@ fn core_signal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             }
         }
     }
-    for script in &tree.corpus.scripts {
+    for script in tree.corpus.scripts() {
         if !CORE_WORDS.iter().any(|w| script.raw.contains(w)) {
             continue;
         }
@@ -2114,6 +2159,42 @@ fn core_signal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             }
         }
     }
+}
+
+/// Each line of `file` ([`SourceFile::lines`]) whose CODE view holds one of `in_code` or whose
+/// TEXT view holds one of `in_text`, in order; no needle holds a line break. Both views break
+/// lines at the same offsets, so a run of whole lines is read line by line only where the run
+/// holds a needle.
+fn lines_holding<'a>(file: &'a SourceFile, in_code: &[&str], in_text: &[&str]) -> Vec<Line<'a>> {
+    const RUN: usize = 1024;
+    let Lexed { code, text } = file.lexed();
+    let holds = |code: &str, text: &str| {
+        in_code.iter().any(|n| code.contains(n)) || in_text.iter().any(|n| text.contains(n))
+    };
+    let mut out = Vec::new();
+    let (mut from, mut no) = (0, 1);
+    while from < code.len() {
+        let probe = (from + RUN).min(code.len());
+        let to = code.as_bytes()[probe..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(code.len(), |nl| probe + nl + 1);
+        let (run_code, run_text) = (&code[from..to], &text[from..to]);
+        if holds(run_code, run_text) {
+            for (at, (code, text)) in run_code.lines().zip(run_text.lines()).enumerate() {
+                if holds(code, text) {
+                    out.push(Line {
+                        no: no + at,
+                        code,
+                        text,
+                    });
+                }
+            }
+        }
+        no += run_code.bytes().filter(|&b| b == b'\n').count();
+        from = to;
+    }
+    out
 }
 
 /// The first shape on `line` that ends a process by a core-dump signal, named.
@@ -3771,5 +3852,22 @@ impl Default for PagePress {}
         ]
         .concat();
         assert_eq!(spots(&found), expected, "{found:#?}");
+    }
+
+    /// A long file is read in runs of whole lines: a signal far into it is found on its own
+    /// line, and lines that name none give nothing.
+    #[test]
+    fn a_signal_deep_in_a_long_file_is_found_on_its_line() {
+        let filler: String = (0..300)
+            .map(|i| format!("fn quiet_{i}() {{ let x = {i}; }}\n"))
+            .collect();
+        let sends = "fn a() { unsafe { libc::kill(pid, libc::SIGABRT) }; }\n";
+        let long = format!("{filler}{sends}{filler}{sends}");
+        let found = run(&CORE_SIGNAL, &[("crates/x/src/lib.rs", &long)]);
+        assert_eq!(
+            spots(&found),
+            ["crates/x/src/lib.rs:301", "crates/x/src/lib.rs:602"]
+        );
+        assert!(run(&CORE_SIGNAL, &[("crates/x/src/lib.rs", &filler)]).is_empty());
     }
 }

@@ -17,6 +17,9 @@ use crate::ai::connector::{Flow, Region, RowKeys, Seam};
 
 use super::one_line;
 
+#[path = "accounts_outbox.rs"]
+pub mod outbox;
+
 #[path = "accounts_auth_route.rs"]
 mod auth_route;
 pub use auth_route::{AuthRoute, TokenEntry};
@@ -562,6 +565,19 @@ pub struct Vendor {
 }
 
 impl Row {
+    /// What the glass names this row by (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+    /// §2.5, owner ruling 2026-11-09): its email, else the provider email it expects, else its
+    /// roster label. Display only: the label stays the row's key in state, login directories and
+    /// series files, and nothing that leaves this machine carries the email.
+    #[must_use]
+    pub fn shown_name(&self) -> &str {
+        self.email
+            .as_deref()
+            .or(self.identity_email.as_deref())
+            .filter(|e| !e.is_empty())
+            .unwrap_or(&self.label)
+    }
+
     /// The email the provider must report for this row, independently of its login address.
     #[must_use]
     pub fn expected_identity_email(&self) -> Option<&str> {
@@ -2044,10 +2060,192 @@ pub fn judged_label<'a>(roster: &'a Roster, who: &ProcessLogin) -> Option<&'a st
         .filter(|_| me.default_home && me.route.on_account())
 }
 
-/// Returns the account label shown in UI surfaces when `roster` lists multiple accounts.
+/// A tab's account once its belief ([`judged_label`]) met what its CLI really runs on
+/// ([`super::observe`]; `docs/DESIGN-account-discovery-2026-11-09.md`): observation beats belief.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reconciled<'a> {
+    /// The observed login answers to the believed row.
+    Agrees(&'a Row),
+    /// The observed login answers to another row: the tab runs on that one.
+    Other(&'a Row),
+    /// No row answers to the observed login: the tab runs on an account the roster does not
+    /// list, named by its email.
+    Unlisted(super::observe::Observed),
+    /// Nothing was observed (no file, an environment login, a gateway), the observed login
+    /// answers to several rows, or the believed row names no address to check it by: the
+    /// belief, unverified.
+    Unread(Option<&'a Row>),
+}
+
+impl<'a> Reconciled<'a> {
+    /// The row the tab runs on, where a row names it.
+    #[must_use]
+    pub const fn row(&self) -> Option<&'a Row> {
+        match self {
+            Self::Agrees(row) | Self::Other(row) => Some(row),
+            Self::Unread(row) => *row,
+            Self::Unlisted(_) => None,
+        }
+    }
+
+    /// Whether the observation contradicts the belief.
+    #[must_use]
+    pub const fn disagrees(&self) -> bool {
+        matches!(self, Self::Other(_) | Self::Unlisted(_))
+    }
+}
+
+impl Roster {
+    /// The one row whose login or identity address is `email`, where exactly one is: two rows
+    /// that answer to one address credit neither.
+    #[must_use]
+    pub fn row_answering(&self, email: &str) -> Option<&Row> {
+        let mut answering = self.rows.iter().filter(|row| {
+            row.expected_identity_email()
+                .is_some_and(|expected| email_matches(expected, email))
+                || row.matches_email(email)
+        });
+        let row = answering.next()?;
+        answering.next().is_none().then_some(row)
+    }
+
+    fn rows_answering(&self, email: &str) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| {
+                row.expected_identity_email()
+                    .is_some_and(|expected| email_matches(expected, email))
+                    || row.matches_email(email)
+            })
+            .count()
+    }
+}
+
+/// Reconcile what `who`'s environment makes the roster believe with what its CLI's login file
+/// says (`seen`). The believed row is [`judged_label`]'s; the observed login is matched to a row
+/// by address ([`Row::expected_identity_email`], [`Row::matches_email`]), never by a recomputed
+/// key.
 #[must_use]
-pub fn footer_label<'a>(roster: &'a Roster, who: &ProcessLogin) -> Option<&'a str> {
-    judged_label(roster, who).filter(|_| roster.several())
+pub fn reconcile<'a>(
+    roster: &'a Roster,
+    who: &ProcessLogin,
+    seen: &super::observe::Observation,
+) -> Reconciled<'a> {
+    let believed = judged_label(roster, who).and_then(|label| roster.row(label));
+    let Some(observed) = seen.seen() else {
+        return Reconciled::Unread(believed);
+    };
+    if let Some(row) = believed
+        && row
+            .expected_identity_email()
+            .is_some_and(|expected| email_matches(expected, &observed.email))
+    {
+        return Reconciled::Agrees(row);
+    }
+    match (
+        roster.rows_answering(&observed.email),
+        roster.row_answering(&observed.email),
+    ) {
+        // A believed row that names no address cannot be contradicted by one: the belief
+        // stands, unverified, until the row names its account.
+        (0, _) if believed.is_some_and(|row| row.expected_identity_email().is_none()) => {
+            Reconciled::Unread(believed)
+        }
+        (0, _) => Reconciled::Unlisted(observed.clone()),
+        (1, Some(row)) if believed.is_some_and(|b| b.label == row.label) => Reconciled::Agrees(row),
+        (1, Some(row)) => Reconciled::Other(row),
+        _ => Reconciled::Unread(believed),
+    }
+}
+
+/// The label of the row the tab runs on once reconciled ([`reconcile`]): the observed row, or
+/// for an unread observation the belief; none for an account no row lists.
+#[must_use]
+pub fn observed_label<'a>(
+    roster: &'a Roster,
+    who: &ProcessLogin,
+    seen: &super::observe::Observation,
+) -> Option<&'a str> {
+    reconcile(roster, who, seen)
+        .row()
+        .map(|row| row.label.as_str())
+}
+
+/// The [`Me`] of a tab once reconciled ([`reconcile`]): the descriptor of the row its login file
+/// names, where that is another row than its environment names, and of no row for an account
+/// no row lists; else its environment's ([`ProcessLogin::me`]). Every reader that acts for the
+/// account a tab runs on (advice, a wall's record, a move's landing, a reset) reads this, never
+/// the belief alone.
+#[must_use]
+pub fn observed_me<'a>(
+    roster: &'a Roster,
+    who: &ProcessLogin,
+    seen: &super::observe::Observation,
+) -> Me<'a> {
+    let me = who.me(roster);
+    match reconcile(roster, who, seen) {
+        Reconciled::Other(row) if me.account != Some(row.label.as_str()) => Me {
+            account: Some(row.label.as_str()),
+            left: None,
+            default_home: me.default_home,
+            route: who.route.for_account(TokenEntry::of_row(row)),
+        },
+        Reconciled::Unlisted(_) => Me {
+            account: None,
+            left: None,
+            default_home: me.default_home,
+            route: who.route.for_account(None),
+        },
+        Reconciled::Agrees(_) | Reconciled::Other(_) | Reconciled::Unread(_) => me,
+    }
+}
+
+/// Returns the account label shown in UI surfaces: where `roster` lists several accounts, or
+/// wherever the observation contradicts the belief (a one-row roster does not hide that the tab
+/// runs on another row).
+#[must_use]
+pub fn footer_label<'a>(
+    roster: &'a Roster,
+    who: &ProcessLogin,
+    seen: &super::observe::Observation,
+) -> Option<&'a str> {
+    let reconciled = reconcile(roster, who, seen);
+    let shown = reconciled.disagrees() || roster.several();
+    reconciled
+        .row()
+        .map(|row| row.label.as_str())
+        .filter(|_| shown)
+}
+
+/// What the footer names a tab's account by ([`footer_account`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FooterAccount {
+    /// The row the tab runs on, where the footer names one ([`footer_label`]).
+    pub label: Option<String>,
+    /// The observed login email, where one was read.
+    pub email: Option<String>,
+    /// The believed row's label, where the observation contradicts it.
+    pub believed: Option<String>,
+}
+
+/// The footer's account: the reconciled row's label, the observed address, and the believed row
+/// where the two disagree. `None` where there is nothing to name.
+#[must_use]
+pub fn footer_account(
+    roster: &Roster,
+    who: &ProcessLogin,
+    seen: &super::observe::Observation,
+) -> Option<FooterAccount> {
+    let reconciled = reconcile(roster, who, seen);
+    let account = FooterAccount {
+        label: footer_label(roster, who, seen).map(str::to_owned),
+        email: seen.email().map(str::to_owned),
+        believed: reconciled
+            .disagrees()
+            .then(|| judged_label(roster, who).map(str::to_owned))
+            .flatten(),
+    };
+    (account.label.is_some() || account.email.is_some()).then_some(account)
 }
 
 /// The logins' file name, in the store beside `state.json` ([`State::to_json`]).
@@ -9710,17 +9908,51 @@ fn tap_shown(held: Option<(u32, i64)>, carried: bool, now: i64) -> String {
 
 /// Records a fresh usage-tap [`TapRead`] for `account` at `now`.
 pub fn note_reading(state: &mut State, account: &str, read: &TapRead, now: i64) -> Vec<Event> {
-    note_reading_held(state, account, read, now).0
+    note_reading_held(state, account, read, now, ReadingOwner::Unobserved).0
+}
+
+/// What the tab's login file said of the account a tap reading is filed under
+/// (`docs/DESIGN-account-discovery-2026-11-09.md`, decision 7): a reading whose key differs from
+/// the record's resets the record only where the account is the same one, re-created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadingOwner {
+    /// No login file was read (a token route, an environment login): the reading's key alone
+    /// speaks, as it always did.
+    Unobserved,
+    /// The login file names this row's account: a new key is the account re-created.
+    This,
+    /// The login file names another account: its reading is never this row's.
+    Another,
+}
+
+impl ReadingOwner {
+    /// The owner a reconciled tab gives a reading filed under `label`: [`Self::This`] where the
+    /// observation answers to that row, [`Self::Another`] where it names another account, and
+    /// [`Self::Unobserved`] where nothing was read.
+    #[must_use]
+    pub fn of(reconciled: &Reconciled<'_>, label: &str) -> Self {
+        match reconciled {
+            Reconciled::Agrees(row) | Reconciled::Other(row) if row.label == label => Self::This,
+            Reconciled::Agrees(_) | Reconciled::Other(_) | Reconciled::Unlisted(_) => Self::Another,
+            Reconciled::Unread(_) => Self::Unobserved,
+        }
+    }
 }
 
 /// Records a usage-tap [`TapRead`] and returns whether any part was held back during login
-/// adoption.
+/// adoption. `owner` is what the tab's login file said of the account: a reading of
+/// [another](ReadingOwner::Another) account files nothing here.
 pub fn note_reading_held(
     state: &mut State,
     account: &str,
     read: &TapRead,
     now: i64,
+    owner: ReadingOwner,
 ) -> (Vec<Event>, bool) {
+    // Another account's reading never reaches this row's record (decision 7).
+    if owner == ReadingOwner::Another {
+        return (Vec::new(), false);
+    }
     let valid = |w: Option<WindowRead>| w.filter(|w| w.pct_x10 <= 10 * PCT_MAX);
     let reads = [
         (SESSION_LIMIT, valid(read.five_hour)),
@@ -11099,6 +11331,10 @@ pub struct LoginObservation<'a> {
     pub row: &'a Row,
     /// The observed process's login and credential-routing facts.
     pub who: &'a ProcessLogin,
+    /// What the process's login file said when `row` was chosen ([`reconcile`]): an
+    /// account-wide record is checked against the row the file names, which `row` is where the
+    /// file contradicts the environment's belief.
+    pub seen: &'a super::observe::Observation,
 }
 
 /// A usage reader's account policy and its source. The implicit default account is
@@ -11190,9 +11426,11 @@ pub struct AccountRecords {
 }
 
 impl LoginObservation<'_> {
-    /// Whether this process still belongs to the same account, including retained logins.
+    /// Whether this process still belongs to the same account, including retained logins:
+    /// the row its login file names ([`observed_label`]), so a record of the account a tab
+    /// really runs on is not refused for the row its environment names.
     fn matches_account(&self, current: &Roster) -> bool {
-        account_matches(self.row, self.who, current)
+        account_matches(self.row, (self.who, self.seen), current)
     }
 
     /// Whether this observation still describes the current row in an effective roster.
@@ -11205,11 +11443,15 @@ impl LoginObservation<'_> {
     }
 }
 
-fn account_matches(captured: &Row, who: &ProcessLogin, current: &Roster) -> bool {
+fn account_matches(
+    captured: &Row,
+    (who, seen): (&ProcessLogin, &super::observe::Observation),
+    current: &Roster,
+) -> bool {
     let Some(row) = current.row(&captured.label) else {
         return false;
     };
-    if judged_label(current, who) != Some(captured.label.as_str()) {
+    if observed_label(current, who, seen) != Some(captured.label.as_str()) {
         return false;
     }
     let mut captured = captured.clone();
@@ -13317,7 +13559,7 @@ impl Store {
         ladder: &[std::time::Duration],
         now: i64,
         captured: &UsageRoster,
-        who: &ProcessLogin,
+        (who, observed): (&ProcessLogin, &super::observe::Observation),
         edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
         seen: impl FnOnce(&State) -> T,
     ) -> Result<(Vec<Event>, T), String> {
@@ -13327,7 +13569,11 @@ impl Store {
         {
             return Err("usage store changed; nothing recorded".into());
         }
-        let label = judged_label(&captured.roster, who).ok_or("usage has no account")?;
+        // Filed under the account the process's login file names, where one was read: a row
+        // the observation answers to, even with no belief (`docs/DESIGN-account-discovery-
+        // 2026-11-09.md`, step 1 E); never the believed row of another account.
+        let label =
+            observed_label(&captured.roster, who, observed).ok_or("usage has no account")?;
         let row = captured
             .roster
             .row(label)
@@ -13343,7 +13589,8 @@ impl Store {
                 } else {
                     bound(raw, logins)
                 };
-                if captured.implicit != implicit || !account_matches(row, who, &current) {
+                if captured.implicit != implicit || !account_matches(row, (who, observed), &current)
+                {
                     return Err(format!(
                         "account `{label}` changed since usage was read; nothing recorded"
                     ));
@@ -13546,18 +13793,21 @@ impl Recorded {
     }
 }
 
-/// Records a standing usage wall hit by a supervised session under a bounded store lock.
+/// Records a standing usage wall hit by a supervised session under a bounded store lock, on the
+/// account its process runs once reconciled with what its login file said (`seen`,
+/// [`observed_me`]): never on the believed row of another account, and on none for an account
+/// no row lists.
 pub fn record_wall(
     store: &Store,
     captured: &UsageRoster,
     sid: &str,
-    who: &ProcessLogin,
+    (who, seen): (&ProcessLogin, &super::observe::Observation),
     wall: &super::upgrade::StandingWall,
     process_started: i64,
     now: i64,
 ) -> Recorded {
     let roster = captured.roster();
-    let me = who.me(roster);
+    let me = observed_me(roster, who, seen);
     let Some(account) = me.label() else {
         return Recorded::NotListed;
     };
@@ -13583,7 +13833,7 @@ pub fn record_wall(
         store.ladder,
         now,
         captured,
-        who,
+        (who, seen),
         |state| {
             let before = state.clone();
             let on_it = state
@@ -13720,17 +13970,18 @@ pub struct UsageSaid {
 }
 
 /// Records screen-observed usage credits, quota warnings and a model's week for a session under a
-/// bounded store lock.
+/// bounded store lock, on the account its process runs once reconciled with what its login file
+/// said (`seen`, [`observed_me`]), as [`record_wall`] does.
 pub fn record_usage(
     store: &Store,
     captured: &UsageRoster,
     sid: &str,
-    who: &ProcessLogin,
+    (who, seen): (&ProcessLogin, &super::observe::Observation),
     said: &UsageSaid,
     now: i64,
 ) -> Recorded {
     let roster = captured.roster();
-    let me = who.me(roster);
+    let me = observed_me(roster, who, seen);
     let Some(account) = me.label() else {
         return Recorded::NotListed;
     };
@@ -13744,7 +13995,7 @@ pub fn record_usage(
         store.ladder,
         now,
         captured,
-        who,
+        (who, seen),
         |state| {
             let by = state.machine.clone();
             let Some(record) = account_mut(state, account) else {
@@ -14527,3 +14778,7 @@ mod checkpoint_read_tests;
 #[cfg(test)]
 #[path = "accounts_lapsed_rule_tests.rs"]
 mod lapsed_rule_tests;
+
+#[cfg(test)]
+#[path = "accounts_reconcile_tests.rs"]
+mod reconcile_tests;

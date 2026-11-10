@@ -71,6 +71,19 @@ fn each_historical_closure_law_has_a_falsifying_control() {
         "AnswerBoot",
         "Fresh",
     ];
+    let rollback_alive: &[&str] = &[
+        "Record",
+        "May",
+        "Deliver",
+        "ChildExits",
+        "DeliverRollback",
+        "Crash",
+        "Expire",
+        "ReadClock",
+        "ReadJournal",
+        "AnswerLapsed",
+        "Fresh",
+    ];
     for (bug, law, path) in [
         (1, "LapsedNeverGranted", read_first),
         (1, "NoDoubleExec", read_first),
@@ -99,6 +112,8 @@ fn each_historical_closure_law_has_a_falsifying_control() {
         ),
         (6, "BootOnlyAfterReboot", same_boot),
         (6, "NoDoubleExec", same_boot),
+        (8, "LapsedNeverGranted", rollback_alive),
+        (8, "NoDoubleExec", rollback_alive),
         (
             7,
             "NoRevivalOverNoExec",

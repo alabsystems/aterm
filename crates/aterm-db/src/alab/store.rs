@@ -8,8 +8,9 @@
 use super::{
     checks::Finding,
     discover::{self, Listing},
+    observe::{self, Sighting},
     register::{self, Input, Me, Outcome, Probe, Registered},
-    registry::{APPLICATION, MACHINE_FACTS, MAILBOX_OBS, REGISTRY},
+    registry::{ACCOUNT_OBS, APPLICATION, MACHINE_FACTS, MAILBOX_OBS, REGISTRY},
     seeds,
     view::LabView,
 };
@@ -26,6 +27,10 @@ use crate::{
 use astream_wire::sync::Digest;
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 use std::{collections::BTreeSet, path::Path};
+
+#[path = "source.rs"]
+mod source;
+pub use source::{SourceRead, SourceRevision};
 
 /// The SHA-256 fingerprint of the registry operations a [`LabView`] was projected from
 /// (`replica::InventorySummary`'s encoding), so a cache can tell whether anything arrived.
@@ -92,6 +97,20 @@ fn quota_room(session: &Session<'_>, log: &Log, view: &View, reserve: usize) -> 
             .self_quota
             .saturating_sub(reserve)
             .saturating_sub(spent)
+}
+
+/// The records `actor` wrote that carry an `account-obs` row: what observation spent of its
+/// share ([`observe::OBSERVE_RESERVE`]).
+fn observed_records(view: &View, actor: astream_wire::sync::Actor) -> usize {
+    view.ops
+        .iter()
+        .filter(|op| op.actor == actor && !op.revert)
+        .filter(|op| {
+            op.changes
+                .iter()
+                .any(|change| change.collection == ACCOUNT_OBS.name)
+        })
+        .count()
 }
 
 /// The Commons uuids of the current members.
@@ -286,6 +305,22 @@ fn planned(
     let empty = crate::typed::owned::OwnedRead::default();
     let facts = view.owned.get(MACHINE_FACTS.name).unwrap_or(&empty);
     register::plan(&input, &view.cells, facts)
+}
+
+/// What one account-observation pass decided and wrote
+/// (`docs/DESIGN-account-discovery-2026-11-09.md`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Observed {
+    /// Why nothing was read: `excluded`, `not-held` or `incomplete`; `None` once a plan ran.
+    pub quiet: Option<&'static str>,
+    /// Accounts born.
+    pub born: usize,
+    /// `account-obs` rows written.
+    pub marked: usize,
+    /// By key, never by value.
+    pub findings: Vec<Finding>,
+    /// Records appended: 0 or 1.
+    pub records: usize,
 }
 
 /// What one discovery pass decided and wrote.
@@ -674,6 +709,93 @@ impl Registry {
                     findings,
                     records: 1,
                 })
+            },
+        )
+    }
+
+    /// One account-observation pass (`docs/DESIGN-account-discovery-2026-11-09.md`): this Mac's
+    /// `account-obs` rows of the logins its tabs run, and the birth of each account (and its
+    /// address) no row names, in one record ([`observe::plan`]). A pass writes while this Mac has
+    /// written fewer than [`observe::OBSERVE_RESERVE`] records of `account-obs` rows and more
+    /// than registration's reserve remains, so observation's spend of the quota mailbox
+    /// discovery also draws on is bounded. It reads `[commons]` first, as a registration pass
+    /// does, and never declares the registry.
+    ///
+    /// # Errors
+    /// `config` is not a valid file; this Mac holds no catalog yet or is no Writer; or the
+    /// registry cannot be read or written.
+    pub fn observe_accounts(
+        &self,
+        config: &Path,
+        sightings: &[Sighting],
+        now_ms: u64,
+    ) -> Result<Observed> {
+        let compiled = self.generation();
+        let quiet = |word| Observed {
+            quiet: Some(word),
+            born: 0,
+            marked: 0,
+            findings: Vec::new(),
+            records: 0,
+        };
+        if let Err(outcome) = self.admitted(config)? {
+            return Ok(quiet(match outcome {
+                Outcome::Excluded => "excluded",
+                _ => "not-held",
+            }));
+        }
+        application::with_store(
+            &self.paths,
+            false,
+            descriptor(compiled),
+            |session, store, scope| {
+                session.writer()?;
+                let log = Log::read_with(session, store, scope, decode)?;
+                log.writable(session.actor())?;
+                let view = View::read(compiled.table, session, &log);
+                if !view.complete {
+                    return Ok(quiet("incomplete"));
+                }
+                let actor = session.actor();
+                let uuid = session
+                    .members()?
+                    .iter()
+                    .find(|binding| binding.actor() == actor)
+                    .map(|binding| keys::uuid32(binding.machine()))
+                    .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
+                let empty = crate::typed::owned::OwnedRead::default();
+                let obs = view.owned.get(ACCOUNT_OBS.name).unwrap_or(&empty);
+                let input = observe::Input {
+                    uuid: &uuid,
+                    sightings,
+                    now_ms,
+                    room: observed_records(&view, actor) < observe::OBSERVE_RESERVE
+                        && quota_room(session, &log, &view, discover::REGISTRATION_RESERVE),
+                };
+                let observe::Plan {
+                    changes,
+                    findings,
+                    born,
+                    marked,
+                    rested: _,
+                } = observe::plan(&input, &view.cells, obs)?;
+                let done = |records| Observed {
+                    quiet: None,
+                    born,
+                    marked,
+                    findings: findings.clone(),
+                    records,
+                };
+                if changes.is_empty() {
+                    return Ok(done(0));
+                }
+                let request = typed::request_id(APPLICATION, compiled.table.role, &changes)?;
+                let command = Command::Write { request, changes };
+                if log.retry(session.actor(), &command)?.is_some() {
+                    return Ok(done(0));
+                }
+                application::append(session, store, &command.encode()?)?;
+                Ok(done(1))
             },
         )
     }

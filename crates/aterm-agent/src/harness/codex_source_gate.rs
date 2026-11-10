@@ -317,6 +317,12 @@ impl PublicationLock {
         Self::try_for_home(home)?.ok_or(BUSY)
     }
 
+    /// The lock, once its last holder's release has come through ([`released`]).
+    #[cfg(test)]
+    pub(crate) fn released_for_home(home: &Path) -> Self {
+        released("the publication lock", || Self::try_for_home(home).unwrap())
+    }
+
     /// Only actual kernel contention is retryable; namespace and I/O failures
     /// remain errors and never become an indefinite admission wait.
     pub(crate) fn try_for_home(home: &Path) -> Result<Option<Self>, &'static str> {
@@ -336,6 +342,28 @@ impl PublicationLock {
 
     pub(crate) fn current(&self) -> Result<(), &'static str> {
         self.0.current()
+    }
+}
+
+/// What `take` claims once its last holder's release has come through: a test that dropped
+/// every holder of a gate lock must find it free, but an `flock` lives with its open file
+/// description, and a child another test forks at that moment holds a copy of the descriptor
+/// until its `exec` closes it, so the claim can read busy for a moment after the drop (more so
+/// on a loaded Mac). The wait is a one-minute hang detector: a lock still held then is a leaked
+/// holder, and fails naming `what`.
+#[cfg(test)]
+pub(crate) fn released<T>(what: &str, mut take: impl FnMut() -> Option<T>) -> T {
+    const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(taken) = take() {
+            return taken;
+        }
+        assert!(
+            started.elapsed() < HANG_DETECTOR,
+            "{what} stayed held {HANG_DETECTOR:?} after its holders dropped"
+        );
+        aterm_uds::deadline::poll_yield();
     }
 }
 
@@ -391,7 +419,7 @@ mod tests {
                 .is_none()
         );
         drop(existing);
-        let publication = PublicationLock::for_home(home.path()).unwrap();
+        let publication = PublicationLock::released_for_home(home.path());
         assert!(publication.current().is_ok());
     }
 
@@ -404,7 +432,7 @@ mod tests {
         drop(first);
         assert!(PublicationLock::for_home(home.path()).is_err());
         drop(second);
-        let publication = PublicationLock::for_home(home.path()).unwrap();
+        let publication = PublicationLock::released_for_home(home.path());
         assert!(SourceWorkLease::for_home(home.path()).is_err());
         publication.current().unwrap();
         let path = publication.0.path.clone();
@@ -432,7 +460,7 @@ mod tests {
         std::os::unix::fs::symlink(&home, &alias).unwrap();
         assert!(identity.matches_home(&alias));
         drop(work);
-        let _publication = PublicationLock::for_home(&home).unwrap();
+        let _publication = PublicationLock::released_for_home(&home);
         // Namespace validation performs no hidden shared acquisition, even
         // while this actual gate is exclusively held.
         assert!(identity.matches_home(&home));

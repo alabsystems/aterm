@@ -49,6 +49,12 @@ pub(super) const WAIT_RETIRED_UNISSUED: &str = "wait:native-retired-unissued";
 pub(super) const WAIT_UNADMITTED: &str = "wait:native-unadmitted";
 /// The wait of a lane whose saved prepare the host proved can grant no exec ([`Recovery::Lapsed`]).
 pub(super) const WAIT_LAPSED: &str = "wait:native-lapsed";
+/// A positive safe-cancellation reply, translated by a constructor's refusal path.
+pub(super) const WAIT_CANCELLED: &str = "wait:native-cancelled";
+/// A retained operation closed with positive proof that its mutation did not happen.
+pub(super) const WAIT_CANCELLED_BEFORE_MUTATION: &str = "wait:native-cancelled-before-mutation";
+/// A retained operation safely closed before its signal step.
+pub(super) const WAIT_ABORTED_BEFORE_SIGNAL: &str = "wait:native-aborted-before-signal";
 
 /// The wait word of a [`begin`] that admitted nothing: its refusal, or the answer that dropped
 /// its prepare. A cancellation is `begin`'s own refusal word.
@@ -57,7 +63,14 @@ pub(super) const fn refusal_word(admission: Result<Recovery, &'static str>) -> &
         Err(why) => why,
         Ok(Recovery::Unadmitted) => "native-unadmitted",
         Ok(Recovery::Lapsed) => "native-lapsed",
-        Ok(_) => "native-cancelled",
+        Ok(Recovery::Cancelled) => "native-cancelled",
+        Ok(
+            Recovery::Legacy
+            | Recovery::Admitted
+            | Recovery::Completed
+            | Recovery::Retired
+            | Recovery::Held,
+        ) => "native-unresolved-operation",
     }
 }
 
@@ -872,6 +885,7 @@ fn begin_plan(
         .and_then(|now| now.checked_add(120_000_000))
         .ok_or("native-clock")?;
     let mut prepare = Prepare {
+        receipt_mode: None,
         rejection_domain,
         asked: asked.cloned(),
         id: native_act::operation_id().map_err(|_| "native-entropy")?,
@@ -1484,12 +1498,14 @@ mod tests {
     #[test]
     fn positive_safe_cancellation_restores_unsent_constructor_while_unknown_retains_original() {
         let (mut st, back) = pending();
+        let recovered = recover_reply(
+            &mut st,
+            Reply::Decision(Decision::ProvenNotCommittedRollbackSafe),
+        );
+        assert_eq!(recovered, Ok(Recovery::Cancelled));
         assert_eq!(
-            recover_reply(
-                &mut st,
-                Reply::Decision(Decision::ProvenNotCommittedRollbackSafe)
-            ),
-            Ok(Recovery::Cancelled)
+            super::super::relaunch::outcome(&format!("wait:{}", refusal_word(recovered))),
+            super::super::relaunch::Outcome::Busy
         );
         assert!(st.native_prepare.is_empty() && st.native.is_none());
         // This is the real constructor's unsent transition, not a fresh native admission.
@@ -1547,10 +1563,12 @@ mod tests {
             ClaimOutcome::Bound(9),
         ] {
             let (mut st, _) = pending();
-            assert_eq!(
-                recover_reply(&mut st, Reply::Committed(claim)),
-                Ok(Recovery::Completed)
-            );
+            let recovered = recover_reply(&mut st, Reply::Committed(claim));
+            assert_eq!(recovered, Ok(Recovery::Completed));
+            assert!(matches!(
+                super::super::relaunch::outcome(&format!("wait:{}", refusal_word(recovered))),
+                super::super::relaunch::Outcome::NotYet(_)
+            ));
             assert!(st.native_prepare.is_empty() && st.native.is_none());
             assert!(
                 matches!(st.phase, Phase::Relaunched { .. }),

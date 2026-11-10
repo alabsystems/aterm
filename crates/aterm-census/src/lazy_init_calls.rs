@@ -3,7 +3,8 @@
 
 //! Conservative dependency-qualified calls for the lazy-init walk.
 
-use super::{DependencyScopes, owned_fn, source_crate};
+use super::{DependencyScopes, WordSet, owned_fn, source_crate};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 type Exports = BTreeMap<String, BTreeSet<String>>;
@@ -15,30 +16,49 @@ pub(super) struct CallScope<'a> {
 }
 
 impl<'a> CallScope<'a> {
+    /// `code` is `text`'s lines, each [`crate::strip_line_comment`] of it.
     pub(super) fn new(
         file: &str,
         text: &str,
+        code: &[&str],
         scopes: &DependencyScopes,
         exports: &'a Exports,
     ) -> Self {
-        let aliases = source_crate(file)
+        let candidates: Vec<(&String, &String)> = source_crate(file)
             .and_then(|dir| scopes.get(dir))
             .into_iter()
             .flat_map(|aliases| aliases.iter())
             .filter_map(|(alias, targets)| {
                 let target = targets.first()?;
-                (targets.len() == 1 && !target.is_empty() && unshadowed(text, alias))
-                    .then(|| (alias.clone(), target.clone()))
+                (targets.len() == 1 && !target.is_empty()).then_some((alias, target))
             })
+            .collect();
+        if candidates.is_empty() {
+            return Self {
+                aliases: BTreeMap::new(),
+                exports,
+            };
+        }
+        let words = WordSet::new(
+            candidates
+                .iter()
+                .map(|(alias, _)| alias.as_str())
+                .filter(|alias| word(alias)),
+        );
+        let shadows = Shadows::of(code, &words);
+        let aliases = candidates
+            .into_iter()
+            .filter(|(alias, _)| shadows.unshadowed(text, alias))
+            .map(|(alias, target)| (alias.clone(), target.clone()))
             .collect();
         Self { aliases, exports }
     }
 
     /// Only a two-segment external free call is narrowed. Everything unproved stays by-name.
-    fn target(&self, before_open: &str) -> Option<String> {
+    fn target<'l>(&self, before_open: &'l str) -> Option<Cow<'l, str>> {
         let before = before_open.trim_end();
         let name = crate::ident_ending_at(before, before.len())?;
-        let bare = || name.to_owned();
+        let bare = || Cow::Borrowed(name);
         let Some(prefix) = before[..before.len() - name.len()]
             .trim_end()
             .strip_suffix("::")
@@ -62,7 +82,7 @@ impl<'a> CallScope<'a> {
                 .get(dir)
                 .is_some_and(|names| names.contains(name))
             {
-                owned_fn(dir, name)
+                Cow::Owned(owned_fn(dir, name))
             } else {
                 bare()
             },
@@ -72,24 +92,137 @@ impl<'a> CallScope<'a> {
     pub(super) fn callees(&self, body: &[String]) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for line in body {
-            for (at, byte) in line.bytes().enumerate() {
-                if byte == b'('
-                    && let Some(target) = self.target(&line[..at])
-                {
-                    out.insert(target);
-                }
-            }
+            self.line_callees(line, &mut out);
         }
         out
     }
 
+    /// Every `<ident>(` target in one line, added to `out`.
+    pub(super) fn line_callees(&self, line: &str, out: &mut BTreeSet<String>) {
+        for (at, byte) in line.bytes().enumerate() {
+            if byte == b'('
+                && let Some(target) = self.target(&line[..at])
+                && !out.contains(&*target)
+            {
+                out.insert(target.into_owned());
+            }
+        }
+    }
+
     pub(super) fn reference(&self, text: &str) -> Option<String> {
-        self.target(text)
+        self.target(text).map(Cow::into_owned)
     }
 }
 
 fn ident(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Every char is one the whole-word test in [`unshadowed`] treats as part of a word.
+fn word(alias: &str) -> bool {
+    !alias.is_empty() && alias.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// What [`unshadowed`] reads from one file, read in one pass for all of its aliases.
+///
+/// A glob or unterminated `use` shadows every alias. For a [`word`] alias, a whole-word
+/// occurrence is exactly a maximal run of word chars equal to it (no earlier occurrence can
+/// overlap a run's start, because the char before the run is not one of the alias's chars),
+/// so one tokenization answers every alias's mention test. Any other alias is judged by
+/// [`unshadowed`] itself.
+struct Shadows<'t> {
+    /// A terminated `use` holds `*`, or the file ends inside a `use`.
+    every: bool,
+    /// The terminated `use` statements that name `self`, as [`unshadowed`] accumulates them.
+    self_uses: Vec<String>,
+    /// [`word`] aliases with a whole-word occurrence that is not a `name::` path head, or that
+    /// a `:` or `$` precedes.
+    misused: BTreeSet<&'t str>,
+}
+
+impl<'t> Shadows<'t> {
+    /// `lines` is the file's lines, each [`crate::strip_line_comment`] of it.
+    fn of(lines: &[&'t str], words: &WordSet<'_>) -> Self {
+        let mut out = Self {
+            every: false,
+            self_uses: Vec::new(),
+            misused: BTreeSet::new(),
+        };
+        let mut use_text = String::new();
+        for &code in lines {
+            if !use_text.is_empty() || code.contains("use ") {
+                use_text.push_str(code);
+                use_text.push(' ');
+                if use_text.contains(';') {
+                    if use_text.contains('*') {
+                        out.every = true;
+                        return out;
+                    }
+                    if super::mentions_ident(&use_text, "self") {
+                        out.self_uses.push(std::mem::take(&mut use_text));
+                    } else {
+                        use_text.clear();
+                    }
+                }
+            }
+            if !words.is_empty() {
+                misused_words(code, words, &mut out.misused);
+            }
+        }
+        out.every = !use_text.is_empty();
+        out
+    }
+
+    fn unshadowed(&self, text: &str, alias: &str) -> bool {
+        if self.every {
+            return false;
+        }
+        if !word(alias) {
+            return unshadowed(text, alias);
+        }
+        !self.misused.contains(alias)
+            && !self
+                .self_uses
+                .iter()
+                .any(|statement| super::mentions_ident(statement, alias))
+    }
+}
+
+/// Each maximal run of word chars in `code` that is one of `words` and is not a `name::`
+/// path head, or that a `:` or `$` precedes, joins `misused`.
+fn misused_words<'t>(code: &'t str, words: &WordSet<'_>, misused: &mut BTreeSet<&'t str>) {
+    let mut start = None;
+    let mut at = 0;
+    loop {
+        // The char at `at` (past the end, none), read byte-wise while it is ASCII.
+        let (in_word, width) = match code.as_bytes().get(at) {
+            None => (false, 0),
+            Some(&byte) if byte.is_ascii() => (byte.is_ascii_alphanumeric() || byte == b'_', 1),
+            Some(_) => code[at..]
+                .chars()
+                .next()
+                .map_or((false, 1), |c| (c.is_alphanumeric(), c.len_utf8())),
+        };
+        match (start, in_word) {
+            (None, true) => start = Some(at),
+            (Some(from), false) => {
+                start = None;
+                let run = &code[from..at];
+                if words.contains(run)
+                    && !misused.contains(run)
+                    && (!code[at..].trim_start().starts_with("::")
+                        || code[..from].trim_end().ends_with([':', '$']))
+                {
+                    misused.insert(run);
+                }
+            }
+            _ => {}
+        }
+        if width == 0 {
+            return;
+        }
+        at += width;
+    }
 }
 
 /// File-wide uncertainty deliberately prevents narrowing: declarations, imports, fn/impl
@@ -373,6 +506,75 @@ mod tests {
                 "mod parsing;\npub use parsing::read;\n",
                 &[("crates/parser-impl/src/parsing.rs", implementation)],
                 red,
+            );
+        }
+    }
+
+    /// Each way a file shadows an alias, judged by the one-pass [`super::Shadows`] (and, for
+    /// an alias that is not one word, by the full scan it falls back to) exactly as the full
+    /// scan [`super::unshadowed`] judges it.
+    #[test]
+    fn every_shadowing_shape_is_judged_per_alias() {
+        for (text, alias, unshadowed) in [
+            ("fn f() { parser::read(); }\n", "parser", true),
+            ("fn f() { parser :: read(); }\n", "parser", true),
+            ("fn f() { other::read(); }\n", "parser", true),
+            (
+                "// parser\nfn f() { parser::read(); } // parser alone\n",
+                "parser",
+                true,
+            ),
+            ("fn f() { parsers::read(); parser_x(); }\n", "parser", true),
+            ("fn f() { éparser::read(); parseré(); }\n", "parser", true),
+            ("use crate::local as parser;\n", "parser", false),
+            ("fn f() { x::parser::read(); }\n", "parser", false),
+            (
+                "macro_rules! m { () => { $parser::read() }; }\n",
+                "parser",
+                false,
+            ),
+            ("fn f() { parser é::read(); }\n", "parser", false),
+            (
+                "use parser::{self, Read};\nfn f() { parser::read(); }\n",
+                "parser",
+                false,
+            ),
+            (
+                "use parser::{\n    self,\n};\nfn f() { parser::read(); }\n",
+                "parser",
+                false,
+            ),
+            (
+                "use other::{self};\nfn f() { parser::read(); }\n",
+                "parser",
+                true,
+            ),
+            (
+                "use other::*;\nfn f() { parser::read(); }\n",
+                "parser",
+                false,
+            ),
+            (
+                "fn f() { parser::read(); }\nuse other::thing",
+                "parser",
+                false,
+            ),
+            ("fn f() { a-b::read(); }\n", "a-b", true),
+            ("fn f() { let x = a-b; }\n", "a-b", false),
+            ("use a-b::{self};\n", "a-b", false),
+        ] {
+            let code: Vec<&str> = text.lines().map(crate::strip_line_comment).collect();
+            let words = super::WordSet::new([alias].into_iter().filter(|a| super::word(a)));
+            let shadows = super::Shadows::of(&code, &words);
+            assert_eq!(
+                shadows.unshadowed(text, alias),
+                unshadowed,
+                "{alias:?} in {text:?}"
+            );
+            assert_eq!(
+                super::unshadowed(text, alias),
+                unshadowed,
+                "{alias:?} in {text:?}, by the full scan"
             );
         }
     }

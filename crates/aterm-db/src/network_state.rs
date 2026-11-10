@@ -231,7 +231,7 @@ impl From<std::io::Error> for OpenFailure {
 
 /// Stable local location independent of whether a secrets identity exists.
 pub fn directory(config: &Path) -> PathBuf {
-    config.with_file_name("network-state")
+    aterm_uds::quiet_state::selected(&config.with_file_name("network-state"))
 }
 
 /// Whether the Commons runtime's observation history for `config` exists: its
@@ -534,6 +534,27 @@ impl Observer {
         config: &Path,
         published: ObservationHandle,
     ) -> std::result::Result<Self, OpenFailure> {
+        let legacy = config.with_file_name("network-state");
+        aterm_uds::quiet_state::prepare(&legacy, || {
+            aterm_secrets::fsx::write_new(&legacy.join("observations.astream"), b"", 0o600)
+                .map_err(std::io::Error::other)?;
+            let (_, metadata) = private_file::open_private(&legacy, "observations.astream")
+                .map_err(std::io::Error::other)?;
+            if metadata.len() > (MAX_BYTES * 3) as u64 {
+                return Err(std::io::Error::other("network history exceeds its bound"));
+            }
+            BrokerLog::open_with(legacy.join("observations.astream"), Durability::Strict)
+        })
+        .map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::WouldBlock
+            ) {
+                OpenFailure::Owned
+            } else {
+                OpenFailure::Unavailable
+            }
+        })?;
         let dir = directory(config);
         private_file::create_private_dir(&dir)?;
         aterm_secrets::fsx::write_new(&dir.join("observations.astream"), b"", 0o600)
@@ -984,6 +1005,56 @@ pub fn value(observation: &NetworkObservation) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_history_moves_only_after_its_writer_releases_it() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let legacy = config.with_file_name("network-state");
+        let mut observer = Observer::open(&config, handle()).unwrap();
+        observer.local(peer(1, 1), trust()).unwrap();
+        let at = Instant::now();
+        observer.accounts_exchange(account_exchange::Candidate {
+            observation: exchange(),
+            sampled_at: at,
+        });
+        observer.observe(
+            Visibility::Active,
+            0,
+            "observing",
+            2000,
+            at + Duration::from_secs(1),
+        );
+        drop(observer);
+        let quiet = directory(&config);
+        // Reconstruct a pre-migration store, including its real journal and sidecars.
+        std::fs::remove_file(&legacy).unwrap();
+        std::fs::rename(&quiet, &legacy).unwrap();
+        let inode = std::fs::metadata(legacy.join("observations.astream"))
+            .unwrap()
+            .ino();
+        let owner =
+            BrokerLog::open_with(legacy.join("observations.astream"), Durability::Strict).unwrap();
+        assert!(matches!(
+            Observer::open(&config, handle()),
+            Err(OpenFailure::Owned)
+        ));
+        assert!(legacy.is_dir());
+        drop(owner);
+        let observer = Observer::open(&config, handle()).unwrap();
+        assert_eq!(observer.state.accounts_exchange, Some(exchange()));
+        assert!(aterm_tempfile::is_quiet(&directory(&config)));
+        assert_eq!(
+            std::fs::metadata(directory(&config).join("observations.astream"))
+                .unwrap()
+                .ino(),
+            inode
+        );
+        assert!(legacy.is_file());
+        assert!(std::fs::create_dir_all(&legacy).is_err());
+    }
 
     fn reachable_publication(at: Instant) -> Publication {
         Publication {

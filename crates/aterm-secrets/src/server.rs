@@ -6756,7 +6756,7 @@ mod tests {
             Ok::<(), io::Error>(())
         });
         gone.recv_timeout(HANG_DETECTOR).unwrap();
-        let replacement = TcpListener::bind(addr).unwrap();
+        let replacement = rebound(addr);
         Running {
             addr,
             stop: Arc::new(AtomicBool::new(false)),
@@ -6790,7 +6790,7 @@ mod tests {
         });
         done.recv_timeout(HANG_DETECTOR).unwrap();
         stopper.join().unwrap();
-        let _replacement = TcpListener::bind(addr).unwrap();
+        rebound(addr);
     }
 
     #[test]
@@ -6809,7 +6809,24 @@ mod tests {
         done.recv_timeout(HANG_DETECTOR).unwrap();
         joiner.join().unwrap();
         assert!(!stop.load(Ordering::SeqCst));
-        let _replacement = TcpListener::bind(addr).unwrap();
+        rebound(addr);
+    }
+
+    /// A listener on `addr` once its port is free again (a hang detector, not a budget): a child
+    /// another test forks in this process holds a copy of every descriptor it took until its
+    /// `exec`, and off Apple nothing keeps a listener out of a fork ([`aterm_uds::kept_out`]),
+    /// so a closed listener's port comes free once each such child exec'd.
+    fn rebound(addr: SocketAddr) -> TcpListener {
+        let deadline = Instant::now() + HANG_DETECTOR;
+        loop {
+            match TcpListener::bind(addr) {
+                Ok(listener) => return listener,
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => panic!("{addr} never came free: {e}"),
+            }
+        }
     }
 
     /// Wait (a hang detector, not a budget) until `done` holds.

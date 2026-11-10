@@ -1119,34 +1119,61 @@ fn is_safe_url(url: &str) -> bool {
     if u.is_empty() || u.bytes().any(|b| b.is_ascii_control() || b == b' ') {
         return false;
     }
-    let l = u.to_ascii_lowercase();
-    l.starts_with("http://") || l.starts_with("https://") || l.starts_with("mailto:")
+    ["http://", "https://", "mailto:"].iter().any(|scheme| {
+        u.as_bytes()
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme.as_bytes()))
+    })
 }
 
-fn find_url_span(chars: &[char], col: usize) -> Option<(String, usize, usize)> {
-    let n = chars.len();
+fn find_url_span(
+    n: usize,
+    col: usize,
+    char_at: impl Fn(usize) -> char,
+) -> Option<std::ops::Range<usize>> {
+    if col >= n {
+        return None;
+    }
+    let prefix_limit = col + 1; // Prefix starts stop here; matched suffixes still use n.
     let is_url = |c: char| c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c);
     let mut i = 0;
-    while i < n {
-        let s = &chars[i..];
-        if s.starts_with(&['h', 't', 't', 'p', ':', '/', '/'])
-            || s.starts_with(&['h', 't', 't', 'p', 's', ':', '/', '/'])
+    while i < n && i < prefix_limit {
+        let prefix = if n - i >= 7
+            && char_at(i) == 'h'
+            && char_at(i + 1) == 't'
+            && char_at(i + 2) == 't'
+            && char_at(i + 3) == 'p'
         {
-            let mut j = i;
-            while j < n && is_url(chars[j]) {
+            match char_at(i + 4) {
+                ':' if char_at(i + 5) == '/' && char_at(i + 6) == '/' => Some(7),
+                's' if n - i >= 8
+                    && char_at(i + 5) == ':'
+                    && char_at(i + 6) == '/'
+                    && char_at(i + 7) == '/' =>
+                {
+                    Some(8)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(prefix) = prefix {
+            let mut j = i + prefix;
+            while j < n && is_url(char_at(j)) {
                 j += 1;
             }
             let mut end = j;
             while end > i
                 && matches!(
-                    chars[end - 1],
+                    char_at(end - 1),
                     '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '\'' | '"'
                 )
             {
                 end -= 1;
             }
             if (i..end).contains(&col) {
-                return Some((chars[i..end].iter().collect(), i, end - 1));
+                return Some(i..end);
             }
             i = j.max(i + 1);
         } else {
@@ -1156,61 +1183,70 @@ fn find_url_span(chars: &[char], col: usize) -> Option<(String, usize, usize)> {
     None
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PlainUrl {
-    url: String,
+#[derive(Clone, Copy, Debug)]
+struct PlainUrl<'a> {
+    cells: &'a [RenderCell],
     faint: bool,
+}
+
+impl PlainUrl<'_> {
+    fn to_url_string(self) -> String {
+        self.cells.iter().map(|cell| cell.ch).collect()
+    }
 }
 
 const FAINT_URL_CONTRAST: f32 = 3.0;
 
-fn plain_url_at(cells: &[RenderCell], col: usize, min_contrast: f32) -> Option<PlainUrl> {
+fn plain_url_at(cells: &[RenderCell], col: usize, min_contrast: f32) -> Option<PlainUrl<'_>> {
+    let span = find_url_span(cells.len(), col, |i| {
+        let cell = &cells[i];
+        if cell.wide { ' ' } else { cell.ch }
+    })?;
+    let col = col.checked_sub(span.start)?;
+    let cells = &cells[span];
+    let previous = std::cell::Cell::new(None);
     let ink = |cell: &RenderCell| {
         let bg = aterm_render::rgb_to_u32(cell.bg);
         let fg = aterm_render::rgb_to_u32(cell.fg);
-        let painted = aterm_render::floor_min_contrast_fg(fg, bg, min_contrast);
+        if min_contrast <= 1.0 || fg == bg {
+            return (fg, bg);
+        }
+        if let Some((last_fg, last_bg, painted)) = previous.get()
+            && fg == last_fg
+            && bg == last_bg
+        {
+            return (painted, bg);
+        }
+        let painted = aterm_render::floor_fg_contrast(fg, bg, min_contrast);
+        previous.set(Some((fg, bg, painted)));
         (painted, bg)
     };
-    let mut chars: Vec<char> = cells
-        .iter()
-        .map(|c| if c.wide { ' ' } else { c.ch })
-        .collect();
-    let (_, start, end) = find_url_span(&chars, col)?;
-    for (ch, cell) in chars[start..=end].iter_mut().zip(&cells[start..=end]) {
+    let span = find_url_span(cells.len(), col, |i| {
+        let cell = &cells[i];
         let (fg, bg) = ink(cell);
-        if fg == bg {
-            *ch = ' ';
+        if cell.wide || fg == bg { ' ' } else { cell.ch }
+    })?;
+    let cells = &cells[span];
+    let mut previous_visible = None;
+    let faint = cells.iter().map(ink).any(|(fg, bg)| {
+        if previous_visible == Some((fg, bg)) {
+            return false;
         }
-    }
-    let (url, start, end) = find_url_span(&chars, col)?;
-    let faint = cells[start..=end]
-        .iter()
-        .map(ink)
-        .any(|(fg, bg)| aterm_render::floor_fg_contrast(fg, bg, FAINT_URL_CONTRAST) != fg);
-    Some(PlainUrl { url, faint })
+        previous_visible = Some((fg, bg));
+        aterm_render::floor_fg_contrast(fg, bg, FAINT_URL_CONTRAST) != fg
+    });
+    Some(PlainUrl { cells, faint })
 }
 
-fn plain_path_at(
-    cells: &[RenderCell],
-    col: usize,
-    min_contrast: f32,
-) -> Option<path_link::PathSpan> {
-    let chars: Vec<char> = cells
-        .iter()
-        .map(|cell| {
-            if cell.wide {
-                return path_link::WIDE_CONTINUATION;
-            }
-            let bg = aterm_render::rgb_to_u32(cell.bg);
-            let fg = aterm_render::rgb_to_u32(cell.fg);
-            if aterm_render::floor_min_contrast_fg(fg, bg, min_contrast) == bg {
-                ' '
-            } else {
-                cell.ch
-            }
-        })
-        .collect();
-    path_link::find_path_span(&chars, col)
+fn plain_path_at(cells: &[RenderCell], col: usize) -> Option<path_link::PathSpan> {
+    path_link::find_path_span(cells.len(), col, |i| {
+        let cell = &cells[i];
+        if cell.wide {
+            return path_link::WIDE_CONTINUATION;
+        }
+        // Contrast flooring preserves equal ink and cannot make distinct ink equal.
+        if cell.fg == cell.bg { ' ' } else { cell.ch }
+    })
 }
 
 /// The GUI's default font family, tried ahead of the library's `FONT_CANDIDATES`.
@@ -15864,7 +15900,7 @@ impl App {
             handoff_history_loss_said: crate::handoff_history::LossSummary::default(),
             handoff_repainted_tabs: 0,
             first_present_done: false,
-            boot_health_confirmation_dispatched: false,
+            boot_health_confirmation_dispatched: true,
             boot_health_confirmation_retry_at: None,
             boot_health_confirmation_backoff: BOOT_HEALTH_RETRY_MIN,
             seamless_position: None,
@@ -30679,6 +30715,15 @@ mod early_out_tests;
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod plain_url_view_tests;
+
+#[cfg(test)]
+mod url_scan_bound_tests;
+
+#[cfg(test)]
+mod url_ink_tests;
 
 #[cfg(test)]
 #[path = "lib_aos_repair_tests.rs"]

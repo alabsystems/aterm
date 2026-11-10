@@ -115,6 +115,7 @@ impl Fixture {
                 roster_path: &self.path,
                 row: &self.row,
                 who: &self.who,
+                seen: &crate::harness::observe::Observation::Unread,
             },
             |state, logins| {
                 self.edits.set(self.edits.get() + 1);

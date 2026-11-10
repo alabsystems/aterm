@@ -10,6 +10,8 @@
 //! so a stray `<<<<<<<`, `|||||||`, `=======` or `>>>>>>>` line left behind after resolving a
 //! merge can land unseen and ship verbatim in release notes.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::{Finding, Rule, Tree};
 
 pub(super) const CONFLICT_MARKER: Rule = Rule {
@@ -76,78 +78,117 @@ fn non_divider_marker(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// How many paths a reader takes at a time.
+const BATCH: usize = 64;
+
 fn conflict_marker(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    for rel in &tree.corpus.paths {
-        if skip_path(rel) {
-            continue;
-        }
-        let Some(body) = tree.text(rel) else {
-            continue;
-        };
-        if !["<<<<<<<", "|||||||", "=======", ">>>>>>>"]
-            .iter()
-            .any(|m| body.contains(m))
-        {
-            continue;
-        }
-        let markdown = rel.ends_with(".md");
-        let is_changelog = rel == "CHANGELOG.md" || rel.ends_with("/CHANGELOG.md");
-
-        let mut fence: Option<(u8, usize)> = None;
-        let mut has_outer_marker = false;
-        if markdown && !is_changelog {
-            for raw in body.lines() {
-                if let Some((ch, len)) = fence {
-                    if fence_closes(raw, ch, len) {
-                        fence = None;
-                    }
-                    continue;
-                }
-                if let Some(opened) = fence_open(raw) {
-                    fence = Some(opened);
-                    continue;
-                }
-                if non_divider_marker(raw).is_some() {
-                    has_outer_marker = true;
-                    break;
+    let rels: Vec<&str> = tree
+        .corpus
+        .paths()
+        .iter()
+        .map(String::as_str)
+        .filter(|rel| !skip_path(rel))
+        .collect();
+    // Opening each file is most of the rule's time, and the kernel overlaps opens, so a few
+    // readers take the paths a batch at a time; the batches are put back in the paths' order.
+    let next = AtomicUsize::new(0);
+    let read = || {
+        let mut judged = Vec::new();
+        loop {
+            let batch = next.fetch_add(1, Ordering::Relaxed);
+            let Some(rels) = rels.chunks(BATCH).nth(batch) else {
+                return judged;
+            };
+            let mut found = Vec::new();
+            for rel in rels {
+                if let Some(body) = tree.text(rel) {
+                    judge(rel, &body, &mut found);
                 }
             }
-            fence = None;
+            judged.push((batch, found));
         }
+    };
+    let readers = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    let mut judged: Vec<(usize, Vec<Finding>)> = crate::memo::threads(|scope| {
+        let running: Vec<_> = (1..readers).map(|_| scope.spawn(read)).collect();
+        let mut judged = read();
+        for reader in running {
+            judged.extend(
+                reader
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        judged
+    });
+    judged.sort_unstable_by_key(|&(batch, _)| batch);
+    out.extend(judged.into_iter().flat_map(|(_, found)| found));
+}
 
-        let mut prev_nonblank = false;
-        for (idx, raw) in body.lines().enumerate() {
-            if markdown {
-                if let Some((ch, len)) = fence {
-                    if fence_closes(raw, ch, len) {
-                        fence = None;
-                    }
-                    prev_nonblank = false;
-                    continue;
+/// The findings of the file at `rel`, whose text is `body`.
+fn judge(rel: &str, body: &str, out: &mut Vec<Finding>) {
+    if !["<<<<<<<", "|||||||", "=======", ">>>>>>>"]
+        .iter()
+        .any(|m| body.contains(m))
+    {
+        return;
+    }
+    let markdown = rel.ends_with(".md");
+    let is_changelog = rel == "CHANGELOG.md" || rel.ends_with("/CHANGELOG.md");
+
+    let mut fence: Option<(u8, usize)> = None;
+    let mut has_outer_marker = false;
+    if markdown && !is_changelog {
+        for raw in body.lines() {
+            if let Some((ch, len)) = fence {
+                if fence_closes(raw, ch, len) {
+                    fence = None;
                 }
-                if let Some(opened) = fence_open(raw) {
-                    fence = Some(opened);
-                    prev_nonblank = false;
-                    continue;
-                }
+                continue;
             }
-            let found_marker = non_divider_marker(raw).or_else(|| {
-                (raw == "======="
-                    && (!markdown || is_changelog || has_outer_marker || !prev_nonblank))
-                    .then_some("=======")
+            if let Some(opened) = fence_open(raw) {
+                fence = Some(opened);
+                continue;
+            }
+            if non_divider_marker(raw).is_some() {
+                has_outer_marker = true;
+                break;
+            }
+        }
+        fence = None;
+    }
+
+    let mut prev_nonblank = false;
+    for (idx, raw) in body.lines().enumerate() {
+        if markdown {
+            if let Some((ch, len)) = fence {
+                if fence_closes(raw, ch, len) {
+                    fence = None;
+                }
+                prev_nonblank = false;
+                continue;
+            }
+            if let Some(opened) = fence_open(raw) {
+                fence = Some(opened);
+                prev_nonblank = false;
+                continue;
+            }
+        }
+        let found_marker = non_divider_marker(raw).or_else(|| {
+            (raw == "=======" && (!markdown || is_changelog || has_outer_marker || !prev_nonblank))
+                .then_some("=======")
+        });
+        if let Some(marker) = found_marker {
+            out.push(Finding {
+                rule: CONFLICT_MARKER.id,
+                path: rel.to_owned(),
+                line: idx + 1,
+                detail: format!(
+                    "leftover git conflict marker `{marker}`: finish resolving the merge"
+                ),
             });
-            if let Some(marker) = found_marker {
-                out.push(Finding {
-                    rule: CONFLICT_MARKER.id,
-                    path: rel.clone(),
-                    line: idx + 1,
-                    detail: format!(
-                        "leftover git conflict marker `{marker}`: finish resolving the merge"
-                    ),
-                });
-            }
-            prev_nonblank = !raw.trim().is_empty();
         }
+        prev_nonblank = !raw.trim().is_empty();
     }
 }
 
@@ -207,5 +248,27 @@ mod tests {
             ],
             "{found:?}"
         );
+    }
+
+    /// Readers take the paths a batch at a time: every file of a tree many batches wide is
+    /// read, and each marker found once, in its file's place.
+    #[test]
+    fn every_file_of_many_batches_is_read() {
+        let files: Vec<(String, &str)> = (0..5 * BATCH)
+            .map(|i| {
+                let body = if i % 3 == 0 {
+                    "# N\n\n<<<<<<< HEAD\n"
+                } else {
+                    "# N\n"
+                };
+                (format!("docs/n{i:04}.md"), body)
+            })
+            .collect();
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+        let expected: Vec<String> = (0..5 * BATCH)
+            .step_by(3)
+            .map(|i| format!("docs/n{i:04}.md:3"))
+            .collect();
+        assert_eq!(spots(&run(&CONFLICT_MARKER, &files)), expected);
     }
 }

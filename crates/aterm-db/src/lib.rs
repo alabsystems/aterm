@@ -118,8 +118,9 @@ pub fn inspect_writer_recovery(paths: &aterm_secrets::client::Paths) -> Result<a
 }
 
 /// A refusal that identifies the failed boundary without quoting payloads or keys.
-pub struct Error(pub String, FailureKind);
+pub struct Error(pub String, #[cfg(unix)] FailureKind);
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum FailureKind {
     Other,
@@ -142,14 +143,18 @@ impl fmt::Debug for Error {
     }
 }
 /// What [`Error::busy`] says.
+#[cfg(unix)]
 const BUSY: &str = "another local writer holds this table; nothing changed, retry shortly";
+#[cfg(unix)]
 const SNAPSHOT_CHANGED: &str = "table witness advanced during observation; reopen and verify";
 #[cfg(unix)]
 const ENROLLMENT_PENDING: &str = "table enrollment is not yet complete";
 impl Error {
+    #[cfg(unix)]
     pub(crate) fn repair(reason: &str, cause: aterm_types::network_state::RepairCause) -> Self {
         Self(reason.into(), FailureKind::Repair(cause))
     }
+    #[cfg(unix)]
     pub(crate) fn repair_cause(&self) -> aterm_types::network_state::RepairCause {
         use aterm_types::network_state::RepairCause;
         match self.1 {
@@ -163,13 +168,22 @@ impl Error {
         }
     }
     pub(crate) fn new(reason: &str) -> Self {
-        Self(reason.into(), FailureKind::Other)
+        #[cfg(unix)]
+        {
+            Self(reason.into(), FailureKind::Other)
+        }
+        #[cfg(not(unix))]
+        {
+            Self(reason.into())
+        }
     }
     /// Another local writer held the store this needed, and nothing changed.
+    #[cfg(unix)]
     pub(crate) fn busy() -> Self {
         Self(BUSY.into(), FailureKind::Busy)
     }
     /// A newer witness needs fresh verification; the changed handle refuses reads.
+    #[cfg(unix)]
     pub(crate) fn snapshot_changed() -> Self {
         Self(SNAPSHOT_CHANGED.into(), FailureKind::SnapshotChanged)
     }
@@ -231,16 +245,19 @@ impl Error {
         }
     }
     /// Whether local contention or a newer snapshot requires a fresh observation.
+    #[cfg(unix)]
     pub(crate) fn is_busy(&self) -> bool {
         matches!(self.1, FailureKind::Busy | FailureKind::SnapshotChanged)
     }
     /// Whether what a read observed moved on while it read: nothing is wrong with the store, and
     /// a fresh observation is the answer.
+    #[cfg(unix)]
     pub(crate) fn is_snapshot_changed(&self) -> bool {
         matches!(self.1, FailureKind::SnapshotChanged)
     }
 
     /// Add local diagnostic context without changing the failure's classification.
+    #[cfg(unix)]
     pub(crate) fn context(self, context: &str) -> Self {
         Self(format!("{context}: {}", self.0), self.1)
     }
@@ -254,28 +271,42 @@ impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         // An I/O WouldBlock can be a network timeout, not local writer contention.
-        Self(
-            value.to_string(),
-            FailureKind::Repair(aterm_types::network_state::RepairCause::Io),
-        )
+        #[cfg(unix)]
+        {
+            Self(
+                value.to_string(),
+                FailureKind::Repair(aterm_types::network_state::RepairCause::Io),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            Self(value.to_string())
+        }
     }
 }
 impl From<aterm_secrets::Error> for Error {
     fn from(value: aterm_secrets::Error) -> Self {
-        let kind = match value.kind() {
-            aterm_secrets::ErrorKind::JournalBusy
-            | aterm_secrets::ErrorKind::CustodyBusy
-            | aterm_secrets::ErrorKind::VaultBusy
-            | aterm_secrets::ErrorKind::VaultChanged => FailureKind::Busy,
-            aterm_secrets::ErrorKind::MembershipCapacity => {
-                FailureKind::Repair(aterm_types::network_state::RepairCause::Quota)
-            }
-            aterm_secrets::ErrorKind::MembershipHistoryUnavailable => {
-                FailureKind::Repair(aterm_types::network_state::RepairCause::NotReady)
-            }
-            _ => FailureKind::Other,
-        };
-        Self(value.to_string(), kind)
+        #[cfg(unix)]
+        {
+            let kind = match value.kind() {
+                aterm_secrets::ErrorKind::JournalBusy
+                | aterm_secrets::ErrorKind::CustodyBusy
+                | aterm_secrets::ErrorKind::VaultBusy
+                | aterm_secrets::ErrorKind::VaultChanged => FailureKind::Busy,
+                aterm_secrets::ErrorKind::MembershipCapacity => {
+                    FailureKind::Repair(aterm_types::network_state::RepairCause::Quota)
+                }
+                aterm_secrets::ErrorKind::MembershipHistoryUnavailable => {
+                    FailureKind::Repair(aterm_types::network_state::RepairCause::NotReady)
+                }
+                _ => FailureKind::Other,
+            };
+            Self(value.to_string(), kind)
+        }
+        #[cfg(not(unix))]
+        {
+            Self(value.to_string())
+        }
     }
 }
 #[cfg(all(unix, test))]

@@ -216,8 +216,8 @@ mod tests {
             let secret = aterm_net::fleet::FleetSecret::new(&[0x5a; 24]).unwrap();
             let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
             let addr = listener.local_addr().unwrap();
-            let running = Arc::new(AtomicBool::new(true));
-            let serving = Arc::clone(&running);
+            let stop = Arc::new(Stop::new());
+            let serve_stop = Arc::clone(&stop);
             let listening = aterm_net::fleet::Listening {
                 secret: secret.clone(),
                 scope: FleetScope::Facts,
@@ -231,7 +231,7 @@ mod tests {
                 aterm_net::fleet::serve_with_handshake(
                     &listener,
                     &listening,
-                    &serving,
+                    &serve_stop,
                     aterm_spec::wait::MUST_HAPPEN,
                     move |served, _| {
                         served.answer(|stream| {
@@ -246,7 +246,7 @@ mod tests {
                 );
             });
             let proved = prove(addr, &secret, &expected, aterm_spec::wait::MUST_HAPPEN);
-            running.store(false, Ordering::Release);
+            stop.set();
             server.join().unwrap();
             assert_eq!(proved.is_ok(), succeeds, "{proved:?}");
         }

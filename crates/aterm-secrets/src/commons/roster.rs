@@ -1092,8 +1092,12 @@ fn commons_log_state_digest(
 ) -> Result<[u8; 32]> {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(heads_digest);
-    // Each file's digest is kept while the file stands ([`crate::fsx::private_digest`]).
-    let state = crate::fsx::private_digest(&paths.state_file(), crate::client::MAX_STATE, glance)?;
+    // Each file's digest is kept while the file stands ([`crate::fsx::private_digest`]); the
+    // state's is of what it holds but when the vault last heard this Mac and the receipts of its
+    // rounds ([`crate::client::state_standing_in`]), which no access is judged by and which a
+    // round of the vault's subscriber rewrites about every 25 s, each rewrite judging every
+    // remembered access afresh (2026-11-09).
+    let state = crate::client::state_standing_in(paths, glance)?;
     let source = crate::fsx::public_digest(
         &paths.dir.join("source.toml"),
         crate::client::MAX_STATE,

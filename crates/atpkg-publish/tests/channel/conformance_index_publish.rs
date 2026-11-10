@@ -261,6 +261,7 @@ impl Channel for FakeChannel {
                 slug,
                 &lay.tag,
                 FakeRelease {
+                    published_at: None,
                     draft: lay.draft,
                     prerelease: true,
                     assets: lay.assets.clone(),

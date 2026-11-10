@@ -16,6 +16,8 @@ pub struct FakeRelease {
     pub draft: bool,
     /// A prerelease.
     pub prerelease: bool,
+    /// The host's publication timestamp, if one was observed.
+    pub published_at: Option<String>,
     /// Asset name -> bytes.
     pub assets: BTreeMap<String, Vec<u8>>,
 }
@@ -346,6 +348,7 @@ impl FakeHost {
             FakeRelease {
                 draft,
                 prerelease: true,
+                published_at: None,
                 assets,
             },
         );
@@ -542,6 +545,7 @@ impl ReleaseHost for FakeHost {
                 tag: tag.clone(),
                 draft: r.draft,
                 prerelease: r.prerelease,
+                published_at: r.published_at.clone(),
                 assets: r.assets.keys().cloned().collect(),
             });
             let n = strays.and_then(|t| t.get(tag)).copied().unwrap_or(0);
@@ -549,6 +553,7 @@ impl ReleaseHost for FakeHost {
                 tag: tag.clone(),
                 draft: true,
                 prerelease: true,
+                published_at: None,
                 assets: Vec::new(),
             }));
         }
@@ -576,6 +581,7 @@ impl ReleaseHost for FakeHost {
             tag: tag.to_string(),
             draft: r.draft,
             prerelease: r.prerelease,
+            published_at: r.published_at.clone(),
             assets: r.assets.keys().cloned().collect(),
         })
     }

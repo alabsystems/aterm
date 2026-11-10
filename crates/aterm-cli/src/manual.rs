@@ -1566,7 +1566,12 @@ AUTOPILOT — how far the harness carries a session's work
   overwrite, reset, force-push) stays a need.
 
 THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
-  enabled [true]                  master switch for the window supervisor
+  enabled [true]                  master switch for the window supervisor; off, an
+                                  agent pane wears only the switch on its top rule
+                                  (drawn off; a click turns the harness back on): no
+                                  glass, facts, chips, quota row, card or typing; in a
+                                  window with no host, not even the switch; a program
+                                  with no top-rule switch keeps line D's `⊘ off` chip
   headless [true]                 supervise `--headless` sessions too
   autopilot ["cruise"]            default mode: `"cruise"`, `"land"` or `"off"`
   land_at [none]                  `"HH:MM"` local time offered as "Cruise until HH:MM,
@@ -1666,7 +1671,8 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   `muse`) stops supervising that agent alone; for `claude` and `codex` it also turns
   off that CLI's account rotation (the account a worker launches on, and Claude Code's
   moves in the window) and its automatic sign-ins, which `[harness] enabled = false`
-  turns off for every CLI. A `[harness.gemini]` table, the retired Gemini CLI's,
+  turns off for every CLI. Its panes wear only the switch, as under the master
+  switch off. A `[harness.gemini]` table, the retired Gemini CLI's,
   switches nothing: its note says agy replaces it.
 
 THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
@@ -1765,14 +1771,24 @@ THE FOOTER
   the rule above the composer, ends with the harness label `alab v<ver> (v<cli>)`, or
   `alab v<ver>` where the CLI's build does not fit or is not known.
   Line D, the rule below it, sets its facts at one size, as terminal text: `◆` the model
-  and effort, `⌂` the path, `⎇` the branch, `◐` the context, `Σ` the session's usage,
-  and `⧗ until <when>` only while the account is out at a usage limit (that slot carries
-  a wall and nothing else). It names the account only where line E is not aterm's: 10 s
+  and effort at the far left, then `⧗ until <when>` only while the account is out at a
+  usage limit (that slot carries a wall and nothing else), the account unit, `⌂` the
+  path, `⎇` the branch, `◐` the context and `Σ` the session's usage. As the rule
+  narrows the model gives way last: the workspace facts first, then the account unit's
+  forms, then the wall, then the effort. In Claude Code a click (or Enter or Space) on
+  the model or its effort switches the session to Opus 5.5 at xhigh effort, keeping a
+  1M-context variant the usage tap names, remembering what it ran as its own, and from
+  there back to that (Claude's default model and auto effort where nothing is
+  remembered): aterm types `/model <id>` into an idle, empty composer and, once Claude
+  answers, `/effort <level>`, refusing as the fact menus' typed rows do (the hover names
+  where a click goes). Their right-click menus offer the same switch beside `Change
+  model…` and `Effort slider…`. In any other program a click hides them. It names the account only where line E is not aterm's: 10 s
   after the session's first frame or its last claim of line E with no claim since (the
   grace is the session's, so a tab shown again keeps its state), and always for agy, a
   CLI with no line E, or a harness switched off. That unit is words only:
   `⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00`, then without the reset, then the
-  name and figure, then the name, each shorter form only after the other facts gave way.
+  name and figure, then its email's local part and figure, then the local part, each
+  shorter form only after the other facts gave way.
   Line E is the row Claude Code prints from aterm's usage tap under the bottom rule:
   `week 63% used · resets Sat 10:00` (`week 63% used` with no reset to say,
   `week · no figure yet` before a figure). Where the tap's newest reading says the row
@@ -1784,13 +1800,20 @@ THE FOOTER
   * the named accounts and their weeks used, `main 75% · alt1 80% · alt2 90%`: at most
     three in roster order (preferred first), this tab's in bold and the one carrying the
     work always among them, the rest folded into `+N`, never dropped; one account reads
-    `main 63% used`. A figure is `63%` read within 15 minutes, `≥70%` for an older
+    `main 63% used`. An account is named by its email (`owner@example.com 75%`) wherever
+    aterm shows it, on line D, line E, their hovers and the Accounts card, and by its
+    roster label only where its roster row has no email; the label stays the account's
+    key, and no email leaves the Mac. An email takes up to 32 cells; a longer one shows
+    its local part, the words before `@`, cut with `…` past 32 cells, and once the row
+    narrows past its widest rungs every name shows its local part cut with `…` past 12
+    cells. A figure is `63%` read within 15 minutes, `≥70%` for an older
     reading (use only rises within a week), `out` at a wall and `?` unread; `100%` only
     for a reading of 100.
   * one chart over [now − 1 d, now + 7 d) at 3 to 12 cells a day: this tab's week as
     read on this Mac in solid steps (blank before its first reading), `▕` now, then the
     projected fill of whichever account carries the work as a thin line, with `↺` a
-    reset, `→` a hand-off (the next account's name after it where it fits), `╳` a stop
+    reset, `→` a hand-off (the next account's name after it where it fits, else its
+    local part, else that cut to 12 cells), `╳` a stop
     (every account out, or the wall the work waits at now), `$` usage credits and `┄`
     not projected (after an unread account the work would reach, or the whole week with
     no pace yet, a paused recovery or a tab the rotation cannot move). Ticks at the foot
@@ -1816,8 +1839,8 @@ THE FOOTER
   says `out ~Sat 03:00`, kept after its plan gives way) over its burn-up lane: its own
   vendor week on the work row's clock, read then projected to its reset, out drawn as a
   line along the lane's top. Folded accounts are items under a rule, and a legend names
-  the glyphs; an account the outlook has no words for keeps the store's own (`m27 ·
-  preferred · 39% used`), and without an outlook every item does. Choosing an item
+  the glyphs; an account the outlook has no words for keeps the store's own
+  (`m27@example.com · preferred · 39% used`), and without an outlook every item does. Choosing an item
   switches this machine to that account and pins it;
   `⇄ No pinned account · this machine` releases the pin; `⋯ Account settings…` opens a
   tab in aterm's configuration folder. The window's thread reads no file for the card:
@@ -1941,6 +1964,10 @@ HOW IT WORKS & GOTCHAS
     kimi's flag is `--auto` (Never Ask), so aterm's `--yolo` takes over Kimi's own
     `-y`/`--yolo` (Ask When Needed) and drops `-y`, `--yes` and `--auto-approve` beside it.
     The agent's own updater (`claude update`) runs `aterm pkg update <program>`.
+  * Inside an aterm session, claude starts its fullscreen renderer from its first launch
+    (`CLAUDE_CODE_NO_FLICKER=1`), unless the launch names a renderer: that variable or
+    `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` set, a `"tui"` key in your own settings.json
+    (`/tui default` saves one), or `--no-harness`.
   * Signed out, grok opens accounts.x.ai in the default browser on every launch. Inside a
     session its twin first runs `aterm harness signin --cli grok --wait`: one sandboxed
     sign-in for the machine, one need with its code and page, no page opened; grok runs
@@ -6306,72 +6333,6 @@ mod tests {
             );
         }
         drop(hold);
-    }
-
-    /// THE DOCTOR'S HELP IS SHORT, BY ROW KIND: `aterm doctor --help` is its usage line and five
-    /// forms; `aterm help doctor` is the same block, what the report shows, one exit-code
-    /// paragraph naming 0, 1 and 2, and one pointer line, in at most 20 lines. The setup prose
-    /// moved to `aterm help setup`, which keeps the settings modes and the develop paragraph.
-    #[test]
-    fn the_doctor_help_is_its_forms_and_exit_codes_and_setup_has_the_prose() {
-        let help = crate::doctor::help();
-        let kinds =
-            |text: &str, kind: &dyn Fn(&str) -> bool| text.lines().filter(|l| kind(l)).count();
-        let usage = |l: &str| l.starts_with("usage: aterm doctor ");
-        let form = |l: &str| l.starts_with("  aterm doctor");
-        assert_eq!(kinds(&help, &usage), 1, "{help}");
-        assert_eq!(kinds(&help, &form), 5, "{help}");
-        assert_eq!(
-            help.lines().count(),
-            6,
-            "the usage line and five forms: {help}"
-        );
-
-        let (page, code) = render(Some("doctor"), None, None);
-        assert_eq!(code, 0);
-        assert!(page.contains(&help), "{page}");
-        assert!(
-            page.lines().count() <= 20,
-            "{} lines:\n{page}",
-            page.lines().count()
-        );
-        assert_eq!(kinds(&page, &usage), 1, "{page}");
-        assert_eq!(kinds(&page, &form), 5, "{page}");
-        let exits = kinds(&page, &|l: &str| l.starts_with("Exit codes:"));
-        assert_eq!(exits, 1, "{page}");
-        let paragraph = page
-            .split("\n\n")
-            .find(|p| p.starts_with("Exit codes:"))
-            .unwrap();
-        for code in [
-            "0 every selected check",
-            "1 something needs you",
-            "2 a usage error",
-        ] {
-            assert!(paragraph.contains(code), "{code}: {paragraph}");
-        }
-        assert_eq!(
-            kinds(&page, &|l: &str| l.starts_with("More: ")),
-            1,
-            "{page}"
-        );
-        assert!(
-            !page.contains("System State remains"),
-            "the setup prose moved: {page}"
-        );
-
-        let (setup, code) = render(Some("setup"), None, None);
-        assert_eq!(code, 0);
-        for kept in [
-            "aterm doctor --check",
-            "aterm doctor --restore",
-            "System State remains",
-            "Restore previous settings",
-            "DEVELOP MACHINES",
-            "verify provision --check",
-        ] {
-            assert!(setup.contains(kept), "{kept}: {setup}");
-        }
     }
 
     /// `aterm help privacy` is the permissions page, which opens with a table of at most ten

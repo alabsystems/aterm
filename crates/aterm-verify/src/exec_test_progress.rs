@@ -22,6 +22,7 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::libtest::Marks;
 use crate::libtest_json::{Kind, case_block, line_event};
@@ -41,12 +42,20 @@ pub struct Failure {
     pub start_col: Option<u64>,
 }
 
-/// Observations, never a complete failure census or a binary verdict.
+/// One completed case's libtest execution time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Timing {
+    pub case: String,
+    pub execution: Duration,
+}
+
+/// Observations retained independently of human rendering, never a binary verdict.
 #[derive(Clone, Debug, Default)]
 pub struct Observations {
     pub read_end: ReadEnd,
     pub json: bool,
     pub failures: Vec<Failure>,
+    pub timings: Vec<Timing>,
 }
 
 /// Why the last bounded read ended; an empty batch alone never means EOF.
@@ -60,6 +69,9 @@ pub enum ReadEnd {
 }
 
 impl ReadEnd {
+    pub(crate) const fn is_eof(self) -> bool {
+        matches!(self, Self::Eof)
+    }
     pub fn name(self) -> &'static str {
         match self {
             Self::Budget => "budget",
@@ -277,6 +289,16 @@ impl LiveCases {
             "ok" | "failed" | "ignored" => {
                 if !self.started.contains(&name) || !self.ended.insert(name.clone()) {
                     return None;
+                }
+                if ev.kind == Kind::Test
+                    && ev.event != "ignored"
+                    && let Some(seconds) = ev.exec_time
+                    && let Ok(execution) = Duration::try_from_secs_f64(seconds)
+                {
+                    self.observations.timings.push(Timing {
+                        case: name.clone(),
+                        execution,
+                    });
                 }
                 if ev.event != "failed"
                     || (self.red

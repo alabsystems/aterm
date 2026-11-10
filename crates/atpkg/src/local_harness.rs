@@ -134,11 +134,13 @@ impl LocalIdentity {
     }
 }
 
-/// A positively absent current entry or a complete checked local selection.
+/// A positively absent current entry, a foreign managed predecessor, or a checked local selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CurrentLocal {
     /// Missing current link, store directory or program directory under proved ancestors.
     Absent,
+    /// A complete current build with no local receipt; only its numeric CAS token is known.
+    Foreign(u64),
     /// Exact local current with coherent ready record, receipt and executable bytes.
     Selected(LocalIdentity),
 }
@@ -149,14 +151,15 @@ impl CurrentLocal {
     pub const fn expected(&self) -> ExpectedCurrent {
         match self {
             Self::Absent => ExpectedCurrent::Absent,
+            Self::Foreign(build) => ExpectedCurrent::Build(*build),
             Self::Selected(identity) => ExpectedCurrent::Build(identity.build),
         }
     }
 }
 
 /// Read current through the held store lock and ancestor descriptors, without changing it.
-/// This observation grants no install, execution or signed authority. Foreign, incomplete,
-/// malformed and unreadable entries are errors, never absence.
+/// This observation grants no install, execution or signed authority. A foreign current has no
+/// local receipt and yields only its build number for CAS. Incomplete or changed entries are errors.
 /// # Errors
 /// A changed lock/ancestor/current, nonlocal numeric build, invalid receipt, or changed payload.
 pub fn observe_current(lock: &StoreLock, program: &str) -> io::Result<CurrentLocal> {
@@ -172,9 +175,19 @@ pub fn observe_current(lock: &StoreLock, program: &str) -> io::Result<CurrentLoc
         parent.reprove()?;
         return Ok(CurrentLocal::Absent);
     };
-    let record: Record =
-        aterm_json::from_slice(&parent.read(&format!("{build}{SUFFIX}"), RECORD_MAX)?)
-            .map_err(|e| invalid(format!("local current record: {e}")))?;
+    let bytes = match parent.read(&format!("{build}{SUFFIX}"), RECORD_MAX) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if parent.current(&layout)? != observed {
+                return Err(invalid("current changed during observation"));
+            }
+            parent.reprove()?;
+            return Ok(CurrentLocal::Foreign(build));
+        }
+        Err(error) => return Err(error),
+    };
+    let record: Record = aterm_json::from_slice(&bytes)
+        .map_err(|e| invalid(format!("local current record: {e}")))?;
     let receipt = &record.receipt;
     // This scope is used only to validate observed metadata; it never escapes as a grant.
     let scope = LocalAuthority::new(program, &receipt.command, &receipt.source, &receipt.target)?;

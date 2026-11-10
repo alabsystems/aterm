@@ -60,6 +60,8 @@ fn used_at(t: u64) -> Event {
         src: Source::CliOutput,
         why: None,
         to: None,
+        tab: None,
+        harness: None,
     }
 }
 

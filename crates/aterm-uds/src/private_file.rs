@@ -6,8 +6,9 @@
 
 use std::fmt;
 use std::io::{self, Read};
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Error returned when reading or opening a private state file ([`read_private`]).
 #[derive(Debug)]
@@ -120,18 +121,145 @@ pub fn read_private_with_metadata(
     max: usize,
 ) -> Result<(Vec<u8>, std::fs::Metadata), PrivateFileError> {
     let (file, metadata) = open_private(dir, name)?;
-    read_capped_with_len(file, metadata.len(), max).map(|bytes| (bytes, metadata))
+    read_capped_with_len(&file, metadata.len(), max).map(|bytes| (bytes, metadata))
+}
+
+/// How old a file's last change must be before a parse of it is kept ([`KeptParse`]): two
+/// changes inside one tick of the filesystem's clock can leave the file with the stamp the
+/// first left (an atomic write's new file can take the inode the write before it freed, at the
+/// same length), so a change younger than this may still be followed by one no stamp tells
+/// apart.
+pub const SETTLE: Duration = Duration::from_secs(1);
+
+/// Whether `meta`, read on the open `file` no earlier than `began`, tells apart every later state
+/// of it: its identity, length and times move at any change after a last change at least `settle`
+/// before `began` ([`SETTLE`]), on a volume whose times this kernel's clock sets (not a network,
+/// user-space or virtual machine's volume). [`KeptParse`] keeps a parse only under such a stamp;
+/// a caller that keeps something else derived from a file asks here.
+#[must_use]
+pub fn stamp_settled(
+    file: &std::fs::File,
+    meta: &std::fs::Metadata,
+    began: SystemTime,
+    settle: Duration,
+) -> bool {
+    Stamp::of(meta).settled(began, settle) && crate::file_watch::volume_times_are_this_kernels(file)
+}
+
+/// A file's identity and times, read on its open descriptor: a write of it, a rename over it
+/// and a change of its owner or mode each move one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+
+    /// Whether the last change this stamp records is at least `settle` before `now`; a change
+    /// time before the epoch or after `now` is not.
+    fn settled(&self, now: SystemTime, settle: Duration) -> bool {
+        let (Ok(secs), Ok(nanos)) = (u64::try_from(self.ctime.0), u32::try_from(self.ctime.1))
+        else {
+            return false;
+        };
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(secs))
+            .and_then(|at| at.checked_add(Duration::from_nanos(u64::from(nanos))))
+            .and_then(|changed| now.duration_since(changed).ok())
+            .is_some_and(|age| age >= settle)
+    }
+}
+
+/// What reads of private files parsed, each kept under the stamp of the file it was read from:
+/// a reader that looks again at a file nothing changed since opens and judges it under
+/// [`read_private`]'s rules, as every read does, then hands back that parse without reading or
+/// parsing the file again. A parse is kept only for a file whose last change is [`SETTLE`]
+/// older than the read's start, on a volume whose times this kernel's clock sets, so any later
+/// change moves the stamp, and of at most `bound` files, the first kept forgotten first. What is
+/// kept stays in memory: no place for a secret.
+pub struct KeptParse<T> {
+    kept: Mutex<Vec<(PathBuf, Stamp, T)>>,
+    bound: usize,
+    settle: Duration,
+}
+
+impl<T: Clone> KeptParse<T> {
+    /// No parse kept yet, and none ever of more than `bound` files.
+    #[must_use]
+    pub const fn new(bound: usize) -> Self {
+        Self::settled_after(bound, SETTLE)
+    }
+
+    /// [`Self::new`], keeping a parse only of a file whose last change is `settle` old.
+    const fn settled_after(bound: usize, settle: Duration) -> Self {
+        Self {
+            kept: Mutex::new(Vec::new()),
+            bound,
+            settle,
+        }
+    }
+
+    /// `parse` of `name` in `dir`, read under [`read_private`]'s rules and byte cap `max`, or
+    /// what `parse` said of that same file before.
+    /// # Errors
+    /// As [`read_private`]: the file is opened and judged at every call, a parse kept or not.
+    pub fn read(
+        &self,
+        dir: &Path,
+        name: &str,
+        max: usize,
+        parse: impl FnOnce(&[u8]) -> T,
+    ) -> Result<T, PrivateFileError> {
+        let began = SystemTime::now();
+        let (file, meta) = open_private(dir, name)?;
+        let path = dir.join(name);
+        let stamp = Stamp::of(&meta);
+        if let Some((.., kept)) = self
+            .lock()
+            .iter()
+            .find(|(at, held, _)| *held == stamp && *at == path)
+        {
+            return Ok(kept.clone());
+        }
+        let parsed = parse(&read_capped_with_len(&file, meta.len(), max)?);
+        if stamp_settled(&file, &meta, began, self.settle) {
+            let mut kept = self.lock();
+            kept.retain(|(at, ..)| *at != path);
+            kept.push((path, stamp, parsed.clone()));
+            let over = kept.len().saturating_sub(self.bound);
+            kept.drain(..over);
+        }
+        Ok(parsed)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<(PathBuf, Stamp, T)>> {
+        self.kept.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// `file`'s bytes, refused when there are more than `max` ([`read_capped_into`] for a vector).
 #[cfg(test)]
 fn read_capped(file: std::fs::File, max: usize) -> Result<Vec<u8>, PrivateFileError> {
     let len = file.metadata().map_err(PrivateFileError::Io)?.len();
-    read_capped_with_len(file, len, max)
+    read_capped_with_len(&file, len, max)
 }
 
 fn read_capped_with_len(
-    file: std::fs::File,
+    file: &std::fs::File,
     file_len: u64,
     max: usize,
 ) -> Result<Vec<u8>, PrivateFileError> {
@@ -295,7 +423,7 @@ impl<'a> JudgedDir<'a> {
         max: usize,
     ) -> Result<(Vec<u8>, std::fs::Metadata), PrivateFileError> {
         let (file, meta) = self.open(name)?;
-        read_capped_with_len(file, meta.len(), max).map(|bytes| (bytes, meta))
+        read_capped_with_len(&file, meta.len(), max).map(|bytes| (bytes, meta))
     }
 }
 
@@ -487,7 +615,7 @@ pub fn read_private_into(
 /// As [`read_owned_into`].
 pub fn read_owned(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
     let (file, meta, _loose) = open_judged(dir, name, Opening::Owned)?;
-    read_capped_with_len(file, meta.len(), max)
+    read_capped_with_len(&file, meta.len(), max)
 }
 
 /// What [`read_owned_into`] read: the length, the file's identity, and whether the file or
@@ -1036,10 +1164,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        OwnedRead, PrivateDir, PrivateFileError, PrivateLock, PrivateRead, check_owned_dir,
-        create_private_dir, ensure_private_dir, judge_private_dir, open_private_rw,
-        read_owned_into, read_private, read_private_into, remove_private, write_private,
-        write_private_new,
+        KeptParse, OwnedRead, PrivateDir, PrivateFileError, PrivateLock, PrivateRead,
+        check_owned_dir, create_private_dir, ensure_private_dir, judge_private_dir,
+        open_private_rw, read_owned_into, read_private, read_private_into, remove_private,
+        write_private, write_private_new,
     };
 
     /// The busy text the lock tests hand [`PrivateLock::take`].
@@ -2065,5 +2193,74 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::InvalidInput
         );
+    }
+
+    /// A parse of a file nothing changed since is handed back without reading the file again,
+    /// and a write over it (a rename, as [`write_private`] makes) is read and parsed again.
+    /// NEGATIVE CONTROL: finding a kept parse by its path alone (`*held == stamp` dropped)
+    /// fails "a rewrite is read again".
+    #[test]
+    fn a_kept_parse_of_a_file_nothing_changed_is_not_read_again() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        write_private(&dir, "book", b"first").unwrap();
+        let kept = KeptParse::settled_after(4, Duration::ZERO);
+        let parses = std::cell::Cell::new(0);
+        let parse = |bytes: &[u8]| {
+            parses.set(parses.get() + 1);
+            bytes.to_vec()
+        };
+        assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"first");
+        assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"first");
+        assert_eq!(parses.get(), 1, "a file nothing changed is parsed once");
+        write_private(&dir, "book", b"again").unwrap();
+        assert_eq!(
+            kept.read(&dir, "book", 64, parse).unwrap(),
+            b"again",
+            "a rewrite is read again"
+        );
+        assert_eq!(parses.get(), 2);
+    }
+
+    /// A kept parse is handed back only after the file was opened and judged again: once its
+    /// directory is no longer private the read is refused, though the file stands as it was.
+    /// NEGATIVE CONTROL: looking the parse up by the stamp `symlink_metadata` gives, before
+    /// and instead of the open, hands the kept parse back.
+    #[test]
+    fn a_kept_parse_is_judged_at_every_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        write_private(&dir, "book", b"held").unwrap();
+        let kept = KeptParse::settled_after(4, Duration::ZERO);
+        assert_eq!(
+            kept.read(&dir, "book", 64, <[u8]>::to_vec).unwrap(),
+            b"held"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            kept.read(&dir, "book", 64, <[u8]>::to_vec),
+            Err(PrivateFileError::NotPrivate(_))
+        ));
+    }
+
+    /// A parse of a file whose last change is younger than the settle time is not kept: two
+    /// changes inside one tick of the filesystem's clock can leave one stamp, so the next read
+    /// parses the file again. NEGATIVE CONTROL: keeping every parse (`stamp.settled` dropped)
+    /// parses it once.
+    #[test]
+    fn a_parse_of_a_file_changed_just_now_is_not_kept() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        write_private(&dir, "book", b"fresh").unwrap();
+        let kept = KeptParse::settled_after(4, Duration::from_secs(3600));
+        let parses = std::cell::Cell::new(0);
+        let parse = |bytes: &[u8]| {
+            parses.set(parses.get() + 1);
+            bytes.to_vec()
+        };
+        assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"fresh");
+        assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"fresh");
+        assert_eq!(parses.get(), 2);
     }
 }

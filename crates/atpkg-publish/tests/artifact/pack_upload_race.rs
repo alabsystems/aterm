@@ -15,6 +15,7 @@ struct BeforeUpload {
     before_create: bool,
     reservation_fault: ReservationFault,
     payload_order: Arc<Mutex<Vec<Vec<String>>>>,
+    created_titles: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -34,6 +35,7 @@ impl BeforeUpload {
             before_create: false,
             reservation_fault: ReservationFault::None,
             payload_order: Arc::default(),
+            created_titles: Arc::default(),
         }
     }
 }
@@ -65,6 +67,7 @@ impl ReleaseHost for BeforeUpload {
         notes: &str,
         files: &[PathBuf],
     ) -> Result<(), HostError> {
+        self.created_titles.lock().unwrap().push(title.to_string());
         if self.before_create {
             let once = self.once.lock().unwrap().take();
             if let Some(once) = once {
@@ -163,6 +166,67 @@ fn empty_release(w: &World) -> Slug {
     slug
 }
 
+#[test]
+fn managed_pack_titles_lead_with_the_exact_product_version() {
+    let w = world("human-pack-titles");
+    for (program, repo, build, version, title) in [
+        ("ay", "ay", 9, "0.27.0", "ay 0.27.0 (build 9)"),
+        (
+            "codex",
+            "codex-alab",
+            2026110901,
+            "0.2.0-dev.15239+codex.0.167.0.g022ae520c",
+            "codex-alab 0.2.0-dev.15239+codex.0.167.0.g022ae520c (build 2026110901)",
+        ),
+    ] {
+        let dir = w.root.join(format!("title-{program}"));
+        let manifest_name = format!("pkg-{program}-{build}.toml");
+        let manifest = dir.join(&manifest_name);
+        let manifest_bytes = format!(
+            "schema = 1\nprogram = \"{program}\"\nversion = \"{version}\"\nbuild_number = {build}\n"
+        )
+        .into_bytes();
+        put(&manifest, &manifest_bytes);
+        let archive_name = format!("{program}-{build}.tar.zst");
+        let archive = dir.join(&archive_name);
+        let payload = b"the qualified payload is unchanged";
+        put(&archive, payload);
+        let wrapper = BeforeUpload::over(Arc::clone(&w.host));
+        let titles = Arc::clone(&wrapper.created_titles);
+        let mut ctx = w.ctx.clone();
+        ctx.hosts.staging = Arc::new(wrapper);
+        let tag = upload::tag(program, build);
+
+        assert_eq!(
+            upload::publish(
+                &ctx,
+                repo,
+                &tag,
+                &manifest,
+                &[archive, manifest.clone()],
+                "pack"
+            )
+            .unwrap(),
+            upload::Uploaded::Staged
+        );
+        assert_eq!(*titles.lock().unwrap(), vec![title.to_string()]);
+        let slug = ctx.staging_slug(repo);
+        assert_eq!(
+            w.host.asset(&slug, &tag, &manifest_name),
+            Some(manifest_bytes)
+        );
+        assert_eq!(
+            w.host.asset(&slug, &tag, &archive_name),
+            Some(payload.to_vec())
+        );
+        assert!(
+            w.host
+                .asset(&slug, &tag, upload::VERSION_RESERVATION)
+                .is_some()
+        );
+    }
+}
+
 /// Both calls use production upload::publish. The hook completes B immediately
 /// after A's last check returned, before A's first payload clobber starts.
 #[test]
@@ -217,6 +281,7 @@ fn a_reserved_staging_version_refuses_another_host_after_the_snapshot() {
         before_create: false,
         reservation_fault: ReservationFault::None,
         payload_order: Arc::default(),
+        created_titles: Arc::default(),
     });
     let mut ctx_a = w.ctx.clone();
     ctx_a.state_dir = w.root.join("host-a-state");

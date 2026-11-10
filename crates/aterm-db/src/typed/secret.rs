@@ -133,6 +133,7 @@ pub trait Sealer {
 
 /// A [`Sealer`] with an explicit key and epoch: the session's resolver in `att`, and fixed test
 /// keys in the importer's plans.
+#[cfg(unix)]
 pub(crate) struct Keyed<'a, F> {
     pub(crate) table: &'a str,
     pub(crate) epoch: Digest,
@@ -141,6 +142,7 @@ pub(crate) struct Keyed<'a, F> {
     pub(crate) resolve: F,
 }
 
+#[cfg(unix)]
 impl<F: Fn(&Digest) -> Result<zeroize::Zeroizing<[u8; 32]>>> Sealer for Keyed<'_, F> {
     fn table(&self) -> &str {
         self.table
@@ -502,6 +504,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn secret_reads_on_another_mac_and_after_audience_rotation() {
         use crate::table::{Session, tests::Lab};
         use aterm_secrets::commons::roster::Role;

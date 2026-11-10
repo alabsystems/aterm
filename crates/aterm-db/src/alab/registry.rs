@@ -25,10 +25,9 @@
 
 use crate::{
     Error, Result,
-    att::Refused,
     database::Change,
     typed::{
-        Collection, Column, Derive, Kind, Member, OnConflict, Table, Ty, Writer, Writers,
+        Collection, Column, Derive, Kind, Member, OnConflict, Refused, Table, Ty, Writer, Writers,
         cell::{self, CellKey, CellValue, Cells},
         keys,
     },
@@ -722,7 +721,7 @@ pub fn guard(rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>>
     Ok(None)
 }
 
-/// A refusal of `collection.column` in row `pk` ([`crate::att::Refused`]).
+/// A refusal of `collection.column` in row `pk` ([`crate::typed::Refused`]).
 fn refused(collection: &Collection, pk: &str, column: &str, rule: String) -> Refused {
     Refused {
         collection: collection.name,
@@ -781,7 +780,7 @@ fn signs_in(row: &cell::Row, addresses: &cell::Projection) -> Option<(&'static s
 
 /// A row key as a refusal prints it.
 fn safe(pk: &str) -> &str {
-    crate::att::command::safe_key(pk)
+    keys::safe_key(pk)
 }
 
 crate::att_collection!(
@@ -856,6 +855,33 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 16 * 1024,
+    }
+);
+
+crate::att_collection!(
+    /// Which account a Mac's tabs really run, as their CLIs' login files say, keyed
+    /// `<account pk>.<signer uuid32>` (`docs/DESIGN-account-discovery-2026-11-09.md`): the
+    /// account, the CLI, whether a tab runs it, how many, since when, when last written, and
+    /// where its login was read. Each Mac writes only its own rows.
+    pub ACCOUNT_OBS = Collection {
+        name: "account-obs",
+        version: 1,
+        kind: Kind::Owned,
+        writers: Writers::SelfSuffix,
+        prefix: "",
+        derive: Derive::Composite,
+        columns: &[
+            Column::new("n", Ty::Uint).writer(Writer::Mine),
+            Column::new("account", Ty::Ref("account")).writer(Writer::Mine),
+            Column::new("cli", Ty::Enum(super::observe::CLIS)).writer(Writer::Mine),
+            Column::new("state", Ty::Enum(super::observe::STATES)).writer(Writer::Mine),
+            Column::new("tabs", Ty::Uint).writer(Writer::Mine),
+            Column::new("first_at", Ty::Time).writer(Writer::Mine),
+            Column::new("at", Ty::Time).writer(Writer::Mine),
+            Column::new("src", Ty::Enum(super::observe::SOURCES)).writer(Writer::Mine),
+        ],
+        unique: &[],
+        max_row: 1024,
     }
 );
 
@@ -1282,7 +1308,7 @@ crate::att_collection!(
 );
 
 /// Every collection of the registry, besides the reserved `schema` collection.
-pub const COLLECTIONS: [&Collection; 15] = [
+pub const COLLECTIONS: [&Collection; 16] = [
     &PROVIDER,
     &CLI,
     &PLAN,
@@ -1292,6 +1318,7 @@ pub const COLLECTIONS: [&Collection; 15] = [
     &ADDRESS,
     &MAILBOX,
     &MAILBOX_OBS,
+    &ACCOUNT_OBS,
     &PHONE,
     &ACCOUNT,
     &SUBACCOUNT,
@@ -1314,7 +1341,7 @@ pub const ROLE_2: &str = "registry.2";
 
 /// The second generation's collections: the first's, the rows a roll carries archived, and its
 /// cover rows.
-pub const COLLECTIONS_2: [&Collection; 17] = [
+pub const COLLECTIONS_2: [&Collection; 18] = [
     &PROVIDER,
     &CLI,
     &PLAN,
@@ -1324,6 +1351,7 @@ pub const COLLECTIONS_2: [&Collection; 17] = [
     &ADDRESS,
     &MAILBOX,
     &MAILBOX_OBS,
+    &ACCOUNT_OBS,
     &PHONE,
     &ACCOUNT,
     &SUBACCOUNT,

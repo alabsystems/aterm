@@ -26,6 +26,7 @@ pub(in crate::harness) fn retain_bound_preparation(state: &mut St) {
         account_intent: state.account_intent.clone().map(Box::new),
     };
     state.native_prepare = Request::prepare(Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         id: binding.id.clone(),
         host_epoch: "ef".repeat(16),

@@ -907,7 +907,7 @@ pub fn identity_in_home(home: &Path, email: &str) -> IdentityObservation {
 
 /// The profile a launch under the login directory `home` reads: its legacy `.config.json` where
 /// that takes precedence ([`effective`]), else its `.claude.json`.
-fn profile_in_home(home: &Path) -> PathBuf {
+pub(super) fn profile_in_home(home: &Path) -> PathBuf {
     effective(&home.join(".claude.json"), Some(home), false)
 }
 
@@ -1031,17 +1031,61 @@ pub struct LoginRecord {
 /// `user_home`), where it names an account by its address.
 #[must_use]
 pub fn login_record(user_home: &Path, login: Option<&str>) -> Option<LoginRecord> {
-    let path = match login.filter(|login| !login.is_empty()) {
+    match login.filter(|login| !login.is_empty()) {
         Some(login) => {
             let home = Path::new(login);
             if !home.is_absolute() {
                 return None;
             }
-            profile_in_home(home)
+            record_at(&profile_in_home(home)).ok().flatten()
         }
-        None => effective_of(&[], user_home)?,
+        None => login_record_of(&[], user_home).map(|(record, _, _)| record),
+    }
+}
+
+/// The login record of the profile that names the login a process's exec environment `env`
+/// runs on, with that file's path and its modification time: what a tab's CLI really runs on
+/// (`docs/DESIGN-account-discovery-2026-11-09.md`), read afresh each call. Under a login
+/// directory ([`super::accounts::LOGIN_ENV`]) it is that directory's profile, as
+/// [`login_record`] reads it; otherwise the one Claude Code reads for the home `env` names
+/// ([`effective_of`]: `CLAUDE_CONFIG_DIR`, `HOME`, the legacy `.config.json`, the custom-OAuth
+/// file). `None` where the file is absent or names no account by its address.
+#[must_use]
+pub fn login_record_of(
+    env: &[String],
+    user_home: &Path,
+) -> Option<(LoginRecord, PathBuf, std::time::SystemTime)> {
+    let path = login_profile_of(env, user_home)?;
+    let record = record_at(&path).ok()??;
+    let mtime = std::fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()?;
+    Some((record, path, mtime))
+}
+
+/// The profile naming the login `env` runs on ([`login_record_of`]): a login directory's own, an
+/// empty login directory being none, else the home's. An empty `env` names no login directory
+/// and no home variable, so it is the default home's profile ([`login_record`]'s default login,
+/// a process whose environment carries none of the selectors); only a login directory `env`
+/// names twice with two values names no profile.
+pub(super) fn login_profile_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
+    let login = if env.is_empty() {
+        None
+    } else {
+        exec_var(env, super::accounts::LOGIN_ENV)?
     };
-    read_with(&path, |bytes| {
+    match login {
+        Some(login) if !login.is_empty() => {
+            let home = Path::new(login);
+            home.is_absolute().then(|| profile_in_home(home))
+        }
+        _ => effective_of(env, user_home),
+    }
+}
+
+/// The login record the profile at `path` holds: `Ok(None)` for a file that names no account.
+pub(super) fn record_at(path: &Path) -> Result<Option<LoginRecord>, NoProfile> {
+    read_with(path, |bytes| {
         let Obj(who) =
             aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
         let Some(Address(Some(email))) = who.and_then(|who| who.oauth.0).map(|o| o.address) else {
@@ -1054,8 +1098,6 @@ pub fn login_record(user_home: &Path, login: Option<&str>) -> Option<LoginRecord
             .and_then(|oauth| oauth.key.0);
         Ok(Some(LoginRecord { email, key }))
     })
-    .ok()
-    .flatten()
 }
 
 /// The provider key in an attributed login's retained profile, if its address matches.
@@ -1195,6 +1237,11 @@ pub struct SubscriptionDisplay {
     /// reading's figure so the frame does no IO. `false` with no reading, one naming the owner's
     /// row, or one written before the `row` key.
     pub tap_own: bool,
+    /// This process's newest usage-tap reading's `model.id`: the model the session runs, as
+    /// Claude Code names it with its context variant (`claude-opus-4-6[1m]`), which the
+    /// footer's display name drops; read with the figure so the frame does no IO. `None` with no
+    /// reading.
+    pub model_id: Option<String>,
 }
 
 /// One weekly figure, whichever source read it (Claude Code's `/usage` cache, this process's usage
@@ -2990,11 +3037,16 @@ fn selected_profile(
         })
         .flatten();
     if let Some(expected) = selected.and_then(super::accounts::Row::expected_identity_email) {
-        if !read
+        let agrees = read
             .email
             .as_deref()
-            .is_some_and(|email| super::accounts::email_matches(expected, email))
-        {
+            .is_some_and(|email| super::accounts::email_matches(expected, email));
+        // In the default home this file is the login the process really runs on: observation
+        // beats belief (`docs/DESIGN-account-discovery-2026-11-09.md`), so a profile that names
+        // another account than the believed row is still this process's, shown by its own
+        // address and plan. Under a login directory the shared profile may describe another
+        // login than the one its keychain slot holds, so a mismatch there names nothing.
+        if !agrees && (who.login.is_some() || read.email.is_none()) {
             return None;
         }
     } else if who.login.is_some()
@@ -3067,6 +3119,7 @@ impl Selected {
             account: self.profile.key,
             usage_read: false,
             tap_own: false,
+            model_id: None,
         }
     }
 

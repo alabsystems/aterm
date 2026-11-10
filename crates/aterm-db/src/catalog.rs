@@ -23,7 +23,7 @@ pub mod release;
 pub(crate) mod ring;
 pub use descriptor::Descriptor;
 pub(crate) use descriptor::application_scope;
-use policy::Policy;
+pub use policy::Policy;
 
 /// The catalog has its own slot; applications cannot displace it.
 pub(crate) const MAX_TABLES: usize = 63;

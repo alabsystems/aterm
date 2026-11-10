@@ -14,7 +14,9 @@ use aterm_spec::derive::Model;
 /// journals admits either; `legacy` is an older issuer that grants without journaling, which
 /// only a prepare with neither stamp can name. `live` is the issuing host epoch; a grant
 /// (`granted`, its grantee `child`) needs possible execution recorded (or a legacy issuer) and a
-/// deadline the delivery itself reads as ahead. `late` is that deadline passed on the boot's monotonic clock, which every process of
+/// deadline the delivery itself reads as ahead. After the forward child exits, a rollback
+/// recipient (`rollback`, its delivery `rollback_granted`) can receive Execute under the same
+/// journal record. The journal does not distinguish these recipients. `late` is that deadline passed on the boot's monotonic clock, which every process of
 /// the boot shares; `boot` is a later boot of the machine, which ends every process of the old
 /// one; `moved` is the custody set aside, after which the journal reads absent.
 /// The reader reads `clock` (before the deadline 1, past it 2), then the journal (`seen` is the
@@ -30,6 +32,7 @@ pub fn native_historical_closure_model() -> Model {
             const Buggy = 0;
             var journal = 0; var bstamp = 0; var cstamp = 0; var legacy = 0; var moved = 0;
             var live = 1; var late = 0; var boot = 0; var granted = 0; var child = 0;
+            var rollback_granted = 0; var rollback = 0;
             var clock = 0; var seen = 0; var stood = 0; var answer = 0; var fresh = 0;
             // The prepare's shape, fixed before anything records or reads it.
             action StampBoot when (bstamp == 0 && legacy == 0 && journal == 0 && granted == 0
@@ -43,13 +46,18 @@ pub fn native_historical_closure_model() -> Model {
             action Deliver when (live == 1 && late == 0 && (journal == 2 || legacy == 1)) {
                 granted = 1; child = 1;
             }
+            action DeliverRollback when (live == 1 && late == 0 && journal == 2
+                && granted == 1 && child == 0 && rollback_granted == 0) {
+                rollback_granted = 1; rollback = 1;
+            }
             action SealOpen when (live == 1 && journal == 1) { journal = 3; }
             action SealMay when (live == 1 && journal == 2) { journal = 4; }
             action NoExec when (live == 1 && journal == 1) { journal = 5; }
             action Expire when (late == 0) { late = 1; }
             action Crash when (live == 1) { live = 0; }
             action ChildExits when (child == 1) { child = 0; }
-            action Reboot when (boot == 0) { boot = 1; live = 0; child = 0; }
+            action RollbackExits when (rollback == 1) { rollback = 0; }
+            action Reboot when (boot == 0) { boot = 1; live = 0; child = 0; rollback = 0; }
             action Move when (moved == 0) { moved = 1; }
             action ReadClock when (clock == 0) { clock = if late == 1 {2} else {1}; }
             action ReadJournal when (seen == 0 && (1 <= clock || Buggy == 1)) {
@@ -60,6 +68,7 @@ pub fn native_historical_closure_model() -> Model {
             // from the custody the custody stamp names, read after the deadline.
             action AnswerLapsed when (answer == 0 && (seen == 4
                 || ((seen == 2 || (Buggy == 2 && seen == 3)) && (clock == 2 || Buggy == 3))
+                || (Buggy == 8 && seen == 3 && clock == 2 && child == 0)
                 || ((seen == 1 || (Buggy == 5 && seen == 7)) && (cstamp == 1 || Buggy == 4)
                     && clock == 2))) {
                 answer = 1;
@@ -73,7 +82,7 @@ pub fn native_historical_closure_model() -> Model {
             }
             action AnswerNoExec when (answer == 0 && seen == 6) { answer = 3; }
             action Fresh when (fresh == 0 && (answer == 1 || answer == 2)) { fresh = 1; }
-            invariant NoDoubleExec: fresh == 0 || child == 0;
+            invariant NoDoubleExec: fresh == 0 || (child == 0 && rollback == 0);
             invariant LapsedNeverGranted: answer == 0 || 2 <= answer || granted == 0;
             invariant BootOnlyAfterReboot: answer <= 1 || answer == 3 || boot == 1;
             invariant NoRevivalOverNoExec: stood == 0 || answer == 0 || answer == 3;
@@ -82,6 +91,8 @@ pub fn native_historical_closure_model() -> Model {
                 && 0 <= moved && moved <= 1 && 0 <= live && live <= 1 && 0 <= late && late <= 1
                 && 0 <= boot && boot <= 1 && 0 <= granted && granted <= 1
                 && 0 <= child && child <= 1 && 0 <= clock && clock <= 2
+                && 0 <= rollback_granted && rollback_granted <= 1
+                && 0 <= rollback && rollback <= 1
                 && 0 <= seen && seen <= 7 && 0 <= stood && stood <= 1
                 && 0 <= answer && answer <= 3 && 0 <= fresh && fresh <= 1;
         }

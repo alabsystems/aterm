@@ -195,6 +195,8 @@ pub struct Command {
     native_image: bool,
     /// The task type the child starts as ([`Self::leave_background_band`]).
     task: Option<super::TaskType>,
+    #[cfg(target_os = "macos")]
+    footprint: Option<trust_exec_policy::FootprintLimit>,
     /// End the child when this process dies ([`super::Tether`]).
     tether: bool,
     /// Fork a tethered child on the calling thread ([`Self::tie_to_this_thread`]).
@@ -261,6 +263,8 @@ impl Command {
             suspended: false,
             native_image: false,
             task: None,
+            #[cfg(target_os = "macos")]
+            footprint: None,
             tether: false,
             #[cfg(all(test, target_os = "linux"))]
             this_thread: false,
@@ -568,6 +572,23 @@ impl Command {
     #[must_use]
     pub const fn starts_suspended(&self) -> bool {
         self.suspended
+    }
+
+    /// Prepare equal active/inactive fatal physical-footprint limits for this
+    /// native spawn or SETEXEC. This is not an RSS reservation or a receipt that
+    /// a child ran with the policy. A later exec needs its own policy; launch
+    /// owners must identify the actual final image and retain original custody.
+    #[cfg(target_os = "macos")]
+    pub const fn footprint_limit(&mut self, limit: trust_exec_policy::FootprintLimit) -> &mut Self {
+        self.footprint = Some(limit);
+        self
+    }
+
+    /// Requested final-exec attributes, not an installed-policy observation.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub const fn get_footprint_limit(&self) -> Option<trust_exec_policy::FootprintLimit> {
+        self.footprint
     }
 
     /// Start the child, or replace this process, OUT OF THIS PROCESS'S BACKGROUND BAND (`true`):
@@ -1591,6 +1612,8 @@ impl Command {
                 disclaim: self.disclaim,
                 suspended: self.suspended,
                 task: self.task,
+                #[cfg(target_os = "macos")]
+                footprint: self.footprint,
             },
         )?;
         drop(handed);

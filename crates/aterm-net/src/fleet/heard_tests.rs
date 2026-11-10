@@ -11,8 +11,9 @@ use super::super::{
 };
 use super::*;
 use crate::fleet_member::node_principal;
+use aterm_uds::stop::Stop;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
@@ -130,7 +131,7 @@ fn heard_under(root: &Path) -> (Vec<Answer>, Vec<String>) {
 /// `Survey`: each connection it handed over tells `seen` whether it spoke the mesh.
 struct Listener {
     addr: SocketAddr,
-    running: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     serving: Option<std::thread::JoinHandle<()>>,
     seen: mpsc::Receiver<bool>,
 }
@@ -140,7 +141,7 @@ impl Listener {
         const SERVES: &[FleetOp] = &[FleetOp::Survey];
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let (tell, seen) = mpsc::channel();
         let tell = Arc::new(Mutex::new(tell));
         let listening = Listening {
@@ -153,13 +154,13 @@ impl Listener {
             lifetime: HANG,
         };
         let serving = {
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 serve_offering_with_ask_within(
                     &listener,
                     (&listening, Arc::new(|| (FleetScope::Content, SERVES)), deny),
                     None,
-                    &running,
+                    &stop,
                     HANG,
                     move |served, _| {
                         let _ = tell
@@ -174,7 +175,7 @@ impl Listener {
         };
         Self {
             addr,
-            running,
+            stop,
             serving: Some(serving),
             seen,
         }
@@ -189,7 +190,7 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
+        self.stop.set();
         if let Some(serving) = self.serving.take() {
             let _ = serving.join();
         }

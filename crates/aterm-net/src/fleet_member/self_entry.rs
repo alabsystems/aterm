@@ -23,7 +23,7 @@ pub fn self_entry(dir: &Path, me: &NodeIdentity, endpoint: (&str, u16, &str)) ->
     self_entry_at(dir, me, endpoint, unix_ms_now().unwrap_or_default())
 }
 
-/// [`self_entry`] for a listener generation that remains `current`. The generation is checked
+/// [`self_entry`] for a listener generation until its stop (`ended`) is set. The stop is checked
 /// under the book lock before allocating or committing a descriptor, including after waiting
 /// for another writer. An ended generation returns `None` without changing the durable record.
 /// # Errors
@@ -32,10 +32,10 @@ pub fn self_entry_while(
     dir: &Path,
     me: &NodeIdentity,
     endpoint: (&str, u16, &str),
-    current: &AtomicBool,
+    ended: &Stop,
 ) -> io::Result<Option<Peer>> {
     self_entry_if(dir, me, endpoint, unix_ms_now().unwrap_or_default(), || {
-        current.load(Ordering::Acquire)
+        !ended.is_set()
     })
 }
 
@@ -116,13 +116,12 @@ impl Registration {
         self,
         dir: &Path,
         me: &NodeIdentity,
-        current: &AtomicBool,
+        ended: &Stop,
     ) -> io::Result<Option<Self>> {
         if self.node != me.node() {
             return Err(invalid("local fleet registration names another node"));
         }
-        let Some(peer) =
-            self_entry_while(dir, me, (&self.host, self.port, &self.version), current)?
+        let Some(peer) = self_entry_while(dir, me, (&self.host, self.port, &self.version), ended)?
         else {
             return Ok(None);
         };

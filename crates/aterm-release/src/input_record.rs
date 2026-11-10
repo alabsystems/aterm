@@ -4,10 +4,17 @@
 //! Selection-local A19 records for the release's early source judgment.
 //! These never answer a whole-workspace qualify question.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::ledger::GitRunner;
 use aterm_uds::spawnfd::Command;
+
+/// One stable input checkout for dry and real runs, quiet for fseventsd and Spotlight.
+pub(crate) fn directory(release: &Path) -> PathBuf {
+    release
+        .join(aterm_tempfile::QUIET)
+        .join("input-checkout.noindex")
+}
 
 /// Maintain the release's exclusively claimed, stable preflight checkout. An existing path
 /// must be registered to this repository and clean; no user work is discarded or adopted.
@@ -62,17 +69,17 @@ struct Attempt {
 
 /// The immediately preceding input attempt for this release base. Its A19 package rows are
 /// only candidates; a failed or unfinished attempt cannot resurrect an older success.
-pub fn previous_lint(
+pub fn previous_items(
     records: &Path,
     base: &str,
-) -> Result<aterm_verify::lint_content::Passed, String> {
+) -> Result<Vec<aterm_verify::input_content::Proof>, String> {
     let at = records.join(format!(
         "previous-{}.json",
         crate::check_record::seal_dir(base)
     ));
-    let text = match std::fs::read_to_string(&at) {
+    let text = match std::fs::read_to_string(at) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.to_string()),
     };
     let previous: Attempt = aterm_json::from_str(&text).map_err(|e| e.to_string())?;
@@ -81,7 +88,7 @@ pub fn previous_lint(
     {
         return Err("previous input judgment has an invalid tree".into());
     }
-    crate::check_record::input_lint_candidates(records, &previous.tree, &previous.seal)
+    crate::check_record::input_item_candidates(records, &previous.tree, &previous.seal)
 }
 
 /// Remember the current attempt before dispatch, so an interrupted or failed run also replaces
@@ -103,9 +110,10 @@ pub fn attempted(records: &Path, base: &str, tree: &str, seal: &str) -> Result<(
     .map_err(|e| e.to_string())
 }
 
-/// Claim one existing record directory without waiting. A concurrent dry or real run must
+/// Create and claim one record directory without waiting. A concurrent dry or real run must
 /// not overwrite its writer's begun record. The guard unlocks explicitly before closing.
 pub fn claim(directory: &Path) -> Result<aterm_uds::file_lock::LockFile, String> {
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     aterm_uds::file_lock::LockFile::take(
         &directory.join("input.lock"),
         std::time::Instant::now(),
@@ -161,6 +169,63 @@ pub fn describe(command: &Command, seal: &str) -> Result<String, String> {
         crate::artifact::file_sha256(&std::env::current_exe().map_err(|e| e.to_string())?)?,
     );
     aterm_json::to_string(&parts).map_err(|e| e.to_string())
+}
+
+/// The tree-independent execution context of preflight readers. File content belongs in
+/// each reader's key; external configuration, policy and the finalized environment do not.
+pub fn context(
+    root: &Path,
+    engine: &Path,
+    seal: &str,
+    command: &Command,
+) -> Result<String, String> {
+    let driver =
+        crate::artifact::file_sha256(&std::env::current_exe().map_err(|e| e.to_string())?)?;
+    let mut hash = aterm_digest::Sha256::new();
+    let mut part = |bytes: &[u8]| {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    };
+    part(b"aterm-preflight-context-v1");
+    part(
+        crate::check_content::context(
+            &driver,
+            seal,
+            command,
+            crate::check_content::ReleaseHalf::Tree,
+        )
+        .as_bytes(),
+    );
+    for directory in root.ancestors() {
+        for name in [
+            ".cargo/config",
+            ".cargo/config.toml",
+            "trustfmt.toml",
+            ".trustfmt.toml",
+            "rustfmt.toml",
+            ".rustfmt.toml",
+            "clippy.toml",
+            ".clippy.toml",
+        ] {
+            file(&mut part, &directory.join(name))?;
+        }
+    }
+    if let Some(home) = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cargo")))
+    {
+        for name in ["config", "config.toml"] {
+            file(&mut part, &home.join(name))?;
+        }
+    }
+    let policy = crate::ledger::GitCli::new(engine)
+        .git(&["rev-parse", "HEAD"])
+        .map_err(|e| e.to_string())?;
+    if !policy.success() {
+        return Err(policy.stderr_utf8());
+    }
+    part(policy.stdout_utf8().as_bytes());
+    Ok(aterm_codec::hex::encode_lower(&hash.finalize()))
 }
 
 /// Bind the tree, discovered input, complete command environment, executable and build seal.
@@ -248,6 +313,8 @@ pub fn identity(
         for name in [
             ".cargo/config",
             ".cargo/config.toml",
+            "trustfmt.toml",
+            ".trustfmt.toml",
             "rustfmt.toml",
             ".rustfmt.toml",
             "clippy.toml",
@@ -296,13 +363,73 @@ mod tests {
     }
 
     #[test]
+    fn reader_context_ignores_product_version_but_binds_configuration_and_environment() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.name", "Fixture"]);
+        git(root, &["config", "user.email", "fixture@example.invalid"]);
+        git(root, &["commit", "--allow-empty", "-qm", "policy"]);
+        let mut command = Command::new("fixed-verifier");
+        command
+            .current_dir(root)
+            .env("INPUT_CONTEXT_CONTROL", "one");
+        let before = context(root, root, "fixed-tools", &command).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace.package]\nversion='1.0.0'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            before,
+            context(root, root, "fixed-tools", &command).unwrap()
+        );
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace.package]\nversion='1.1.0'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            before,
+            context(root, root, "fixed-tools", &command).unwrap()
+        );
+        std::fs::create_dir(root.join(".cargo")).unwrap();
+        std::fs::write(root.join(".cargo/config.toml"), "[build]\njobs=2\n").unwrap();
+        assert_ne!(
+            before,
+            context(root, root, "fixed-tools", &command).unwrap()
+        );
+        std::fs::remove_file(root.join(".cargo/config.toml")).unwrap();
+        for name in aterm_verify::fmt::CONFIG_FILES {
+            std::fs::write(root.join(name), "edition='2024'\n").unwrap();
+            assert_ne!(
+                before,
+                context(root, root, "fixed-tools", &command).unwrap(),
+                "the formatter reads {name}"
+            );
+            std::fs::remove_file(root.join(name)).unwrap();
+        }
+        command.env("INPUT_CONTEXT_CONTROL", "two");
+        assert_ne!(
+            before,
+            context(root, root, "fixed-tools", &command).unwrap()
+        );
+        command.env("INPUT_CONTEXT_CONTROL", "one");
+        assert_ne!(
+            before,
+            context(root, root, "changed-tools", &command).unwrap()
+        );
+    }
+
+    #[test]
     fn one_writer_per_input_key_without_blocking_other_keys() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let other = dir.path().join("other-key");
-        std::fs::create_dir(&other).unwrap();
         let held = claim(dir.path()).unwrap();
         assert!(claim(dir.path()).is_err());
         let independent = claim(&other).unwrap();
+        assert!(other.join("input.lock").is_file());
+        assert!(claim(&other).is_err());
         drop(held);
         let resumed = claim(dir.path()).unwrap();
         drop((independent, resumed));
@@ -310,7 +437,8 @@ mod tests {
 
     #[test]
     fn stable_checkout_moves_clean_tips_but_preserves_unexpected_work() {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = aterm_tempfile::Builder::new().heard().tempdir().unwrap();
+        assert!(!aterm_tempfile::is_quiet(dir.path()));
         let source = dir.path().join("source");
         std::fs::create_dir(&source).unwrap();
         git(&source, &["init", "-q"]);
@@ -323,9 +451,10 @@ mod tests {
         git(&source, &["add", "."]);
         git(&source, &["commit", "-qm", "first"]);
         let first = git(&source, &["rev-parse", "HEAD"]);
-        let owned = dir.path().join("owned");
+        let owned = directory(dir.path());
         let runner = crate::ledger::GitCli::new(&source);
         checkout(&runner, &owned, &first).unwrap();
+        assert!(aterm_tempfile::is_quiet(&owned));
         std::fs::write(source.join("input"), "second").unwrap();
         git(&source, &["commit", "-qam", "second"]);
         let second = git(&source, &["rev-parse", "HEAD"]);

@@ -16,6 +16,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LOGS_KEPT: usize = 20;
 
+/// Default logs and event streams stay out of both fseventsd and Spotlight. Explicit
+/// `--log` paths remain the caller's choice.
+pub(super) fn default_dir(state: &Path) -> PathBuf {
+    state.join(aterm_tempfile::QUIET).join("logs.noindex")
+}
+
 /// Immutable file-role header, not a run identity or deletion capability.
 pub(crate) const PRIVATE_EVENTS_HEADER: &str = "verify-event: {\"schema\":1,\"event\":\"private-run-events\",\"storage\":\"aterm-verify-private-v1\"}\n";
 pub(crate) const PRIVATE_HUMAN_HEADER: &str = "verify-event: {\"schema\":1,\"event\":\"private-run-log\",\"storage\":\"aterm-verify-private-human-v1\"}\n";
@@ -484,6 +490,24 @@ fn prune(dir: &Path, _directory: &LockFile) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_log_and_event_writes_use_a_quiet_directory_and_explicit_logs_keep_their_path() {
+        let root = aterm_tempfile::Builder::new().heard().tempdir().unwrap();
+        assert!(!aterm_tempfile::is_quiet(root.path()));
+        let destination = default_dir(root.path());
+        let mut log = open(None, root.path(), &destination, None).unwrap();
+        log.write_all(b"check output\n").unwrap();
+        assert!(aterm_tempfile::is_quiet(&log.path));
+        assert!(aterm_tempfile::is_quiet(&events_path(&log.path)));
+        assert_eq!(payload(&log.path), b"check output\n");
+        // Negative control: an explicit path outside .ubd must stay there, so the default's
+        // quietness cannot be supplied accidentally by the fixture's temporary root.
+        let chosen = root.path().join("chosen.log");
+        let explicit = open(Some(&chosen), root.path(), &destination, None).unwrap();
+        assert_eq!(explicit.path, chosen);
+        assert!(!aterm_tempfile::is_quiet(&explicit.path));
+    }
 
     fn paired(path: &Path) -> (Log, crate::event_log::EventLog) {
         let mut events = crate::event_log::EventLog::unrecorded();

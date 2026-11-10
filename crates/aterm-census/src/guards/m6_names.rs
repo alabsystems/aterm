@@ -22,13 +22,13 @@ pub(super) const M6_NAMES: Rule = Rule {
 };
 
 fn m6_names(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    for file in &tree.corpus.files {
+    for file in tree.corpus.under(&[""]) {
         let path = file.rel.as_str();
-        for refusal in scan_confinement(path, &file.raw) {
+        for refusal in scan_confinement(path, file.raw()) {
             out.push(file.finding(M6_NAMES.id, 0, refusal));
         }
         if !M6_NAMERS.contains(&path) {
-            for refusal in scan_workspace_file(path, &file.raw) {
+            for refusal in scan_workspace_file(path, file.raw()) {
                 out.push(file.finding(M6_NAMES.id, 0, refusal));
             }
         }
@@ -40,7 +40,7 @@ fn m6_names(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         let Some(file) = tree.corpus.get(want) else {
             continue;
         };
-        let named = words(&file.raw).filter(|word| *word == real).count();
+        let named = words(file.raw()).filter(|word| *word == real).count();
         if named != n {
             out.push(file.finding(
                 M6_NAMES.id,

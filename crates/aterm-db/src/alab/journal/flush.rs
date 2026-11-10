@@ -163,7 +163,7 @@ pub(super) fn pass_started(
     // Without a table read: nothing can be due while a hold stands (the pace line, a kept
     // append's retry), nor unless the week is new, a sharp event or a batch waits, or the routine
     // interval passed since the last write or the last read that found nothing to write.
-    let waiting = outbox.iter().any(|e| e.kind.sharp()) || outbox.len() >= book::BATCH_EVENTS;
+    let waiting = outbox.iter().any(Event::sharp) || outbox.len() >= book::BATCH_EVENTS;
     let routine = now
         >= book
             .flushed_at

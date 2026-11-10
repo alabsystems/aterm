@@ -424,7 +424,7 @@ fn admin_cached_observed(paths: &Paths, lock: Option<&StateLock>) -> crate::Resu
             "cached admin requires a completely applied, admitted vault",
         ));
     }
-    let bytes = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)?
+    let held_vault = super::chain_cache::held(&paths.cache_file())?
         .ok_or_else(|| Error::new("no cached admin vault"))?;
     let held = floor(paths, &state, &config.name, &config);
     let unchained = held.as_ref().map(|floor| Floor {
@@ -432,7 +432,7 @@ fn admin_cached_observed(paths: &Paths, lock: Option<&StateLock>) -> crate::Resu
         ..floor.clone()
     });
     let (envelope, pinned, _) = envelope::verify_for_reader(
-        bytes.as_slice(),
+        held_vault.bytes(),
         &config.name,
         &pin,
         &config.followed,

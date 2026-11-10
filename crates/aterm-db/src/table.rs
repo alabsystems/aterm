@@ -203,11 +203,12 @@ fn revalidate(
 thread_local! {
     /// How many of this thread's session checks that a look at the vault ([`Session::observe_in`])
     /// can serve were handed none, and asked on their own calls: an open's custody (`revalidate`)
-    /// and access (`Session::with_generation`), and a peer's or an observation's currency
-    /// (`Session::current_in`). A check handed a look counts as served by it, though where the look
-    /// observes nothing or looks at another vault `aterm-secrets` answers on its own call
-    /// uncounted; a session's other checks (a read batch's custody, `Session::context`'s currency,
-    /// ...) are not counted.
+    /// and access (`Session::with_generation`), a peer's or an observation's currency
+    /// (`Session::current_in`), and a peer's roster (`Session::peer_member_in`). A check handed a
+    /// look counts as served by it, though where the look observes nothing or looks at another
+    /// vault `aterm-secrets` answers on its own call uncounted; a peer's roster read on its own
+    /// call because its look is at another vault counts. A session's other checks (a read batch's
+    /// custody, `Session::context`'s currency, ...) are not counted.
     pub(crate) static OWN_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -543,7 +544,8 @@ impl<'a> Session<'a> {
         self.peer_member_in(actor, None)
     }
 
-    /// [`Self::peer_member`], the session's currency judged through `look` where given.
+    /// [`Self::peer_member`], the session's currency judged, and its roster read, through `look`
+    /// where given: the roster through a look at this session's vault only.
     fn peer_member_in(
         &self,
         actor: Actor,
@@ -553,9 +555,17 @@ impl<'a> Session<'a> {
             return Err(Error::new("Commons membership changed during table repair"));
         }
         // A roster this device cannot read now could name this peer: the last one it read is
-        // used, and while it never read one the peer is refused.
-        let roster = crate::control::roster_or_last(self.bootstrap.paths())
-            .ok_or_else(|| Error::new("this device has not read its roster yet"))?;
+        // used, and while it never read one the peer is refused. Through the look it stands for
+        // the moment of the vault the currency above does.
+        let roster = match look.filter(|look| look.paths() == self.bootstrap.paths()) {
+            Some(look) => crate::control::roster_or_last_in(look),
+            None => {
+                #[cfg(test)]
+                own_check();
+                crate::control::roster_or_last(self.bootstrap.paths())
+            }
+        }
+        .ok_or_else(|| Error::new("this device has not read its roster yet"))?;
         self.access
             .members()
             .iter()
@@ -573,8 +583,8 @@ impl<'a> Session<'a> {
         self.peer_in(actor, None)
     }
 
-    /// [`Self::peer`], the session's currency judged through `look` where given
-    /// ([`Self::observe_in`]).
+    /// [`Self::peer`], the session's currency judged, and its roster read, through `look` where
+    /// given ([`Self::observe_in`]): the roster through a look at this session's vault only.
     pub(crate) fn peer_in(
         &self,
         actor: Actor,
@@ -1054,6 +1064,28 @@ impl<'a> Session<'a> {
             None
         };
         Self::with_generation(bootstrap, journal, generation, Some(read_by), None)
+    }
+
+    /// A writer session whose caller retains every ancestor control writer and
+    /// vault source. Reuse its non-repairing generation observation instead of
+    /// reopening ancestor custody through the writer-succession repair path.
+    pub(crate) fn admit_selected(
+        bootstrap: &'a Bootstrap,
+        journal: Journal,
+        selection: crate::generation::Observation,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        if journal.directory() != bootstrap.journal_dir()
+            || !journal.is_writer()
+            || selection.paths() != bootstrap.paths()
+        {
+            return Err(Error::new(
+                "application admission belongs to another custody",
+            ));
+        }
+        bootstrap.revalidate_custody().map_err(failure)?;
+        selection.check(true, false, deadline)?;
+        Self::with_generation(bootstrap, journal, Some(selection), Some(deadline), None)
     }
 
     fn from_journal(

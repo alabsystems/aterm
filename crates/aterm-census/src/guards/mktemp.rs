@@ -26,7 +26,7 @@ fn checked_mktemp(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             }
         }
     }
-    for script in &tree.corpus.scripts {
+    for script in tree.corpus.scripts() {
         if !script.raw.contains("$(mktemp") && !script.raw.contains("`mktemp") {
             continue;
         }

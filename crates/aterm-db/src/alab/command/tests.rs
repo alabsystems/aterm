@@ -1617,6 +1617,8 @@ fn the_journal_readers_say_who_used_an_account_and_its_quota() {
         src: Source::CliOutput,
         why: None,
         to: None,
+        tab: None,
+        harness: None,
     };
     let spool = Spool::at(scratch.path().join("alab"));
     spool.append(&base).unwrap();

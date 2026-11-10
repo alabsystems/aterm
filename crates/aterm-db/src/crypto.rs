@@ -447,6 +447,7 @@ impl<'a> Reader<'a> {
     pub(crate) fn byte(&mut self) -> Result<u8> {
         Ok(self.array::<1>()?[0])
     }
+    #[cfg(unix)]
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.pos
     }

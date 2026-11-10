@@ -182,24 +182,38 @@ fn read_opened_stamped(
     let Some((file, meta)) = open_admitted(path, admit, links)? else {
         return Ok(None);
     };
+    let bytes = read_bounded(&file, meta.len(), max, past, path)?;
+    Ok(Some((FileStamp::of(&meta), bytes)))
+}
+
+/// Read the opened `file` (whose `fstat` gave `len`), at most `max` bytes, doing `past` with a
+/// longer one; `path` names it in an error.
+fn read_bounded(
+    mut file: &File,
+    len: u64,
+    max: usize,
+    past: Past,
+    path: &Path,
+) -> Result<Vec<u8>, Unread> {
     let refused = |why: String| Unread::Refused(Error::new(format!("{}: {why}", path.display())));
     let failed = |e: io::Error| Unread::Failed(Error::new(format!("{}: {e}", path.display())));
     let limit = u64::try_from(max).unwrap_or(u64::MAX);
-    if past == Past::Refuse && meta.len() > limit {
+    if past == Past::Refuse && len > limit {
         return Err(refused(format!("larger than {max} bytes")));
     }
-    let mut bytes = read_buffer(meta.len(), max);
+    let mut bytes = read_buffer(len, max);
     let limit = if past == Past::Head {
         limit
     } else {
         limit.saturating_add(1)
     };
-    crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes).map_err(failed)?;
+    crate::secret::read_to_end_wiping_on_error((&mut file).take(limit), &mut bytes)
+        .map_err(failed)?;
     if bytes.len() > max {
         zeroize::Zeroize::zeroize(&mut bytes);
         return Err(refused(format!("larger than {max} bytes")));
     }
-    Ok(Some((FileStamp::of(&meta), bytes)))
+    Ok(bytes)
 }
 
 fn open_admitted(
@@ -291,6 +305,14 @@ impl OwnedReader {
         self.stamp
     }
 
+    /// The opened file's bytes, at most `max`, as [`read_private`] reads them: a longer one is
+    /// refused.
+    pub(crate) fn read_private(&self, max: usize) -> crate::Result<SecretBytes> {
+        read_bounded(&self.file, self.stamp.len, max, Past::Refuse, &self.path)
+            .map(SecretBytes::new)
+            .map_err(Unread::into_error)
+    }
+
     /// Refuse an observation when the opened file changed while it was being read.
     pub(crate) fn check_unchanged(&self) -> crate::Result<()> {
         self.check_unchanged_classified()
@@ -333,8 +355,19 @@ pub(crate) fn open_owned_reader(path: &Path) -> crate::Result<Option<OwnedReader
 
 /// Admit the same owned descriptor while preserving stable refusal versus retryable failure.
 pub(crate) fn open_owned_reader_classified(path: &Path) -> Result<Option<OwnedReader>, Unread> {
+    open_reader(path, Admit::Owned)
+}
+
+/// Open the same descriptor that passes [`read_private`]'s admission checks, stamped before a
+/// byte is read ([`OwnedReader::read_private`]): a reader that holds the bytes of a file of
+/// that stamp need not read them again.
+pub(crate) fn open_private_reader(path: &Path) -> crate::Result<Option<OwnedReader>> {
+    open_reader(path, Admit::Private).map_err(Unread::into_error)
+}
+
+fn open_reader(path: &Path, admit: Admit) -> Result<Option<OwnedReader>, Unread> {
     Ok(
-        open_admitted(path, Admit::Owned, Links::Refuse)?.map(|(file, metadata)| OwnedReader {
+        open_admitted(path, admit, Links::Refuse)?.map(|(file, metadata)| OwnedReader {
             file,
             path: path.to_path_buf(),
             stamp: FileStamp::of(&metadata),

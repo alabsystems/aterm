@@ -619,7 +619,7 @@ pub struct Proc {
 
 /// Whether `name`, a [`Proc::name`], is a trustd's: its last `/`-separated part is `trustd`.
 /// On macOS that name is the exec'd file's, so a trustd started through a symlink of another
-/// name is not recognised: its argv[0] is not read, because reading a program's arguments can
+/// name is not recognised: its `argv[0]` is not read, because reading a program's arguments can
 /// hang while macOS holds it at its start, the hang this listing avoids.
 #[must_use]
 pub fn is_trustd(name: &str) -> bool {

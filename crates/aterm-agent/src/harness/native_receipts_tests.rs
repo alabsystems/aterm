@@ -25,7 +25,13 @@ mod closure;
 #[path = "native_receipts_rejection_tests.rs"]
 mod rejection;
 
-fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
+#[path = "native_receipts_mode_tests.rs"]
+mod mode;
+
+#[path = "native_receipts_namespace_tests.rs"]
+mod namespace;
+
+pub(super) fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(home.path());
     let image = |n| Image {
@@ -42,6 +48,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
         image: image(u64::from(pid)),
     };
     let prepare = Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),

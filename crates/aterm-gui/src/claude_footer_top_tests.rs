@@ -187,8 +187,6 @@ fn key_for(
         face,
         cell: CELL,
         clip: aterm_core::render::PxRect::EVERYWHERE,
-        mark_hover: false,
-        title_gen: 0,
     }
 }
 
@@ -291,7 +289,7 @@ fn a_wide_name_moves_with_the_tag() {
             )
         };
         let mut top = ComposedTop::default();
-        compose_top(&key, &mut top, None, None, tail);
+        compose_top(&key, &mut top, None, tail);
         let s = top.switch.as_ref().expect("the switch");
         let (label, _) = s.label.clone().expect("a label at 120 columns");
         if plain {
@@ -369,7 +367,7 @@ fn the_harness_lays_from_the_rules_right_end() {
                         frame_row: region.strip + 20,
                         ..key_for(program, run, switch, palette, blank, KeyFace::default())
                     };
-                    compose_top(&key, &mut top, None, None, tail);
+                    compose_top(&key, &mut top, None, tail);
                     let (laid, _) = laid_run(&key);
                     if what.starts_with("voice label") {
                         let mut after = before.clone();
@@ -505,8 +503,8 @@ fn the_harness_lays_from_the_rules_right_end() {
                     )
                 };
                 let (mut whole, mut short) = (ComposedTop::default(), ComposedTop::default());
-                compose_top(&key(run.len), &mut whole, None, None, &[]);
-                compose_top(&key(run.len - 1), &mut short, None, None, &[]);
+                compose_top(&key(run.len), &mut whole, None, &[]);
+                compose_top(&key(run.len - 1), &mut short, None, &[]);
                 assert_ne!(
                     whole.cells, short.cells,
                     "CONTROL {cols}: a shorter run composes otherwise"
@@ -763,7 +761,6 @@ fn composed_with(
             ..key_for(program, run, switch, palette, blank(), face)
         },
         &mut top,
-        None,
         None,
         tail,
     );
@@ -1987,14 +1984,6 @@ fn the_mark_stands_only_where_its_write_took() {
             drawn,
             "{what}: its switch"
         );
-        assert_eq!(
-            ws.claude_lights
-                .mark_hits
-                .iter()
-                .any(|m| m.session == session),
-            drawn,
-            "{what}: its lockup"
-        );
     }
 }
 
@@ -2250,7 +2239,7 @@ fn marks_write_only_the_run() {
                     frame_row: strip + 20,
                     ..key_for(program, run, switch, palette, blank, face)
                 };
-                compose_top(&key, &mut top, None, None, tail);
+                compose_top(&key, &mut top, None, tail);
                 let (laid, label) = laid_run(&key);
                 writes_only_the_run(&before, laid, &top).unwrap_or_else(|e| {
                     panic!("{what} at {cols}, {switch:?} {palette:?}: {e}: {drawn:?}")
@@ -2290,7 +2279,7 @@ fn marks_write_only_the_run() {
                 if muse && muse_seen.is_none() {
                     let plain = TopRun { voice: None, ..run };
                     let mut kept = ComposedTop::default();
-                    compose_top(&TopKey { run: plain, ..key }, &mut kept, None, None, &[]);
+                    compose_top(&TopKey { run: plain, ..key }, &mut kept, None, &[]);
                     if !kept.cells.is_empty() {
                         muse_seen = Some((before.clone(), plain, kept));
                     }
@@ -3105,7 +3094,7 @@ fn slot_top(paint: SwitchPaint, w: usize) -> (TopKey, ComposedTop) {
         },
     );
     let mut top = ComposedTop::default();
-    compose_top(&key, &mut top, None, None, &tail);
+    compose_top(&key, &mut top, None, &tail);
     (key, top)
 }
 
@@ -3499,7 +3488,7 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
             KeyFace::default(),
         );
         let mut top = ComposedTop::default();
-        compose_top(&key, &mut top, None, None, &tail);
+        compose_top(&key, &mut top, None, &tail);
         top
     };
     let slot = |top: &ComposedTop| -> (String, Vec<RenderCell>) {

@@ -23,6 +23,10 @@ pub struct AosRow {
 /// A take's wall-clock limit: every wait and request on the instance ends with it.
 pub const BUDGET_SECS: u64 = 300;
 
+/// The fewest repairs before an irreversible failure can end acquisition. A passing p99
+/// still takes the entire declared sample; this finite-sample row makes no population claim.
+const MIN_REPAIRS: usize = 8;
+
 /// The glow on, so a typed key reaches the hosted task.
 const GLOW_ON: &str = "serious_mode = false\ncursor_trail = true\ncursor_momentum_glow = true";
 
@@ -48,8 +52,11 @@ impl std::fmt::Display for AosReport {
         let max = self.main_us.iter().max().copied().unwrap_or(0);
         write!(
             f,
-            "AOS repairs={} keys={} p99_main_us={} max_main_us={max} max_p99_us={} \
+            "AOS repairs={} planned_repairs={} stopping_sample={} decision=all_completions \
+             keys={} p99_main_us={} max_main_us={max} max_p99_us={} \
              off_main={} verdict={:?} {}",
+            self.main_us.len(),
+            self.row.repairs,
             self.main_us.len(),
             self.row.keys,
             self.p99_us,
@@ -84,11 +91,49 @@ pub fn judge(row: &AosRow, main_us: &[u64], off_main: bool) -> ShapeVerdict {
     }
 }
 
-/// Measure one row: attach the shipped code, then type and repair `row.repairs` times, reading each repair's `main_us=` and `off_main=`.
+/// A failure that no remaining repair can reverse. A favorable prefix never passes:
+/// the unobserved tail and every repair's prepare-thread check remain obligations.
+#[must_use]
+pub fn decision(row: &AosRow, main_us: &[u64], off_main: bool) -> Option<ShapeVerdict> {
+    let cap = row.repairs as usize;
+    if main_us.len() < cap.min(MIN_REPAIRS) {
+        return None;
+    }
+    let rank = cap - cap / 100;
+    let (lo, _) = super::decision::completion(main_us, cap, rank)?;
+    if !off_main || lo > row.max_p99_us {
+        Some(ShapeVerdict::Fail)
+    } else if main_us.len() == cap {
+        Some(judge(row, main_us, off_main))
+    } else {
+        None
+    }
+}
+
+fn run_plan(
+    row: &AosRow,
+    mut sample: impl FnMut(u32) -> Result<(u64, bool), CouldNotRun>,
+) -> Result<(Vec<u64>, bool), CouldNotRun> {
+    let mut main_us = Vec::new();
+    let mut off_main = true;
+    for repair in 0..row.repairs {
+        let (us, off) = sample(repair)?;
+        main_us.push(us);
+        off_main &= off;
+        if decision(row, &main_us, off_main).is_some() {
+            break;
+        }
+    }
+    Ok((main_us, off_main))
+}
+
+/// Measure one row: attach the shipped code, then type and repair at most `row.repairs` times,
+/// reading each repair's `main_us=` and `off_main=`. Only an irreversible failure ends early.
 /// # Errors
 /// [`CouldNotRun`] when the instance did not start or a request failed; [`CouldNotRun::Unanswered`] when a repair answered without the fields.
 pub fn measure(rig: &Rig, row: &AosRow) -> Result<AosReport, CouldNotRun> {
     let _one = super::take(true);
+    let mut phases = super::instance::Phases::new("row=aos".into());
     let budget = Budget::from_now(BUDGET_SECS);
     let mut scratch = Scratch::new("ataos")
         .map_err(|e| CouldNotRun::Refused(format!("cannot make a scratch world: {e}")))?;
@@ -100,14 +145,15 @@ pub fn measure(rig: &Rig, row: &AosRow) -> Result<AosReport, CouldNotRun> {
     super::write_fresh(world.home.join(".shrc"), TYPED_INTO)
         .map_err(|e| CouldNotRun::Refused(format!("cannot write the scratch shell's rc: {e}")))?;
     let inst = Instance::launch(&rig.aterm, &world, budget)?;
+    phases.end("launch");
     let ctl = &inst.ctl;
     let attached = ctl.ok(&["aos", "attach", "code=shipped"])?;
     if field(&attached, "attached") != Some("true") {
         return could_not_run(format!("aos attach did not attach ({attached})"));
     }
-    let mut main_us = Vec::new();
-    let mut off_main = true;
-    for _ in 0..row.repairs {
+    phases.end("attach");
+    let (main_us, off_main) = run_plan(row, |repair| {
+        let started = std::time::Instant::now();
         for _ in 0..row.keys {
             ctl.ok(&["key", "a"])?;
         }
@@ -120,19 +166,30 @@ pub fn measure(rig: &Rig, row: &AosRow) -> Result<AosReport, CouldNotRun> {
                 "aos repair named no main_us= or off_main= ({line})"
             ));
         };
-        main_us.push(us);
-        off_main &= off == "true";
-    }
+        eprintln!(
+            "measure-sample: {}",
+            aterm_json::json!({
+                "schema": 1, "measurement": "aos", "sample": repair + 1,
+                "main_us": us, "off_main": off == "true", "seconds": started.elapsed().as_secs_f64(),
+            })
+        );
+        Ok((us, off == "true"))
+    })?;
+    phases.end("samples");
     let _ = ctl.ok(&["aos", "detach"]);
     let p99_us = p99(&main_us);
-    Ok(AosReport {
+    let report = AosReport {
         checks: super::instance::replay_checks(ctl),
         row: *row,
         verdict: judge(row, &main_us, off_main),
         main_us,
         off_main,
         p99_us,
-    })
+    };
+    phases.end("fences");
+    drop(inst);
+    phases.end("stop");
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -144,6 +201,57 @@ mod tests {
         keys: 8,
         max_p99_us: 8_000,
     };
+
+    #[test]
+    fn aos_keeps_its_tail_obligation_and_a_decided_failure_cannot_recover() {
+        let row = AosRow { repairs: 40, ..ROW };
+        assert_eq!(decision(&row, &[1; 8], true), None);
+        assert_eq!(decision(&row, &[1; 39], true), None);
+        assert_eq!(decision(&row, &[1; 40], true), Some(ShapeVerdict::Pass));
+        assert_eq!(decision(&row, &[8_001; 7], true), None);
+        assert_eq!(decision(&row, &[8_001; 8], true), Some(ShapeVerdict::Fail));
+        assert_eq!(decision(&row, &[1; 8], false), Some(ShapeVerdict::Fail));
+        let mut slow_tail = vec![1; 39];
+        slow_tail.push(8_001);
+        assert_eq!(decision(&row, &slow_tail, true), Some(ShapeVerdict::Fail));
+        let hundred = AosRow {
+            repairs: 100,
+            ..ROW
+        };
+        let mut recoverable = vec![1; 7];
+        recoverable.push(8_001);
+        assert_eq!(decision(&hundred, &recoverable, true), None);
+        recoverable.push(8_001);
+        assert_eq!(
+            decision(&hundred, &recoverable, true),
+            Some(ShapeVerdict::Fail)
+        );
+        recoverable.resize(100, 0);
+        assert_eq!(judge(&hundred, &recoverable, true), ShapeVerdict::Fail);
+        assert_eq!(decision(&AosRow { repairs: 0, ..ROW }, &[], true), None);
+        let mut calls = 0;
+        let (values, off) = run_plan(&row, |_| {
+            calls += 1;
+            Ok((8_001, true))
+        })
+        .unwrap();
+        assert_eq!(calls, MIN_REPAIRS);
+        assert_eq!(judge(&row, &values, off), ShapeVerdict::Fail);
+        calls = 0;
+        let (values, off) = run_plan(&row, |i| {
+            calls += 1;
+            Ok((if i == row.repairs - 1 { 8_001 } else { 1 }, true))
+        })
+        .unwrap();
+        assert_eq!(calls, 40);
+        assert_eq!(judge(&row, &values, off), ShapeVerdict::Fail);
+        assert!(
+            run_plan(&row, |_| super::super::instance::could_not_run(
+                "missing timing"
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn the_nearest_rank_p99_is_the_top_sample_below_a_hundred_and_ignores_order() {

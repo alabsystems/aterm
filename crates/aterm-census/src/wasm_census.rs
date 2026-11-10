@@ -227,6 +227,10 @@ fn spawn_sites(root: &Path, scan_dirs: &[String], unloaded: &BTreeSet<PathBuf>) 
         let Ok(text) = crate::tree::read_to_string(&file) else {
             continue;
         };
+        // Masking only blanks or cuts text: a file naming no token has no hit to mask.
+        if !SPAWN_TOKENS.iter().any(|token| text.contains(token)) {
+            continue;
+        }
         let rel = crate::rel_path(root, &file);
         let masked = mask_unshipped(&text);
         for (i, raw) in masked.lines().enumerate() {

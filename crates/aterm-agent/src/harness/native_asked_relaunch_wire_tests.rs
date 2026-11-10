@@ -20,6 +20,7 @@ fn prepare() -> Prepare {
         image: image.clone(),
     };
     Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         id: "12".repeat(16),
         host_epoch: "34".repeat(16),

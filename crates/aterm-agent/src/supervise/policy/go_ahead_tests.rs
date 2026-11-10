@@ -1183,3 +1183,57 @@ fn a_condition_s_nouns_are_not_the_agent_s_work() {
         assert!(parked("", park).is_some(), "must park: {park}");
     }
 }
+
+/// OWN WORK BESIDE TOOLS, CODE AND OFFERS STILL PARKS (2026-11-09 hostile review): each word a
+/// person's part is read by needs its syntax, so a tool waits on no one (`once Xcode finishes`),
+/// a code noun is no act (`the mail module`, `every user of the helper`, `no snapshot tests`), a
+/// narrowed scope is no refusal (`I won't commit the generated files, only the sources`) and an
+/// offer is no demand (`if you'd rather do it yourself`). CONTROL:
+/// `a_persons_part_beside_own_work_gets_no_go_ahead` in `turn_end_go_ahead_tests.rs`.
+#[test]
+fn own_work_beside_tools_code_and_offers_still_parks() {
+    let lost: Vec<&str> = [
+        "I'll rebuild once Xcode finishes indexing; waiting on your go-ahead.",
+        "I'll commit and push when GitHub is reachable again; waiting on your go-ahead.",
+        "I'll push to main once Trust finishes building; waiting on your go-ahead.",
+        "Ready to rebuild and rerun the tests when Spotlight finishes indexing; waiting on your go-ahead.",
+        "I'll rebuild after Claude Code restarts; waiting on your go-ahead to push to main.",
+        "Ready to commit the fix to the mail module and push to main; waiting on your go-ahead.",
+        "I fixed the mail parser. Ready to commit and push to main; waiting on your go-ahead.",
+        "Ready to commit and push the form submit handler fix; waiting on your go-ahead.",
+        "Updated every user of the helper; ready to commit and push to main; waiting on your go-ahead.",
+        "The tests for all users of the API pass. Ready to commit and push; waiting on your go-ahead.",
+        "The change fixes the app store receipt parser tests; ready to commit and push; waiting on your go-ahead.",
+        "I didn't touch the live database code; ready to commit and push to main; waiting on your go-ahead.",
+        "No snapshot tests changed; ready to commit and push to main; waiting on your go-ahead.",
+        "Fixed the $ and dollars rendering bug. Ready to commit and push to main; waiting on your go-ahead.",
+        "I won't commit the generated files, only the sources; ready to push to main, waiting on your go-ahead.",
+        "I'd rather not push the scratch branch; ready to commit and push my branch to main, waiting on your go-ahead.",
+        "The teammate struct rename is done; ready to commit and push; waiting on your go-ahead.",
+        "This only touches our crate, no other teams' code; ready to commit and push; waiting on your go-ahead.",
+        "Ready to commit and push to main; waiting on your go-ahead, or say so if you'd rather do it yourself.",
+        "I won't land it without your go-ahead.",
+        "Clippy is happy now; ready to commit and push to main, waiting on your go-ahead.",
+        "Clippy is happy. Tests pass; ready to commit and push; waiting on your go-ahead.",
+        "Rewrote the token parser. Tests pass; ready to commit and push to main, waiting on your go-ahead.",
+        "I fixed the login form validation. Tests pass; ready to commit and push to main, waiting on your go-ahead.",
+        "Fixed the OAuth callback; tests pass; ready to push to main; waiting on your go-ahead.",
+        "Fixed the admin page crash; all tests pass; ready to commit and push, waiting on your go-ahead.",
+        "Fixed the mutex unlock ordering; ready to commit and push to main, waiting on your go-ahead.",
+        "Fixed the refund calculation rounding; ready to commit and push to main, waiting on your go-ahead.",
+        "Fixed the bug where the client accepts stale frames; ready to commit and push to main, waiting on your go-ahead.",
+        "Rebuilt with the fix from the Trust toolchain; ready to commit and push to main, waiting on your go-ahead.",
+        "Fixed the GitHub review comment parser; ready to commit and push to main, waiting on your go-ahead.",
+        "Added a teammate invite flow; ready to commit and push to main, waiting on your go-ahead.",
+        "Fixed the message author field; ready to commit and push to main, waiting on your go-ahead.",
+        "Fixed the bug that showed the beta banner to all users; ready to commit and push to main, waiting on your go-ahead.",
+        "There's no snapshot to compare against yet, so I recorded one; ready to commit and push to main, waiting on your go-ahead.",
+        "I won't push this to main yet; waiting on your go-ahead.",
+        "I won't commit this on my own; waiting on your go-ahead.",
+        "Ready to push to main; waiting on your go-ahead, unless you want to do it yourself.",
+    ]
+    .into_iter()
+    .filter(|reply| parked("", reply).is_none())
+    .collect();
+    assert!(lost.is_empty(), "no park for: {lost:#?}");
+}

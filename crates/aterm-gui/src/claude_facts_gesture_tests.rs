@@ -44,6 +44,15 @@ fn click_fact(app: &mut App, wid: WindowId, fact: Fact) {
     press_at(app, wid, (hit.frame_row, hit.cols.0), MouseButton::Left);
 }
 
+/// Name the program of `session`'s foreground group, `PGID`: only Claude Code's model and
+/// effort a click switches (`crate::claude_facts`' `App::model_switch`).
+fn set_program(app: &App, session: u64, program: &str) {
+    let ctx = app.pool.get(session).expect("session").ctx.clone();
+    let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    timeline.note_foreground_group(PGID);
+    timeline.set_program(PGID, Some(program.into()));
+}
+
 fn mask(kinds: &[FactKind]) -> FactMask {
     kinds
         .iter()
@@ -302,37 +311,73 @@ fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() 
 
 #[test]
 fn each_fact_hides_alone_and_each_stub_shows_its_own() {
-    let (mut app, wid, session, mut reader) = app();
+    let (mut app, wid, session, _reader) = app();
     publish_facts(&app, session);
+    set_program(&app, session, "claude");
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
     let row = footer_row(&app, wid);
-    click_fact(&mut app, wid, Fact::Model);
-    frame(&mut app, wid);
-    assert!(row_text(&app, wid, row).contains("\u{25C6} Opus 5.5 off xhigh"));
-    click_fact(&mut app, wid, Fact::Effort);
-    frame(&mut app, wid);
-    let text = row_text(&app, wid, row);
-    assert!(text.contains("\u{25C6} Opus 5.5 off xhigh off"), "{text:?}");
-    assert_eq!(
-        (
-            fact_hit(&app, wid, Fact::Model).restores,
-            fact_hit(&app, wid, Fact::Effort).restores
-        ),
-        (mask(&[FactKind::Model]), mask(&[FactKind::Effort]))
-    );
-    click_fact(&mut app, wid, Fact::Model);
-    assert_eq!(app.fact_mask(session), mask(&[FactKind::Effort]));
-    frame(&mut app, wid);
-    assert!(row_text(&app, wid, row).contains("\u{25C6} Opus 5.5 xhigh off"));
-    click_fact(&mut app, wid, Fact::Effort);
-    assert_eq!(app.fact_mask(session), FactMask::default());
+    for fact in [Fact::Model, Fact::Effort] {
+        click_fact(&mut app, wid, fact);
+        app.close_autopilot_menu();
+        assert_eq!(
+            app.fact_mask(session),
+            FactMask::default(),
+            "{fact:?}: a click switches the model, it hides nothing"
+        );
+    }
     frame(&mut app, wid);
     assert!(row_text(&app, wid, row).contains("\u{25C6} Opus 5.5 xhigh"));
     click_fact(&mut app, wid, Fact::Path);
     frame(&mut app, wid);
     assert!(row_text(&app, wid, row).contains("\u{2302} ~/aterm off"));
-    assert!(pty(&mut reader, 0).is_empty());
+    click_fact(&mut app, wid, Fact::Branch);
+    frame(&mut app, wid);
+    assert_eq!(
+        (
+            fact_hit(&app, wid, Fact::Path).restores,
+            fact_hit(&app, wid, Fact::Branch).restores
+        ),
+        (mask(&[FactKind::Path]), mask(&[FactKind::Branch]))
+    );
+    click_fact(&mut app, wid, Fact::Path);
+    assert_eq!(app.fact_mask(session), mask(&[FactKind::Branch]));
+    click_fact(&mut app, wid, Fact::Branch);
+    assert_eq!(app.fact_mask(session), FactMask::default());
+}
+
+/// WHERE NOTHING TYPES `/model`, A CLICK HIDES THE MODEL AND ITS EFFORT: aterm types into Claude
+/// Code alone, so another program's model and effort keep the click that hides them, their
+/// titles say so, their menus offer no switch, and nothing reaches the program. Control: the
+/// same pane named Claude Code switches and hides nothing.
+#[test]
+fn a_model_click_hides_it_where_no_claude_code_takes_the_switch() {
+    let (mut app, wid, session, mut reader) = app();
+    publish_facts(&app, session);
+    draw_claude(&app, session, PLAN);
+    frame(&mut app, wid);
+    assert_eq!(app.model_switch(session), None);
+    assert_eq!(app.switch_plan(session), None);
+    assert_eq!(app.fact_title(session, Fact::Model).1, "click: hide");
+    click_fact(&mut app, wid, Fact::Model);
+    assert_eq!(app.fact_mask(session), mask(&[FactKind::Model]));
+    click_fact(&mut app, wid, Fact::Effort);
+    assert_eq!(
+        app.fact_mask(session),
+        mask(&[FactKind::Model, FactKind::Effort])
+    );
+    assert!(pty(&mut reader, 0).is_empty(), "nothing reached the PTY");
+    app.set_fact_mask(session, FactMask::default());
+    set_program(&app, session, "claude");
+    frame(&mut app, wid);
+    assert!(
+        app.model_switch(session).is_some(),
+        "control: Claude Code switches"
+    );
+    assert_eq!(
+        app.fact_title(session, Fact::Model).1,
+        "click: back to the default model at auto effort"
+    );
 }
 
 #[test]
@@ -993,6 +1038,7 @@ fn facts_are_buttons_named_in_words() {
     use crate::a11y_tree::HarnessChip;
     let (mut app, wid, session, _reader) = app();
     publish_facts(&app, session);
+    set_program(&app, session, "claude");
     publish_side(&app, session, "/Users//someone/aterm");
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
@@ -1008,7 +1054,7 @@ fn facts_are_buttons_named_in_words() {
         named(HarnessChip::Model),
         (
             "Model: Opus 5.5".to_owned(),
-            Some("Activate to hide it.".to_owned())
+            Some("Activate to switch back to the default model at auto effort.".to_owned())
         )
     );
     assert_eq!(named(HarnessChip::Effort).0, "Effort: xhigh");

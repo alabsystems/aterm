@@ -761,13 +761,13 @@ fn heard(paths: &Paths) -> u64 {
 /// revocation and a roster that denies this Mac are each read at the next call. A scratch vault a
 /// test registers as the ALab vault's after a first read is read again, though no file moved.
 ///
-/// NEGATIVE CONTROLS (2026-11-09): with the memo stamping none of the files it reads
-/// (`Memo::keyed(|_| Some(Vec::new()), true)`), the next call after the vault's newer word gives
-/// the earlier one (`the vault's newer word at the next call`, `left: Some(1794216841), right:
-/// Some(1794216901)`); with the memo not quiet (`Memo::keyed(observation_inputs, false)`), the call
-/// under the writer is given the answer kept from before it (`a writer holding the vault meets the
-/// read`); keyed by nothing (`&false` for the registration), the registration is not read
-/// (`a registration after a first read`).
+/// NEGATIVE CONTROLS (2026-11-09): with `state_look` finding a kept look by its path alone (`*stamp
+/// == before` dropped), the next call after the vault's newer word gives the earlier one (`the
+/// vault's newer word at the next call`, `left: Some(1794270305), right: Some(1794270365)`); with
+/// the memo not quiet (`Memo::keyed(observation_inputs, false)`), the call under the writer is
+/// given the answer kept from before it (`a writer holding the vault meets the read`); keyed by
+/// nothing (`&false` for the registration), the registration is not read (`a registration after a
+/// first read`).
 #[test]
 fn the_lan_presence_reads_the_vault_again_only_when_a_file_moved() {
     let _answering = ServersAnswering::set();
@@ -966,6 +966,60 @@ fn the_desk_inputs_stand_over_a_round_and_move_with_the_state() {
     assert!(
         desk_inputs(m7).as_ref() != Some(&before),
         "a change of the state moves them"
+    );
+    lab.server.stop();
+}
+
+/// A round of the vault's subscriber that brings nothing new rewrites `state.toml` with its
+/// receipt and, a minute apart at most, the time the vault last heard this Mac: about every 25 s
+/// on a member. Each rewrite read every memo of the vault again ([`vault_memo`]), the deny list a
+/// node's watch asks every two seconds, the roster, the records, the Commons observation and the
+/// LAN presence, each reading the held vault whole, though none is read from those fields. Now
+/// each stamps the state by what it holds but them: the round reads `state.toml` once, and
+/// nothing else, and the LAN presence gives the vault's newer word; a change of what the state
+/// holds reads them again at once.
+///
+/// NEGATIVE CONTROL (2026-11-09): with `stamp_memo_inputs_in` stamping `state.toml` by its
+/// metadata (as `stamp_inputs_in`), the round reads the vault again (`a round reads state.toml
+/// alone`).
+#[test]
+fn a_round_that_moves_only_heard_reads_no_memo_again() {
+    let _answering = ServersAnswering::set();
+    let lab = log_entries_tests::two_macs(&[]);
+    with_a_denied_node(&lab.m22, &lab.m7);
+    let m7 = &lab.m7;
+    test_alab_standing(m7);
+    let deadline = || std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let ask = || {
+        assert!(swarm_denied_nodes_now(m7).unwrap().is_some());
+        assert!(swarm_roster_now_until(m7, deadline()).unwrap().is_some());
+        let _ = records_now(m7).unwrap();
+        assert_eq!(verdict(&commons::observe_settled(m7)), "visible");
+        swarm_member_heard_now(m7).unwrap()
+    };
+    sync(m7, None).expect("a round that finds nothing new");
+    assert_eq!(ask(), Some(heard(m7)));
+    let (again, read) = reads_during(m7, ask);
+    assert_eq!(again, Some(heard(m7)));
+    assert!(read.is_empty(), "kept reads of unchanged files: {read:#?}");
+
+    let mut state = load_state(m7).unwrap();
+    state.heard += 60;
+    save_state(m7, &state).unwrap();
+    let (newer, read) = reads_during(m7, ask);
+    assert_eq!(newer, Some(state.heard), "the vault's newer word");
+    assert_eq!(
+        read.into_iter().collect::<Vec<_>>(),
+        vec![(m7.state_file(), 1)],
+        "a round reads state.toml alone"
+    );
+
+    state.seq += 1;
+    save_state(m7, &state).unwrap();
+    let (_, read) = reads_during(m7, || swarm_denied_nodes_now(m7));
+    assert!(
+        read.contains_key(&m7.cache_file()),
+        "a change of the state reads the deny list again: {read:#?}"
     );
     lab.server.stop();
 }

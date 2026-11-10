@@ -53,7 +53,7 @@ fn transcript_usage_rejects_answers_before_the_process_started() {
             said: &said,
         };
         let word = super::super::account_usage_of(
-            (root.path(), &store),
+            (root.path(), &store, None),
             &captured,
             "transcript",
             &read,
@@ -150,7 +150,7 @@ fn transcript_usage_and_walls_admit_the_captured_source_at_the_writer() {
                 (&store, root.path().join("state"))
             };
             let result = super::super::account_usage_of(
-                (&state, writer),
+                (&state, writer, None),
                 &captured,
                 "transcript",
                 &read,
@@ -175,8 +175,13 @@ fn transcript_usage_and_walls_admit_the_captured_source_at_the_writer() {
                     credits: None,
                 }),
             };
-            let result =
-                super::super::account_wall_of(writer, &captured, "transcript", &wall, ACCT_NOW);
+            let result = super::super::account_wall_of(
+                (writer, None),
+                &captured,
+                "transcript",
+                &wall,
+                ACCT_NOW,
+            );
             assert_eq!(
                 result.0 == "wall",
                 accepted,

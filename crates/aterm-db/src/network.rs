@@ -15,16 +15,13 @@ use crate::{
 use astream_wire::sync::{Actor, Digest};
 use aterm_net::fleet::{self, FleetOp, FleetScope, FleetSecret, NodeIdentity, NodeProof};
 use aterm_net::lan::{Connection, Listener, Scope};
+use aterm_uds::stop::Stop;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -471,7 +468,7 @@ pub fn serve(dir: &Path, listener: Listener, peers: Vec<SocketAddr>) -> Result<(
     serve_until(
         dir,
         listener,
-        Arc::new(AtomicBool::new(true)),
+        Arc::new(Stop::new()),
         Arc::new(Mutex::new(peers)),
     )
 }
@@ -480,23 +477,23 @@ pub fn serve(dir: &Path, listener: Listener, peers: Vec<SocketAddr>) -> Result<(
 pub fn serve_until(
     dir: &Path,
     listener: Listener,
-    running: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     peers: Arc<Mutex<Vec<SocketAddr>>>,
 ) -> Result<()> {
     let credentials = Credentials::load(dir)?;
     let (secret, identity) = transport(&credentials)?;
     let outbound = {
         let dir = dir.to_path_buf();
-        let running = running.clone();
+        let stop = stop.clone();
         thread::Builder::new()
             .name("db-anti-entropy".into())
             .spawn(move || {
                 let mut repairs = BTreeMap::new();
                 let mut peer_list = Vec::new();
-                while running.load(Ordering::Acquire) {
+                while !stop.is_set() {
                     peer_list.clone_from(&peers.lock().unwrap_or_else(|p| p.into_inner()));
                     for peer in &peer_list {
-                        if !running.load(Ordering::Acquire) {
+                        if stop.is_set() {
                             break;
                         }
                         // Bound cached retry hints, not the set of machines we
@@ -509,12 +506,7 @@ pub fn serve_until(
                         repairs.insert(*peer, repair);
                     }
                     let jitter = crate::crypto::random::<1>().map_or(0, |b| u64::from(b[0]));
-                    for _ in 0..(10 + jitter / 40) {
-                        if !running.load(Ordering::Acquire) {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(500));
-                    }
+                    stop.sleep(Duration::from_millis(500 * (10 + jitter / 40)));
                 }
             })?
     };
@@ -533,7 +525,7 @@ pub fn serve_until(
             per_source: 4,
             lifetime: WITHIN,
         },
-        &running,
+        &stop,
         HANDSHAKE,
         move |served, _| {
             let peer = served.peer_node().cloned();
@@ -551,7 +543,7 @@ pub fn serve_until(
             }
         },
     );
-    running.store(false, Ordering::Release);
+    stop.set();
     let _ = outbound.join();
     let error = stopped.lock().unwrap_or_else(|p| p.into_inner()).take();
     error.map_or(Ok(()), |reason| Err(Error::new(&reason)))
@@ -595,23 +587,23 @@ pub fn sync_fleet_round_with(dir: &Path, peer: SocketAddr, repair: &mut Repair) 
 pub fn serve_fleet_until(
     dir: &Path,
     listener: std::net::TcpListener,
-    running: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     peers: Arc<Mutex<Vec<SocketAddr>>>,
 ) -> Result<()> {
     let credentials = Credentials::load(dir)?;
     let (secret, identity) = transport(&credentials)?;
     let outbound = {
         let dir = dir.to_path_buf();
-        let running = running.clone();
+        let stop = stop.clone();
         thread::Builder::new()
             .name("db-fleet-anti-entropy".into())
             .spawn(move || {
                 let mut repairs = BTreeMap::new();
                 let mut peer_list = Vec::new();
-                while running.load(Ordering::Acquire) {
+                while !stop.is_set() {
                     peer_list.clone_from(&peers.lock().unwrap_or_else(|p| p.into_inner()));
                     for peer in &peer_list {
-                        if !running.load(Ordering::Acquire) {
+                        if stop.is_set() {
                             break;
                         }
                         let mut repair = repairs.remove(peer).unwrap_or_default();
@@ -622,12 +614,7 @@ pub fn serve_fleet_until(
                         repairs.insert(*peer, repair);
                     }
                     let jitter = crate::crypto::random::<1>().map_or(0, |b| u64::from(b[0]));
-                    for _ in 0..(10 + jitter / 40) {
-                        if !running.load(Ordering::Acquire) {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(500));
-                    }
+                    stop.sleep(Duration::from_millis(500 * (10 + jitter / 40)));
                 }
             })?
     };
@@ -649,7 +636,7 @@ pub fn serve_fleet_until(
         &listener,
         &listening,
         Arc::new(|| (FleetScope::Facts, SERVED_OPS)),
-        &running,
+        &stop,
         move |served, _| {
             let peer = served.peer_node().cloned();
             let credentials = Credentials::load(&dir).map_err(std::io::Error::other)?;
@@ -666,7 +653,7 @@ pub fn serve_fleet_until(
             }
         },
     );
-    running.store(false, Ordering::Release);
+    stop.set();
     let _ = outbound.join();
     let error = stopped.lock().unwrap_or_else(|p| p.into_inner()).take();
     error.map_or(Ok(()), |reason| Err(Error::new(&reason)))
@@ -857,17 +844,15 @@ mod tests {
         }
         let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
         let address = listener.local_addr().unwrap();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let server = {
             let a = a.clone();
-            let running = running.clone();
-            thread::spawn(move || {
-                serve_until(&a, listener, running, Arc::new(Mutex::new(Vec::new())))
-            })
+            let stop = stop.clone();
+            thread::spawn(move || serve_until(&a, listener, stop, Arc::new(Mutex::new(Vec::new()))))
         };
         let first = sync_round(&b, address);
         let second = first.as_ref().ok().map(|_| sync_round(&b, address));
-        running.store(false, Ordering::Release);
+        stop.set();
         server.join().unwrap().unwrap();
         let first = first.unwrap();
         assert_eq!((first.sent, first.received, first.deferred), (1, 1, 0));

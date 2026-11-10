@@ -640,6 +640,102 @@ fn scanner_freshness_transport_is_could_not_run_not_an_install_remedy() {
 }
 
 #[test]
+fn export_package_keys_bind_policy_binary_clearance_and_package_content() {
+    let (_dir, mut ctx) = checkout("pub fn x() {}\n");
+    let other = ctx.root.join("crates/y/src/lib.rs");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, "pub fn y() {}\n").unwrap();
+    std::fs::write(ctx.root.join("payload.bin"), b"\0binary").unwrap();
+    git(&ctx.root, &["add", "."]);
+    git(&ctx.root, &["commit", "-qm", "packages"]);
+    ctx.carry_context = Some("a".repeat(64));
+    let listed = Listed {
+        paths: vec!["crates/x/src/lib.rs".into(), "crates/y/src/lib.rs".into()],
+        gitlinks: Vec::new(),
+        whole: false,
+        what: "fixture".into(),
+    };
+    let keys = || {
+        input_plans(&ctx, &listed)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.proof.key)
+            .collect::<Vec<_>>()
+    };
+    let original = keys();
+    std::fs::write(
+        ctx.root.join("crates/x/src/lib.rs"),
+        "pub fn changed() {}\n",
+    )
+    .unwrap();
+    git(&ctx.root, &["commit", "-qam", "one package"]);
+    let changed = keys();
+    assert_ne!(original[0], changed[0]);
+    assert_eq!(original[1], changed[1]);
+    let before_binary = input_plans(&ctx, &listed).unwrap();
+    std::fs::write(ctx.root.join("payload.bin"), b"\0different").unwrap();
+    git(&ctx.root, &["commit", "-qam", "clearance input"]);
+    assert_ne!(
+        changed[1],
+        keys()[1],
+        "another package's binary can clear a finding"
+    );
+    let mut drift = Report::new("export-scan");
+    finish_inputs(&ctx, &mut drift, &listed, before_binary);
+    assert!(
+        drift
+            .outcomes()
+            .any(|(outcome, _)| outcome != crate::ladder::Outcome::Ok),
+        "a clearance input changed after the initial snapshot"
+    );
+    std::fs::write(ctx.root.join(CONFIG), "[extend]\nuseDefault=false\n").unwrap();
+    git(&ctx.root, &["commit", "-qam", "policy"]);
+    assert_ne!(changed, keys());
+}
+
+#[cfg(unix)]
+#[test]
+fn partial_package_reuse_materializes_the_shared_scanner_configuration() {
+    let (_dir, mut ctx) = checkout("pub fn original() {}\n");
+    git(&ctx.root, &["add", "."]);
+    git(&ctx.root, &["commit", "-qm", "original package"]);
+    ctx.input_paths = Some(vec!["crates/x/src/lib.rs".into(), CONFIG.into()]);
+    ctx.carry_context = Some("a".repeat(64));
+    let listed = listed_input(
+        &ctx.root,
+        &ctx.path_env,
+        &ctx.scope,
+        ctx.input_paths.as_deref(),
+    )
+    .unwrap();
+    ctx.input_items = input_plans(&ctx, &listed)
+        .unwrap()
+        .into_iter()
+        .map(|plan| plan.proof)
+        .collect();
+    std::fs::write(
+        ctx.root.join("crates/x/src/lib.rs"),
+        "pub fn changed() {}\n",
+    )
+    .unwrap();
+    git(&ctx.root, &["commit", "-qam", "changed package"]);
+    let (outcomes, _, report) = verdict(&ctx, Ok(Scanner::Fixture("/usr/bin/true".into())));
+    assert!(
+        outcomes.iter().all(|outcome| *outcome == Outcome::Ok),
+        "{}",
+        report.render()
+    );
+    std::fs::write(ctx.root.join("crates/x/src/lib.rs"), "// quokkaword\n").unwrap();
+    git(&ctx.root, &["commit", "-qam", "negative content control"]);
+    let (_, findings, _) = verdict(&ctx, Ok(Scanner::Fixture("/usr/bin/true".into())));
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding == "crates/x/src/lib.rs:1")
+    );
+}
+
+#[test]
 fn the_gitlink_is_read_as_the_astream_files_the_export_carries() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let root = dir.path();

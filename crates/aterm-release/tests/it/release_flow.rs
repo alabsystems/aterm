@@ -95,9 +95,15 @@ fn hop_of(fix: &str) -> String {
     format!("9{}", &fix[1..])
 }
 
+type ExecJudge = Box<dyn FnMut(&str) -> Result<(), Refusal> + Send>;
+
 struct World {
+    preview_own: bool,
+    gate_repo: Option<PathBuf>,
+    gate_revision: bool,
     input_refusal: Option<Refusal>,
     fleet_refusal: Option<String>,
+    fleet_panics: bool,
     supersede_preflight_refusal: Option<Refusal>,
     supersede_unknown_once: bool,
     supersede_unknown_absent_once: bool,
@@ -122,6 +128,7 @@ struct World {
     exec_result: Result<(), Refusal>,
     /// R the last exec was asked to replace this image with.
     exec_commit: Option<String>,
+    exec_judge: Option<ExecJudge>,
     times: String,
     history: Vec<String>,
     versions: BTreeMap<String, String>,
@@ -132,6 +139,7 @@ struct World {
     ledger: Vec<String>,
     published: BTreeMap<String, String>,
     newest: Option<String>,
+    publish_pending_on_unscoped_read: bool,
     cut: Option<CutState>,
     attested: Option<String>,
     /// Each check's record, by R's commit (its tree here), the executable for the bundle's
@@ -196,6 +204,8 @@ struct World {
     cutter_recovery: crate::release_tools::Recovery,
     warming_active: bool,
     unrecorded_hops: BTreeSet<String>,
+    rewind_refusal: Option<Refusal>,
+    move_refusal: Option<Refusal>,
     asks: Vec<String>,
     resolved: Vec<String>,
     withdrawn: Vec<String>,
@@ -290,6 +300,7 @@ struct World {
     sign_code: i32,
     /// The build whose copy `cut --sign` signed privately and kept the record of.
     signed: Option<u64>,
+    drafts_discarded: usize,
     prepared_signature: Option<u64>,
     prepare_code: i32,
     early_overlap: bool,
@@ -325,8 +336,12 @@ impl World {
         let mut origin_tags = BTreeMap::new();
         origin_tags.insert("v0.5.0".into(), OLD.into());
         Self {
+            preview_own: false,
+            gate_repo: None,
+            gate_revision: false,
             input_refusal: None,
             fleet_refusal: None,
+            fleet_panics: false,
             supersede_preflight_refusal: None,
             supersede_unknown_once: false,
             supersede_unknown_absent_once: false,
@@ -352,6 +367,7 @@ impl World {
                 "nothing",
             )),
             exec_commit: None,
+            exec_judge: None,
             times: String::new(),
             history: vec![OLD.into(), TIP.into()],
             versions,
@@ -362,6 +378,7 @@ impl World {
             ledger: vec!["0.4.0".into(), "0.5.0".into()],
             published: BTreeMap::new(),
             newest: Some(OLD.into()),
+            publish_pending_on_unscoped_read: false,
             cut: None,
             attested: None,
             records: BTreeMap::new(),
@@ -400,6 +417,8 @@ impl World {
             cutter_recovery: crate::release_tools::Recovery::Initial,
             warming_active: false,
             unrecorded_hops: BTreeSet::new(),
+            rewind_refusal: None,
+            move_refusal: None,
             asks: Vec::new(),
             resolved: Vec::new(),
             withdrawn: Vec::new(),
@@ -449,6 +468,7 @@ impl World {
             keep_build_on_test_red: false,
             sign_code: 0,
             signed: None,
+            drafts_discarded: 0,
             prepared_signature: None,
             prepare_code: 0,
             early_overlap: false,
@@ -1347,6 +1367,7 @@ impl Backend for World {
         line: &crate::line::Line,
         _handed: bool,
     ) -> Result<crate::line::Line, String> {
+        assert!(!self.fleet_panics, "planted release bug in fleet selection");
         self.fleet_refusal.clone().map_or_else(
             || Ok(self.fleet_selected.clone().unwrap_or_else(|| line.clone())),
             Err,
@@ -1503,6 +1524,14 @@ impl Backend for World {
         self.ledger.clone()
     }
     fn engine_rows(&mut self, commit: Option<&str>) -> EngineRows {
+        if commit.is_none()
+            && self.publish_pending_on_unscoped_read
+            && self.preview_own
+            && self.release_dir().join(SELECTION_FILE).exists()
+        {
+            self.newest = Some(BUMP.into());
+            self.publish_pending_on_unscoped_read = false;
+        }
         let mine = commit.and_then(|c| self.published.get(c));
         EngineRows {
             newest: self.newest.clone(),
@@ -1566,7 +1595,19 @@ impl Backend for World {
             ));
         }
         Ok(Admitted::Fix(Fix {
-            subject: format!("fix {}", &commit[..4]),
+            subject: self.carry_repo.as_ref().map_or_else(
+                || format!("fix {}", &commit[..4]),
+                |repo| {
+                    crate::ledger::git_ok(
+                        &crate::ledger::testing::Git::new(repo),
+                        &["show", "-s", "--format=%s", &commit],
+                    )
+                    .unwrap()
+                    .stdout_utf8()
+                    .trim()
+                    .to_owned()
+                },
+            ),
             commit,
             paths: vec!["src/fixed.rs".into()],
         }))
@@ -1645,7 +1686,7 @@ impl Backend for World {
         }
         self.head = commit.to_string();
         self.interrupt_at("move");
-        Ok(())
+        self.move_refusal.clone().map_or(Ok(()), Err)
     }
     fn own_cutter(&mut self, _commit: &str) -> Result<String, crate::cutter::NotOwn> {
         if self.own_cutter {
@@ -1663,6 +1704,9 @@ impl Backend for World {
     fn exec_cutter(&mut self, commit: &str, _prover: &Prover) -> Result<(), Refusal> {
         self.calls.push("exec-cutter".into());
         self.exec_commit = Some(commit.to_owned());
+        if let Some(judge) = &mut self.exec_judge {
+            return judge(commit);
+        }
         self.exec_result.clone()
     }
     fn warm_tools(&mut self, _commit: &str, _prover: &Prover) -> Result<(), Refusal> {
@@ -1688,7 +1732,18 @@ impl Backend for World {
     }
     fn rewind_selection(&mut self, line: &Line) -> Result<(), Refusal> {
         self.calls.push("rewind-selection".into());
-        self.head = line.base.clone();
+        if let Some(refusal) = self.rewind_refusal.clone() {
+            return Err(refusal);
+        }
+        let tip = self.tip();
+        let mut prefix = line.clone();
+        while !self.is_ancestor(prefix.head(), &tip) {
+            prefix
+                .hops
+                .pop()
+                .expect("the fake line's base remains on main");
+        }
+        self.head = prefix.head().to_string();
         Ok(())
     }
     fn facts(&mut self, c: &Candidate, _prover: &Prover, artifact: Option<&Artifact>) -> Facts {
@@ -1742,7 +1797,7 @@ impl Backend for World {
     fn let_disk_go(&mut self, passed: bool) {
         self.calls.push(format!("disk-let-go {passed}"));
     }
-    fn commit_gates(&mut self, _c: &Candidate, dry: bool) -> Vec<Refusal> {
+    fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal> {
         self.calls.push(
             if dry {
                 "commit-gates-dry"
@@ -1751,7 +1806,25 @@ impl Backend for World {
             }
             .into(),
         );
-        self.blocks.clone()
+        let mut found = self.blocks.clone();
+        if let Some(repo) = &self.gate_repo {
+            let git = crate::ledger::GitCli::new(repo);
+            let revision = if self.gate_revision {
+                c.commit.as_str()
+            } else {
+                "HEAD"
+            };
+            if let Err(why) = crate::gates::changelog_gate_at(&git, revision, &c.version) {
+                found.push(Refusal::new(
+                    format!("changelog — {why}"),
+                    "repair the entry",
+                ));
+            }
+        }
+        found
+    }
+    fn can_check_commit(&mut self, _c: &Candidate) -> bool {
+        self.preview_own
     }
     fn cut_gates(
         &mut self,
@@ -1955,6 +2028,12 @@ impl Backend for World {
         }
         if self.prepared_signature == Some(build) {
             self.prepared_signature = None;
+        }
+        Vec::new()
+    }
+    fn discard_draft(&mut self, _version: &str, build: u64) -> Vec<String> {
+        if self.signed == Some(build) {
+            self.drafts_discarded += 1;
         }
         Vec::new()
     }
@@ -2199,6 +2278,38 @@ fn supersession_preflight_and_unknown_write_use_one_candidate_transaction() {
     assert_eq!(std::fs::read(&journal_path).unwrap(), before);
     assert!(!selected.release_dir().join(SELECTION_FILE).exists());
     assert_eq!(selected.count("supersede"), 0);
+
+    // --forget rolls an unentered replacement back to the transaction's exact original HEAD
+    // before deleting its journals. NEGATIVE CONTROL: generic line-prefix cleanup skips a
+    // supersession and strands HEAD at the private replacement.
+    let mut forgotten = setup();
+    forgotten.own_cutter = false;
+    forgotten.exec_result = Ok(());
+    let release_path = forgotten.release_dir().join(JOURNAL_FILE);
+    let release_before = std::fs::read(&release_path).unwrap();
+    assert_eq!(forgotten.run(options(false)).0, 0);
+    assert_eq!(forgotten.head, TIP);
+    let selection = forgotten.release_dir().join(SELECTION_FILE);
+    let transaction = Journal::load(&selection)
+        .unwrap()
+        .unwrap()
+        .supersede
+        .unwrap();
+    assert!(!transaction.cas_unknown);
+    assert_eq!(transaction.head, NEXT);
+    assert_eq!(std::fs::read(&release_path).unwrap(), release_before);
+    assert!(forgotten.supersession.is_none());
+    let (code, last) = forgotten.run(ReleaseOptions {
+        forget: true,
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert!(last.contains("supersession's original head"), "{last}");
+    assert_eq!(forgotten.head, NEXT);
+    assert!(!selection.exists());
+    assert!(!release_path.exists());
+    assert_eq!(forgotten.count("supersede"), 0);
+    assert!(forgotten.supersession.is_none());
 
     // The replacement image can fail its own toolchain gates before repeated preflight. Those
     // failures still restore the launcher's exact pre-selection state.
@@ -2549,9 +2660,10 @@ fn a_build_inputs_seal_failure_stops_step_one_with_its_own_remedy() {
     assert_eq!(world.count("validation-tools"), 0);
     let mut dry = World::new();
     dry.seal_error = Some("never asked".into());
+    dry.versions.insert(TIP.into(), "0.6.0".into());
     let (code, last) = dry.run(ReleaseOptions {
         dry_run: true,
-        ..bump()
+        ..mac()
     });
     assert_eq!(code, 0, "{last}");
     assert_eq!((dry.count("lease"), dry.count("seal-inputs")), (0, 0));
@@ -2641,11 +2753,11 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             "sync",
             "bump",
             "move cccc",
+            "commit-gates",
             input.as_str(),
             "sync",
             "validation-tools",
             "disk-claim 30",
-            "commit-gates",
             "reserve",
             "verify --bundle",
             "disk-let-go true",
@@ -2903,7 +3015,7 @@ fn a_release_claims_its_disk_until_verify_ends_and_a_later_stage_claims_its_own(
         dry_run: true,
         ..bump()
     });
-    assert_eq!(code, 0, "{last}");
+    assert_eq!(code, 3, "{last}");
     assert!(claims(&w).is_empty(), "{:?}", w.calls);
     assert!(
         w.out.iter().any(|l| l.contains("disk: would claim 30 GiB"))
@@ -3177,7 +3289,8 @@ fn a_dry_run_changes_nothing_and_asks_nobody() {
         dry_run: true,
         ..bump()
     });
-    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(code, 3, "{last}\n{:#?}", w.out);
+    assert!(last.contains("cannot judge every step") && !last.contains("would refuse"));
     assert!(w.journal().is_none(), "a dry run writes no journal");
     assert!(!w.release_dir().join(RUNNING_FILE).exists());
     for call in [
@@ -3209,19 +3322,87 @@ fn a_dry_run_changes_nothing_and_asks_nobody() {
     );
 }
 
+/// The checkout's Rust cutter refuses, while R's different Rust source passes. The
+/// controller must dispatch before asking any old gate. NEGATIVE CONTROL: the old
+/// dry branch skips dispatch and returns the checkout's planted refusal instead.
+#[test]
+fn a_dry_run_uses_rs_frozen_source_instead_of_the_checkouts_verdict() {
+    let fixture = crate::release_steps::dry_tools_tests::Fixture::new();
+    let (code, output) = fixture.verdict(&fixture.checkout);
+    assert_eq!(code, 17, "negative control: {output}");
+    assert!(output.contains("checkout policy refuses"));
+    let candidate = fixture.candidate.clone();
+    let mut world = World::new();
+    world.history.push(candidate.clone());
+    world.versions.insert(candidate.clone(), "0.6.0".into());
+    world.own_cutter = false;
+    world.blocks = vec![Refusal::new("checkout policy refuses", "use R's tools")];
+    world.exec_judge = Some(Box::new(move |revision| {
+        assert_eq!(revision, fixture.candidate);
+        let (code, output) = fixture.verdict(revision);
+        assert_eq!(code, 0, "R's frozen source: {output}");
+        assert!(output.contains("R policy passes"));
+        Ok(())
+    }));
+    let (code, last) = world.run(ReleaseOptions {
+        commit: Some(candidate.clone()),
+        dry_run: true,
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert_eq!(world.exec_commit, Some(candidate));
+    assert_eq!(world.count("commit-gates-dry"), 0);
+    assert!(
+        !world
+            .calls
+            .iter()
+            .any(|call| call.starts_with("input-checks "))
+    );
+    assert!(world.journal().is_none());
+}
+
+#[test]
+fn a_dry_run_without_rs_cutter_reports_no_r_verdict() {
+    let mut world = World::new();
+    world.versions.insert(TIP.into(), "0.6.0".into());
+    world.own_cutter = false;
+    world.exec_result = Err(Refusal::new(
+        "R's cutter cannot be built",
+        "repair its build",
+    ));
+    world.blocks = vec![Refusal::new("old cutter's false refusal", "carry a fix")];
+    let (code, last) = world.run(ReleaseOptions {
+        dry_run: true,
+        ..mac()
+    });
+    assert_eq!(code, 3, "{last}");
+    assert!(
+        last.contains("cannot judge") && !last.contains("would refuse"),
+        "{last}"
+    );
+    assert_eq!(world.count("commit-gates-dry"), 0);
+    assert!(
+        !world
+            .calls
+            .iter()
+            .any(|call| call.starts_with("input-checks "))
+    );
+}
+
 /// Both entry paths judge the input before qualify; the negative control reaches its dry
 /// success summary only after that same check passes.
 #[test]
 fn unchecked_input_refuses_at_step_one_including_a_dry_run() {
     for dry in [true, false] {
         let mut w = World::new();
+        w.versions.insert(TIP.into(), "0.6.0".into());
         w.input_refusal = Some(Refusal::new(
             "export-scan: planted forbidden content",
             "land the fix",
         ));
         let (code, last) = w.run(ReleaseOptions {
             dry_run: dry,
-            ..bump()
+            ..mac()
         });
         assert_ne!(code, 0, "{last}\n{:?}", w.out);
         assert!(
@@ -3236,22 +3417,216 @@ fn unchecked_input_refuses_at_step_one_including_a_dry_run() {
         assert!(w.calls.iter().any(|call| call.starts_with("input-checks ")));
     }
     let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
     let (code, last) = w.run(ReleaseOptions {
         dry_run: true,
-        ..bump()
+        ..mac()
     });
     assert_eq!(code, 0, "{last}");
     assert!(last.contains("would go ahead"), "{last}");
     assert!(w.calls.iter().any(|call| call.starts_with("input-checks ")));
 }
 
+/// Real Git objects and the production changelog gate; only release authority and
+/// compilation are the controller's existing fake world. No publication is possible.
+fn changelog_defect_clone() -> aterm_tempfile::TempDir {
+    use crate::ledger::{GitCli, git_ok};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    crate::ledger::testing::init(
+        &source,
+        &[
+            ("user.name", "Fixture"),
+            ("user.email", "fixture@example.invalid"),
+        ],
+    );
+    std::fs::write(
+        source.join("CHANGELOG.md"),
+        "# Changelog\n\n## [Unreleased]\n\n- A useful change.\n",
+    )
+    .unwrap();
+    let git = GitCli::new(&source);
+    git_ok(&git, &["add", "."]).unwrap();
+    git_ok(&git, &["commit", "-qm", "clean fixture"]).unwrap();
+    let clone = root.path().join("clone");
+    git_ok(
+        &git,
+        &[
+            "clone",
+            "-q",
+            source.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    std::fs::write(
+        clone.join("CHANGELOG.md"),
+        "# Changelog\n\n- This orphan would be lost.\n\n## [Unreleased]\n\n- A useful change.\n",
+    )
+    .unwrap();
+    let git = GitCli::new(&clone);
+    git_ok(&git, &["add", "."]).unwrap();
+    git_ok(
+        &git,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "planted orphan",
+        ],
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn commit_preflight_precedes_input_compile_and_dry_run_collects_both_reds() {
+    let root = changelog_defect_clone();
+    for dry in [false, true] {
+        let mut w = World::new();
+        w.versions.insert(TIP.into(), "0.6.0".into());
+        w.gate_repo = Some(root.path().join("clone"));
+        w.input_refusal = Some(Refusal::new(
+            "census: planted input defect",
+            "repair census",
+        ));
+        let (code, last) = w.run(ReleaseOptions {
+            dry_run: dry,
+            ..mac()
+        });
+        assert_eq!(code, 1, "{last}");
+        assert!(
+            last.contains("1/10 checks") && last.contains("changelog"),
+            "{last}"
+        );
+        assert!(
+            w.calls
+                .iter()
+                .all(|c| !matches!(c.as_str(), "build" | "verify --tree" | "validation-tools")),
+            "{:?}",
+            w.calls
+        );
+        assert!(!w.observations.contains(&"warm-tools"));
+        if dry {
+            assert!(last.contains("census: planted input defect"), "{last}");
+            let gate = w
+                .calls
+                .iter()
+                .position(|c| c == "commit-gates-dry")
+                .unwrap();
+            let input = w
+                .calls
+                .iter()
+                .position(|c| c.starts_with("input-checks "))
+                .unwrap();
+            assert!(gate < input, "{:?}", w.calls);
+        } else {
+            assert!(
+                !w.calls.iter().any(|c| c.starts_with("input-checks ")),
+                "{:?}",
+                w.calls
+            );
+            assert_eq!(w.count("seal-inputs"), 0);
+        }
+    }
+    // Negative control: a red test has no commit-only evidence and still fails in qualify.
+    let mut w = World::new();
+    w.verify_passes = false;
+    w.verify_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 4/10 qualify"), "{last}");
+    assert_eq!(w.count("commit-gates"), 1);
+    assert_eq!(w.count("verify --tree"), 1);
+}
+
+#[test]
+fn current_source_cutter_can_refuse_before_freezing_but_old_rules_cannot() {
+    let root = changelog_defect_clone();
+    for current in [false, true] {
+        let mut w = World::new();
+        w.preview_own = current;
+        w.gate_repo = Some(root.path().join("clone"));
+        w.own_cutter = false;
+        w.exec_result = Ok(());
+        let (code, last) = w.run(bump());
+        if current {
+            assert_eq!(code, 1, "{last}");
+            assert!(last.starts_with("REFUSED at 1/10 checks"), "{last}");
+            assert_eq!(w.count("exec-cutter"), 0);
+            assert_eq!(w.count("bump"), 0);
+        } else {
+            assert_eq!(code, 0, "{last}");
+            assert_eq!(w.count("exec-cutter"), 1);
+            assert_eq!(w.count("commit-gates-dry"), 0);
+        }
+    }
+}
+
+#[test]
+fn dry_run_does_not_hide_commit_findings_behind_an_already_cut_tag() {
+    let root = changelog_defect_clone();
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.gate_repo = Some(root.path().join("clone"));
+    w.origin_tags.insert("v0.6.0".into(), NEXT.into());
+    w.input_refusal = Some(Refusal::new(
+        "census: planted input defect",
+        "repair census",
+    ));
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..mac()
+    });
+    assert_eq!(code, 1, "{last}");
+    for finding in ["already cut", "changelog", "census: planted input defect"] {
+        assert!(last.contains(finding), "{finding}: {last}");
+    }
+}
+
+/// Opt-in ABBA instrument for launch-to-refusal, with a real committed orphan in a
+/// scratch clone. The output states the authority seam and input dispatch count.
+#[test]
+#[ignore = "explicit credential-free commit-gate order measurement"]
+fn measure_commit_gate_refusal_order() {
+    let root = changelog_defect_clone();
+    for dry in [false, true] {
+        let mut w = World::new();
+        w.gate_repo = Some(root.path().join("clone"));
+        if dry {
+            w.input_refusal = Some(Refusal::new(
+                "census: planted input defect",
+                "repair census",
+            ));
+        }
+        let start = std::time::Instant::now();
+        let (code, last) = w.run(ReleaseOptions {
+            dry_run: dry,
+            ..bump()
+        });
+        println!(
+            "commit-order-sample {}",
+            aterm_json::json!({
+                "dry": dry, "execution_s": start.elapsed().as_secs_f64(), "code": code,
+                "input_dispatches": w.calls.iter().filter(|c| c.starts_with("input-checks ")).count(),
+                "last": last, "authority": "offline-controller; production changelog gate",
+            })
+        );
+        assert_eq!(code, 1);
+    }
+}
+
 #[test]
 fn selection_states_the_bases_lane_red_without_refusing_or_reselecting() {
     let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
     let tip = w.history.last().unwrap().clone();
     let (code, last) = w.run(ReleaseOptions {
         dry_run: true,
-        ..bump()
+        ..mac()
     });
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert!(w.out.iter().any(|line| line == &format!("main lane: base {tip}: red, age_s=23 (advisory fixture)")));
@@ -3387,7 +3762,7 @@ fn a_refused_candidate_never_stages_or_publishes() {
                     "generate them at tag v0.5.0",
                 )];
             },
-            "4/10 qualify",
+            "1/10 checks",
         ),
     ];
     for (case, change, at) in cases {
@@ -3419,9 +3794,16 @@ fn a_refused_candidate_never_stages_or_publishes() {
 
         let mut w = World::new();
         change(&mut w);
+        let options = if case == "main declares a version no release has used: a bump would skip it"
+        {
+            bump()
+        } else {
+            w.versions.insert(TIP.into(), "0.6.0".into());
+            mac()
+        };
         let (code, dry) = w.run(ReleaseOptions {
             dry_run: true,
-            ..bump()
+            ..options
         });
         assert_eq!(code, 1, "{case}: {dry}");
         assert!(
@@ -3859,9 +4241,14 @@ pub(super) fn real_carry_fixture(
     line: &Line,
     fixes: &[Fix],
     dry_run: bool,
+    judge_changelog: bool,
 ) -> (i32, String, Vec<String>) {
     let mut w = World::new();
     w.carry_repo = Some(repo.to_path_buf());
+    if judge_changelog {
+        w.gate_repo = Some(repo.to_path_buf());
+        w.gate_revision = true;
+    }
     w.verify_code = 0;
     w.verify_passes = true;
     w.head = line.head().into();
@@ -3927,7 +4314,6 @@ fn a_dry_fix_plans_the_new_head_and_agrees_with_the_real_run() {
         "build",
         "verify --tree",
         "verify --bundle",
-        "verify-line",
     ] {
         assert_eq!(w.count(call), 0, "{call}: {:?}", w.calls);
     }
@@ -3945,11 +4331,11 @@ fn a_dry_fix_plans_the_new_head_and_agrees_with_the_real_run() {
     let said = |needle: &str| w.out.iter().any(|l| l.contains(needle));
     for needle in [
         "111111111 carries cleanly as hop 1",
-        "asked of the line's head ccccccccc before the carry",
+        "asked of the planned head 911111111 after the carry",
         "would reserve build n",
-        "the line's new head is not made yet",
-        "pub stage aterm --commit <the line's new head>",
-        "would check the line's new head with line::verify",
+        "the planned head has no release records yet",
+        "pub stage aterm --commit 9111111111111111111111111111111111111111",
+        "checked with line::verify_pending before step 1",
     ] {
         assert!(said(needle), "{needle}: {:#?}", w.out);
     }
@@ -3971,14 +4357,14 @@ fn a_dry_fix_plans_the_new_head_and_agrees_with_the_real_run() {
     let (code, dry_last) = w.run(dry);
     assert_eq!(code, 1, "{dry_last}\n{:#?}", w.out);
     assert!(
-        dry_last.contains("would refuse at 4/10 qualify: the preflight BLOCKED"),
+        dry_last.contains("would refuse at 1/10 checks: the preflight BLOCKED"),
         "{dry_last}"
     );
     assert_eq!(w.journal().unwrap(), before);
     assert_eq!(w.count("carry"), 1, "{:?}", w.calls);
     let (code, last) = w.run(fix(&[FIX]));
     assert!(
-        code == 1 && last.starts_with("REFUSED at 4/10 qualify: the preflight BLOCKED"),
+        code == 1 && last.starts_with("REFUSED at 1/10 checks: the preflight BLOCKED"),
         "the real run refuses where the dry one said: {last}"
     );
 }
@@ -4129,6 +4515,7 @@ fn a_hop_main_no_longer_holds_drops_the_line() {
             w.head = w.tip();
         }
         assert_eq!(w.head == hop, at == "its hop");
+        let moved_to_hop_before = w.count(&format!("move {}", &hop[..4]));
         let (code, last) = w.run(mac());
         assert!(
             code == 1
@@ -4138,6 +4525,19 @@ fn a_hop_main_no_longer_holds_drops_the_line() {
             "{at}: {last}"
         );
         assert!(!last.contains("git push origin main"), "{at}: {last}");
+        assert!(
+            last.contains("release.toml retains lost line"),
+            "{at}: {last}"
+        );
+        // Even from origin/main, preparation reselects the journaled line head before the
+        // ancestry check; settlement therefore owns that exact private hop and rewinds it.
+        assert_eq!(
+            w.count(&format!("move {}", &hop[..4])),
+            moved_to_hop_before + usize::from(at == "origin/main"),
+            "{at}: {:?}",
+            w.calls
+        );
+        assert_eq!(w.head, BUMP, "{at}: {last}");
         assert_eq!(w.journal().unwrap(), before, "{at}");
     }
 
@@ -4154,6 +4554,36 @@ fn a_hop_main_no_longer_holds_drops_the_line() {
             && last.contains("land it on main first"),
         "{last}"
     );
+}
+
+/// The explicit lost-record remedy is safe even when invoked directly, before another release
+/// run has had a chance to restore the checkout. NEGATIVE CONTROL: unlink release.toml first and
+/// main is stranded at a private hop with no recovery identity.
+#[test]
+fn forget_directly_restores_a_lost_record_before_removing_its_journal() {
+    let mut w = red_line();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    assert_eq!(w.run(fix(&[FIX])).0, 1);
+    let hop = hop_of(FIX);
+    let merge = format!("8{}", &hop[1..]);
+    assert_eq!(w.head, hop);
+    assert_eq!(w.journal().unwrap().commit, hop);
+    w.history
+        .retain(|commit| *commit != hop && *commit != merge);
+
+    let (code, last) = w.run(ReleaseOptions {
+        forget: true,
+        ..ReleaseOptions::default()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert!(
+        last.contains("forgot this clone's release journal"),
+        "{last}"
+    );
+    assert!(last.contains("restored to its recorded prefix"), "{last}");
+    assert_eq!(w.head, BUMP);
+    assert!(w.journal().is_none());
 }
 
 /// A remedy that starts a line (`--commit`, `--bump`) names `--forget` first while this clone
@@ -4255,6 +4685,32 @@ fn a_second_run_in_the_same_clone_is_refused_naming_the_first() {
     );
 }
 
+/// A contender that failed to claim the clone never "cleans up" the live holder's pending
+/// checkout. NEGATIVE CONTROL: settling every refusal rewinds main underneath that live run.
+#[test]
+fn a_contender_never_rewinds_the_live_holders_pending_head() {
+    let mut w = red_line();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    assert_eq!(w.run(fix(&[FIX])).0, 0);
+    let selection = w.release_dir().join(SELECTION_FILE);
+    let before = std::fs::read(&selection).unwrap();
+    let rewinds = w.count("rewind-selection");
+
+    std::fs::write(
+        w.release_dir().join(RUNNING_FILE),
+        "pid 777\nstarted Thu Oct  9 01:00:00 2026\nlogs /l\n",
+    )
+    .unwrap();
+    w.alive.insert(777, "Thu Oct  9 01:00:00 2026".into());
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.contains("pid 777"), "{last}");
+    assert_eq!(w.head, hop_of(FIX));
+    assert_eq!(w.count("rewind-selection"), rewinds);
+    assert_eq!(std::fs::read(selection).unwrap(), before);
+}
+
 /// A cutter built from another commit asks the backend to replace this image exactly once with
 /// R's frozen cutter. A pre-exec refusal ends preparation before step 1; the successful exec edge
 /// returns no final line because the real backend never returns from it.
@@ -4344,8 +4800,8 @@ fn only_the_frozen_candidate_judges_step_one() {
         1
     );
     assert!(
-        w.observations.iter().position(|&item| item == "warm-tools")
-            < w.observations.iter().position(|&item| item == "machine")
+        w.observations.iter().position(|&item| item == "machine")
+            < w.observations.iter().position(|&item| item == "warm-tools")
     );
 }
 
@@ -4434,22 +4890,23 @@ fn a_fresh_proposal_adopts_a_durable_replacement_without_becoming_a_retired_jour
     assert_eq!(w.count("supersede"), 0);
 }
 
-/// NEGATIVE CONTROL: releasing the Run before stop_tools either leaves the compiler active,
-/// or fails the fake's assertion that cleanup still owns the clone claim.
+/// NEGATIVE CONTROL: starting the warmup before checks makes a cheap red start a compiler.
 #[test]
-fn a_step_one_refusal_settles_tools_before_releasing_the_clone() {
+fn a_step_one_refusal_starts_no_tool_warmup() {
     let mut w = World::new();
     w.versions.insert(TIP.into(), "0.6.0".into());
     w.machine_refusals = vec![Refusal::new("planted machine refusal", "retry")];
     let (code, last) = w.run(mac());
     assert_eq!(code, 1, "{last}");
-    assert!(w.observations.contains(&"warm-tools"));
+    assert!(!w.observations.contains(&"warm-tools"));
     assert!(!w.warming_active);
     assert!(!w.release_dir().join(RUNNING_FILE).exists());
 }
 
 /// NEGATIVE CONTROLS: checking the old roster, refreshing before carrying, recording the hop
-/// from the launcher, or executing the old head each breaks a different assertion here.
+/// from the launcher, executing the old head, or applying the ordinary origin/main ancestry
+/// rule to the exact PENDING_LINE head each breaks a different assertion here. The last is the
+/// old bug: the frozen head refuses itself as a lost record before step 1 can record it.
 #[test]
 fn a_fix_reaches_its_own_step_one_before_any_remote_read_or_record() {
     let mut w = red_line();
@@ -4468,6 +4925,17 @@ fn a_fix_reaches_its_own_step_one_before_any_remote_read_or_record() {
     assert_eq!(w.count("carry"), 1);
     assert_eq!(w.count("record-line"), 0);
     assert!(!w.observations.contains(&"machine"));
+    let candidate = Journal::load(&w.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.commit, hop_of(FIX));
+    assert_eq!(candidate.done, ["locally-carried-line"]);
+    assert_eq!(w.head, hop_of(FIX));
+    let tip = w.tip();
+    assert!(
+        !w.is_ancestor(&hop_of(FIX), &tip),
+        "ordinary mainline ancestry still rejects the deliberately pending head"
+    );
     assert_eq!(
         w.journal().unwrap().commit,
         BUMP,
@@ -4475,12 +4943,43 @@ fn a_fix_reaches_its_own_step_one_before_any_remote_read_or_record() {
     );
 
     w.own_cutter = true;
+    w.preview_own = true;
     w.fetch_refusal = None;
     w.verify_passes = true;
     w.verify_code = 0;
     assert_eq!(w.run(mac()).0, 0, "{:#?}", w.out);
     assert_eq!(w.count("record-line"), 1);
-    assert_eq!(w.fetches, fetches + 1);
+    assert_eq!(w.count("verify-line"), 2, "pending and release judgment");
+    let judged = w
+        .calls
+        .iter()
+        .position(|call| call == "verify-line")
+        .unwrap();
+    let recorded = w
+        .calls
+        .iter()
+        .position(|call| call == "record-line")
+        .unwrap();
+    assert!(judged < recorded, "the frozen head judges before recording");
+    let judged_release = w
+        .calls
+        .iter()
+        .rposition(|call| call == "verify-line")
+        .unwrap();
+    assert!(
+        recorded < judged_release,
+        "the recorded line is judged again for export"
+    );
+    assert_eq!(w.fetches, fetches + 2);
+    assert!(!w.unrecorded_hops.contains(&hop_of(FIX)));
+    assert!(!w.release_dir().join(SELECTION_FILE).exists());
+    assert!(
+        w.out
+            .iter()
+            .any(|line| line.contains("[ 1/10] checks") && line.contains(" ok ")),
+        "{:#?}",
+        w.out
+    );
     assert_eq!(w.journal().unwrap().commit, hop_of(FIX));
 }
 
@@ -4490,8 +4989,22 @@ fn a_pending_fix_survives_step_one_failure_without_a_fleet_record_deadlock() {
     w.machine_refusals = vec![Refusal::new("planted step-one refusal", "retry")];
     let (code, last) = w.run(fix(&[FIX]));
     assert_eq!(code, 1, "{last}");
+    assert!(last.contains("clone main was restored"), "{last}");
+    assert!(
+        last.contains("candidate.toml retains pending line"),
+        "{last}"
+    );
+    assert_eq!(
+        w.head, BUMP,
+        "a refusal never leaves main at the private hop"
+    );
     assert!(w.unrecorded_hops.contains(&hop_of(FIX)));
     assert_eq!(w.journal().unwrap().commit, BUMP);
+    let candidate = Journal::load(&w.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.commit, hop_of(FIX));
+    assert_eq!(candidate.done, ["locally-carried-line"]);
     w.existing_fleet_line = Some(w.journal().unwrap().line());
     w.machine_refusals.clear();
     w.verify_passes = true;
@@ -4500,6 +5013,326 @@ fn a_pending_fix_survives_step_one_failure_without_a_fleet_record_deadlock() {
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert!(!w.unrecorded_hops.contains(&hop_of(FIX)));
     assert_eq!(w.journal().unwrap().commit, hop_of(FIX));
+}
+
+/// A refusal in the frozen head's pre-step preview restores the checkout without erasing the
+/// only exact retry. NEGATIVE CONTROL: omit refusal settlement and main remains at the private
+/// hop; erase candidate.toml and the retry cannot distinguish it from a lost record.
+#[test]
+fn a_frozen_pending_head_refusal_restores_main_and_retains_the_exact_retry() {
+    let mut w = red_line();
+    w.own_cutter = false;
+    let (code, last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 1, "{last}");
+    assert!(last.contains("clone main was restored"), "{last}");
+    assert_eq!(w.head, BUMP, "a failed exec restores the pending head too");
+    assert!(w.release_dir().join(SELECTION_FILE).exists());
+
+    w.exec_result = Ok(());
+    assert_eq!(w.run(mac()).0, 0);
+    assert_eq!(w.head, hop_of(FIX));
+    let selection = w.release_dir().join(SELECTION_FILE);
+    let candidate_before = std::fs::read(&selection).unwrap();
+    let release_before = std::fs::read(w.release_dir().join(JOURNAL_FILE)).unwrap();
+
+    w.own_cutter = true;
+    w.preview_own = true;
+    w.blocks = vec![Refusal::new("planted frozen-head refusal", "repair it")];
+    let rewinds = w.count("rewind-selection");
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}");
+    assert!(w.out.join("\n").contains("planted frozen-head refusal"));
+    assert!(last.contains("clone main was restored"), "{last}");
+    assert!(
+        last.contains("candidate.toml retains pending line"),
+        "{last}"
+    );
+    assert_eq!(w.count("rewind-selection"), rewinds + 1);
+    assert_eq!(w.head, BUMP);
+    assert_eq!(std::fs::read(&selection).unwrap(), candidate_before);
+    assert_eq!(
+        std::fs::read(w.release_dir().join(JOURNAL_FILE)).unwrap(),
+        release_before
+    );
+    assert_eq!(w.journal().unwrap().commit, BUMP);
+    let candidate = Journal::load(&w.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.commit, hop_of(FIX));
+    assert_eq!(candidate.done, ["locally-carried-line"]);
+
+    w.blocks.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("record-line"), 1);
+    assert!(!w.release_dir().join(SELECTION_FILE).exists());
+    assert_eq!(w.journal().unwrap().commit, hop_of(FIX));
+}
+
+/// Candidate state is durable before checkout movement. NEGATIVE CONTROL: moving first means a
+/// post-move submodule/cleanliness refusal strands an unjournaled private head.
+#[test]
+fn a_post_move_refusal_has_a_durable_retry_and_restores_main() {
+    let mut w = red_line();
+    let release = w.release_dir().join(JOURNAL_FILE);
+    let mut journal = w.journal().unwrap();
+    journal.asks.push("release.notary".into());
+    journal.save(&release).unwrap();
+    w.asks.push("release.notary".into());
+    let release_before = std::fs::read(&release).unwrap();
+    w.move_refusal = Some(Refusal::new(
+        "planted refusal after moving main",
+        "repair the checkout",
+    ));
+
+    let (code, last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 1, "{last}");
+    assert!(last.contains("clone main was restored"), "{last}");
+    assert_eq!(w.head, BUMP);
+    assert_eq!(std::fs::read(release).unwrap(), release_before);
+    let candidate = Journal::load(&w.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.commit, hop_of(FIX));
+    assert_eq!(candidate.done, ["locally-carried-line"]);
+    assert_eq!(candidate.asks, ["release.notary"]);
+    assert!(w.withdrawn.is_empty(), "the durable candidate owns the ask");
+}
+
+/// The fleet selector's string stop has the same checkout transaction as a structured refusal.
+/// NEGATIVE CONTROL: returning its Halt directly leaves main at the private pending hop.
+#[test]
+fn a_fleet_stop_restores_the_pending_head_and_preserves_its_exit_class() {
+    let mut w = red_line();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    assert_eq!(w.run(fix(&[FIX])).0, 0);
+    let selection = w.release_dir().join(SELECTION_FILE);
+    let candidate_before = std::fs::read(&selection).unwrap();
+    let release_before = std::fs::read(w.release_dir().join(JOURNAL_FILE)).unwrap();
+    let rewinds = w.count("rewind-selection");
+
+    w.history.push(N2.into());
+    w.versions.insert(N2.into(), "0.6.0".into());
+    w.existing_fleet_line = Some(Line::start("0.6.0", N2, 2_000_000));
+    w.own_cutter = true;
+    w.fleet_refusal = Some("CUTTING ELSEWHERE: planted pending-holder refusal".into());
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 4, "{last}");
+    assert!(last.contains("CUTTING ELSEWHERE"), "{last}");
+    assert!(last.contains("clone main was restored"), "{last}");
+    assert!(
+        last.contains("candidate.toml retains pending line"),
+        "{last}"
+    );
+    assert_eq!(w.head, BUMP);
+    assert_eq!(w.count("rewind-selection"), rewinds + 1);
+    assert_eq!(std::fs::read(&selection).unwrap(), candidate_before);
+    assert_eq!(
+        std::fs::read(w.release_dir().join(JOURNAL_FILE)).unwrap(),
+        release_before
+    );
+    assert_eq!(w.count("record-line"), 0);
+
+    w.fleet_refusal = None;
+    w.existing_fleet_line = None;
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.journal().unwrap().commit, hop_of(FIX));
+}
+
+/// A successful fleet adoption still has to undo this clone's superseded private checkout. If
+/// that restoration fails, both durable journals and the actual checkout state are named.
+/// NEGATIVE CONTROL: the adopted in-memory journal cannot settle the prior candidate for us.
+#[test]
+fn a_fleet_adoption_rewind_failure_names_and_retains_the_prior_pending_state() {
+    let mut w = red_line();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    assert_eq!(w.run(fix(&[FIX])).0, 0);
+    let hop = hop_of(FIX);
+    let selection = w.release_dir().join(SELECTION_FILE);
+    let candidate_before = std::fs::read(&selection).unwrap();
+    let release = w.release_dir().join(JOURNAL_FILE);
+    let release_before = std::fs::read(&release).unwrap();
+
+    w.history.push(N2.into());
+    w.versions.insert(N2.into(), "0.6.0".into());
+    w.existing_fleet_line = Some(Line::start("0.6.0", N2, 2_000_000));
+    w.own_cutter = true;
+    w.rewind_refusal = Some(Refusal::new(
+        "planted adoption rewind failure",
+        "repair the checkout",
+    ));
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 3, "{last}");
+    assert!(
+        last.contains("fleet selected a different release line"),
+        "{last}"
+    );
+    assert!(last.contains("planted adoption rewind failure"), "{last}");
+    assert!(
+        last.contains("candidate.toml retains pending line"),
+        "{last}"
+    );
+    assert!(last.contains("main remains at 911111111"), "{last}");
+    assert_eq!(w.head, hop);
+    assert_eq!(std::fs::read(selection).unwrap(), candidate_before);
+    assert_eq!(std::fs::read(release).unwrap(), release_before);
+}
+
+/// Even an unexpected release bug restores from candidate.toml, not potentially corrupted
+/// in-memory state. NEGATIVE CONTROL: the old panic catch printed REFUSED and stranded the hop.
+#[test]
+fn a_panic_restores_the_disk_journaled_pending_head() {
+    let mut w = red_line();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    assert_eq!(w.run(fix(&[FIX])).0, 0);
+    let selection = w.release_dir().join(SELECTION_FILE);
+    let candidate_before = std::fs::read(&selection).unwrap();
+    let release_before = std::fs::read(w.release_dir().join(JOURNAL_FILE)).unwrap();
+
+    w.history.push(N2.into());
+    w.versions.insert(N2.into(), "0.6.0".into());
+    w.existing_fleet_line = Some(Line::start("0.6.0", N2, 2_000_000));
+    w.own_cutter = true;
+    w.fleet_panics = true;
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.contains("stopped unexpectedly"), "{last}");
+    assert!(last.contains("clone main was restored"), "{last}");
+    assert!(
+        last.contains("candidate.toml retains pending line"),
+        "{last}"
+    );
+    assert_eq!(w.head, BUMP);
+    assert_eq!(std::fs::read(&selection).unwrap(), candidate_before);
+    assert_eq!(
+        std::fs::read(w.release_dir().join(JOURNAL_FILE)).unwrap(),
+        release_before
+    );
+
+    w.fleet_panics = false;
+    w.existing_fleet_line = None;
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.journal().unwrap().commit, hop_of(FIX));
+}
+
+/// A failed recovery is explicit and retains every recovery byte. NEGATIVE CONTROL: deleting the
+/// candidate or claiming a reset succeeded makes the checkout state ambiguous.
+#[test]
+fn a_failed_pending_rewind_reports_the_actual_head_and_retains_both_journals() {
+    let mut w = red_line();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    assert_eq!(w.run(fix(&[FIX])).0, 0);
+    let selection = w.release_dir().join(SELECTION_FILE);
+    let candidate_before = std::fs::read(&selection).unwrap();
+    let release = w.release_dir().join(JOURNAL_FILE);
+    let release_before = std::fs::read(&release).unwrap();
+
+    w.own_cutter = true;
+    w.machine_refusals = vec![Refusal::new("planted step-one refusal", "retry")];
+    w.rewind_refusal =
+        Some(Refusal::new("planted rewind failure", "repair the checkout").could_not_run());
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 3, "{last}");
+    assert!(last.contains("restoring the release clone"), "{last}");
+    assert!(last.contains("main is still at 911111111"), "{last}");
+    assert!(last.contains("candidate.toml still retains line"), "{last}");
+    assert_eq!(w.head, hop_of(FIX));
+    assert_eq!(std::fs::read(selection).unwrap(), candidate_before);
+    assert_eq!(std::fs::read(release).unwrap(), release_before);
+}
+
+/// Rewinding a second private hop stops at the newest recorded hop, not the line's base.
+/// NEGATIVE CONTROL: resetting to the base discards an already-recorded, judged carry.
+#[test]
+fn a_pending_second_hop_restores_the_newest_recorded_prefix() {
+    let mut w = red_line();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let (code, last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 4/10 qualify"), "{last}");
+    let first = hop_of(FIX);
+    assert_eq!(w.head, first);
+    assert_eq!(w.journal().unwrap().commit, first);
+    assert!(!w.unrecorded_hops.contains(&first));
+
+    w.history.push(FIX2.into());
+    w.versions.insert(FIX2.into(), "0.6.0".into());
+    w.verify_code = 0;
+    w.verify_passes = true;
+    w.machine_refusals = vec![Refusal::new("planted second-hop refusal", "retry")];
+    let release = w.release_dir().join(JOURNAL_FILE);
+    let release_before = std::fs::read(&release).unwrap();
+    let (code, last) = w.run(fix(&[FIX2]));
+    assert_eq!(code, 1, "{last}");
+    assert!(last.contains("clone main was restored"), "{last}");
+    assert_eq!(w.head, first, "the recorded first hop is retained");
+    assert_eq!(std::fs::read(release).unwrap(), release_before);
+    let candidate = Journal::load(&w.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.line().hops.len(), 2);
+    assert_eq!(candidate.commit, hop_of(FIX2));
+}
+
+/// `--forget` restores a candidate-only checkout before erasing its last journal and says which
+/// state it removed. NEGATIVE CONTROL: the old order removed candidate.toml first, reported "no
+/// release journal", and stranded main at the private hop.
+#[test]
+fn forget_restores_and_names_a_candidate_only_pending_line() {
+    let mut w = red_line();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    assert_eq!(w.run(fix(&[FIX])).0, 0);
+    assert_eq!(w.head, hop_of(FIX));
+    std::fs::remove_file(w.release_dir().join(JOURNAL_FILE)).unwrap();
+
+    let (code, last) = w.run(ReleaseOptions {
+        forget: true,
+        ..ReleaseOptions::default()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert!(
+        last.contains("forgot this clone's candidate journal"),
+        "{last}"
+    );
+    assert!(last.contains("restored to its recorded prefix"), "{last}");
+    assert_eq!(w.head, BUMP);
+    assert!(!w.release_dir().join(SELECTION_FILE).exists());
+    assert!(w.journal().is_none());
+}
+
+/// If publication appears after the frozen preview but before its record write, the pending
+/// candidate is discarded only after main is restored; release.toml remains the unambiguous
+/// release to finish. NEGATIVE CONTROL: the old order removed candidate.toml and stranded the hop.
+#[test]
+fn publication_race_restores_main_before_dropping_the_pending_candidate() {
+    let mut w = red_line();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    assert_eq!(w.run(fix(&[FIX])).0, 0);
+    assert_eq!(w.head, hop_of(FIX));
+
+    w.own_cutter = true;
+    w.preview_own = true;
+    w.publish_pending_on_unscoped_read = true;
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.contains("already published or claimed"), "{last}");
+    assert!(
+        last.contains("candidate was dropped after restoring main"),
+        "{last}"
+    );
+    assert_eq!(w.head, BUMP);
+    assert!(!w.release_dir().join(SELECTION_FILE).exists());
+    assert_eq!(w.journal().unwrap().commit, BUMP);
+    assert_eq!(w.count("record-line"), 0);
 }
 
 #[test]
@@ -4832,6 +5665,28 @@ fn a_source_red_stops_the_sign_and_nothing_is_claimed() {
         w.calls
     );
     assert!(w.cut.is_none() && w.signed.is_none());
+}
+
+/// NEGATIVE CONTROL: omitting the run's cleanup callback leaves the completed
+/// private upload orphaned when the other side subsequently refuses.
+#[test]
+fn a_source_refusal_withdraws_its_completed_draft_but_a_claim_keeps_recovery() {
+    let mut w = World::new();
+    w.sides = SideOrder::SignFirst;
+    w.publish_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(w.signed.is_some() && w.cut.is_none());
+    assert_eq!(w.drafts_discarded, 1);
+
+    let mut w = World::new();
+    w.cut_code = 1;
+    w.cut_claims = true;
+    w.cut_finishes = false;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(w.cut.is_some());
+    assert_eq!(w.drafts_discarded, 0, "the claimed journal owns recovery");
 }
 
 #[test]
@@ -5697,11 +6552,12 @@ fn forget_takes_no_flag_it_would_ignore() {
 fn explicit_credentials_reach_preflight_and_publish_audits() {
     for dry in [false, true] {
         let mut w = World::new();
+        w.versions.insert(TIP.into(), "0.6.0".into());
         let profile = PathBuf::from("/existing-release-profile.toml");
         let (code, last) = w.run(ReleaseOptions {
             release_credentials: Some(profile.clone()),
             dry_run: dry,
-            ..bump()
+            ..mac()
         });
         assert_eq!(code, 0, "{last}\n{:#?}", w.out);
         assert!(!w.audited_profiles.is_empty());
@@ -6255,7 +7111,6 @@ fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
     );
     for never in [
         "bump",
-        "commit-gates",
         "reserve",
         "build",
         "verify --tree",
@@ -6460,6 +7315,21 @@ fn the_execed_cutter_drops_fix_and_resumes_the_journaled_head() {
         .map(Into::into)
         .collect();
     assert_eq!(again, want);
+    let dry_args: Vec<std::ffi::OsString> = args
+        .iter()
+        .copied()
+        .chain(["--dry-run"])
+        .map(Into::into)
+        .collect();
+    assert_eq!(
+        ReleaseOptions {
+            dry_run: true,
+            ..mac()
+        }
+        .dispatch_args(dry_args.clone()),
+        dry_args,
+        "the preview must reconstruct its unjournaled hops after the handover"
+    );
     let again = mac().exec_args(
         ["release", "--commit", TIP, "--supersede", "--mac-only"]
             .iter()

@@ -35,7 +35,7 @@ const MAX: usize = 64 * 1024;
 /// The place's directory under `state` (aterm's state root).
 #[must_use]
 pub fn dir(state: &Path) -> PathBuf {
-    state.join(DIR)
+    aterm_uds::quiet_state::selected(&state.join(DIR))
 }
 
 /// The record as written: the keeper's memory and who wrote it.

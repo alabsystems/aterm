@@ -428,6 +428,7 @@ fn release_of(object: &ReleaseObject) -> Release {
         tag: object.tag_name.clone(),
         draft: object.draft,
         prerelease: object.prerelease,
+        published_at: object.published_at.clone(),
         assets: object.assets.iter().map(|a| a.name.clone()).collect(),
     }
 }

@@ -30,6 +30,8 @@ pub(super) struct Host {
     live: bool,
     granted: std::cell::Cell<bool>,
     child: std::cell::Cell<bool>,
+    rollback_granted: bool,
+    rollback: bool,
     clock: i64,
     seen: i64,
     stood: bool,
@@ -57,6 +59,8 @@ impl Host {
             live: true,
             granted: std::cell::Cell::new(false),
             child: std::cell::Cell::new(false),
+            rollback_granted: false,
+            rollback: false,
             clock: 0,
             seen: 0,
             stood: false,
@@ -117,6 +121,8 @@ impl Host {
             ),
             ("granted", i64::from(self.granted.get())),
             ("child", i64::from(self.child.get())),
+            ("rollback_granted", i64::from(self.rollback_granted)),
+            ("rollback", i64::from(self.rollback)),
             ("clock", self.clock),
             ("seen", self.seen),
             ("stood", i64::from(self.stood)),
@@ -205,6 +211,10 @@ impl Host {
                     self.granted.set(true);
                     self.child.set(true);
                 }
+                "DeliverRollback" => {
+                    self.rollback_granted = true;
+                    self.rollback = true;
+                }
                 "SealOpen" | "SealMay" => assert!(self.facts.record_sealed(prepare, &binding)),
                 "NoExec" => {
                     assert!(
@@ -218,6 +228,7 @@ impl Host {
                     .store(self.request.deadline_us, Ordering::SeqCst),
                 "Crash" => self.live = false,
                 "ChildExits" => self.child.set(false),
+                "RollbackExits" => self.rollback = false,
                 "Reboot" => {
                     *self.facts.boot.lock().unwrap() = Some(BootStamp {
                         host: self.origin.host.clone(),
@@ -225,6 +236,7 @@ impl Host {
                     });
                     self.live = false;
                     self.child.set(false);
+                    self.rollback = false;
                 }
                 "Move" => {
                     self.set_aside = Some(std::mem::take(&mut *self.facts.journal.lock().unwrap()));
@@ -380,6 +392,55 @@ fn the_lapsed_answer_refines_the_historical_closure_model() {
         assert_eq!(reply, expected, "{before:?}");
         host.steps(&model, &mut state, after);
         host.holds(&model, &state);
+    }
+}
+
+#[test]
+fn historical_closure_keeps_a_rollback_recipient_in_the_execution_history() {
+    let model = aterm_models_harness::native_historical_closure_model();
+    for (case, tail, answer) in [
+        (0, &["Crash", "Expire"][..], None),
+        (
+            1,
+            &["RollbackExits", "SealMay", "Crash", "Expire"][..],
+            None,
+        ),
+        (2, &["Reboot"][..], Some("AnswerBoot")),
+    ] {
+        let mut host = Host::new(8460 + case);
+        let mut state = model.init_state();
+        host.steps(
+            &model,
+            &mut state,
+            &[
+                "StampBoot",
+                "Record",
+                "May",
+                "Deliver",
+                "ChildExits",
+                "DeliverRollback",
+            ],
+        );
+        host.steps(&model, &mut state, tail);
+        let reply = host.replay(&model, &mut state, answer);
+        if answer.is_some() {
+            assert_eq!(reply, host.lapsed());
+            host.steps(&model, &mut state, &["Fresh"]);
+        } else {
+            assert_eq!(reply, EPOCH_CHANGED);
+        }
+        host.holds(&model, &state);
+        if case == 0 {
+            // Negative control: treating the forward child's exit as no possible execution
+            // makes the real reader authorize a fresh plan beside the live rollback child.
+            *host.facts.closure_view.lock().unwrap() = Some(Closure::Exact(Recorded::Prepared));
+            assert_eq!(host.read(&model), host.lapsed());
+            let bad = host.probe(&model);
+            assert!(!model.successors("AnswerLapsed", &state).contains(&bad));
+            assert!(!model.check_invariant("LapsedNeverGranted", &bad));
+            host.fresh = true;
+            assert!(!model.check_invariant("NoDoubleExec", &host.probe(&model)));
+        }
     }
 }
 

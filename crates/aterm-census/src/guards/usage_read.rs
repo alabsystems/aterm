@@ -10,7 +10,7 @@
 //! function that means one of those; the walk does not enter it, and a timer's own body naming one
 //! is a finding, since a wait is no use.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::graph::{attribute, reach};
 use super::{Finding, Rule, SourceFile, Tree, is_word};
@@ -148,33 +148,51 @@ struct Body<'a> {
 }
 
 fn read_bodies<'a>(files: &[&'a SourceFile]) -> BTreeMap<&'a str, Body<'a>> {
+    // Each file's bodies are gathered in hash maps, one lookup a word, and joined to the sorted
+    // ones as the file ends: a word keeps its first spot, since it joins after every spot of an
+    // earlier file and with its own first line in this one.
+    #[derive(Default)]
+    struct Gathered<'a> {
+        words: HashMap<&'a str, usize>,
+        declared: usize,
+        timed: bool,
+    }
     let mut bodies: BTreeMap<&str, Body<'_>> = BTreeMap::new();
+    let mut gathered: HashMap<&str, Gathered<'_>> = HashMap::new();
     for file in files {
-        let shipped: BTreeSet<usize> = file.shipped_lines().map(|line| line.no).collect();
+        let shipped = file.shipped_flags();
+        let spawns = file.lexed().text.contains("\"accounts\"");
         for line in attribute(file) {
             let Some(func) = line.func.filter(|_| !line.in_test) else {
                 continue;
             };
-            if !shipped.contains(&line.line.no) {
+            if !shipped.get(line.line.no - 1).copied().unwrap_or(true) {
                 continue;
             }
-            let body = bodies.entry(func).or_default();
+            let body = gathered.entry(func).or_default();
             let code = line.line.code;
             if super::graph::fn_name(code) == Some(func) {
                 body.declared += 1;
             }
-            body.timed |= TIMED_WAITS.iter().any(|wait| code.contains(wait));
+            // Every timed wait opens a call.
+            if !body.timed && code.contains('(') {
+                body.timed = TIMED_WAITS.iter().any(|wait| code.contains(wait));
+            }
             for word in words(code) {
-                body.words
-                    .entry(word)
-                    .or_insert((file.rel.as_str(), line.line.no));
+                body.words.entry(word).or_insert(line.line.no);
             }
             // A read another process makes for it: a spawn of the verb that opens a quota tab.
             let text = line.line.text;
-            if text.contains("\"accounts\"") && text.contains("\"refresh\"") {
-                body.words
-                    .entry(SPAWNED_READ)
-                    .or_insert((file.rel.as_str(), line.line.no));
+            if spawns && text.contains("\"accounts\"") && text.contains("\"refresh\"") {
+                body.words.entry(SPAWNED_READ).or_insert(line.line.no);
+            }
+        }
+        for (func, found) in gathered.drain() {
+            let body = bodies.entry(func).or_default();
+            body.declared += found.declared;
+            body.timed |= found.timed;
+            for (word, no) in found.words {
+                body.words.entry(word).or_insert((file.rel.as_str(), no));
             }
         }
     }
@@ -189,6 +207,11 @@ fn usage_read_on_timer(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         .collect();
     let bodies = read_bodies(&files);
     let doors: BTreeSet<&str> = IN_USE.iter().map(|(door, _)| *door).collect();
+    let callees: HashSet<&str> = bodies
+        .iter()
+        .filter(|(_, callee)| callee.declared < AMBIGUOUS_AT)
+        .map(|(func, _)| *func)
+        .collect();
     let edges: BTreeMap<&str, Vec<&str>> = bodies
         .iter()
         .filter(|(func, _)| !doors.contains(*func))
@@ -197,12 +220,7 @@ fn usage_read_on_timer(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                 .words
                 .keys()
                 .copied()
-                .filter(|word| {
-                    word != func
-                        && bodies
-                            .get(word)
-                            .is_some_and(|callee| callee.declared < AMBIGUOUS_AT)
-                })
+                .filter(|word| word != func && callees.contains(word))
                 .collect();
             (*func, next)
         })
@@ -498,5 +516,22 @@ fn {door}() {{ SignIn::{constructor}(cli, row); }}
         let thrice = format!("fn tick() {{ run(); }}\n{helper}{helper}{helper}");
         assert!(found(&thrice).is_empty());
         assert_eq!(found(&format!("fn tick() {{ run(); }}\n{helper}")).len(), 1);
+    }
+
+    /// Bodies of one name join across files, each word at its first spot: the earlier file's.
+    #[test]
+    fn a_word_keeps_its_first_spot_across_files() {
+        let tick = "fn tick() {\n    launch_read_use(evidence);\n}\n";
+        let late = "fn other() {}\nfn tick() {\n    launch_read_use(evidence);\n}\n";
+        let spot = |files: &[(&str, &str)]| {
+            let found = run(&USAGE_READ_ON_TIMER, files);
+            found
+                .iter()
+                .map(|f| format!("{}:{}", f.path, f.line))
+                .collect::<Vec<_>>()
+        };
+        let (a, b) = ("crates/aterm/src/a.rs", "crates/aterm/src/b.rs");
+        assert_eq!(spot(&[(a, tick), (b, late)]), [format!("{a}:2")]);
+        assert_eq!(spot(&[(b, late)]), [format!("{b}:3")]);
     }
 }

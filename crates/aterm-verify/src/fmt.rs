@@ -14,6 +14,14 @@ use crate::ladder::{Finding, Report};
 /// The formatter, beside `targo` in the stage2 bin directory, run by path.
 pub const TRUSTFMT: &str = "trustfmt";
 
+/// Configuration names in the pinned formatter's order of preference.
+pub const CONFIG_FILES: [&str; 4] = [
+    ".trustfmt.toml",
+    "trustfmt.toml",
+    ".rustfmt.toml",
+    "rustfmt.toml",
+];
+
 /// Tracked sources whose layout is their content, never handed to the formatter.
 pub const EXCLUDED: [&str; 6] = [
     "crates/aterm-core/tests/support/replay_corpus_data.rs",
@@ -77,10 +85,107 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         }
     };
     let mut editions = Editions::new(&ctx.root);
+    let plans = if ctx.input_paths.is_some() && ctx.carry_context.is_some() {
+        input_plans(ctx, &files, &mut editions)
+    } else {
+        Vec::new()
+    };
+    let carried: BTreeSet<_> = plans
+        .iter()
+        .filter(|plan| {
+            plan.proof
+                .as_ref()
+                .is_some_and(|p| crate::input_content::exact(ctx, p))
+        })
+        .flat_map(|plan| plan.files.iter().cloned())
+        .collect();
+    let files: Vec<_> = files
+        .into_iter()
+        .filter(|file| !carried.contains(file))
+        .collect();
     let groups = by_edition(&files, &mut editions);
     let found = sweep(ctx, &bin, &groups, false);
     record_sweep(ctx, r, &bin, &found);
     record_editions(r, &edition_gaps(&ctx.root, &files, &mut editions));
+    if !carried.is_empty() {
+        r.pass(format!(
+            "trustfmt: {} files reused by package input key",
+            carried.len()
+        ));
+    }
+    if r.outcomes()
+        .all(|(outcome, _)| outcome == crate::ladder::Outcome::Ok)
+    {
+        for proof in plans.into_iter().filter_map(|plan| plan.proof) {
+            if proof.reusable(ctx) {
+                let reused = crate::input_content::exact(ctx, &proof);
+                r.raw(crate::input_content::event(ctx, &proof, reused));
+            } else {
+                r.cannot_run("formatter package inputs changed during the run");
+            }
+        }
+    }
+}
+
+struct InputPlan {
+    files: Vec<String>,
+    proof: Option<crate::input_content::Proof>,
+}
+
+fn input_plans(ctx: &Ctx, files: &[String], editions: &mut Editions) -> Vec<InputPlan> {
+    let mut packages: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for file in files {
+        let item = format!(
+            "{}:edition={}",
+            manifest_dir_of(&ctx.root, file),
+            editions.manifest(file)
+        );
+        packages.entry(item).or_default().push(file.clone());
+    }
+    packages
+        .into_iter()
+        .map(|(item, files)| {
+            let mut paths: BTreeSet<String> = BTreeSet::new();
+            for file in &files {
+                let mut directory = Path::new(file).parent();
+                while let Some(dir) = directory {
+                    for name in CONFIG_FILES {
+                        paths.insert(dir.join(name).to_string_lossy().into_owned());
+                    }
+                    directory = dir.parent();
+                }
+            }
+            let inputs: Option<Vec<_>> = paths
+                .iter()
+                .map(|path| aterm_census::inputs::file(&ctx.root, path))
+                .collect();
+            let proof = inputs.and_then(|mut inputs| {
+                let physical = ctx.root.canonicalize().ok()?;
+                if files.iter().any(|file| {
+                    ctx.root.join(file).canonicalize().ok().as_ref() != Some(&physical.join(file))
+                }) {
+                    return None;
+                }
+                // --skip-children makes each selected source an independent reader. The
+                // edition is in the item, and configuration candidates are above; unrelated
+                // package assets, manifests and documents cannot affect this invocation.
+                for file in &files {
+                    inputs.push(aterm_census::inputs::file(&ctx.root, file)?);
+                }
+                let mut selection = aterm_digest::Sha256::new();
+                for file in &files {
+                    selection.update((file.len() as u64).to_le_bytes());
+                    selection.update(file.as_bytes());
+                }
+                let item = format!(
+                    "{item}:{}",
+                    aterm_codec::hex::encode_lower(&selection.finalize())
+                );
+                crate::input_content::Proof::new(ctx, "fmt", &item, inputs)
+            });
+            InputPlan { files, proof }
+        })
+        .collect()
 }
 
 fn record_sweep(ctx: &Ctx, r: &mut Report, bin: &Path, found: &Sweep) {
@@ -526,7 +631,7 @@ impl Editions {
         let found = dir
             .ancestors()
             .find_map(|d| {
-                ["rustfmt.toml", ".rustfmt.toml"].iter().find_map(|name| {
+                CONFIG_FILES.iter().find_map(|name| {
                     toml_edition(&crate::read_regular_text(self.root.join(d).join(name)).ok()?)
                 })
             })
@@ -1042,5 +1147,82 @@ mod tests {
         assert!(!toml_workspace_edition(
             "edition = \"2021\" # inherited from workspace\n"
         ));
+    }
+
+    #[test]
+    fn formatting_keys_follow_selected_sources_edition_and_config() {
+        let dir = tree(&[
+            (
+                "Cargo.toml",
+                "[workspace.package]\nversion='1.0.0'\nedition='2024'\n",
+            ),
+            ("rustfmt.toml", "edition='2024'\n"),
+            (
+                "crates/a/Cargo.toml",
+                "[package]\nname='a'\nversion='0.0.0'\nedition.workspace=true\n",
+            ),
+            ("crates/a/src/lib.rs", "pub fn a() {}\n"),
+            ("crates/a/src/other.rs", "pub fn other() {}\n"),
+            (
+                "crates/b/Cargo.toml",
+                "[package]\nname='b'\nversion='0.0.0'\nedition.workspace=true\n",
+            ),
+            ("crates/b/src/lib.rs", "pub fn b() {}\n"),
+        ]);
+        let mut ctx = Ctx::new(
+            dir.path().into(),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            dir.path().join("scratch"),
+        );
+        ctx.carry_context = Some("a".repeat(64));
+        let files = vec!["crates/a/src/lib.rs".into(), "crates/b/src/lib.rs".into()];
+        let keys = |files: &[String]| {
+            input_plans(&ctx, files, &mut Editions::new(dir.path()))
+                .into_iter()
+                .map(|p| p.proof.unwrap().key)
+                .collect::<Vec<_>>()
+        };
+        let original = keys(&files);
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion='2.0.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        assert_eq!(original, keys(&files));
+        std::fs::write(dir.path().join("crates/a/README.md"), "new documentation\n").unwrap();
+        std::fs::write(
+            dir.path().join("crates/a/src/other.rs"),
+            "pub fn unselected() {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            original,
+            keys(&files),
+            "neither documentation nor an unselected child is a --skip-children input"
+        );
+        let mut expanded = files.clone();
+        expanded.push("crates/a/src/other.rs".into());
+        assert_ne!(
+            original[0],
+            keys(&expanded)[0],
+            "new selected files require judgment"
+        );
+        std::fs::write(dir.path().join(&files[0]), "pub fn changed() {}\n").unwrap();
+        let changed = keys(&files);
+        assert_ne!(original[0], changed[0]);
+        assert_eq!(original[1], changed[1]);
+        std::fs::write(dir.path().join("rustfmt.toml"), "edition='2021'\n").unwrap();
+        assert_ne!(changed[1], keys(&files)[1]);
+        let old_config = keys(&files);
+        std::fs::write(dir.path().join("trustfmt.toml"), "edition='2024'\n").unwrap();
+        assert_ne!(
+            old_config,
+            keys(&files),
+            "the native config is an input too"
+        );
+        assert_eq!(Editions::new(dir.path()).rustfmt(&files[0]), "2024");
+        std::fs::write(dir.path().join(".trustfmt.toml"), "edition='2021'\n").unwrap();
+        assert_eq!(Editions::new(dir.path()).rustfmt(&files[0]), "2021");
     }
 }

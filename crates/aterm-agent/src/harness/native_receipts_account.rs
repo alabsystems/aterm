@@ -127,7 +127,9 @@ pub(super) struct Bound {
     )
 )]
 fn valid_relation(relation: AccountRelation<'_>) -> bool {
-    valid_pair(relation.predecessor, relation.predecessor_binding)
+    relation.predecessor.receipt_mode.is_none()
+        && relation.candidate.receipt_mode.is_none()
+        && valid_pair(relation.predecessor, relation.predecessor_binding)
         && relation
             .predecessor
             .account_successor_recipe(relation.candidate, relation.phase)
@@ -152,6 +154,7 @@ impl Bound {
             .get(&self.predecessor.operation)
             .filter(|parent| {
                 parent.receipt == self.predecessor
+                    && parent.recipients.is_none()
                     && parent.state == IssuerState::NoExec
                     && parent.epoch == Some(self.epoch)
                     && parent.closed_phase == Some(self.phase)
@@ -297,6 +300,7 @@ pub(super) fn ingest(view: &mut View, key: &Key, body: &[u8]) -> io::Result<()> 
     let parent = view.entries.get(&predecessor).ok_or_else(invalid)?;
     if view.entries.contains_key(&receipt.operation)
         || parent.state != IssuerState::NoExec
+        || parent.recipients.is_some()
         || parent.closed_phase != Some(phase)
         || parent.epoch != Some(epoch)
         || (!fence && parent.successor.is_some())
@@ -309,34 +313,33 @@ pub(super) fn ingest(view: &mut View, key: &Key, body: &[u8]) -> io::Result<()> 
         .committed_bytes
         .checked_add(if fence { FENCE_FRAME } else { ACCOUNT_FRAME })
         .ok_or_else(invalid)?;
-    if !fence {
-        view.entries.get_mut(&predecessor).unwrap().successor = Some(receipt.operation);
-    }
     let link = Link {
         phase,
         sequence: view.sequence,
         recorded_ms: number(12),
     };
-    view.entries.insert(
-        receipt.operation,
-        Entry {
-            receipt,
-            observed: Observed {
-                sequence: link.sequence,
-                recorded_ms: link.recorded_ms,
-            },
-            epoch: Some(epoch),
-            state: if fence {
-                IssuerState::Fenced
-            } else {
-                IssuerState::Prepared
-            },
-            predecessor: Some(predecessor),
-            successor: None,
-            closed_phase: None,
-            account: Some(link),
+    let operation = receipt.operation;
+    view.replace_entry(Entry {
+        receipt,
+        observed: Observed {
+            sequence: link.sequence,
+            recorded_ms: link.recorded_ms,
         },
-    );
+        epoch: Some(epoch),
+        state: if fence {
+            IssuerState::Fenced
+        } else {
+            IssuerState::Prepared
+        },
+        predecessor: Some(predecessor),
+        successor: None,
+        closed_phase: None,
+        account: Some(link),
+        recipients: None,
+    })?;
+    if !fence {
+        view.entries.get_mut(&predecessor).unwrap().successor = Some(operation);
+    }
     view.sequence = sequence;
     view.committed_bytes = committed_bytes;
     view.head = key.digest(b"receipt\0", body);

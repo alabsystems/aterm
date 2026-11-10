@@ -54,6 +54,9 @@ fn a_legacy_cold_noexec_receipt_survives_route_normalization() {
             Request::prepare(prepare.clone()).encode_legacy_cold(),
             Some(legacy.clone())
         );
+        let mut complete = prepare.clone();
+        complete.receipt_mode = Some(crate::harness::native_act::ReceiptMode::Recipients5);
+        assert!(Request::prepare(complete).encode_legacy_cold().is_none());
 
         let key = write_key(&paths).unwrap();
         let receipt = Receipt {

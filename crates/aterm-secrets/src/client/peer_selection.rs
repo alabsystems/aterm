@@ -207,11 +207,11 @@ pub(super) fn select(
     };
     // A changed URL does not invalidate signed comparison evidence. The
     // source-bound cache helpers still control reuse and publication elsewhere.
-    let mut baseline = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
+    let mut baseline = super::chain_cache::held(&paths.cache_file())
         .ok()
         .flatten()
-        .filter(|bytes| exact_body(bytes.as_slice()))
-        .map(|bytes| bytes.as_slice().to_vec())
+        .filter(|parsed| exact_body(parsed.bytes()))
+        .map(|parsed| parsed.bytes().to_vec())
         .or_else(|| match primary {
             Ok(Fetched::Body(bytes)) if primary_is_held && exact_body(bytes) => Some(bytes.clone()),
             _ => None,

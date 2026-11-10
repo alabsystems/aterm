@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use crate::error::{Error, Result};
 
-/// Maximum explicit refs in one network fetch, including a fresh Codex tag catalog.
+/// Maximum explicit refs or objects in one network fetch, including a fresh Codex tag catalog.
 pub const FETCH_ROWS_MAX: usize = 2048;
 /// Maximum combined row bytes; generated stdin remains below the child input bound.
 pub const FETCH_BYTES_MAX: usize = 512 * 1024;
@@ -25,10 +25,12 @@ pub struct FetchRow {
     pub expected_oid: String,
 }
 
-/// An immutable batch whose names, expected identities, uniqueness and size were checked.
+/// An immutable ref snapshot or object import whose names, identities, uniqueness and size
+/// were checked. An object import publishes no caller refs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchBatch {
     rows: Vec<FetchRow>,
+    objects: Vec<String>,
 }
 
 impl FetchBatch {
@@ -84,7 +86,42 @@ impl FetchBatch {
             }
         }
         rows.sort_unstable_by(|left, right| left.into.cmp(&right.into));
-        Ok(Self { rows })
+        Ok(Self {
+            rows,
+            objects: Vec::new(),
+        })
+    }
+
+    /// Admit immutable raw objects for import without publishing any caller cache refs.
+    /// Remote authentication and exact fetched-object checks still apply to every object.
+    ///
+    /// # Errors
+    /// Empty or oversized batches, duplicate IDs, or anything except nonzero lowercase
+    /// forty-digit hexadecimal object IDs.
+    pub fn objects(mut objects: Vec<String>) -> Result<Self> {
+        if objects.is_empty() || objects.len() > FETCH_ROWS_MAX {
+            return Err(Error::usage("object import needs 1–2048 explicit IDs"));
+        }
+        if objects
+            .iter()
+            .any(|oid| !crate::path::is_sha(oid) || oid.bytes().all(|b| b == b'0'))
+        {
+            return Err(Error::usage("object import needs nonzero raw object IDs"));
+        }
+        objects.sort_unstable();
+        if objects.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::usage("object import IDs must be unique"));
+        }
+        Ok(Self {
+            rows: Vec::new(),
+            objects,
+        })
+    }
+
+    /// Validated immutable imports in canonical order; these publish no caller refs.
+    #[must_use]
+    pub fn object_ids(&self) -> &[String] {
+        &self.objects
     }
 
     /// The validated rows in canonical destination order.
@@ -103,6 +140,24 @@ mod tests {
             source: source.into(),
             into: into.into(),
             expected_oid: "a".repeat(40),
+        }
+    }
+
+    #[test]
+    fn object_imports_are_bounded_exact_unique_and_publish_no_refs() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let batch = FetchBatch::objects(vec![b.clone(), a.clone()]).unwrap();
+        assert!(batch.rows().is_empty());
+        assert_eq!(batch.object_ids(), &[a.clone(), b]);
+        for invalid in [
+            Vec::new(),
+            vec!["0".repeat(40)],
+            vec!["refs/heads/main".into()],
+            vec![a.clone(), a.clone()],
+            vec![a; super::FETCH_ROWS_MAX + 1],
+        ] {
+            assert!(FetchBatch::objects(invalid).is_err());
         }
     }
 

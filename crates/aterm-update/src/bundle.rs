@@ -5,6 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "bundle_capabilities.rs"]
+mod capabilities;
+
 /// A resolved installed bundle: the `.app` root and the executable inside it.
 pub struct Bundle {
     /// `…/aterm.app`.
@@ -38,39 +41,7 @@ pub const HANDOFF_GRANT_CHUNKS_TOKEN: &str = "chunks1";
 /// Whether an `Info.plist`'s text declares the chunked grant.
 #[must_use]
 pub fn plist_declares_grant_chunks(text: &str) -> bool {
-    crate::manifest::xml_plist_string(text, HANDOFF_GRANT_CHUNKS_KEY)
-        .is_some_and(|value| value == HANDOFF_GRANT_CHUNKS_TOKEN)
-}
-
-/// Read the chunked-grant declaration off a bundle whose signature was just verified.
-pub(crate) fn declares_grant_chunks(app_root: &Path) -> Result<bool, String> {
-    let path = app_root.join("Contents/Info.plist");
-    grant_chunks_judged(&path, crate::read_ledger_text_checked(&path))
-}
-
-/// What the read of the `Info.plist` at `path` says about the chunked grant.
-pub(crate) fn grant_chunks_judged(
-    path: &Path,
-    read: std::io::Result<Option<String>>,
-) -> Result<bool, String> {
-    grant_judged(path, read, plist_declares_grant_chunks)
-}
-
-/// What the read of the `Info.plist` at `path` says by `declares`: an absent plist, or one
-/// the system refuses for good (for example `EACCES`), declares nothing, and a momentary
-/// read error is an `Err`.
-fn grant_judged(
-    path: &Path,
-    read: std::io::Result<Option<String>>,
-    declares: fn(&str) -> bool,
-) -> Result<bool, String> {
-    match read {
-        Ok(text) => Ok(text.is_some_and(|text| declares(&text))),
-        Err(error) if aterm_update_core::handoff_policy::is_momentary_read_error(&error) => {
-            Err(format!("{}: unreadable: {error}", path.display()))
-        }
-        Err(_) => Ok(false),
-    }
+    Capabilities::from_plist(text).grant_chunks
 }
 
 /// The `Info.plist` key by which a bundle declares it takes a sessionless rendezvous grant.
@@ -82,18 +53,7 @@ pub const HANDOFF_GRANT_EMPTY_TOKEN: &str = "empty1";
 /// Whether an `Info.plist`'s text declares the sessionless grant.
 #[must_use]
 pub fn plist_declares_grant_empty(text: &str) -> bool {
-    crate::manifest::xml_plist_string(text, HANDOFF_GRANT_EMPTY_KEY)
-        .is_some_and(|value| value == HANDOFF_GRANT_EMPTY_TOKEN)
-}
-
-/// Read the sessionless-grant declaration off a bundle whose signature was just verified.
-pub(crate) fn declares_grant_empty(app_root: &Path) -> Result<bool, String> {
-    let path = app_root.join("Contents/Info.plist");
-    grant_judged(
-        &path,
-        crate::read_ledger_text_checked(&path),
-        plist_declares_grant_empty,
-    )
+    Capabilities::from_plist(text).grant_empty
 }
 
 /// The `Info.plist` key by which a bundle declares it rebuilds a window that held only an empty
@@ -106,18 +66,51 @@ pub const HANDOFF_GRANT_DESK_TOKEN: &str = "desk1";
 /// Whether an `Info.plist`'s text declares the desk grant.
 #[must_use]
 pub fn plist_declares_grant_desk(text: &str) -> bool {
-    crate::manifest::xml_plist_string(text, HANDOFF_GRANT_DESK_KEY)
-        .is_some_and(|value| value == HANDOFF_GRANT_DESK_TOKEN)
+    Capabilities::from_plist(text).grant_desk
 }
 
-/// Read the desk-grant declaration off a bundle whose signature was just verified.
-pub(crate) fn declares_grant_desk(app_root: &Path) -> Result<bool, String> {
-    let path = app_root.join("Contents/Info.plist");
-    grant_judged(
-        &path,
-        crate::read_ledger_text_checked(&path),
-        plist_declares_grant_desk,
-    )
+/// The `Info.plist` key declaring complete-recipient journal recovery support.
+pub const NATIVE_RECIPIENT_RECOVERY_KEY: &str = "<key>ATermNativeRecipientRecovery</key>";
+
+/// Reads ANG5 histories and recovers them only with complete recipient retirement evidence.
+pub const NATIVE_RECIPIENT_RECOVERY_TOKEN: &str = "recipients5";
+
+/// Whether an `Info.plist` declares complete-recipient recovery, not writer admission.
+#[must_use]
+pub fn plist_declares_recipient_recovery(text: &str) -> bool {
+    Capabilities::from_plist(text).recipient_recovery
+}
+
+/// Declarations from one immutable read of a candidate's sealed `Info.plist`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Capabilities {
+    pub grant_chunks: bool,
+    pub grant_empty: bool,
+    pub grant_desk: bool,
+    pub recipient_recovery: bool,
+}
+
+impl Capabilities {
+    /// Read only after authenticating the candidate bundle.
+    pub(crate) fn read(app_root: &Path) -> Result<Self, String> {
+        let path = app_root.join("Contents/Info.plist");
+        Self::judge(&path, crate::read_ledger_text_checked(&path))
+    }
+
+    /// An absent or permanently unreadable plist declares nothing. A transient error
+    /// refuses the entire snapshot, rather than returning partially read capabilities.
+    pub(crate) fn judge(
+        path: &Path,
+        read: std::io::Result<Option<String>>,
+    ) -> Result<Self, String> {
+        match read {
+            Ok(Some(text)) => Ok(Self::from_plist(&text)),
+            Err(error) if aterm_update_core::handoff_policy::is_momentary_read_error(&error) => {
+                Err(format!("{}: unreadable: {error}", path.display()))
+            }
+            Ok(None) | Err(_) => Ok(Self::default()),
+        }
+    }
 }
 
 /// Resolve the installed bundle the updater may replace, or `None` when it must not act:

@@ -1044,6 +1044,7 @@ fn a_cold_completion_keeps_the_selected_intent_and_the_original_seed_with_or_wit
     shell.pid = if vendor.pid == 2 { 3 } else { 2 };
     shell.group = shell.pid;
     let original = Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),

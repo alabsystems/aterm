@@ -354,7 +354,15 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
             && !named_skip(ctx, s.id)
         {
             let key = crate::memory::Key::of_stage(&s, ctx);
-            s.mem = crate::memory::need(records, plain, &s, &key, book.physical).bytes;
+            s.mem = crate::memory::need_for_jobs(
+                records,
+                plain,
+                &s,
+                &key,
+                book.physical,
+                crate::compile_width::jobs_for(ctx, s.id),
+            )
+            .bytes;
             if s.id == StageId::TestCompile && !ctx.scope.is_workspace() {
                 let checkout = ctx.root.display().to_string();
                 let shaping = crate::shape::Shaping {

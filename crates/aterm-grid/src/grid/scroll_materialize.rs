@@ -26,6 +26,8 @@ pub struct MaterializedRow {
     pub cells: Vec<super::Cell>,
     /// Sparse extras for the columns that need them.
     extras: FxHashMap<u16, CellExtra>,
+    /// Set while restoring links; public access to extras is immutable.
+    has_hyperlinks: bool,
     /// Soft-wrap flag from the source [`Line`], as a live `Row` reports it (`row_is_wrapped`).
     wrapped: bool,
     /// The cells reach all but the last column, the shape an early-wrap hole leaves.
@@ -33,6 +35,13 @@ pub struct MaterializedRow {
 }
 
 impl MaterializedRow {
+    /// Whether hyperlink restoration installed a link in this row.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn has_hyperlinks(&self) -> bool {
+        self.has_hyperlinks
+    }
+
     /// Look up extras for a column (mirrors `CellExtras::get`).
     #[must_use]
     #[inline]
@@ -131,6 +140,7 @@ pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
     let mut row = MaterializedRow {
         cells: vec![super::Cell::default(); cols as usize],
         extras: FxHashMap::default(),
+        has_hyperlinks: false,
         wrapped: line.is_wrapped(),
         hole: false,
     };
@@ -153,7 +163,7 @@ pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
     let filled = walk.col;
     row.hole = leaves_wrap_hole(filled, cols);
 
-    restore_hyperlinks(&mut row.extras, line, filled);
+    row.has_hyperlinks = restore_hyperlinks(&mut row.extras, line, filled);
 
     restore_underline_colors(&mut row.extras, line, filled);
 
@@ -409,6 +419,7 @@ pub(in crate::grid) fn materialize_from_row_extras(
     let mut out = MaterializedRow {
         cells: vec![Cell::default(); cols as usize],
         extras: FxHashMap::default(),
+        has_hyperlinks: false,
         wrapped: row.is_wrapped(),
         hole: false,
     };
@@ -438,7 +449,7 @@ pub(in crate::grid) fn materialize_from_row_extras(
 
     let col = walk.col;
     out.hole = leaves_wrap_hole(col, cols);
-    restore_hyperlink_spans(&mut out.extras, &extras.hyperlinks, col);
+    out.has_hyperlinks = restore_hyperlink_spans(&mut out.extras, &extras.hyperlinks, col);
     if !extras.underline_colors.is_empty() {
         restore_underline_color_spans(
             &mut out.extras,
@@ -973,10 +984,9 @@ fn store_rgb_extras(
 }
 
 /// Restore a line's hyperlinks onto its first `filled` columns, bounded to `O(cols)` writes.
-fn restore_hyperlinks(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, filled: u16) {
-    if let Some(spans) = line.hyperlinks() {
-        restore_hyperlink_spans(extras, spans, filled);
-    }
+fn restore_hyperlinks(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, filled: u16) -> bool {
+    line.hyperlinks()
+        .is_some_and(|spans| restore_hyperlink_spans(extras, spans, filled))
 }
 
 /// Restore hyperlink spans onto the first `filled` columns.
@@ -984,8 +994,9 @@ fn restore_hyperlink_spans(
     extras: &mut FxHashMap<u16, CellExtra>,
     spans: &[HyperlinkSpan],
     filled: u16,
-) {
+) -> bool {
     let mut budget = filled;
+    let mut restored = false;
     'restore: for span in spans {
         for hcol in filled_span_cols(span.start_col, span.end_col, filled) {
             if budget == 0 {
@@ -993,9 +1004,11 @@ fn restore_hyperlink_spans(
             }
             let extra = extras.entry(hcol).or_default();
             extra.set_hyperlink_data(Some(Arc::clone(&span.payload)));
+            restored = true;
             budget -= 1;
         }
     }
+    restored
 }
 
 /// The columns of a stored span (`start_col..end_col`) clamped to `filled`.

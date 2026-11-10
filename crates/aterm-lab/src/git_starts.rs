@@ -50,12 +50,15 @@ pub const SURVEY_EVERY: Duration = Duration::from_secs(1);
 const SURVEY_WITHIN: Duration = Duration::from_secs(4);
 /// The git starts one record read makes, fewest and most: `rev-parse` (the common dir and the top
 /// level), the branch, the main ref (`origin/HEAD`, then one to three `rev-parse --verify`),
-/// `merge-base`, the behind count, `diff-tree`, the person's excludes (one or two) and the status.
-/// Not counted: in a checkout whose status shows a submodule modified, the probe's status read
-/// adds a `status --porcelain=v2` of those submodules, and where a submodule's commit alone moved,
-/// a `rev-parse --git-path` of the reflog, its `diff-tree --stdin` and a `rev-parse` of each such
-/// submodule's `HEAD` (`without_lagging_submodules`, `crates/aterm-agent/src/harness/repo_work.rs`).
-pub const STARTS_PER_READ: (u32, u32) = (9, 12);
+/// `merge-base`, the behind count, `diff-tree`, the person's excludes (one or two), the index's
+/// `rev-parse --git-path` and the status, and at the first read of each state of the index its
+/// private copy's `update-index --refresh` (`private_index`). Not counted: a status read again from
+/// the repository's own index where its copy was let go mid-read; in a checkout whose status shows
+/// a submodule modified, the probe's status read adds a `status --porcelain=v2` of those
+/// submodules, and where a submodule's commit alone moved, a `rev-parse --git-path` of the reflog,
+/// its `diff-tree --stdin` and a `rev-parse` of each such submodule's `HEAD`
+/// (`without_lagging_submodules`, `crates/aterm-agent/src/harness/repo_work.rs`).
+pub const STARTS_PER_READ: (u32, u32) = (10, 14);
 
 /// A process [`Readers::process`] read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

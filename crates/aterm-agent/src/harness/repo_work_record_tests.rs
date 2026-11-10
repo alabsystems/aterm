@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::harness::repo_work::PROBE_LIMIT;
-use crate::harness::repo_work::tests::{repo, scratch_git};
+use crate::harness::repo_work::tests::{dated, repo, scratch_git};
 
 /// What [`read_work`] reads of `dir` with `home` as the person's, nothing held back.
 fn read(dir: &Path, home: &Path) -> WorkRead {
@@ -41,6 +41,15 @@ fn script(path: &Path, body: &str) -> String {
     std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("script");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     path.display().to_string()
+}
+
+/// Date the index of the repository at `work` anew, `k` milliseconds past the second
+/// 1,800,000,000, so its next read copies and refreshes it as a first read does.
+fn anew(work: &Path, k: u32) {
+    let at = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(1_800_000_000)
+        + std::time::Duration::from_millis(u64::from(k));
+    dated(&work.join(".git/index"), at);
 }
 
 /// A home with nothing in it, beside the repository under `tmp`.
@@ -261,8 +270,10 @@ fn a_guarded_folder_is_never_read() {
 }
 
 /// A READ THE HANG DETECTOR CUTS IS UNREAD: a read starved past [`PROBE_LIMIT`], the first or any
-/// later one of the record's, makes it [`WorkRead::Unread`], never an empty record. NEGATIVE
-/// CONTROL: unstarved, the same repository is read.
+/// later one of the record's, makes it [`WorkRead::Unread`], never an empty record: through the
+/// private index a first read refreshes (`repo_work`'s `private_index`), and through the one a
+/// later read finds. NEGATIVE CONTROL: unstarved, the same repository is read, a later read with
+/// fewer gits than the first.
 #[test]
 fn a_read_the_hang_detector_cuts_is_unread() {
     use crate::harness::repo_work::read_stall;
@@ -270,20 +281,35 @@ fn a_read_the_hang_detector_cuts_is_unread() {
     let work = repo(tmp.path(), true);
     let home = empty_home(tmp.path());
     std::fs::write(work.join("b.txt"), "x\n").expect("b.txt");
-    let whole = record(&work, &home);
+    let (whole, warm) = (record(&work, &home), record(&work, &home));
     assert_eq!(whole.paths, ["b.txt"], "CONTROL: unstarved, it is read");
+    assert!(
+        warm.starts < whole.starts,
+        "CONTROL: a later read finds the refreshed copy"
+    );
     let hung = u64::try_from(PROBE_LIMIT.as_millis()).unwrap_or(u64::MAX) + 1_000;
-    for k in 0..whole.starts {
-        read_stall::set_after(k, hung);
-        let cut = read(&work, &home);
-        read_stall::set(0);
-        assert_eq!(cut, WorkRead::Unread, "read {k} past its limit");
+    for (cold, starts) in [(false, warm.starts), (true, whole.starts)] {
+        for k in 0..starts {
+            if cold {
+                anew(&work, k);
+            }
+            read_stall::set_after(k, hung);
+            let cut = read(&work, &home);
+            read_stall::set(0);
+            assert_eq!(
+                cut,
+                WorkRead::Unread,
+                "read {k} past its limit, cold {cold}"
+            );
+        }
     }
 }
 
 /// A HOLD THAT COMES MID-READ STARTS NO MORE GIT: a hold on new starts that turns on before the
 /// record's `k`-th git, for every `k` its reads make, ends the read there, unread, after exactly
-/// the `k` gits before it. NEGATIVE CONTROL: with no hold the same repository is read whole.
+/// the `k` gits before it: through the private index a first read refreshes (`repo_work`'s
+/// `private_index`), and through the one a later read finds. NEGATIVE CONTROL: with no hold the
+/// same repository is read whole, a later read with fewer gits than the first.
 #[test]
 fn a_hold_that_comes_mid_read_starts_no_more_git() {
     let tmp = aterm_tempfile::tempdir().expect("tmp");
@@ -291,22 +317,31 @@ fn a_hold_that_comes_mid_read_starts_no_more_git() {
     let home = empty_home(tmp.path());
     std::fs::write(work.join("b.txt"), "x\n").expect("b.txt");
     let (whole, all) = counted(&work, &home, &|| false);
-    assert!(
-        matches!(&whole, WorkRead::Read(r) if r.paths == ["b.txt"]),
-        "CONTROL: with no hold it is read: {whole:?}"
-    );
-    for k in 0..all {
-        let looks = Cell::new(0u32);
-        let held = || {
-            let n = looks.get();
-            looks.set(n + 1);
-            n >= k
-        };
-        assert_eq!(
-            counted(&work, &home, &held),
-            (WorkRead::Unread, k),
-            "held from git {k} on"
+    let (later, warm) = counted(&work, &home, &|| false);
+    for read in [&whole, &later] {
+        assert!(
+            matches!(read, WorkRead::Read(r) if r.paths == ["b.txt"]),
+            "CONTROL: with no hold it is read: {read:?}"
         );
+    }
+    assert!(warm < all, "CONTROL: a later read finds the refreshed copy");
+    for (cold, starts) in [(false, warm), (true, all)] {
+        for k in 0..starts {
+            if cold {
+                anew(&work, k);
+            }
+            let looks = Cell::new(0u32);
+            let held = || {
+                let n = looks.get();
+                looks.set(n + 1);
+                n >= k
+            };
+            assert_eq!(
+                counted(&work, &home, &held),
+                (WorkRead::Unread, k),
+                "held from git {k} on, cold {cold}"
+            );
+        }
     }
 }
 

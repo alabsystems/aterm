@@ -109,15 +109,13 @@ impl Snapshot {
 
     /// The ledger and the GUI can observe different generations.
     pub(crate) fn apply_posture(&self, status: &aterm_update::UpdateStatus) -> &'static str {
-        if !status.enabled {
-            return "disabled";
-        }
         if !status
             .staged_build
             .is_some_and(|b| b > status.current_build)
         {
-            return "none";
+            return if status.enabled { "none" } else { "disabled" };
         }
+        // A stage can still install when automatic checking is off.
         let matched =
             self.staged
                 .as_ref()
@@ -371,6 +369,17 @@ mod tests {
         snapshot.retry_scheduled = true;
         assert_eq!(snapshot.apply_posture(&status), "automatic");
         assert_eq!(snapshot.apply_phase(&status), Some("prefer-output-gap"));
+        status.enabled = false;
+        assert_eq!(
+            snapshot.apply_posture(&status),
+            "automatic",
+            "turning off checks does not disable an admitted staged installation"
+        );
+        assert_eq!(snapshot.apply_phase(&status), Some("prefer-output-gap"));
+        snapshot.applying = true;
+        assert_eq!(snapshot.apply_posture(&status), "applying");
+        snapshot.applying = false;
+        status.enabled = true;
         status.staged_commit = status.staged_commit.map(|s| s.to_uppercase());
         status.staged_dmg_sha256 = status.staged_dmg_sha256.map(|s| s.to_uppercase());
         assert_eq!(snapshot.apply_posture(&status), "automatic");
@@ -405,6 +414,11 @@ mod tests {
         assert_eq!(snapshot.apply_posture(&status), "manual-config");
         status.staged_commit = Some("d".repeat(40));
         assert_eq!(snapshot.apply_posture(&status), "unreconciled");
+        status.staged_build = None;
+        status.enabled = false;
+        assert_eq!(snapshot.apply_posture(&status), "disabled");
+        status.enabled = true;
+        assert_eq!(snapshot.apply_posture(&status), "none");
     }
 
     #[test]

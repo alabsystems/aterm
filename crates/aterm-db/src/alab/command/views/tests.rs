@@ -955,3 +955,192 @@ fn a_failed_read_of_a_declared_registry_is_that_error_and_never_not_imported() {
     assert_eq!(missing["registry"].as_str(), Some("not imported"));
     assert_eq!(missing["next"].as_str(), Some("next"));
 }
+
+/// One `account-obs` row of `account` written by the Mac `uuid`, under `key`.
+fn obs_row(
+    key: &str,
+    account: &str,
+    state: &str,
+    tabs: u64,
+    at: u64,
+) -> (String, crate::typed::owned::OwnedRow) {
+    (
+        key.to_owned(),
+        crate::typed::owned::OwnedRow {
+            machine: [0; 16],
+            actor: [0; 48],
+            value: json!({"r": 1, "n": 1, "account": account, "cli": "claude", "state": state,
+                "tabs": tabs, "first_at": at, "at": at, "src": "profile"}),
+            rank: (0, 1, 1),
+            operation: [0; 32],
+        },
+    )
+}
+
+const M65: &str = "65656565656565656565656565656565";
+const M22: &str = "22222222222222222222222222222222";
+const UNICORN: &str = "ac-00000000000000a1";
+const BRONTO: &str = "ac-00000000000000b2";
+
+fn named(uuid: &str) -> String {
+    match uuid {
+        M65 => "m65 (cheetah)".into(),
+        M22 => "m22 (brontosaurus)".into(),
+        other => other[..8].into(),
+    }
+}
+
+fn fleet() -> crate::typed::owned::OwnedRead {
+    crate::typed::owned::OwnedRead {
+        rows: [
+            obs_row(
+                &format!("{UNICORN}.{M65}"),
+                UNICORN,
+                "running",
+                1,
+                NOW - 12_000,
+            ),
+            obs_row(
+                &format!("{BRONTO}.{M22}"),
+                BRONTO,
+                "running",
+                2,
+                NOW - 3_600_000,
+            ),
+            obs_row(
+                &format!("{BRONTO}.{M65}"),
+                BRONTO,
+                "idle",
+                0,
+                NOW - 7_200_000,
+            ),
+            // Not its own account's key: no Mac's word.
+            obs_row(&format!("{UNICORN}.{M22}"), BRONTO, "running", 5, NOW),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    }
+}
+
+/// `ai-accounts` says where each account runs and when it was last seen, from every Mac's
+/// `account-obs` rows, each Mac a tab runs it on by name with its tabs (an idle row dates the
+/// account but runs it nowhere); a row whose key is not its own account's is skipped, and an
+/// account no Mac observed shows neither.
+/// NEGATIVE CONTROL: with `seen_on` skipping no row by its key, unicorn's last sighting is the
+/// stray row's: `` left: "0 s" right: "12 s" ``.
+#[test]
+fn ai_accounts_seen_on_and_last_seen() {
+    let seen = seen_on(&fleet(), &[], &named, NOW);
+    let mut rows = vec![
+        json!({"ac": UNICORN, "status": "active"}),
+        json!({"ac": BRONTO, "status": "active"}),
+        json!({"ac": "ac-00000000000000c3", "status": "active"}),
+    ];
+    shown_seen(&mut rows, &seen, NOW);
+    assert_eq!(rows[0]["seen_on"], json!("m65 (cheetah) \u{d7}1"));
+    assert_eq!(rows[0]["last_seen"], json!("12 s"));
+    assert_eq!(rows[1]["seen_on"], json!("m22 (brontosaurus) \u{d7}2"));
+    assert_eq!(rows[1]["last_seen"], json!("1 h"));
+    assert_eq!(rows[2]["seen_on"], Value::Null);
+    assert_eq!(rows[2]["last_seen"], Value::Null);
+    assert_eq!(
+        rows[0]["status"],
+        json!("active"),
+        "an owner's status stands"
+    );
+}
+
+/// A catalog `pending` account a Mac runs now reads as signed in there: observation wins over
+/// belief. One only idle somewhere stays pending.
+/// NEGATIVE CONTROL: with `shown_seen` leaving `status` alone, `` left: "pending" right: "signed
+/// in · on m65 (cheetah)" ``.
+#[test]
+fn observed_signed_in_beats_catalog_pending() {
+    let seen = seen_on(&fleet(), &[], &named, NOW);
+    let mut rows = vec![
+        json!({"ac": UNICORN, "status": "pending"}),
+        json!({"ac": BRONTO, "status": Value::Null}),
+    ];
+    shown_seen(&mut rows, &seen, NOW);
+    assert_eq!(
+        rows[0]["status"],
+        json!("signed in \u{b7} on m65 (cheetah)")
+    );
+    assert_eq!(
+        rows[1]["status"],
+        json!("signed in \u{b7} on m22 (brontosaurus)")
+    );
+    let idle = crate::typed::owned::OwnedRead {
+        rows: [obs_row(
+            &format!("{UNICORN}.{M65}"),
+            UNICORN,
+            "idle",
+            0,
+            NOW,
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let mut rows = vec![json!({"ac": UNICORN, "status": "pending"})];
+    shown_seen(&mut rows, &seen_on(&idle, &[], &named, NOW), NOW);
+    assert_eq!(rows[0]["status"], json!("pending"));
+}
+
+fn heard(uuid: &str, account: &str, tab: &str, t_ms: u64, ended: bool) -> Heard {
+    Heard {
+        uuid: uuid.to_owned(),
+        account: account.to_owned(),
+        tab: tab.to_owned(),
+        t_ms,
+        ended,
+    }
+}
+
+/// A Mac stops running an account once nothing says so within two hours: a `running` row no
+/// later sighting refreshed lapses, however long ago it was written, while a tab's heard `seen`
+/// keeps it on, counted by distinct tabs, until that tab's `session-end`.
+/// NEGATIVE CONTROL: with `seen_on` taking every running row whatever its age, the lapsed row
+/// still runs on m65: `` left: "m65 (cheetah) ×1" right: Null ``; with heard events ignored,
+/// m22's two tabs are not counted: `` left: Null right: "m22 (brontosaurus) ×2" ``.
+#[test]
+fn seen_on_lapses_without_a_sighting_and_counts_heard_tabs() {
+    let lapsed = crate::typed::owned::OwnedRead {
+        rows: [obs_row(
+            &format!("{UNICORN}.{M65}"),
+            UNICORN,
+            "running",
+            1,
+            NOW - 3 * 3_600_000,
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let events = [
+        heard(M22, UNICORN, "aaaaaaaa", NOW - 60_000, false),
+        heard(M22, UNICORN, "bbbbbbbb", NOW - 3_000_000, false),
+        heard(M22, UNICORN, "aaaaaaaa", NOW - 120_000, false),
+        heard(M22, UNICORN, "cccccccc", NOW - 30_000, false),
+        heard(M22, UNICORN, "cccccccc", NOW - 10_000, true),
+        heard(M65, BRONTO, "dddddddd", NOW - 3 * 3_600_000, false),
+    ];
+    let seen = seen_on(&lapsed, &events, &named, NOW);
+    let mut rows = vec![
+        json!({"ac": UNICORN, "status": "pending"}),
+        json!({"ac": BRONTO, "status": "pending"}),
+    ];
+    shown_seen(&mut rows, &seen, NOW);
+    assert_eq!(rows[0]["seen_on"], json!("m22 (brontosaurus) \u{d7}2"));
+    assert_eq!(rows[0]["last_seen"], json!("30 s"));
+    assert_eq!(
+        rows[0]["status"],
+        json!("signed in \u{b7} on m22 (brontosaurus)")
+    );
+    assert_eq!(rows[1]["seen_on"], Value::Null, "seen three hours ago");
+    assert_eq!(rows[1]["last_seen"], json!("3 h"));
+    assert_eq!(rows[1]["status"], json!("pending"));
+    let alone = seen_on(&lapsed, &[], &named, NOW);
+    assert!(alone[UNICORN].macs.is_empty(), "{alone:?}");
+}

@@ -1280,7 +1280,7 @@ fn a_pre_park_check_that_did_not_finish_defers_without_a_launch_failure() {
 }
 
 #[test]
-fn an_inconclusive_worker_verification_rearms_without_spending_prior_failures() {
+fn an_unconfirmed_trial_rearms_without_spending_prior_failures() {
     use crate::app_native::{PREVERIFY_RETRY_AFTER, PhysicalFailureShape};
     use std::time::Instant;
 
@@ -1297,13 +1297,20 @@ fn an_inconclusive_worker_verification_rearms_without_spending_prior_failures() 
         last_attempt: Instant::now(),
     };
     app.auto_apply_physical_retry = Some(prior);
+    // The live pre-launch swap refused this trial before any successor existed.
+    // Exercise its classification as well as the returned-completion reducer.
+    let refusal = format!(
+        "update trial for build {current} is still unconfirmed ({})",
+        aterm_update::PASSING_REFUSAL_KEY
+    );
+    let outcome = super::pre_park_refusal_outcome(&refusal);
     let started = Instant::now();
     reduce_one_returned_failure(
         &mut app,
         ApplyMode::AutomaticPastGrace,
         build,
         &"ab".repeat(32),
-        crate::UpdateHandoffOutcome::VerificationDeferred,
+        outcome,
         crate::ChildDeathEvidence::Unobserved,
     );
     let intent = app

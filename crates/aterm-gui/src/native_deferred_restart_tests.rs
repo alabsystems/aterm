@@ -164,8 +164,8 @@ impl Kernel for DeferredFacts {
     fn own_launcher(&self, image: &Image) -> bool {
         self.base.own_launcher(image) || self.actual_launcher.as_ref() == Some(image)
     }
-    fn birth_alive(&self, process: &Process) -> Option<bool> {
-        self.base.birth_alive(process)
+    fn birth_is_alive(&self, pid: u32, birth: u64) -> Option<bool> {
+        self.base.birth_is_alive(pid, birth)
     }
     fn signal(&self, master: i32, process: &Process, ctx: &crate::SessionCtx) -> String {
         self.base.signal(master, process, ctx)

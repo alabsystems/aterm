@@ -389,7 +389,8 @@ pub(super) fn show_status(ctx: &Ctx, args: &[String]) -> Result<()> {
     status.selected = match atpkg::local_harness::observe_current(&lock, program)
         .map_err(|e| Error::io("checked local current is unknown", &e))?
     {
-        atpkg::local_harness::CurrentLocal::Absent => None,
+        atpkg::local_harness::CurrentLocal::Absent
+        | atpkg::local_harness::CurrentLocal::Foreign(_) => None,
         atpkg::local_harness::CurrentLocal::Selected(identity) => Some(identity.into()),
     };
     drop(lock);

@@ -409,7 +409,7 @@ fn queue_status_from(
                 .find(|entry| entry.matches_row(row))?
                 .queued
                 .as_ref()?;
-            (format!("Account {}", request.label()), queued)
+            (format!("Account {}", row.shown_name()), queued)
         }
         accounts::PendingSelection::Next(_) => (
             "Next account".to_owned(),

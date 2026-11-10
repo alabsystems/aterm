@@ -48,6 +48,7 @@ pub(super) fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
         dialect: crate::harness::upgrade::Dialect::Zsh,
     };
     let prepare = Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),

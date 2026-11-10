@@ -314,7 +314,9 @@ pub enum Rank {
 pub const RELEASE_RUN_ENV: &str = "ATERM_RELEASE_RUN";
 
 mod background;
+mod branch_shares;
 mod jobserver;
+pub use branch_shares::BranchShares;
 pub use jobserver::{Jobserver, POOL_ENV, Token};
 
 /// What a claim needs. Sizes are bytes.

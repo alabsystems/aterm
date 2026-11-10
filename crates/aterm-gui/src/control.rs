@@ -1194,6 +1194,16 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let staged_version = st.staged_version.as_deref().unwrap_or("-");
     let staged_commit = st.staged_commit.as_deref().unwrap_or("-");
     let relaunch_ready = st.staged_build.is_some_and(|b| b > st.current_build);
+    let enabled = match apply_snapshot.as_ref().map(|live| live.enabled) {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    };
+    let auto_apply = match apply_snapshot.as_ref().map(|live| live.auto_apply) {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    };
     let apply_posture = apply_snapshot
         .as_ref()
         .map_or("unknown", |live| live.apply_posture(&st));
@@ -1250,11 +1260,12 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let staged_is_same_commit =
         aterm_update::commit_matches(crate::build_info::git_commit(), staged_commit);
     let mut out = format!(
-        "OK enabled={} current_build={} commit={} staged_build={} staged_version={} \
+        "OK enabled={} auto_apply={} current_build={} commit={} staged_build={} staged_version={} \
          staged_commit={} staged_is_same_commit={} relaunch_ready={} apply_posture={} failing={} \
          failing_applies={} persistent={}{stale_check}{checked_at}{next_check}{checker} \
          outcome={:?}\n",
-        st.enabled,
+        enabled,
+        auto_apply,
         st.current_build,
         crate::build_info::git_commit(),
         staged_build,
@@ -1350,9 +1361,9 @@ fn fold_installed_activation(
     st: &mut aterm_update::UpdateStatus,
     stage: Option<&crate::native_updater_service::StagedUpdate>,
 ) {
-    let Some(activation) = stage.filter(|stage| {
-        st.enabled && stage.build > st.current_build && stage.is_installed_activation()
-    }) else {
+    let Some(activation) =
+        stage.filter(|stage| stage.build > st.current_build && stage.is_installed_activation())
+    else {
         return;
     };
     st.staged_build = Some(activation.build);
@@ -1426,9 +1437,16 @@ mod installed_activation_fold_tests {
 
     #[test]
     fn the_reducers_activation_is_the_stage_in_its_own_words() {
-        for (version, said) in [("0.40.0", Some("0.40.0")), ("build 12", None)] {
+        for (enabled, version, said) in [
+            (true, "0.40.0", Some("0.40.0")),
+            (true, "build 12", None),
+            (false, "0.40.0", Some("0.40.0")),
+            (false, "build 12", None),
+        ] {
             let mut st = ledger_with_download();
+            st.enabled = enabled;
             fold_installed_activation(&mut st, Some(&activation(12, version)));
+            assert_eq!(st.current_build, 10, "the target is not the running build");
             assert_eq!(st.staged_build, Some(12), "{version}");
             assert_eq!(st.staged_version.as_deref(), Some(version));
             assert_eq!(st.staged_commit.as_deref(), Some(COMMIT), "{version}");
@@ -1450,12 +1468,9 @@ mod installed_activation_fold_tests {
     fn nothing_but_a_newer_activation_folds() {
         let mut download = activation(12, "0.40.0");
         download.dmg_sha256 = "b".repeat(64);
-        let mut disabled = ledger();
-        disabled.enabled = false;
         for (mut st, stage) in [
             (ledger(), Some(download)),
             (ledger(), Some(activation(10, "0.39.0"))),
-            (disabled, Some(activation(12, "0.40.0"))),
             (ledger(), None),
         ] {
             let before = format!("{st:?}");

@@ -3640,7 +3640,9 @@ fn node_health_rechecks_inputs_after_a_window_relay_answers_or_refuses() {
                         crate::test_scratch::write_config(&config, "[swarm]\nenabled = false\n")
                     }
                     "key" => std::fs::write(state.join("fleet.key"), "ab".repeat(24)).unwrap(),
-                    "stop" => updater.stop.set(),
+                    "stop" => {
+                        updater.stop.set();
+                    }
                     _ => unreachable!(),
                 }
                 answers
@@ -3750,7 +3752,9 @@ fn node_health_fences_probes_and_preserves_only_definite_holds() {
             &cfg.stop,
             |_| {
                 match cut {
-                    "stop" => cfg.stop.set(),
+                    "stop" => {
+                        cfg.stop.set();
+                    }
                     "policy" => crate::test_scratch::write_config(
                         &config,
                         format!("[fleet]\nlisten = \"{listen}\"\nallow = \"content\"\n"),

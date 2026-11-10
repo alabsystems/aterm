@@ -22,6 +22,7 @@
 //! isolated instance) neither listens on nor dials it at any address ([`aterm_types::reach`]),
 //! however a peer or a listen names it.
 
+use aterm_uds::stop::Stop;
 use std::io::{self, BufRead as _, Read, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -54,7 +55,8 @@ pub const SERVE_SWITCH: &str = serve_switch!();
 /// The most fleet members a download asks ([`fleet_peers`]), the most recently heard first.
 const FLEET_PEERS_MAX: usize = 16;
 
-/// How often a server looks at its stop flag and the person's off ([`share`], [`serve`]).
+/// How often a server looks at the person's off ([`share`], [`serve`]); [`share`]'s stop ends a
+/// wait at once.
 const ACCEPT_POLL: Duration = Duration::from_millis(250);
 
 /// How long [`share`] waits to bind again while another server holds its port.
@@ -1086,8 +1088,9 @@ impl Sharing {
 pub struct Share<'a> {
     /// The address to listen on.
     pub listen: SocketAddr,
-    /// Cleared to stop: the listener closes within [`ACCEPT_POLL`].
-    pub running: &'a AtomicBool,
+    /// Set to stop: the listener closes within [`ACCEPT_POLL`], and a wait to bind again ends
+    /// at once.
+    pub stop: &'a Stop,
     /// The addresses whose connections are answered (this machine's fleet members'); a
     /// connection from any other is closed unread. Read at most once every
     /// [`Share::refresh`], so a host that connects in a loop costs a lookup, not a read.
@@ -1098,7 +1101,7 @@ pub struct Share<'a> {
     pub note: &'a dyn Fn(&str),
 }
 
-/// Serve this store's kept units while `how.running` holds: the default-on server of the
+/// Serve this store's kept units until `how.stop` is set: the default-on server of the
 /// process that runs the fleet listener (owner ruling 2026-10-27). While the person's off
 /// stands ([`turn_off`]) nothing listens. Otherwise `how.listen` is bound, again every
 /// [`BIND_RETRY`] while another server holds it, `units/` is made and the bound address is
@@ -1131,10 +1134,10 @@ pub fn share(layout: &Layout, how: &Share<'_>) {
             .as_ref()
             .is_some_and(|(_, members)| members.contains(&ip))
     };
-    while how.running.load(Ordering::Acquire) {
+    while !how.stop.is_set() {
         if turned_off(layout) {
             say("LAN toolset sharing off (`aterm pkg serve-units --off`)".to_owned());
-            std::thread::sleep(ACCEPT_POLL);
+            how.stop.sleep(ACCEPT_POLL);
             continue;
         }
         let listener = match open(layout, how.listen) {
@@ -1145,11 +1148,7 @@ pub fn share(layout: &Layout, how: &Share<'_>) {
                     how.listen,
                     BIND_RETRY.as_secs()
                 ));
-                let mut waited = Duration::ZERO;
-                while waited < BIND_RETRY && how.running.load(Ordering::Acquire) {
-                    std::thread::sleep(ACCEPT_POLL);
-                    waited += ACCEPT_POLL;
-                }
+                how.stop.sleep(BIND_RETRY);
                 continue;
             }
         };
@@ -1159,7 +1158,7 @@ pub fn share(layout: &Layout, how: &Share<'_>) {
             "LAN toolset sharing: serving this {}'s toolset archives to its fleet members on {at}",
             aterm_types::machine_name::OS_NOUN
         ));
-        answer_until(&listener, layout, how.running, &mut admits);
+        answer_until(&listener, layout, how.stop, &mut admits);
         drop(listener);
         clear_serving(layout);
     }
@@ -1188,7 +1187,7 @@ pub fn serve(
     let at = listener.local_addr()?;
     record_serving(layout, at);
     ready(at);
-    answer_until(&listener, layout, &AtomicBool::new(true), &mut |_| true);
+    answer_until(&listener, layout, &Stop::new(), &mut |_| true);
     clear_serving(layout);
     Ok(())
 }
@@ -1239,17 +1238,17 @@ impl Slots {
     }
 }
 
-/// Answer `listener`'s connections from addresses `admits` takes until `running` is cleared or
+/// Answer `listener`'s connections from addresses `admits` takes until `stop` is set or
 /// the person turns sharing off, as [`Slots`] allow.
 fn answer_until(
     listener: &TcpListener,
     layout: &Layout,
-    running: &AtomicBool,
+    stop: &Stop,
     admits: &mut dyn FnMut(IpAddr) -> bool,
 ) {
     let units = units_dir(layout);
     let slots = Arc::new(Slots::default());
-    while running.load(Ordering::Acquire) && !turned_off(layout) {
+    while !stop.is_set() && !turned_off(layout) {
         let (conn, from) = match aterm_uds::accept(
             listener,
             aterm_uds::AcceptWait::Ready,
@@ -1257,7 +1256,7 @@ fn answer_until(
         ) {
             Ok(accepted) => accepted,
             Err(_) => {
-                std::thread::sleep(ACCEPT_POLL);
+                stop.sleep(ACCEPT_POLL);
                 continue;
             }
         };

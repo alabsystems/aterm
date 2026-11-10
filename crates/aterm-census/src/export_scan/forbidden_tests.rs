@@ -55,17 +55,17 @@ fn scanned(
         std::fs::create_dir_all(path.parent().expect("rel has a parent")).expect("mkdir");
         std::fs::write(path, bytes).expect("write the binary");
     }
-    let corpus = Corpus::read(&root).expect("the synth tree reads");
+    let corpus = Corpus::at(&root).expect("the synth tree reads");
     let engine = baseline.ok().map(|baseline| Engine {
         baseline,
         names: Vec::new(),
     });
     let listing = Listing {
         root: &root,
-        paths: &corpus.paths,
+        paths: corpus.paths(),
         gitlinks: &[],
         whole: true,
-        export: &|| corpus.paths.clone(),
+        export: &|| corpus.paths().to_vec(),
     };
     let scanned = scan(&listing, engine.as_ref(), None);
     let _ = std::fs::remove_dir_all(&root);

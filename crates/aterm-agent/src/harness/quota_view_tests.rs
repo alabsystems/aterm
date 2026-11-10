@@ -206,6 +206,25 @@ fn scenarios() -> Vec<(&'static str, QuotaView)> {
         .collect()
 }
 
+/// Every scenario's view with each row named by an email ([`outlook::RowOutlook::name`]), as a
+/// roster that holds its accounts' emails names them (§2.5).
+fn emailed_scenarios() -> Vec<(&'static str, QuotaView)> {
+    outlooks()
+        .into_iter()
+        .map(|(name, mut out, tab)| {
+            for row in &mut out.rows {
+                row.name = format!("{}@example-domain.test", row.label);
+            }
+            (name, out.quota(tab, None, true))
+        })
+        .collect()
+}
+
+/// `n`'s name as a rung lays it: whole, or its local part.
+fn name_forms(n: &Named) -> [String; 2] {
+    [cut(&n.name), short(&n.name)]
+}
+
 /// The view laid at `room`, where a rung fits.
 fn laid(view: &QuotaView, room: usize) -> Option<QuotaLine> {
     let mut line = QuotaLine::default();
@@ -259,6 +278,7 @@ fn flat(x10: u16) -> Chart {
         now: T5,
         runs: vec![Run {
             label: "main".into(),
+            name: "main".into(),
             from: T5,
             to: T5 + 7 * D,
             knots: vec![
@@ -298,9 +318,11 @@ fn labels(view: &QuotaView) -> (Vec<&str>, Vec<&str>) {
 
 /// THE NAMED THREE FOLLOW ROSTER ORDER: `Class::Preferred` rows first, then file order; one to
 /// three rows are all named; past three, the first three are named and the rest fold, in that
-/// order; with no roster row the one login is named `this login`. The glass names accounts by
-/// their roster labels, so no email reaches the row, the title, the spoken words or the
-/// fallback. Negative control: ordering by file order alone names the pool row `r0` among six.
+/// order; with no roster row the one login is named `this login`. The glass names each account
+/// by its email (owner ruling 2026-11-09), its roster label only where its row has none: the
+/// row, the title, the spoken words and the fallback say the email, and the row's narrowest
+/// rung its local part. Negative controls: ordering by file order alone names the pool row `r0`
+/// among six; naming by the roster label leaves the emails unsaid.
 #[test]
 fn the_named_three_follow_roster_order() {
     use Class::{Pool, Preferred};
@@ -315,7 +337,10 @@ fn the_named_three_follow_roster_order() {
         let mut fx = Fx::new(&rows);
         fx.now = T5;
         for (i, label) in names.iter().enumerate() {
-            fx.roster.rows[i].email = Some(format!("{label}.person@example.test"));
+            // Every row but the last has an email; the last is named by its label.
+            if i + 1 < n {
+                fx.roster.rows[i].email = Some(format!("{label}.person@example.test"));
+            }
             let x10 = u32::try_from(100 * (i + 1)).unwrap();
             fx.read(label, None, Some((x10, SAT7)), T5);
         }
@@ -332,12 +357,111 @@ fn the_named_three_follow_roster_order() {
             _ => (vec!["r1", "r3", "r4"], vec!["r0", "r2", "r5"]),
         };
         assert_eq!(labels(&view), want, "{n} rows");
-        for words in every_word(&view) {
-            assert!(
-                !words.contains('@') && !words.contains("person"),
-                "no email on the glass: {words}"
-            );
+        let shown = |label: &str| {
+            let last = names.last().map(String::as_str);
+            if label == THIS_LOGIN || Some(label) == last {
+                label.to_owned()
+            } else {
+                format!("{label}.person@example.test")
+            }
+        };
+        let tab_name = shown(view.tab().map_or(THIS_LOGIN, |t| t.label.as_str()));
+        let mut wide = QuotaLine::default();
+        assert!(view.lay(1000, &mut wide), "{n} rows");
+        for named in &view.named {
+            let name = shown(&named.label);
+            assert_eq!(named.name, name, "{n} rows");
+            assert!(view.title.contains(&name), "{n} rows: {}", view.title);
+            assert!(view.spoken.contains(&name), "{n} rows: {}", view.spoken);
+            assert!(wide.text().contains(&name), "{n} rows: {}", wide.text());
         }
+        let fallback = view.fallback();
+        assert_eq!(fallback[0][0].text, tab_name, "{n} rows");
+        // The narrowest rung names the tab's email by its local part.
+        let narrow = (0..=1000)
+            .find_map(|room| laid(&view, room))
+            .map(|line| line.text())
+            .unwrap_or_default();
+        let local = tab_name.split('@').next().unwrap_or_default();
+        assert!(
+            narrow.starts_with(local) && !narrow.contains('@'),
+            "{n} rows: {narrow}"
+        );
+        assert_eq!(
+            fallback.last().map(|f| f[0].text.as_str()),
+            Some(local),
+            "{n} rows"
+        );
+    }
+}
+
+/// A NAME IS ITS EMAIL, WHICH GIVES WAY TO ITS LOCAL PART BEFORE IT IS CUT (§2.5): an email of
+/// up to [`NAME_CELLS`] cells is laid whole; a longer one is laid as its local part, cut with
+/// `…` only where that is still too wide; the narrow form is the local part cut to
+/// [`SHORT_CELLS`]; a roster label (no `@`) is cut so too. Negative control: a cut by cells alone
+/// lays `andrew.yates.accounts@a-long-d…`.
+#[test]
+fn a_long_email_gives_way_to_its_local_part_before_it_is_cut() {
+    assert_eq!((NAME_CELLS, SHORT_CELLS), (32, 12), "a typical email fits");
+    assert_eq!(cut("owner@example.com"), "owner@example.com");
+    assert_eq!(short("owner@example.com"), "owner");
+    let long = "andrew.yates.accounts@a-long-domain-name.example";
+    assert_eq!(cut(long), "andrew.yates.accounts");
+    assert_eq!(short(long), "andrew.yate\u{2026}");
+    let longer = format!("{}@example.com", "x".repeat(40));
+    assert_eq!(cut(&longer), format!("{}\u{2026}", "x".repeat(31)));
+    assert_eq!(short(&longer), format!("{}\u{2026}", "x".repeat(11)));
+    for label in ["m22", THIS_LOGIN, "@handle"] {
+        assert_eq!(cut(label), label);
+        assert_eq!(short(label), label);
+    }
+    assert_eq!(short("a-long-account-label"), "a-long-acco\u{2026}");
+}
+
+/// THE ACCOUNTS CARD NAMES EACH ITEM BY ITS EMAIL (§1.4, §2.5): a wide card's item and its
+/// spoken words say the email, a row with none its roster label, and the narrowest form the
+/// email's local part; the item keeps the label as its key. Negative control: the card naming
+/// `m22` where the row has an email.
+#[test]
+fn the_accounts_card_names_each_item_by_its_email() {
+    let mut fx = Fx::new(&[("m22", Class::Preferred), ("m20", Class::Preferred)]);
+    fx.now = T5;
+    fx.roster.rows[0].email = Some("owner@example.com".into());
+    fx.read("m22", None, Some((630, SAT7)), T5);
+    fx.read("m20", None, Some((300, SAT7)), T5);
+    fx.state.active = Some("m22".into());
+    let out = fx.outlook();
+    let item = |room: usize, key: &str| {
+        out.card_rows("m22", None, true, room, None)
+            .into_iter()
+            .find_map(|r| match r {
+                outlook::CardRow::Account {
+                    label,
+                    text,
+                    spoken,
+                    ..
+                } if label == key => Some((text, spoken)),
+                _ => None,
+            })
+            .expect("the item")
+    };
+    let (text, spoken) = item(120, "m22");
+    assert!(text.starts_with("owner@example.com"), "{text}");
+    assert!(
+        spoken.starts_with("owner@example.com, this tab"),
+        "{spoken}"
+    );
+    let (text, spoken) = item(120, "m20");
+    assert!(text.starts_with("m20"), "{text}");
+    assert!(spoken.starts_with("m20"), "{spoken}");
+    let narrowest = (8..120)
+        .map(|room| item(room, "m22").0)
+        .find(|text| !text.contains('\u{2026}'))
+        .expect("a form that fits");
+    assert!(narrowest.starts_with("owner "), "{narrowest}");
+    for room in [30, 60, 120] {
+        let (text, _) = item(room, "m22");
+        assert!(!text.starts_with("m22"), "NEGATIVE CONTROL: {room}: {text}");
     }
 }
 
@@ -506,6 +630,7 @@ fn every_stop_takes_a_cell() {
 fn a_hand_off_is_always_drawn() {
     let run = |label: &str, from: i64, to: i64, a: u16, b: u16| Run {
         label: label.into(),
+        name: label.into(),
         from,
         to,
         knots: vec![
@@ -570,6 +695,7 @@ fn a_hand_off_is_always_drawn() {
 fn a_name_is_drawn_only_where_its_run_holds_it() {
     let flat_run = |label: &str, from: i64, to: i64| Run {
         label: label.into(),
+        name: label.into(),
         from,
         to,
         knots: vec![
@@ -606,6 +732,56 @@ fn a_name_is_drawn_only_where_its_run_holds_it() {
     chart.unknown_from = Some(T5 + 2 * H);
     let lean: String = text(&chart).chars().take(10).collect();
     assert_eq!(lean, format!("{l}\u{2192}pool1?\u{2504}\u{2504}"));
+}
+
+/// AN EMAIL TOO WIDE FOR ITS RUN GIVES WAY TO ITS LOCAL PART: `alt1@example-domain.test` with
+/// ten plain cells before the next mark reads `→alt1`, the account still named; the whole email
+/// where the run holds it. Negative control: drawing only the whole email draws a bare `→`.
+#[test]
+fn an_email_too_wide_for_its_run_gives_way_to_its_local_part() {
+    let email = "alt1@example-domain.test";
+    let flat_run = |label: &str, from: i64, to: i64| Run {
+        label: label.into(),
+        name: label.into(),
+        from,
+        to,
+        knots: vec![
+            Knot {
+                t: from,
+                x10: Some(300),
+            },
+            Knot {
+                t: to,
+                x10: Some(300),
+            },
+        ],
+    };
+    let mut chart = Chart {
+        now: T5,
+        runs: vec![
+            flat_run("alt1", T5, T5 + 22 * H),
+            flat_run("main", T5 + 22 * H, T5 + 7 * D),
+        ],
+        marks: vec![
+            (T5, Mark::Handoff(email.into())),
+            (T5 + 22 * H, Mark::Handoff("main".into())),
+        ],
+        ..Chart::default()
+    };
+    let text = |chart: &Chart| -> String { future(chart, 12).iter().map(|c| c.glyph()).collect() };
+    let l = Cell::Ahead(level(300)).glyph();
+    assert!(
+        text(&chart).starts_with(&format!("\u{2192}alt1{l}")),
+        "{}",
+        text(&chart)
+    );
+    chart.marks.truncate(1);
+    chart.runs.truncate(1);
+    assert!(
+        text(&chart).starts_with(&format!("\u{2192}{email}")),
+        "{}",
+        text(&chart)
+    );
 }
 
 /// PAST CELLS HOLD THE LAST READING AND NEVER INTERPOLATE: at 12 cells a day, readings of 20% at
@@ -901,6 +1077,7 @@ fn a_reset_past_a_week_is_never_said_or_drawn() {
     }
     let lane = |start: i64, renews: i64| Burn {
         label: "main".into(),
+        name: "main".into(),
         start,
         renews,
         read: Vec::new(),
@@ -1580,8 +1757,12 @@ fn parts(view: &QuotaView, line: &QuotaLine) -> Parts {
     let names = view
         .named
         .iter()
-        .map(|n| cut(&n.label))
-        .filter(|n| lead.split(' ').any(|w| w == n))
+        .filter(|n| {
+            name_forms(n)
+                .iter()
+                .any(|form| lead.split(' ').any(|w| w == form))
+        })
+        .map(|n| n.label.clone())
         .collect();
     let tail = line.text_of(&line.tail);
     let mut phrases = Vec::new();
@@ -1609,15 +1790,18 @@ fn parts(view: &QuotaView, line: &QuotaLine) -> Parts {
 /// never fold; (2) a stop, wall, lean or credits phrase stays, at least short, while any figure
 /// shows; (3) no figure shows without its name; (4) each narrower room's parts are a subset of a
 /// wider one's (names, phrases, a full phrase only where the wider is full) and its chart is
-/// never finer; (5) no rung is finer than 12 cells a day. The design's mocks hold their rungs at
+/// never finer, and a name laid as its email's local part is never laid whole in a narrower room;
+/// (5) no rung is finer than 12 cells a day. Each case is laid with its rows named by their roster
+/// labels and again by emails (§2.5). The design's mocks hold their rungs at
 /// 166, 96 and 66 cells in each case's own test (`case_a_lays_r1_r3_r6`, `case_b_lays_r2_r5_r7`,
 /// `case_c_lays_r2_r5_r7`, `case_d_lays_its_words_full_then_short`). Negative control: a T2 that
 /// keeps phrase 1 over phrase 2 drops case (b)'s stop from 77 cells down (invariant 2).
 #[test]
 fn the_quota_ladder_keeps_its_invariants() {
-    for (name, view) in scenarios() {
+    for (name, view) in scenarios().into_iter().chain(emailed_scenarios()) {
         let tab = view.tab().unwrap();
         let mut wider: Option<Parts> = None;
+        let mut wider_local = false;
         let mut fits = false;
         for room in (0..=200).rev() {
             let Some(line) = laid(&view, room) else {
@@ -1635,7 +1819,7 @@ fn the_quota_ladder_keeps_its_invariants() {
             let text = line.text();
             // (1) and (3).
             if view.waiting() {
-                assert_eq!(lead, cut(&tab.label), "{name} at {room}");
+                assert!(name_forms(tab).contains(&lead), "{name} at {room}: {lead}");
             } else {
                 let mut body = lead.as_str();
                 body = body.strip_suffix(" used").unwrap_or(body);
@@ -1645,16 +1829,20 @@ fn the_quota_ladder_keeps_its_invariants() {
                     body = head;
                 }
                 let shown: Vec<&str> = body.split(SEP).collect();
+                let laid_as =
+                    |n: &Named| name_forms(n).map(|form| format!("{form} {}", n.figure.words()));
                 for part in &shown {
                     assert!(
                         view.named
                             .iter()
-                            .any(|n| *part == format!("{} {}", cut(&n.label), n.figure.words())),
+                            .any(|n| laid_as(n).iter().any(|form| part == form)),
                         "{name} at {room}: `{part}` in `{lead}`"
                     );
                 }
-                let own = format!("{} {}", cut(&tab.label), tab.figure.words());
-                assert!(shown.contains(&own.as_str()), "{name} at {room}: {lead}");
+                assert!(
+                    laid_as(tab).iter().any(|own| shown.contains(&own.as_str())),
+                    "{name} at {room}: {lead}"
+                );
                 // (2).
                 if let Some(v) = view.tail.verdict.as_ref().filter(|v| v.kept) {
                     assert!(
@@ -1667,6 +1855,12 @@ fn the_quota_ladder_keeps_its_invariants() {
             assert!(line.per_day == 0 || PER_DAY.contains(&line.per_day));
             assert!(line.per_day <= 12);
             // (4).
+            let local = view.named.iter().any(|n| n.name.contains('@')) && !lead.contains('@');
+            assert!(
+                local || !wider_local,
+                "{name} at {room}: a whole email after its local part: {lead}"
+            );
+            wider_local = local;
             let now = parts(&view, &line);
             if let Some(w) = &wider {
                 assert!(now.0.is_subset(&w.0), "{name} at {room}: {now:?} {w:?}");

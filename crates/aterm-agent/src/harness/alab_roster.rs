@@ -4,8 +4,8 @@
 //! The harness's side of LabView (`docs/DESIGN-alab-lab-model-2026-11-01.md` §0, §7, §9, step
 //! 11): a roster from the lab registry's preferences instead of a sheet.
 //!
-//! `aterm-agent` does not link `aterm-db`, so the registry reaches it as a [`Lab`] the `aterm`
-//! executable projects in the background and hands over through a [`Source`] it installs at
+//! The registry reaches this module as a [`Lab`] the `aterm` executable projects in the
+//! background and hands over through a [`Source`] it installs at
 //! start (`crates/aterm/src/alab_view.rs`), as the journal's sink is. With none installed there is
 //! no lab and every sync reads the sources it always read: a Mac without the registry keeps its
 //! rows and its fleet files.
@@ -135,7 +135,7 @@ pub fn preference_projection_inputs() {}
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "LabSourceAvailability",
     action = "Read",
-    reason = "The validated registry reader supplies absence, a projection, unchanged state, partial state or failure."
+    reason = "The validated registry reader supplies absence, a complete projection, incomplete history or failure."
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "LabSourceAvailability",

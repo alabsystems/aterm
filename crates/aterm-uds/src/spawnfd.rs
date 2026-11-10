@@ -22,6 +22,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 
+#[cfg(target_os = "macos")]
+pub use trust_exec_policy::FootprintLimit;
+
 /// The two descriptor numbers the fabric bridge inherits.
 pub const BRIDGE_VERB_FD: RawFd = 3;
 pub const BRIDGE_PUSH_FD: RawFd = 4;
@@ -461,6 +464,8 @@ struct Placement<'a> {
     /// The task type the child starts as, in place of the one it inherits ([`TaskType`]).
     #[cfg(target_vendor = "apple")]
     task: Option<TaskType>,
+    #[cfg(target_os = "macos")]
+    footprint: Option<trust_exec_policy::FootprintLimit>,
 }
 
 /// The task type a child starts as (`posix_spawnattr_setprocesstype_np`) in place of the one
@@ -532,6 +537,8 @@ impl Default for Placement<'_> {
             suspended: false,
             #[cfg(target_vendor = "apple")]
             task: None,
+            #[cfg(target_os = "macos")]
+            footprint: None,
         }
     }
 }
@@ -1043,6 +1050,13 @@ mod platform {
                     super::TaskType::Interactive => PROC_TYPE_DAEMON_INTERACTIVE,
                 };
                 check(posix_spawnattr_setprocesstype_np(&mut objects.attr, kind))?;
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(limit) = place.footprint {
+                // SAFETY: Objects owns this initialized native attribute handle
+                // exclusively until the actual spawn/SETEXEC and destruction.
+                // The shared setter changes only jetsam policy, not spawn flags.
+                limit.prepare(&mut objects.attr)?;
             }
             for (target, slot) in (0..).zip(place.stdio) {
                 let null_mode = if target == 0 { O_RDONLY } else { O_WRONLY };
@@ -2371,6 +2385,10 @@ mod mapped_tests;
 #[cfg(test)]
 #[path = "spawnfd_command_tests.rs"]
 mod command_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "spawnfd_footprint_tests.rs"]
+mod footprint_tests;
 
 #[cfg(test)]
 #[path = "spawnfd_signal_tests.rs"]

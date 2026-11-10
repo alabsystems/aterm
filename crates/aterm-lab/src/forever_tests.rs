@@ -6673,9 +6673,8 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
         (Chain::LandJ, &j_),
         (Chain::Off, &off),
     ];
-    let end = |d: &surfaces::Desk, t: &[(Chain, &surfaces::Window)]| {
-        surfaces::judge_end(d, t, "claude").word()
-    };
+    let end =
+        |d: &surfaces::Desk, t: &[(Chain, &surfaces::Window)]| surfaces::judge_end(d, t).word();
     assert_eq!(end(&rest_desk(REST, "0"), &tabs), "PASS");
     // CONTROL: the same counts where a `metrics` call failed (the reset: counts from before the
     // window) judge none of them, and an Off tab whose line in front went unread is no `-`.
@@ -6683,7 +6682,7 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
     if let Some(i) = d.idle.as_mut() {
         i.metrics_failed = Some("`metrics reset` answered 1: ERR timeout".into());
     }
-    let v = surfaces::judge_end(&d, &tabs, "claude");
+    let v = surfaces::judge_end(&d, &tabs);
     assert_eq!(v.word(), "FAIL", "{}", v.why());
     assert!(v.why().contains("ERR timeout"), "{}", v.why());
     let unread_off = surfaces::Window {
@@ -6697,7 +6696,6 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
             (Chain::LandJ, &j_),
             (Chain::Off, &unread_off),
         ],
-        "claude",
     );
     assert_eq!(v.word(), "FAIL", "{}", v.why());
     assert!(v.why().contains("unread in front"), "{}", v.why());
@@ -6731,7 +6729,7 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
     );
     let wrote = "timer_wakes=53 event_wakes=124 deadline_owner=session_status deadline_arms_by_owner=session_status:124/0 deadline_fires_by_owner=session_status:53 wakes_by_variant=ReadSessionStatus:39,Output:32";
     let (w, why) = {
-        let v = surfaces::judge_end(&rest_desk(wrote, "0"), &tabs, "muse");
+        let v = surfaces::judge_end(&rest_desk(wrote, "0"), &tabs);
         (v.word(), v.why().to_string())
     };
     assert_eq!(w, "PASS", "{why}");
@@ -6758,7 +6756,7 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
         .replace("timer_wakes=53", "timer_wakes=400")
         .replace("session_status:53", "session_status:400")
         .replace("session_status:124/0", "session_status:420/0");
-    let v = surfaces::judge_end(&rest_desk(&spun, "0"), &tabs, "muse");
+    let v = surfaces::judge_end(&rest_desk(&spun, "0"), &tabs);
     assert_eq!(v.word(), "FAIL", "{}", v.why());
     assert!(v.why().contains("past 3 a write"), "{}", v.why());
     let three = wrote
@@ -6788,7 +6786,7 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
     );
     let g = front("window=2 program=agy face=- drawn=- why=no-footer spoken=-");
     assert_eq!(
-        surfaces::judge_end(&rest_desk(REST, "0"), &[(Chain::CruiseN, &g)], "agy").word(),
+        surfaces::judge_end(&rest_desk(REST, "0"), &[(Chain::CruiseN, &g)]).word(),
         "FAIL",
         "every harness the lab runs draws its chip: a no-footer line at rest is no face"
     );
@@ -6802,7 +6800,7 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
     if let Some(i) = d.idle.as_mut() {
         i.page_open = false;
     }
-    let v = surfaces::judge_end(&d, &tabs, "claude");
+    let v = surfaces::judge_end(&d, &tabs);
     assert_eq!(v.word(), "UNOBSERVED", "{}", v.why());
     assert!(v.why().contains("the page was not open"), "{}", v.why());
     let mut d = rest_desk(REST, "0");
@@ -6811,10 +6809,10 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
     }
     let b = front("window=2 program=claude face=land drawn=\"⤓\" spoken=\"x\"");
     let held = [(Chain::CruiseN, &n), (Chain::LandB, &b), (Chain::Off, &off)];
-    let v = surfaces::judge_end(&d, &held, "claude");
+    let v = surfaces::judge_end(&d, &held);
     assert_eq!(v.word(), "UNOBSERVED", "{}", v.why());
     assert!(v.why().contains("no hold stood in it"), "{}", v.why());
-    let v = surfaces::judge_end(&d, &tabs, "claude");
+    let v = surfaces::judge_end(&d, &tabs);
     assert_eq!(
         v.word(),
         "PASS",
@@ -6824,12 +6822,12 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
     assert!(v.why().contains("no chain of the run holds"), "{}", v.why());
     let k = front("window=2 program=claude face=landed drawn=\"✓ landed\" spoken=\"x\"");
     let unheld = [(Chain::LandJ, &j_), (Chain::LandK, &k), (Chain::Off, &off)];
-    let v = surfaces::judge_end(&d, &unheld, "claude");
+    let v = surfaces::judge_end(&d, &unheld);
     assert_eq!(v.word(), "PASS", "{}", v.why());
 }
 
 #[test]
-fn end_takes_agys_off_tab_as_its_switch_alone() {
+fn end_takes_an_off_tab_as_its_switch_alone() {
     const REST: &str = "timer_wakes=0 event_wakes=3 deadline_owner=presence deadline_arms_by_owner=presence:1/0 deadline_fires_by_owner=none wakes_by_variant=HostNote:2,HarnessFact:1";
     let front = |line: &str| surfaces::Window {
         front: Some((T0, line.to_string())),
@@ -6843,20 +6841,22 @@ fn end_takes_agys_off_tab_as_its_switch_alone() {
         let v = surfaces::judge_end(
             &rest_desk(REST, "0"),
             &[(Chain::CruiseN, &n), (Chain::Off, &off)],
-            program,
         );
         (v.word(), v.why().to_string())
     };
-    for face in ["agent-off", "master-off"] {
-        let line = format!(
-            "window=2 program=agy face={face} drawn=- why=switch-only spoken=- description=-"
-        );
-        let (w, why) = end("agy", &line);
-        assert_eq!(w, "PASS", "{face}: {why}");
-        assert!(
-            why.contains("off: drawn=- why=switch-only"),
-            "{face}: {why}"
-        );
+    for program in ["agy", "claude", "muse"] {
+        for face in ["agent-off", "master-off"] {
+            let line = format!(
+                "window=2 program={program} face={face} drawn=- why=switch-only spoken=- \
+                 description=-"
+            );
+            let (w, why) = end(program, &line);
+            assert_eq!(w, "PASS", "{program} {face}: {why}");
+            assert!(
+                why.contains("off: drawn=- why=switch-only"),
+                "{program} {face}: {why}"
+            );
+        }
     }
     let (w, why) = end(
         "agy",
@@ -6887,6 +6887,10 @@ fn end_takes_agys_off_tab_as_its_switch_alone() {
         (
             "agy",
             "window=2 program=agy face=agent-off drawn=\"⊘ off\" spoken=\"x\"",
+        ),
+        (
+            "claude",
+            "window=2 program=claude face=master-off drawn=\"⊘ off\" spoken=\"x\"",
         ),
         (
             "agy",
@@ -6923,7 +6927,7 @@ fn end_allows_the_wake_watchs_recheck_beside_writes_only() {
     };
     let n = front("window=2 program=muse face=cruise drawn=\"∞\" spoken=\"x\"");
     let end = |metrics: &str| {
-        let v = surfaces::judge_end(&rest_desk(metrics, "0"), &[(Chain::CruiseN, &n)], "muse");
+        let v = surfaces::judge_end(&rest_desk(metrics, "0"), &[(Chain::CruiseN, &n)]);
         (v.word(), v.why().to_string())
     };
     let (w, why) = end(WROTE);
@@ -6991,7 +6995,7 @@ fn end_reads_the_wake_watchs_counts_from_the_metrics_reply() {
     };
     let end = |reply: &str| {
         let kept = surfaces::idle_metrics(reply);
-        let v = surfaces::judge_end(&rest_desk(&kept, "0"), &[(Chain::CruiseN, &n)], "muse");
+        let v = surfaces::judge_end(&rest_desk(&kept, "0"), &[(Chain::CruiseN, &n)]);
         (kept, v.word(), v.why().to_string())
     };
     let (kept, w, why) = end(REPLY);
@@ -7021,7 +7025,7 @@ fn end_counts_fires_from_its_opening_read_so_a_write_before_the_reset_is_not_cha
     };
     let end = |opened: &str| {
         let kept = surfaces::idle_metrics_between(opened, CLOSED);
-        let v = surfaces::judge_end(&rest_desk(&kept, "0"), &[(Chain::CruiseN, &n)], "muse");
+        let v = surfaces::judge_end(&rest_desk(&kept, "0"), &[(Chain::CruiseN, &n)]);
         (kept, v.word(), v.why().to_string())
     };
     let (kept, w, why) = end(OPENED);
@@ -9228,20 +9232,20 @@ fn end_wants_each_holding_chains_own_hold() {
         (Chain::LandC, &c),
         (Chain::Off, &off),
     ];
-    let v = surfaces::judge_end(&rest_desk(REST, "0"), &tabs, "claude");
+    let v = surfaces::judge_end(&rest_desk(REST, "0"), &tabs);
     assert_eq!(v.word(), "FAIL", "land-c's hold lost at rest: {}", v.why());
     assert!(v.why().contains("land-c"), "{}", v.why());
     let mut both = rest_desk(REST, "0");
     if let Some(i) = both.idle.as_mut() {
         i.holds.push("land-c(repo, since 1792000070)".into());
     }
-    let v = surfaces::judge_end(&both, &tabs, "claude");
+    let v = surfaces::judge_end(&both, &tabs);
     assert_eq!(v.word(), "PASS", "{}", v.why());
     let mut none = rest_desk(REST, "0");
     if let Some(i) = none.idle.as_mut() {
         i.holds.clear();
     }
-    let v = surfaces::judge_end(&none, &tabs, "claude");
+    let v = surfaces::judge_end(&none, &tabs);
     assert_eq!(v.word(), "UNOBSERVED", "{}", v.why());
 }
 

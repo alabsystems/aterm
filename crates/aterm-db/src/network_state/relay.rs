@@ -1483,7 +1483,7 @@ mod tests {
         std::fs::write(&path, b"unrelated").unwrap();
         let mut owner = Observer::open(&config, ObservationHandle::default()).unwrap();
         assert!(owner.relay.is_none());
-        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(directory(&config).join(NAME)).unwrap();
         let retry = Instant::now();
         owner.relay_checked = retry - Duration::from_secs(10);
         owner.observe(

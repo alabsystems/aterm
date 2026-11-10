@@ -171,26 +171,33 @@ impl App {
     )> {
         let wid = self.frontmost_window?;
         let tab = self.windows.get(&wid)?.tab_set.active()?;
-        let mut views = tab.root.leaves();
-        views.sort_unstable_by_key(|view| (usize::from(*view != tab.focus), view.get()));
-        views.into_iter().find_map(|view| {
-            let crate::tab_model::View::Native(native) = self.view_store.get(view).copied()? else {
-                return None;
-            };
-            if self.native_runtime.app(native.instance)?.kind()
-                != crate::native_app::AppKind::Settings
-            {
-                return None;
+        let mut best = None;
+        tab.root.visit(&mut |&view| {
+            let key = (usize::from(view != tab.focus), view.get());
+            if best.is_some_and(|(best_key, _)| key >= best_key) {
+                return;
             }
-            let crate::native_app::AppViewState::Settings(state) =
-                self.native_runtime.view_state(view)?
+            let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view).copied()
             else {
-                return None;
+                return;
             };
-            route
-                .is_none_or(|expected| state.route == expected)
-                .then_some((wid, native.instance, view, state.as_ref()))
-        })
+            if self
+                .native_runtime
+                .app(native.instance)
+                .is_none_or(|app| app.kind() != crate::native_app::AppKind::Settings)
+            {
+                return;
+            }
+            let Some(crate::native_app::AppViewState::Settings(state)) =
+                self.native_runtime.view_state(view)
+            else {
+                return;
+            };
+            if route.is_none_or(|expected| state.route == expected) {
+                best = Some((key, (wid, native.instance, view, state.as_ref())));
+            }
+        });
+        best.map(|(_, target)| target)
     }
 
     /// Whether any window presents the process-singleton native Settings app.

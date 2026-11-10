@@ -1106,6 +1106,7 @@ fn escaped_daemon(scrubbed: bool) {
     let parent = bsdinfo_uniq(daemon.pbsd.pbi_ppid as i32).expect("its held parent");
     assert_eq!(parent.pbsd.pbi_ppid, shell_pid as u32, "our child's child");
     owned.daemon = Some((daemon_pid, daemon.p_uniqueid));
+    aterm_uds::deadline::execd(daemon_pid, &sleep);
     std::fs::write(&release, b"release\n").expect("release its parent");
     loop {
         let info = bsdinfo_uniq(daemon_pid).expect("the owned daemon is still live");
@@ -1123,17 +1124,12 @@ fn escaped_daemon(scrubbed: bool) {
         + Duration::from_secs(daemon.pbsd.pbi_start_tvsec)
         + Duration::from_micros(daemon.pbsd.pbi_start_tvusec);
     if scrubbed {
-        // `$!` names the forked subshell, which becomes `env -i` and then the daemon: until the
-        // daemon's exec its environment still names the run. Wait for the scrubbed image.
-        while !atpkg::caller_shell::process_args(daemon_pid as u32)
-            .is_some_and(|args| args.env.is_empty())
-        {
-            assert!(
-                Instant::now() < give_up,
-                "the fixture's daemon never cleared its environment"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            atpkg::caller_shell::process_args(daemon_pid as u32)
+                .expect("the exec'd daemon's arguments")
+                .env
+                .is_empty()
+        );
         assert_eq!(environment_names(daemon_pid, FIXTURE_SID), Some(false));
     }
     let caught = escape_scan(
@@ -1519,6 +1515,7 @@ fn a_daemon_read_before_its_launcher_exited_is_read_again() {
         "held by its launcher"
     );
     owned.daemon = Some((daemon_pid, stale.p_uniqueid));
+    aterm_uds::deadline::execd(daemon_pid, &fixture_sleep());
     let launcher_birth = bsdinfo_uniq(launcher_pid)
         .expect("the live launcher")
         .p_uniqueid;
@@ -1714,6 +1711,7 @@ fn session_shell(
         daemon: None,
     };
     let child_pid = waits.pid_in(&mark);
+    aterm_uds::deadline::execd(child_pid, &fixture_sleep());
     let child = bsdinfo_uniq(child_pid).expect("the shell's child");
     assert_eq!(
         child.pbsd.pbi_ppid, shell_pid as u32,
@@ -1745,26 +1743,13 @@ fn adopted_orphan(
     let pid = waits.pid_in(&mark);
     let birth = bsdinfo_uniq(pid).expect("the orphan-to-be").p_uniqueid;
     owned.daemon = Some((pid, birth));
-    // The shell writes $! before its child necessarily execs. Establish the fixture's
-    // intended executable and ownership marker before killing its parent; otherwise a
-    // scan can correctly find no ownership evidence in a child that is still starting.
-    loop {
-        assert!(
-            bsdinfo_uniq(pid).is_some_and(|info| info.p_uniqueid == birth),
-            "the orphan-to-be must stay alive while it starts"
-        );
-        if let Some(args) = atpkg::caller_shell::process_args(pid as u32)
-            && args.exec_path == sleeper.to_string_lossy()
-            && args.env_var(aterm_types::domain::ENV_PARENT_SESSION_ID) == Some(FIXTURE_SID)
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < waits.give_up,
-            "the orphan-to-be never reached its owned executable"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    aterm_uds::deadline::execd(pid, &sleeper);
+    assert_eq!(
+        atpkg::caller_shell::process_args(pid as u32)
+            .expect("the exec'd orphan's arguments")
+            .env_var(aterm_types::domain::ENV_PARENT_SESSION_ID),
+        Some(FIXTURE_SID)
+    );
     let mut launcher = owned.child.take().expect("the owned launcher");
     launcher.kill().expect("kill the launcher");
     launcher.wait().expect("reap the launcher");
@@ -1848,6 +1833,7 @@ fn stranger_orphan(shell_orphan: bool) {
     } else {
         &stranger_sleep
     };
+    aterm_uds::deadline::execd(pid, expected_image);
     let (adopted, args) = loop {
         let now = bsdinfo_uniq(pid).expect("the daemon lives");
         if now.pbsd.pbi_ppid == 1
@@ -2663,15 +2649,11 @@ impl ForeignSession {
         let pid = waits.pid_in(&self.mark);
         let birth = bsdinfo_uniq(pid).expect("the orphan-to-be").p_uniqueid;
         self.owned.daemon = Some((pid, birth));
-        // Adopted is not enough: until the background job has exec'd its own image, a read of
-        // its arguments and environment can fail, and the scan then has no evidence the orphan
-        // is the run's. Under a loaded test phase that read raced the exec and the scan answered
-        // Clean for the run's own orphan (aterm 0.191.0's qualify tree).
+        aterm_uds::deadline::execd(pid, &fixture_sleep());
         loop {
             if let Some(info) = bsdinfo_uniq(pid)
                 && info.p_uniqueid == birth
                 && info.pbsd.pbi_ppid == 1
-                && info.pbsd.pbi_flags & PROC_FLAG_EXEC != 0
             {
                 return (pid, info);
             }
@@ -2888,10 +2870,10 @@ impl TerminalSession {
         let pid = waits.pid_in(&mark);
         let birth = bsdinfo_uniq(pid).expect("the orphan-to-be").p_uniqueid;
         session.orphan.daemon = Some((pid, birth));
-        let adopted = session.orphan_once(waits, |info| {
-            info.pbsd.pbi_ppid == 1
-                && (exec == OrphanExec::AfterLeader || info.pbsd.pbi_flags & PROC_FLAG_EXEC != 0)
-        });
+        if exec == OrphanExec::WhileLed {
+            aterm_uds::deadline::execd(pid, &fixture_sleep());
+        }
+        let adopted = session.orphan_once(waits, |info| info.pbsd.pbi_ppid == 1);
         (session, pid, adopted)
     }
 
@@ -2937,7 +2919,9 @@ impl TerminalSession {
         };
         go.write_all(b"go\n").expect("tell the orphan to exec");
         drop(go);
-        self.orphan_once(waits, |info| info.pbsd.pbi_flags & PROC_FLAG_EXEC != 0)
+        let (pid, _) = self.orphan.daemon.expect("the orphan");
+        aterm_uds::deadline::execd(pid, &fixture_sleep());
+        self.orphan_once(waits, |_| true)
     }
 
     fn end_leader(&mut self) {
@@ -4977,6 +4961,7 @@ fn the_linux_escape_scan_catches_a_daemon_the_session_left_behind() {
         .expect("its held parent");
     assert_eq!(parent.ppid, shell_pid, "our child's child");
     owned.daemon = Some((daemon_pid, daemon.start));
+    aterm_uds::deadline::execd(daemon_pid, std::path::Path::new("/bin/sleep"));
     std::fs::write(&release, b"release\n").expect("release its parent");
     let reapers = super::reapers(
         &mut Procfs,

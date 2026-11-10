@@ -54,34 +54,7 @@ pub type Birth = fn(&Collection, &BTreeMap<String, Value>, &Cells) -> Result<Str
 /// A change is not a typed cell of its collection.
 pub type Guard = fn(&mut [Vec<crate::database::Change>], &Cells) -> Result<Option<Refused>>;
 
-/// A table rule's refusal of an owner write ([`Guard`]): the collection, row and column it stops
-/// and the rule, by keys and column names, never a value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Refused {
-    pub collection: &'static str,
-    pub pk: String,
-    pub column: String,
-    pub rule: String,
-}
-
-impl Refused {
-    /// The rule with the column it stops, as a grid problem reads it (its place names the row).
-    pub fn problem_rule(&self) -> String {
-        format!("{}.{}: {}", self.collection, self.column, self.rule)
-    }
-}
-
-impl From<Refused> for Error {
-    fn from(refused: Refused) -> Self {
-        Self::new(&format!(
-            "{}.{}: row {}: {}",
-            refused.collection,
-            refused.column,
-            command::safe_key(&refused.pk),
-            refused.rule
-        ))
-    }
-}
+pub use crate::typed::Refused;
 
 /// A keyed comparison of a collection. The epoch is part of the output: digests
 /// from different epochs cannot be called a table mismatch.

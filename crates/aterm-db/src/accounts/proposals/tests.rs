@@ -15,6 +15,54 @@ use std::{net::TcpListener, thread, time::Duration};
 fn app(lab: &Lab, n: usize) -> Proposals {
     Proposals::at(lab.paths[n].clone())
 }
+
+#[test]
+fn durable_publication_retries_exactly_and_refuses_a_different_writer() {
+    use crate::accounts::publication::Draft;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let db = app(&lab, 0);
+    db.initialize().unwrap();
+    let pending = Draft::new(
+        db.publication_destination().unwrap(),
+        "accounts".into(),
+        "one".into(),
+        None,
+        account("first").value.unwrap(),
+    )
+    .unwrap()
+    .allocate()
+    .unwrap();
+    let accepted = db.deliver_publication(&pending).unwrap();
+    assert!(accepted.matches(&pending));
+    let before = db.snapshot().unwrap();
+    let retried = db.deliver_publication(&pending).unwrap();
+    assert_eq!(accepted.operation(), retried.operation());
+    assert_eq!(db.snapshot().unwrap().retained, before.retained);
+    let peer = app(&lab, 1);
+    peer.initialize().unwrap();
+    let before_peer = peer.snapshot().unwrap();
+    assert!(peer.deliver_publication(&pending).is_err());
+    assert_eq!(peer.snapshot().unwrap().retained, before_peer.retained);
+    let replacement = Draft::new(
+        db.publication_destination().unwrap(),
+        "accounts".into(),
+        "one".into(),
+        Some(*accepted.operation()),
+        account("replacement").value.unwrap(),
+    )
+    .unwrap()
+    .allocate()
+    .unwrap();
+    db.write([9; 16], vec![account("later")]).unwrap();
+    let later = db.snapshot().unwrap();
+    assert!(db.deliver_publication(&replacement).is_err());
+    assert_eq!(db.snapshot().unwrap().retained, later.retained);
+    assert_eq!(db.snapshot().unwrap().cells, later.cells);
+    assert_eq!(
+        db.deliver_publication(&pending).unwrap().operation(),
+        accepted.operation()
+    );
+}
 pub(super) fn account(plan: &str) -> Change {
     Change {
         collection: "accounts".into(),
@@ -224,7 +272,7 @@ fn rounds(lab: &Lab, count: usize) {
         });
     }
 }
-fn raw(lab: &Lab, n: usize, payload: &[u8]) -> Receipt {
+pub(super) fn raw(lab: &Lab, n: usize, payload: &[u8]) -> Receipt {
     let bootstrap = lab.bootstrap(n);
     let session = Session::open(&bootstrap).unwrap();
     let descriptor = descriptor(&bootstrap).unwrap();

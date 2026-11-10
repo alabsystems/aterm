@@ -1226,6 +1226,41 @@ fn binary_event(
     let tests = crate::libtest::tests_run(&run.output);
     let test_counts =
         crate::libtest::test_counts(&run.output).filter(|counts| run.ok == (counts.failed == 0));
+    let case_timings_complete = run.case_observations.as_ref().is_some_and(|observed| {
+        observed.json
+            && observed.read_end.is_eof()
+            && test_counts.as_ref().is_some_and(|counts| {
+                counts.passed.checked_add(counts.failed)
+                    == u64::try_from(observed.timings.len()).ok()
+            })
+    });
+    let learned_partition = (run.ok && case_timings_complete)
+        .then(|| {
+            run.case_observations
+                .as_ref()
+                .and_then(|observed| crate::test_shards::learn(&observed.timings, ran.execution))
+        })
+        .flatten();
+    let partition_work = run
+        .case_observations
+        .as_ref()
+        .zip(learned_partition.as_deref())
+        .map(|(observed, filter)| {
+            let (mut selected, mut remaining) = (Duration::ZERO, Duration::ZERO);
+            let (mut selected_cases, mut remaining_cases) = (0_usize, 0_usize);
+            for timing in &observed.timings {
+                if timing.case.contains(filter) {
+                    selected = selected.saturating_add(timing.execution);
+                    selected_cases += 1;
+                } else {
+                    remaining = remaining.saturating_add(timing.execution);
+                    remaining_cases += 1;
+                }
+            }
+            aterm_json::json!({"filter":filter, "selected_case_s":selected.as_secs_f64(),
+            "remaining_case_s":remaining.as_secs_f64(), "selected_cases":selected_cases,
+            "remaining_cases":remaining_cases})
+        });
     let usage = run.usage;
     let hung_cases = run.hung.as_ref().map(|hung| {
         hung.running
@@ -1258,6 +1293,11 @@ fn binary_event(
         "verify-event: {}",
         aterm_json::json!({
             "schema": 1, "event": "test-binary-finished",
+            "slow_cases": run.case_observations.as_ref().map_or_else(Vec::new,
+                |observed| crate::libtest_json::slow_cases(&observed.timings)),
+            "case_timings_complete": case_timings_complete,
+            "case_timings_observed": run.case_observations.as_ref().map_or(0, |observed| observed.timings.len()),
+            "partition": partition_work,
             "test": crate::report::clip_json(&binary.spec, crate::report::EVENT_ROW_BYTES),
             "outcome": crate::report::word(outcome), "exit_code": run.code,
             "waiting_s": ran.waiting.as_secs_f64(), "execution_s": ran.execution.as_secs_f64(),
@@ -1327,6 +1367,7 @@ fn binary_event(
         },
         width,
         tests,
+        partition: learned_partition,
     });
     (outcome, event, sample)
 }
@@ -2175,7 +2216,7 @@ fn plan_from_history(
     let seen: Vec<_> = bins
         .iter()
         .map(|b| {
-            history.seen(&b.spec).map(|mut seen| {
+            crate::test_shards::seen(history, &b.spec).map(|mut seen| {
                 if seen.peak == 0 {
                     seen.peak = fallback_peak;
                 }
@@ -2269,7 +2310,13 @@ fn json_ladder(probe: &Probe) -> String {
 }
 
 /// libtest's JSON flags, which go right after the executable.
-const JSON_FLAGS: [&str; 4] = ["-Z", "unstable-options", "--format", "json"];
+const JSON_FLAGS: [&str; 5] = [
+    "-Z",
+    "unstable-options",
+    "--format",
+    "json",
+    "--report-time",
+];
 
 /// The binaries [`probe_json`] asks before it takes no answer for one.
 const PROBE_TRIES: usize = 3;
@@ -2458,6 +2505,7 @@ fn run_planned_observed(
         preface,
         rerun,
     } = planned;
+    bins = crate::test_shards::expand(bins, &history, ctx.passed_binaries.as_ref());
     let listed = bins.len();
     // Plan and claim the complete recorded set. A carry may remove work, but cannot change any
     // peer's width or charge after that peer's content key has committed to its command.
@@ -3319,6 +3367,7 @@ mod tests {
                 history.push(
                     &binary.spec,
                     crate::test_history::Sample {
+                        partition: None,
                         at_ms: 1,
                         outcome: "ok".to_owned(),
                         wall_ms: 1000,
@@ -5491,6 +5540,7 @@ exit 0"#,
                 "unstable-options",
                 "--format",
                 "json",
+                "--report-time",
                 "--skip",
                 "slow::"
             ]

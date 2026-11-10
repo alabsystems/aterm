@@ -16,6 +16,19 @@ const ENGINE_URL: &str = "https://github.com/fixture/app.git";
 const SHARED_NAME: &str = "Engine Owner";
 const SHARED_EMAIL: &str = "owner@example.invalid";
 
+#[test]
+fn sync_rechecks_readiness_when_origin_replaces_the_engine() {
+    let w = World::new();
+    peer_lands(&w, "bin/pub", "#!/bin/sh\n# run_pre_promote_hook\nexit 0\n");
+    let mut real = w.real(false);
+    real.engine_sync().unwrap();
+    assert!(real.engine_readiness().is_ok());
+    peer_lands(&w, "bin/pub", "#!/bin/sh\nexit 0\n");
+    // Negative control: removing sync's recheck reaches submodule sync instead.
+    let refused = Backend::sync(&mut real).unwrap_err();
+    assert!(refused.why.contains("no pre-promote seam"), "{refused:?}");
+}
+
 fn git_in(dir: &Path, args: &[&str]) -> String {
     let out = crate::ledger::testing::git()
         .arg("-C")

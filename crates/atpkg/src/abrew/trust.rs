@@ -1309,6 +1309,27 @@ pub fn bundle_trust_entries(
     Ok(out)
 }
 
+/// brew `Trust.wholly_untrusted_taps`: untrusted taps with no trusted
+/// formula, cask or command entry under their prefix.
+pub fn wholly_untrusted_taps(prefix: &Prefix) -> Vec<TapRef> {
+    untrusted_taps(prefix)
+        .into_iter()
+        .filter(|tap| {
+            let mut prefixes = vec![tap.reference(None).to_lowercase()];
+            if tap.uses_custom_remote() {
+                prefixes.push(tap.name());
+            }
+            ![TrustType::Formula, TrustType::Cask, TrustType::Command]
+                .iter()
+                .any(|kind| {
+                    trusted_entries(*kind)
+                        .iter()
+                        .any(|entry| prefixes.iter().any(|p| entry.starts_with(&format!("{p}/"))))
+                })
+        })
+        .collect()
+}
+
 /// brew `Trust.untrusted_taps`.
 pub fn untrusted_taps(prefix: &Prefix) -> Vec<TapRef> {
     let mut taps: Vec<TapRef> = super::tap::list(prefix)

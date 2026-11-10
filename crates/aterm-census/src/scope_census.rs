@@ -612,15 +612,25 @@ fn check_closure(root: &Path, claims: &[ScopeClaim], v: &mut Vec<String>) {
     if claims.iter().all(|c| c.closed_tokens.is_empty()) {
         return;
     }
-    let files = sweep_files(root);
-    let ctors = closed_token_ctors(&files, claims);
+    let tokens = closed_tokens(claims);
+    // Masking only blanks or cuts text, so a file whose raw text names no closed token holds no
+    // field of one and constructs none: each file is read once, and only those naming one are
+    // masked, for the constructors and for the sweep.
+    let naming: Vec<(std::path::PathBuf, String)> = sweep_files(root)
+        .into_iter()
+        .filter_map(|path| {
+            let raw = crate::tree::read_to_string(&path).ok()?;
+            tokens
+                .iter()
+                .any(|t| raw.contains(t))
+                .then_some((path, raw))
+        })
+        .collect();
+    let ctors = closed_token_ctors(&naming, &tokens);
     let no_ctors = BTreeSet::new();
-    for path in files {
-        let Ok(raw) = crate::tree::read_to_string(&path) else {
-            continue;
-        };
-        let file = crate::rel_path(root, &path);
-        let masked = mask_comments(&mask_gated_items(&raw, UNSHIPPED_GATES));
+    for (path, raw) in &naming {
+        let file = crate::rel_path(root, path);
+        let masked = mask_comments(&mask_gated_items(raw, UNSHIPPED_GATES));
         let structs = all_struct_bodies(&masked);
         for claim in claims {
             for token in claim.closed_tokens {
@@ -692,24 +702,27 @@ fn returns_token(before: &str) -> bool {
     rest.ends_with("->")
 }
 
-fn closed_token_ctors(
-    files: &[std::path::PathBuf],
-    claims: &[ScopeClaim],
-) -> BTreeMap<&'static str, BTreeSet<String>> {
-    let tokens: BTreeSet<&'static str> = claims
+/// Every claim's closed tokens.
+fn closed_tokens(claims: &[ScopeClaim]) -> BTreeSet<&'static str> {
+    claims
         .iter()
         .flat_map(|c| c.closed_tokens.iter().copied())
-        .collect();
+        .collect()
+}
+
+/// The fns each token's `impl` blocks return it from, over `naming`: the files whose text names
+/// one of `tokens`, as [`check_closure`] keeps them.
+fn closed_token_ctors(
+    naming: &[(std::path::PathBuf, String)],
+    tokens: &BTreeSet<&'static str>,
+) -> BTreeMap<&'static str, BTreeSet<String>> {
     let mut out: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
-    for path in files {
-        let Ok(raw) = crate::tree::read_to_string(path) else {
-            continue;
-        };
-        if !raw.contains("impl") || !tokens.iter().any(|t| raw.contains(t)) {
+    for (_, raw) in naming {
+        if !raw.contains("impl") {
             continue;
         }
-        let masked = mask_comments(&mask_gated_items(&raw, UNSHIPPED_GATES));
-        for &token in &tokens {
+        let masked = mask_comments(&mask_gated_items(raw, UNSHIPPED_GATES));
+        for &token in tokens {
             for body in impl_bodies(&masked, token) {
                 out.entry(token)
                     .or_default()
@@ -1228,13 +1241,11 @@ mod tests {
                    impl EffectsPipeline {\n\
                    \x20   fn for_test() -> Self {\n        Self\n    }\n\
                    }\n";
-        let rel = "crates/engine/src/pipeline.rs";
-        let root = synth_tree(
-            "aterm-scope-census",
-            "ctors",
-            &[(rel.to_string(), src.to_string())],
-        );
-        let ctors = closed_token_ctors(&[root.join(rel)], SYNTH_CLAIMS);
+        let named = [(
+            std::path::PathBuf::from("crates/engine/src/pipeline.rs"),
+            src.to_string(),
+        )];
+        let ctors = closed_token_ctors(&named, &closed_tokens(SYNTH_CLAIMS));
         let fx: Vec<&str> = ctors["EffectsPipeline"]
             .iter()
             .map(String::as_str)

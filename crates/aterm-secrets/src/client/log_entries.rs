@@ -351,10 +351,10 @@ pub(super) fn current_records_digest(
             .map(|c| records_heads_digest(&c.log));
     }
     let cached = super::held_copy(paths, config, state).or_else(|| {
-        fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
+        super::chain_cache::held(&paths.cache_file())
             .ok()
             .flatten()
-            .map(|b| b.as_slice().to_vec())
+            .map(|parsed| parsed.bytes().to_vec())
     })?;
     let env = envelope::parse(&cached).ok()?;
     trusted_seeded_log(paths, config, &env)

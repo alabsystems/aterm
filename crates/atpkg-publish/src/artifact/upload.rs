@@ -311,15 +311,18 @@ pub(crate) fn reserve_pack_version(
     notes: &str,
 ) -> Result<ReservedPack> {
     let prepared = version::Prepared::new(manifest, files)?;
-    if let Some((program, build)) = managed_pack(tag) {
+    let title = if let Some((program, build)) = managed_pack(tag) {
         version::check_managed_manifest_bytes(
             &prepared.manifest,
             &prepared.manifest_bytes,
             program,
             build,
         )?;
-    }
-    let title = format!("atpkg {tag}");
+        let product = atpkg::alab::agent(program).map_or(program, |agent| agent.product);
+        format!("{product} {} (build {build})", prepared.version)
+    } else {
+        format!("atpkg {tag}")
+    };
     let unread = |e: HostError| Error::cannot_run(format!("could not read {owner} {tag}: {e}"));
     let before = match host.release(owner, tag) {
         Ok(release) => release,

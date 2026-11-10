@@ -10,10 +10,11 @@ use std::fmt;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use aterm_types::machine_name::Number;
+use aterm_uds::stop::Stop;
 use rustls::ClientConnection;
 
 use crate::fleet::{
@@ -478,7 +479,7 @@ impl Drop for HeldSilent {
 }
 
 use aterm_uds::private_file::{
-    PrivateDir, check_owned_dir, judge_private_dir, remove_private, write_private,
+    KeptParse, PrivateDir, check_owned_dir, judge_private_dir, remove_private, write_private,
 };
 pub use aterm_uds::private_file::{PrivateFileError, ensure_private_dir, read_private};
 
@@ -2002,26 +2003,38 @@ fn held_mark(dir: &Path) -> Option<FleetMark> {
 /// The book in `dir` as the fleet `held` marks it: its entries of that fleet
 /// ([`read_peers`]), then those of another fleet.
 fn read_book(dir: &Path, held: Option<FleetMark>) -> Result<(Vec<Peer>, Vec<Peer>), PeersError> {
-    let bytes = match read_private(dir, PEERS_FILE, PEERS_FILE_MAX) {
-        Ok(bytes) => bytes,
+    static BOOKS: KeptParse<Result<Vec<Peer>, usize>> = KeptParse::new(KEPT_BOOKS);
+    let book = match BOOKS.read(dir, PEERS_FILE, PEERS_FILE_MAX, parse_book) {
+        Ok(book) => book.map_err(PeersError::Line)?,
         Err(PrivateFileError::Missing) => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(PeersError::File(e)),
     };
-    let text = String::from_utf8_lossy(&bytes);
+    Ok(book
+        .into_iter()
+        .partition(|peer| peer.fleet.is_none_or(|mark| Some(mark) == held)))
+}
+
+/// The state directories whose book files' parses are kept ([`KeptParse`]): the node's watch
+/// and each connection it admits read the book ([`Keyring::read`]), and a book nothing
+/// rewrote is opened and judged but not read or parsed again.
+const KEPT_BOOKS: usize = 4;
+
+/// The entries of a book's text other than copies ([`Via::IssuerBook`]), or the number of its
+/// first line that is no peer record.
+fn parse_book(bytes: &[u8]) -> Result<Vec<Peer>, usize> {
+    let text = String::from_utf8_lossy(bytes);
     let mut book = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let peer = Peer::parse(line).ok_or(PeersError::Line(n + 1))?;
+        let peer = Peer::parse(line).ok_or(n + 1)?;
         if peer.via != Via::IssuerBook {
             book.push(peer);
         }
     }
-    Ok(book
-        .into_iter()
-        .partition(|peer| peer.fleet.is_none_or(|mark| Some(mark) == held)))
+    Ok(book)
 }
 
 const ISSUER_BOOK_HEAD: &str = "issuer node=";
@@ -2031,14 +2044,44 @@ const ISSUER_BOOK_HEAD: &str = "issuer node=";
 /// that shares none (an older aterm), or a member that never read one, leaves none.
 #[must_use]
 pub fn holds_issuer_book(dir: &Path, issuer: &str) -> bool {
-    read_private(dir, ISSUER_BOOK_FILE, PEERS_FILE_MAX).is_ok_and(|bytes| {
-        String::from_utf8_lossy(&bytes)
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty() && !line.starts_with('#'))
-            .and_then(|head| head.strip_prefix(ISSUER_BOOK_HEAD))
-            == Some(issuer)
-    })
+    issuer_copy(dir).is_some_and(|copy| copy.issuer.as_deref() == Some(issuer))
+}
+
+/// What [`ISSUER_BOOK_FILE`] in a state directory says: the issuer its head names, and its
+/// copies, at most [`PEERS_MAX`], or none when a line is no copy.
+#[derive(Clone)]
+struct IssuerCopy {
+    issuer: Option<String>,
+    copies: Option<Vec<Peer>>,
+}
+
+/// [`ISSUER_BOOK_FILE`] in `dir`, read under [`read_private`]'s rules: `None` when it is
+/// missing or refused.
+fn issuer_copy(dir: &Path) -> Option<IssuerCopy> {
+    static COPIES: KeptParse<IssuerCopy> = KeptParse::new(KEPT_BOOKS);
+    COPIES
+        .read(dir, ISSUER_BOOK_FILE, PEERS_FILE_MAX, |bytes| {
+            let text = String::from_utf8_lossy(bytes);
+            let mut lines = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'));
+            let issuer = lines
+                .next()
+                .and_then(|head| head.strip_prefix(ISSUER_BOOK_HEAD))
+                .map(str::to_owned);
+            let copies: Option<Vec<Peer>> = lines
+                .map(|line| Peer::parse(line).filter(|peer| peer.via == Via::IssuerBook))
+                .collect();
+            IssuerCopy {
+                issuer,
+                copies: copies.map(|mut copies| {
+                    copies.truncate(PEERS_MAX);
+                    copies
+                }),
+            }
+        })
+        .ok()
 }
 
 /// The member's copy of its issuer's book in `dir` ([`ISSUER_BOOK_FILE`]), at most
@@ -2046,27 +2089,10 @@ pub fn holds_issuer_book(dir: &Path, issuer: &str) -> bool {
 /// book names as its issuer) at its head, and holds only copies.
 #[must_use]
 pub fn read_issuer_book(dir: &Path, issuer: &str) -> Vec<Peer> {
-    let Ok(bytes) = read_private(dir, ISSUER_BOOK_FILE, PEERS_FILE_MAX) else {
-        return Vec::new();
-    };
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'));
-    if lines
-        .next()
-        .and_then(|head| head.strip_prefix(ISSUER_BOOK_HEAD))
-        != Some(issuer)
-    {
-        return Vec::new();
-    }
-    let copies: Option<Vec<Peer>> = lines
-        .map(|line| Peer::parse(line).filter(|peer| peer.via == Via::IssuerBook))
-        .collect();
-    let mut copies = copies.unwrap_or_default();
-    copies.truncate(PEERS_MAX);
-    copies
+    issuer_copy(dir)
+        .filter(|copy| copy.issuer.as_deref() == Some(issuer))
+        .and_then(|copy| copy.copies)
+        .unwrap_or_default()
 }
 
 /// The word [`ANSWERED_FILE`] keys `peer`'s answers by: `node=<id>`, or `place=<host:port>` for
@@ -4735,11 +4761,11 @@ pub fn heartbeat_members_with_denied(
         reg,
         within,
         (log, denied_nodes, hints),
-        &AtomicBool::new(true),
+        &Stop::new(),
     )
 }
 
-/// [`heartbeat_members_with_denied`] for a listener generation that remains `current`.
+/// [`heartbeat_members_with_denied`] for a listener generation until its stop (`ended`) is set.
 /// An ended generation stops at its next exchange or commit boundary, and cannot allocate a
 /// descriptor version after a newer generation's publication. An exchange already sent can
 /// finish remotely; its descriptor precedes a newer generation's. Under a log that cannot be read
@@ -4752,16 +4778,16 @@ pub fn heartbeat_members_while(
     reg: &Registration,
     within: Duration,
     (log, denied_nodes, hints): (Option<&MemberKeys>, &[String], &dyn Fn() -> Vec<SocketAddr>),
-    current: &AtomicBool,
+    ended: &Stop,
 ) -> Result<Vec<Answered>, String> {
     // A log that cannot be read now admits no member to dial and judges no book entry: the
     // round dials no one and leaves the book as it is, as a listener with no deny list read.
-    if !current.load(Ordering::Acquire) || log.is_some_and(|log| log.unread().is_some()) {
+    if ended.is_set() || log.is_some_and(|log| log.unread().is_some()) {
         return Ok(Vec::new());
     }
     let Some(reg) = reg
         .clone()
-        .signed_in_while(state_dir, me, current)
+        .signed_in_while(state_dir, me, ended)
         .map_err(|e| e.to_string())?
     else {
         return Ok(Vec::new());
@@ -4775,11 +4801,11 @@ pub fn heartbeat_members_while(
         .as_deref()
         .map(|node| read_issuer_book(state_dir, node))
         .unwrap_or_default();
-    if !current.load(Ordering::Acquire) {
+    if ended.is_set() {
         return Ok(Vec::new());
     }
     prune_pushed_facts(state_dir, &peers, denied_nodes, log);
-    if !current.load(Ordering::Acquire) {
+    if ended.is_set() {
         return Ok(Vec::new());
     }
     prune_pushed_facts(state_dir, &issuer_copies, denied_nodes, log);
@@ -4826,7 +4852,7 @@ pub fn heartbeat_members_while(
         .iter()
         .filter_map(|peer| Some((peer.node.clone()?, peer.addr)))
         .collect();
-    if !current.load(Ordering::Acquire) {
+    if ended.is_set() {
         return Ok(Vec::new());
     }
     // Away from the ALab LAN the round passes over the members behind it, save the first round
@@ -4866,7 +4892,7 @@ pub fn heartbeat_members_while(
     // members gone dark for good cost a round one dial past its three answers, by its share.
     let mut missed_again = false;
     for member in members {
-        if !current.load(Ordering::Acquire) {
+        if ended.is_set() {
             return Ok(Vec::new());
         }
         if Instant::now() >= members_until {
@@ -4897,7 +4923,7 @@ pub fn heartbeat_members_while(
         };
         let beat = match reach_node(&target, &keys, (secret, me), FleetOp::Join, by) {
             Ok((reached, node)) => {
-                let beat = beat(reached, &node, (secret, me), &reg, bounds, current);
+                let beat = beat(reached, &node, (secret, me), &reg, bounds, ended);
                 if beat.is_none() {
                     blocked += 1;
                 }
@@ -4921,7 +4947,7 @@ pub fn heartbeat_members_while(
             }
         }
     }
-    if !current.load(Ordering::Acquire) {
+    if ended.is_set() {
         return Ok(Vec::new());
     }
     // The adverts are resolved only for a round the book's members did not fill.
@@ -4931,7 +4957,7 @@ pub fn heartbeat_members_while(
         Vec::new()
     };
     for hint in &hints {
-        if !current.load(Ordering::Acquire) {
+        if ended.is_set() {
             return Ok(Vec::new());
         }
         if answered.len() >= HEARTBEAT_MEMBERS || Instant::now() >= deadline.0 {
@@ -4971,11 +4997,11 @@ pub fn heartbeat_members_while(
             deadline.0.max(deadline_after(Duration::from_secs(1))),
             deadline,
         );
-        if let Some(beat) = beat(reached, &proof.node, (secret, me), &reg, bounds, current) {
+        if let Some(beat) = beat(reached, &proof.node, (secret, me), &reg, bounds, ended) {
             answered.push(beat);
         }
     }
-    if !current.load(Ordering::Acquire) {
+    if ended.is_set() {
         return Ok(Vec::new());
     }
     // A member a hint reached answered, whatever its dial from the book came to.
@@ -4993,7 +5019,7 @@ pub fn heartbeat_members_while(
     };
     let has_barred = peers.iter().any(is_barred) || issuer_copies.iter().any(is_barred);
     if answered.is_empty() && missed.is_empty() && !has_barred {
-        if current.load(Ordering::Acquire) {
+        if !ended.is_set() {
             pace.end(state_dir);
         }
         return Ok(Vec::new());
@@ -5003,7 +5029,7 @@ pub fn heartbeat_members_while(
         state_dir,
         Began::Under(&Held::Key(secret.clone())),
         |book| -> Result<bool, String> {
-            if !current.load(Ordering::Acquire) {
+            if ended.is_set() {
                 return Ok(false);
             }
             book.observe_self_entries(
@@ -5146,7 +5172,7 @@ pub fn heartbeat_members_while(
         Err(Unwritten::Moved) => return Ok(Vec::new()),
         Err(why) => return Err(why.to_string()),
     }
-    if !current.load(Ordering::Acquire) {
+    if ended.is_set() {
         return Ok(Vec::new());
     }
     pace.end(state_dir);
@@ -5393,9 +5419,9 @@ fn beat(
     (secret, me): (&FleetSecret, &NodeIdentity),
     reg: &Registration,
     (register_until, deadline): (Instant, (Instant, Duration)),
-    current: &AtomicBool,
+    ended: &Stop,
 ) -> Option<(Answered, Option<Book>, Option<NodeKey>)> {
-    if !current.load(Ordering::Acquire) {
+    if ended.is_set() {
         return None;
     }
     let at = reached.addr;
@@ -5406,7 +5432,7 @@ fn beat(
         return None;
     }
     let mut fetched = None;
-    if current.load(Ordering::Acquire) && Instant::now() < deadline.0 {
+    if !ended.is_set() && Instant::now() < deadline.0 {
         let target = Target {
             host: at.ip().to_canonical().to_string(),
             addr: Some(at.ip().to_canonical()),

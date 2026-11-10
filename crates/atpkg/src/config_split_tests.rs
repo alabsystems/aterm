@@ -17,18 +17,24 @@ fn a_complete_launchd_answer_preserves_native_bytes_and_trims_only_newlines() {
         stderr: Vec::new(),
     };
     assert_eq!(
-        super::launchd_value(answer(0, b"/private/\xff config\n\n".to_vec())),
+        super::launchd_value(answer(0, b"/private/\xff config\n\n".to_vec())).unwrap(),
         Some(std::ffi::OsString::from_vec(
             b"/private/\xff config".to_vec()
         ))
     );
-    assert_eq!(super::launchd_value(answer(0, b"\n\n".to_vec())), None);
     assert_eq!(
-        super::launchd_value(answer(1 << 8, b"/prefix-only".to_vec())),
+        super::launchd_value(answer(0, b"\n\n".to_vec())).unwrap(),
         None
     );
+    for (status, stdout) in [
+        (1 << 8, b"/prefix-only".to_vec()),
+        (1 << 8, Vec::new()),
+        (9, Vec::new()),
+    ] {
+        assert!(super::launchd_value(answer(status, stdout)).is_err());
+    }
     assert_eq!(
-        super::launchd_value(answer(0, b"/trailing space \n".to_vec())),
+        super::launchd_value(answer(0, b"/trailing space \n".to_vec())).unwrap(),
         Some(std::ffi::OsString::from("/trailing space "))
     );
 }

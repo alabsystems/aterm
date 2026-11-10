@@ -660,34 +660,35 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
     // Literal/comment state spans physical lines. A fixture's column-zero `}`
     // or `#[cfg(test)]` is data, never an item boundary or an attribute. Keep
     // attribute values in the text view for value-aware target predicates.
-    let lexed = crate::lex::lex(text);
+    // One lexing serves both views, the attributes and the carried lines.
+    let spans = crate::lex::spans(text);
+    let lexed = lexed_views(text, &spans);
     let lines: Vec<&str> = lexed.code.lines().collect();
-    let attribute_spans = crate::lex::outer_attributes(text);
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(text.match_indices('\n').map(|(at, _)| at + 1))
         .collect();
-    let attributes: BTreeMap<usize, (usize, &str, bool)> = attribute_spans
-        .iter()
-        .map(|&(start, end)| {
-            let first = line_starts.partition_point(|&at| at <= start) - 1;
-            let last = line_starts.partition_point(|&at| at <= end) - 1;
-            let tail = lexed.code[end..]
-                .lines()
-                .next()
-                .is_some_and(|line| !line.trim().is_empty());
-            (first, (last, &lexed.text[start..end], tail))
-        })
-        .collect();
-    let carried = lines_opening_in_a_span(text, lines.len());
+    // By the line each starts on; of two on one line, the later one.
+    let mut attributes: Vec<Option<(usize, &str, bool)>> = vec![None; line_starts.len()];
+    for (start, end) in outer_attributes_of(&lexed.code) {
+        let first = line_starts.partition_point(|&at| at <= start) - 1;
+        let last = line_starts.partition_point(|&at| at <= end) - 1;
+        let tail = lexed.code[end..]
+            .lines()
+            .next()
+            .is_some_and(|line| !line.trim().is_empty());
+        attributes[first] = Some((last, &lexed.text[start..end], tail));
+    }
+    let attribute_at = |line: usize| attributes.get(line).copied().flatten();
+    let carried = lines_opening_in_a_span(&spans, &line_starts, lines.len());
     let indent_of = |line: &str| line.len() - line.trim_start().len();
     let mut keep = vec![true; lines.len()];
     let mut i = 0;
     while i < lines.len() {
-        let t = lines[i].trim_start();
-        let Some(&(attr_end, attr, tail)) = attributes.get(&i) else {
+        let Some((attr_end, attr, tail)) = attribute_at(i) else {
             i += 1;
             continue;
         };
+        let t = lines[i].trim_start();
         if !t.starts_with("#[") || tail || !is_gate(attr.trim()) {
             i += 1;
             continue;
@@ -695,7 +696,7 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
         let indent = lines[i].len() - t.len();
         let mut j = attr_end + 1;
         let mut ambiguous_tail = false;
-        while let Some(&(end, _, tail)) = attributes.get(&j) {
+        while let Some((end, _, tail)) = attribute_at(j) {
             if tail {
                 ambiguous_tail = true;
                 break;
@@ -852,15 +853,16 @@ fn item_has_ambiguous_tail(code: &str, stack: &mut Vec<u8>) -> bool {
     false
 }
 
-/// Per line of `text` (`count` of them, as [`str::lines`] splits it), whether the line opens inside
-/// a literal or comment that began on an earlier line.
-fn lines_opening_in_a_span(text: &str, count: usize) -> Vec<bool> {
-    let starts: Vec<usize> = std::iter::once(0)
-        .chain(text.match_indices('\n').map(|(at, _)| at + 1))
-        .take(count)
-        .collect();
+/// Per line (`count` of them, as [`str::lines`] splits the text `line_starts` indexes), whether
+/// the line opens inside one of `spans` that began on an earlier line.
+fn lines_opening_in_a_span(
+    spans: &[crate::lex::Span],
+    line_starts: &[usize],
+    count: usize,
+) -> Vec<bool> {
+    let starts = &line_starts[..count.min(line_starts.len())];
     let mut carried = vec![false; count];
-    for span in crate::lex::spans(text) {
+    for span in spans {
         let first = starts.partition_point(|&start| start <= span.start);
         for (line, &start) in starts.iter().enumerate().skip(first) {
             if start >= span.end {
@@ -870,6 +872,75 @@ fn lines_opening_in_a_span(text: &str, count: usize) -> Vec<bool> {
         }
     }
     carried
+}
+
+/// [`crate::lex::lex`] of `src` from its already-read `spans`.
+fn lexed_views(src: &str, spans: &[crate::lex::Span]) -> crate::lex::Lexed {
+    let blank = |bytes: &mut [u8]| {
+        for b in bytes {
+            if *b != b'\n' {
+                *b = b' ';
+            }
+        }
+    };
+    let utf8 = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    };
+    let mut code = src.as_bytes().to_vec();
+    let mut text = code.clone();
+    for span in spans {
+        blank(&mut code[span.start..span.end]);
+        if span.kind == crate::lex::SpanKind::Comment {
+            blank(&mut text[span.start..span.end]);
+        }
+        if let Some((open, close)) = span.quotes
+            && !src.as_bytes()[span.start..span.end].contains(&b'\n')
+        {
+            code[open] = b'"';
+            code[close] = b'"';
+        }
+    }
+    crate::lex::Lexed {
+        code: utf8(code),
+        text: utf8(text),
+    }
+}
+
+/// [`crate::lex::outer_attributes`] of the source whose code view is `code`.
+fn outer_attributes_of(code: &str) -> Vec<(usize, usize)> {
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        // Only a `#` can open one.
+        match code[at..].find('#') {
+            Some(hash) => at += hash,
+            None => break,
+        }
+        if at + 1 >= bytes.len() {
+            break;
+        }
+        if bytes[at + 1] == b'[' {
+            let start = at;
+            at += 2;
+            let mut depth = 1usize;
+            while at < bytes.len() && depth > 0 {
+                match bytes[at] {
+                    b'[' => depth += 1,
+                    b']' => depth -= 1,
+                    _ => {}
+                }
+                at += 1;
+            }
+            if depth == 0 {
+                out.push((start, at));
+            }
+        } else {
+            at += 1;
+        }
+    }
+    out
 }
 
 /// A logical statement line.
@@ -882,19 +953,21 @@ struct LogicalLine {
 fn logical_lines(body: &[String], start_line: usize) -> Vec<LogicalLine> {
     let mut out: Vec<LogicalLine> = Vec::new();
     for (i, raw) in body.iter().enumerate() {
-        let masked = mask_literals(raw);
-        let t = masked.trim();
-        if t.is_empty() {
+        let mut text = mask_literals(raw);
+        text.truncate(text.trim_end().len());
+        let start = text.len() - text.trim_start().len();
+        if text.is_empty() {
             continue;
         }
-        if t.starts_with('.')
+        if text[start..].starts_with('.')
             && let Some(prev) = out.last_mut()
         {
-            prev.text.push_str(t);
+            prev.text.push_str(&text[start..]);
             continue;
         }
+        text.drain(..start);
         out.push(LogicalLine {
-            text: t.to_string(),
+            text,
             lineno: start_line + i,
         });
     }
@@ -1115,6 +1188,15 @@ fn impl_spans(text: &str) -> Vec<ImplSpan> {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
     for (i, raw) in lines.iter().enumerate() {
+        // Only a line that opens with `impl`, `unsafe ` or `default ` can head an impl, and
+        // cutting a comment off its end cannot change how it opens.
+        let opening = raw.trim_start();
+        if !["impl", "unsafe ", "default "]
+            .iter()
+            .any(|word| opening.starts_with(word))
+        {
+            continue;
+        }
         let line = strip_line_comment(raw);
         let head = line.trim_start();
         let indent = line.len() - head.len();
@@ -1256,19 +1338,20 @@ fn resolve_receiver(line: &str, dot: usize, ctx: &SiteCtx<'_>) -> Option<String>
 /// All acquisitions on one logical line, in byte order.
 fn acquisitions_on(line: &str, ctx: &SiteCtx<'_>) -> Vec<RawAcq> {
     let mut out = Vec::new();
-    for h in GUARD_HELPERS {
-        let sym = h.symbol;
-        let first = sym.as_bytes()[0];
-        let mut from = 0;
-        while let Some(rel) = line.as_bytes()[from..].iter().position(|&c| c == first) {
-            let at = from + rel;
-            if !line[at..].starts_with(sym) || !line[at + sym.len()..].starts_with('(') {
-                from = at + 1;
+    // A helper call is `<symbol>(` with no identifier byte before the symbol, so each `(`
+    // is asked once which symbols end at it.
+    let bytes = line.as_bytes();
+    for (open, _) in line.match_indices('(') {
+        for h in GUARD_HELPERS {
+            let sym = h.symbol;
+            let Some(at) = open.checked_sub(sym.len()) else {
+                continue;
+            };
+            if !bytes[..open].ends_with(sym.as_bytes()) {
                 continue;
             }
-            from = at + sym.len() + 1;
             let boundary = at == 0 || {
-                let prev = line.as_bytes()[at - 1];
+                let prev = bytes[at - 1];
                 !(prev.is_ascii_alphanumeric() || prev == b'_')
             };
             if !boundary || line[..at].trim_end().ends_with("fn") {
@@ -1561,37 +1644,59 @@ enum ModuleResolution {
     Unknown,
 }
 
+/// What [`ModulePaths`] reads of one file, gathered on the worker that scanned it.
+struct ModuleFile {
+    /// The file's [`lock_graph_code`], which the shadow checks read.
+    code: String,
+    /// Each load the module loader reads ([`crate::guards::SourceFile::loads`]): its module
+    /// path (`None` splices the file into its includer), whether it is test-gated, and the
+    /// files it can name.
+    loads: Vec<(Option<Vec<String>>, bool, Vec<String>)>,
+}
+
+impl ModuleFile {
+    fn read(rel: &str, text: String, code: String) -> Self {
+        let reader = crate::guards::SourceFile::outside(rel.to_owned(), text);
+        let loads = reader
+            .loads()
+            .iter()
+            .map(|load| (load.module.clone(), load.gated, load.files.clone()))
+            .collect();
+        Self { code, loads }
+    }
+}
+
 /// Only declarations read by the existing module loader establish module edges.
 struct ModulePaths {
-    sources: BTreeMap<String, String>,
+    files: BTreeMap<String, ModuleFile>,
     edges: BTreeMap<(String, Vec<String>), BTreeSet<String>>,
     parents: BTreeMap<String, BTreeSet<String>>,
     spliced: BTreeSet<String>,
     /// Pure lexical facts reused only within this immutable source snapshot.
     shadow_facts: BTreeMap<(String, String, bool), bool>,
+    /// Each asked file's root-independent shadow facts, read once.
+    file_shadows: BTreeMap<String, ShadowFacts>,
 }
 
 impl ModulePaths {
-    fn new(sources: &BTreeMap<String, String>) -> Self {
+    fn new(files: BTreeMap<String, ModuleFile>) -> Self {
         let mut edges: BTreeMap<(String, Vec<String>), BTreeSet<String>> = BTreeMap::new();
         let mut parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut spliced = BTreeSet::new();
-        for (file, source) in sources {
-            let reader = crate::guards::SourceFile::new(file.clone(), source.clone());
-            for load in reader.loads() {
-                let Some(module) = &load.module else {
+        for (file, read) in &files {
+            for (module, gated, targets) in &read.loads {
+                let Some(module) = module else {
                     spliced.insert(file.clone());
                     continue;
                 };
-                if load.gated {
+                if *gated {
                     continue;
                 }
-                let files: Vec<_> = load
-                    .files
+                let targets: Vec<_> = targets
                     .iter()
-                    .filter(|path| sources.contains_key(*path))
+                    .filter(|path| files.contains_key(*path))
                     .collect();
-                if let [target] = files.as_slice() {
+                if let [target] = targets.as_slice() {
                     edges
                         .entry((file.clone(), module.clone()))
                         .or_default()
@@ -1606,11 +1711,12 @@ impl ModulePaths {
             }
         }
         Self {
-            sources: sources.clone(),
+            files,
             edges,
             parents,
             spliced,
             shadow_facts: BTreeMap::new(),
+            file_shadows: BTreeMap::new(),
         }
     }
 
@@ -1619,15 +1725,66 @@ impl ModulePaths {
         if let Some(&fact) = self.shadow_facts.get(&key) {
             return fact;
         }
-        let fact = self.sources.get(file).is_none_or(|source| {
+        let fact = self.files.get(file).is_none_or(|read| {
+            let facts = self
+                .file_shadows
+                .entry(file.to_owned())
+                .or_insert_with(|| ShadowFacts::of(&read.code));
             if module {
-                module_root_shadowed(source, root)
+                facts.module_root_shadowed(&read.code, root)
             } else {
-                root_may_be_shadowed(source, root)
+                facts.root_may_be_shadowed(&read.code, root)
             }
         });
         self.shadow_facts.insert(key, fact);
         fact
+    }
+
+    /// `file` and every file that declares it, at any depth.
+    fn scopes(&self, file: &str) -> BTreeSet<String> {
+        let mut scopes = BTreeSet::from([file.to_owned()]);
+        let mut pending = vec![file.to_owned()];
+        while let Some(scope) = pending.pop() {
+            if let Some(parents) = self.parents.get(&scope) {
+                for parent in parents {
+                    if scopes.insert(parent.clone()) {
+                        pending.push(parent.clone());
+                    }
+                }
+            }
+        }
+        scopes
+    }
+
+    /// Read, across the workers, the shadow facts of every file [`Self::resolve`] can ask
+    /// about for `callers`' held calls: the files it asks are among these.
+    fn read_shadows(&mut self, callers: &[FnLockFacts]) {
+        let mut wanted: BTreeSet<String> = BTreeSet::new();
+        for caller in callers {
+            for (_, target, _) in &caller.held_calls {
+                let Some(first) = target.path.first() else {
+                    continue;
+                };
+                if caller.type_params.contains(first) {
+                    continue;
+                }
+                if matches!(first.as_str(), "std" | "core" | "alloc") && target.path.len() > 1 {
+                    wanted.extend(self.scopes(&caller.source_file));
+                }
+                if !matches!(first.as_str(), "crate" | "self" | "super")
+                    && let Some(module) = &caller.module
+                {
+                    wanted.insert(module.clone());
+                }
+            }
+        }
+        let wanted: Vec<String> = wanted
+            .into_iter()
+            .filter(|file| self.files.contains_key(file) && !self.file_shadows.contains_key(file))
+            .collect();
+        let files = &self.files;
+        let facts = run_parallel(wanted.len(), |at| ShadowFacts::of(&files[&wanted[at]].code));
+        self.file_shadows.extend(wanted.into_iter().zip(facts));
     }
 
     fn resolve(&mut self, caller: &FnLockFacts, target: &CallTarget) -> ModuleResolution {
@@ -1639,17 +1796,7 @@ impl ModulePaths {
             return ModuleResolution::Unknown;
         }
         if matches!(first.as_str(), "std" | "core" | "alloc") && target.path.len() > 1 {
-            let mut scopes = BTreeSet::from([file.clone()]);
-            let mut pending = vec![file.clone()];
-            while let Some(scope) = pending.pop() {
-                if let Some(parents) = self.parents.get(&scope) {
-                    for parent in parents {
-                        if scopes.insert(parent.clone()) {
-                            pending.push(parent.clone());
-                        }
-                    }
-                }
-            }
+            let scopes = self.scopes(file);
             let shadowed = scopes
                 .iter()
                 .any(|scope| self.shadowed(scope, first, false));
@@ -1717,92 +1864,116 @@ impl ModulePaths {
     }
 }
 
-/// Lexical uncertainty is not proof of an external root. In particular a glob may
-/// import a module with this name, and an alias or type parameter may shadow it.
-fn root_may_be_shadowed(source: &str, root: &str) -> bool {
-    let masked = lock_graph_code(source);
-    if masked.contains(&format!("r#{root}")) {
-        return true;
-    }
-    let code = masked.replace("r#", "");
-    let words: Vec<_> = code
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|s| !s.is_empty())
-        .collect();
-    if words.windows(2).any(|pair| {
-        pair[1] == root
-            && matches!(
-                pair[0],
-                "mod" | "type" | "struct" | "enum" | "trait" | "union" | "as" | "crate"
-            )
-    }) {
-        return true;
-    }
-    for at in use_starts(&code) {
-        let import = code[at + 3..].split(';').next().unwrap_or_default();
-        if import.contains('*') {
-            return true;
-        }
-        let import = import
-            .trim()
-            .strip_prefix(&format!("{root}::"))
-            .unwrap_or(import.trim());
-        if import
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .any(|word| word == root)
-        {
-            return true;
-        }
-    }
-    false
+/// The lexical evidence one file's code holds against a root, before any root is asked.
+struct ShadowFacts {
+    /// Byte offset of every `r#` in the code.
+    raw: Vec<usize>,
+    /// Every word a `type`, `struct`, `enum`, `trait`, `union`, `as` or `crate` precedes.
+    declared: BTreeSet<String>,
+    /// How many times `mod` precedes each word.
+    mods: BTreeMap<String, usize>,
+    /// Some `use` tree holds a glob.
+    glob: bool,
+    /// Every `use` tree, trimmed.
+    imports: Vec<String>,
 }
 
-/// A local import/type can shadow a same-named declared module. More than one
-/// lexical module declaration is not enough evidence to pick a scope.
-fn module_root_shadowed(source: &str, root: &str) -> bool {
-    let masked = lock_graph_code(source);
-    if masked.contains(&format!("r#{root}")) {
-        return true;
-    }
-    let code = masked.replace("r#", "");
-    let words: Vec<_> = code
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|s| !s.is_empty())
-        .collect();
-    if words
-        .windows(2)
-        .filter(|pair| pair[0] == "mod" && pair[1] == root)
-        .count()
-        > 1
-    {
-        return true;
-    }
-    if words.windows(2).any(|pair| {
-        pair[1] == root
-            && matches!(
-                pair[0],
-                "type" | "struct" | "enum" | "trait" | "union" | "as" | "crate"
-            )
-    }) {
-        return true;
-    }
-    for at in use_starts(&code) {
-        let import = code[at + 3..].split(';').next().unwrap_or_default();
-        if import.contains('*') {
-            return true;
+impl ShadowFacts {
+    /// Words and `use` trees are read with every `r#` removed.
+    fn of(code: &str) -> Self {
+        let raw: Vec<usize> = code.match_indices("r#").map(|(at, _)| at).collect();
+        let code = if raw.is_empty() {
+            std::borrow::Cow::Borrowed(code)
+        } else {
+            std::borrow::Cow::Owned(code.replace("r#", ""))
+        };
+        let mut declared = BTreeSet::new();
+        let mut mods: BTreeMap<String, usize> = BTreeMap::new();
+        let mut before: Option<&str> = None;
+        for word in ascii_words(&code) {
+            match before {
+                Some("mod") => match mods.get_mut(word) {
+                    Some(count) => *count += 1,
+                    None => {
+                        mods.insert(word.to_owned(), 1);
+                    }
+                },
+                Some("type" | "struct" | "enum" | "trait" | "union" | "as" | "crate")
+                    if !declared.contains(word) =>
+                {
+                    declared.insert(word.to_owned());
+                }
+                _ => {}
+            }
+            before = Some(word);
         }
-        let import = import
-            .trim()
-            .strip_prefix(&format!("{root}::"))
-            .unwrap_or(import.trim());
-        if import
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .any(|word| word == root)
-        {
-            return true;
+        let mut glob = false;
+        let mut imports = Vec::new();
+        for at in use_starts(&code) {
+            let import = code[at + 3..].split(';').next().unwrap_or_default();
+            glob |= import.contains('*');
+            imports.push(import.trim().to_owned());
+        }
+        Self {
+            raw,
+            declared,
+            mods,
+            glob,
+            imports,
         }
     }
-    false
+
+    /// `code` spells `r#<root>`.
+    fn raw_root(&self, code: &str, root: &str) -> bool {
+        self.raw.iter().any(|&at| code[at + 2..].starts_with(root))
+    }
+
+    /// A glob, or a `use` tree naming `root` other than as its own first segment.
+    fn imports_root(&self, root: &str) -> bool {
+        self.glob
+            || self.imports.iter().any(|import| {
+                import
+                    .strip_prefix(&format!("{root}::"))
+                    .unwrap_or(import)
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|word| word == root)
+            })
+    }
+
+    /// Lexical uncertainty is not proof of an external root. In particular a glob may
+    /// import a module with this name, and an alias or type parameter may shadow it.
+    fn root_may_be_shadowed(&self, code: &str, root: &str) -> bool {
+        self.raw_root(code, root)
+            || self.mods.contains_key(root)
+            || self.declared.contains(root)
+            || self.imports_root(root)
+    }
+
+    /// A local import/type can shadow a same-named declared module. More than one
+    /// lexical module declaration is not enough evidence to pick a scope.
+    fn module_root_shadowed(&self, code: &str, root: &str) -> bool {
+        self.raw_root(code, root)
+            || self.mods.get(root).is_some_and(|&count| count > 1)
+            || self.declared.contains(root)
+            || self.imports_root(root)
+    }
+}
+
+/// The maximal runs of ASCII alphanumerics and `_` in `code`, in order: what splitting it at
+/// every other char leaves, empty pieces dropped.
+fn ascii_words(code: &str) -> impl Iterator<Item = &str> {
+    let bytes = code.as_bytes();
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+        let start = at + bytes[at..].iter().position(word)?;
+        let end = bytes[start..]
+            .iter()
+            .position(|b| !word(b))
+            .map_or(bytes.len(), |len| start + len);
+        at = end;
+        Some(&code[start..end])
+    })
 }
 
 /// Keyword boundaries allow whitespace or comments between `use` and its tree.
@@ -1842,12 +2013,20 @@ impl FieldTypes {
                 .is_some_and(|tys| tys.iter().any(|t| self.defined.contains(t)))
     }
 
+    /// Add another file's harvest: each set is the union of every file's.
+    fn absorb(&mut self, other: Self) {
+        self.defined.extend(other.defined);
+        for (field, tys) in other.field_tys {
+            self.field_tys.entry(field).or_default().extend(tys);
+        }
+    }
+
     /// Harvest declarations from one already-cfg-masked source file.
     fn harvest(&mut self, text: &str) {
         let mut body_depth: Option<i32> = None;
         let mut depth: i32 = 0;
         for raw in text.lines() {
-            let line = raw.split("//").next().unwrap_or(raw);
+            let line = before_double_slash(raw);
             let t = line.trim_start();
             let mut opens_fields = false;
             for kw in ["struct ", "enum ", "union ", "trait ", "type "] {
@@ -1888,7 +2067,8 @@ impl FieldTypes {
                     }
                 }
             }
-            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+            let (opens, closes) = brace_counts(line);
+            depth += opens as i32 - closes as i32;
             if opens_fields {
                 body_depth = Some(depth);
             } else if let Some(d) = body_depth
@@ -1898,6 +2078,19 @@ impl FieldTypes {
             }
         }
     }
+}
+
+/// `s` up to its first `//`.
+fn before_double_slash(s: &str) -> &str {
+    let mut from = 0;
+    while let Some(slash) = s[from..].find('/') {
+        let at = from + slash;
+        if s.as_bytes().get(at + 1) == Some(&b'/') {
+            return &s[..at];
+        }
+        from = at + 1;
+    }
+    s
 }
 
 /// The leading identifier of `s`, if it starts with one.
@@ -2086,6 +2279,25 @@ struct FnLockFacts {
     binding_calls: Vec<(String, String)>,
 }
 
+impl FnLockFacts {
+    /// Move every site index by `base`, as when its file's sites join the global table there.
+    fn rebase(&mut self, base: usize) {
+        for site in &mut self.acq {
+            *site += base;
+        }
+        for (hold, acq) in &mut self.edges {
+            *hold += base;
+            *acq += base;
+        }
+        for (hold, _, _) in &mut self.held_calls {
+            *hold += base;
+        }
+        for (hold, _, _, _) in &mut self.field_recv_calls {
+            *hold += base;
+        }
+    }
+}
+
 /// Lexical guard-return detection over the signature region.
 fn returns_guard(body: &[String]) -> bool {
     for line in body {
@@ -2177,10 +2389,21 @@ fn module_root_lines(masked: &str) -> BTreeSet<usize> {
         .enumerate()
         .filter_map(|(line, code)| {
             let root = depth == 0;
-            depth += code.matches('{').count() as i32 - code.matches('}').count() as i32;
+            let (opens, closes) = brace_counts(code);
+            depth += opens as i32 - closes as i32;
             root.then_some(line + 1)
         })
         .collect()
+}
+
+/// How many `{` and `}` bytes `code` holds.
+fn brace_counts(code: &str) -> (usize, usize) {
+    code.bytes()
+        .fold((0, 0), |(opens, closes), byte| match byte {
+            b'{' => (opens + 1, closes),
+            b'}' => (opens, closes + 1),
+            _ => (opens, closes),
+        })
 }
 
 /// Scan one fn body.
@@ -2273,8 +2496,9 @@ fn scan_fn(
         // before its condition or body can call an unshadowed corpus function.
         let entry_depth = depth - i32::try_from(leading_closes).unwrap_or(0);
         local_bindings.retain(|binding| entry_depth >= binding.binding_depth);
-        let opens = i32::try_from(line.matches('{').count()).unwrap_or(0);
-        let closes = i32::try_from(line.matches('}').count()).unwrap_or(0);
+        let (opens, closes) = brace_counts(line);
+        let opens = i32::try_from(opens).unwrap_or(0);
+        let closes = i32::try_from(closes).unwrap_or(0);
         let depth_end = depth + opens - closes;
         if !live.is_empty() && line.contains("drop(") {
             live.retain(|g| {
@@ -2522,13 +2746,134 @@ fn append_cycle_repair(log: &mut String, invert: &str) {
     );
 }
 
+/// One file's part of the census, read on a worker and merged in the census's file order.
+struct FileScan {
+    rel: String,
+    module: ModuleFile,
+    /// The declarations of a workspace file; an isolated library's add none.
+    field_types: FieldTypes,
+    /// Its fns, their site indices into [`Self::sites`].
+    fns: Vec<FnLockFacts>,
+    sites: Vec<AcqSite>,
+    /// For a file in a labeled platform slice, the slice and its site count, in place of
+    /// [`Self::fns`] and [`Self::sites`].
+    slice: Option<(usize, usize)>,
+}
+
+/// Read and scan one file of a workspace crate (`vendored` `None`) or of an isolated library.
+fn scan_file(
+    root: &Path,
+    file: &Path,
+    vendored: Option<&crate::scan_set::ScannedVendored>,
+) -> Option<FileScan> {
+    let text = crate::tree::read_to_string(file).ok()?;
+    let slice_idx = vendored.and_then(|v| {
+        let in_crate = crate::rel_path(&root.join(&v.crate_dir), file);
+        v.platform_slices.iter().position(|s| {
+            s.paths
+                .iter()
+                .any(|p| in_crate == *p || in_crate.starts_with(&format!("{p}/")))
+        })
+    });
+    let rel = crate::rel_path(root, file);
+    let masked = lock_graph_code(&text);
+    let mut field_types = FieldTypes::default();
+    if vendored.is_none() {
+        field_types.harvest(&masked);
+    }
+    let impls = impl_spans(&masked);
+    let root_lines = module_root_lines(&masked);
+    let ctx = FileCtx {
+        rel: &rel,
+        namespace: vendored.map(|v| v.namespace),
+        impls: &impls,
+        root_lines: &root_lines,
+    };
+    let mut parsed = Vec::new();
+    parse_source_fns(&masked, &rel, &mut parsed);
+    let mut fns = Vec::new();
+    let mut sites = Vec::new();
+    let slice = match slice_idx {
+        Some(i) => {
+            for f in &parsed {
+                let _ = scan_fn(&f.name, &f.span, &f.body, &ctx, &mut sites);
+            }
+            let count = sites.len();
+            sites.clear();
+            Some((i, count))
+        }
+        None => {
+            for f in &parsed {
+                fns.push(scan_fn(&f.name, &f.span, &f.body, &ctx, &mut sites));
+            }
+            None
+        }
+    };
+    let module = ModuleFile::read(&rel, text, masked);
+    Some(FileScan {
+        rel,
+        module,
+        field_types,
+        fns,
+        sites,
+        slice,
+    })
+}
+
+/// `job(0)..job(count)` across worker threads (this one among them), each answer in its slot.
+fn run_parallel<T: Send>(count: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        let mut done = Vec::new();
+        loop {
+            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if at >= count {
+                return done;
+            }
+            done.push((at, job(at)));
+        }
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get().min(16))
+        .min(count);
+    let mut slots: Vec<Option<T>> = (0..count).map(|_| None).collect();
+    // Each worker carries this thread's memo scope, so what it reads is the census unit's
+    // question ([`crate::memo::threads`]).
+    crate::memo::threads(|scope| {
+        // A worker that cannot start leaves its share to the others.
+        let helpers: Vec<_> = (1..workers)
+            .filter_map(|n| {
+                scope
+                    .spawn_named(format!("census-locks-{n}"), 8 << 20, work)
+                    .ok()
+            })
+            .collect();
+        for (at, answer) in work() {
+            slots[at] = Some(answer);
+        }
+        for helper in helpers {
+            match helper.join() {
+                Ok(done) => {
+                    for (at, answer) in done {
+                        slots[at] = Some(answer);
+                    }
+                }
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| slot.expect("every job ran"))
+        .collect()
+}
+
 /// The lock-order census's verdict title.
 const LOCKS: &str = "lock-order census";
 
 pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     let mut log = String::new();
     let mut failures = 0usize;
-    let mut module_sources = BTreeMap::new();
     let _ = writeln!(
         log,
         "=== lock-order census (L0 deadlock, lock-graph sense) ===\n\
@@ -2551,10 +2896,12 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     };
     log.push_str(&crate::scan_set::render_scan_set(&scan));
 
-    let mut sites: Vec<AcqSite> = Vec::new();
-    let mut fns: Vec<FnLockFacts> = Vec::new();
-    let mut field_types = FieldTypes::default();
-    let mut test_gated = 0usize;
+    // Each crate's files as the census reads them: the workspace crates, then the isolated
+    // libraries. Every file is read on a worker; the merge below keeps this order.
+    let mut units: Vec<(
+        Vec<std::path::PathBuf>,
+        Option<&crate::scan_set::ScannedVendored>,
+    )> = Vec::new();
     for crate_dir in &scan.scan_dirs {
         if scan
             .vendored_scanned
@@ -2566,85 +2913,79 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         let mut files = Vec::new();
         let _ = collect_rs_files(&root.join(crate_dir), &mut files);
         files.retain(|p| !is_test_file(p));
-        let gated = test_gated_module_files(&files);
-        test_gated += gated.len();
-        files.retain(|p| !gated.contains(p));
-        files.sort();
-        for file in files {
-            let Ok(text) = crate::tree::read_to_string(&file) else {
-                continue;
-            };
-            let rel = crate::rel_path(root, &file);
-            module_sources.insert(rel.clone(), text.clone());
-            let masked = lock_graph_code(&text);
-            field_types.harvest(&masked);
-            let impls = impl_spans(&masked);
-            let root_lines = module_root_lines(&masked);
-            let ctx = FileCtx {
-                rel: &rel,
-                namespace: None,
-                impls: &impls,
-                root_lines: &root_lines,
-            };
-            let mut parsed = Vec::new();
-            parse_source_fns(&masked, &rel, &mut parsed);
-            for f in &parsed {
-                fns.push(scan_fn(&f.name, &f.span, &f.body, &ctx, &mut sites));
-            }
-        }
+        units.push((files, None));
     }
-
-    let mut slice_counts: Vec<(String, &'static str, usize)> = Vec::new();
     for v in &scan.vendored_scanned {
-        let crate_root = root.join(&v.crate_dir);
         let mut files = Vec::new();
         let _ = collect_rs_files(&root.join(&v.scan_dir), &mut files);
         files.retain(|p| !is_test_file(p));
-        let gated = test_gated_module_files(&files);
+        units.push((files, Some(v)));
+    }
+    let gates: Vec<std::sync::OnceLock<BTreeSet<std::path::PathBuf>>> =
+        units.iter().map(|_| std::sync::OnceLock::new()).collect();
+    // The longest jobs first: each crate's test-module walk, largest crate first, then the files.
+    let mut jobs: Vec<(usize, Option<usize>)> = (0..units.len()).map(|u| (u, None)).collect();
+    jobs.sort_by_key(|&(u, _)| std::cmp::Reverse(units[u].0.len()));
+    for (u, (files, _)) in units.iter().enumerate() {
+        jobs.extend((0..files.len()).map(|i| (u, Some(i))));
+    }
+    let mut scanned: BTreeMap<(usize, usize), FileScan> = BTreeMap::new();
+    for (job, done) in jobs.iter().zip(run_parallel(jobs.len(), |at| {
+        let (u, file) = jobs[at];
+        let (files, vendored) = &units[u];
+        let Some(i) = file else {
+            let _ = gates[u].set(test_gated_module_files(files));
+            return None;
+        };
+        // A file its crate already declared test-only is left out by the merge anyway.
+        if gates[u]
+            .get()
+            .is_some_and(|gated| gated.contains(&files[i]))
+        {
+            return None;
+        }
+        scan_file(root, &files[i], *vendored)
+    })) {
+        if let (Some(scan), (u, Some(i))) = (done, *job) {
+            scanned.insert((u, i), scan);
+        }
+    }
+
+    let mut module_files: BTreeMap<String, ModuleFile> = BTreeMap::new();
+    let mut sites: Vec<AcqSite> = Vec::new();
+    let mut fns: Vec<FnLockFacts> = Vec::new();
+    let mut field_types = FieldTypes::default();
+    let mut test_gated = 0usize;
+    let mut slice_counts: Vec<(String, &'static str, usize)> = Vec::new();
+    for (u, ((files, vendored), gated)) in units.iter().zip(gates).enumerate() {
+        let gated = gated.into_inner().unwrap_or_default();
         test_gated += gated.len();
-        files.retain(|p| !gated.contains(p));
-        files.sort();
-        let mut per_slice = vec![0usize; v.platform_slices.len()];
-        for file in files {
-            let Ok(text) = crate::tree::read_to_string(&file) else {
+        let mut order: Vec<usize> = (0..files.len())
+            .filter(|&i| !gated.contains(&files[i]))
+            .collect();
+        order.sort_by(|&a, &b| files[a].cmp(&files[b]));
+        let mut per_slice = vec![0usize; vendored.map_or(0, |v| v.platform_slices.len())];
+        for i in order {
+            let Some(file) = scanned.remove(&(u, i)) else {
                 continue;
             };
-            let in_crate = crate::rel_path(&crate_root, &file);
-            let slice_idx = v.platform_slices.iter().position(|s| {
-                s.paths
-                    .iter()
-                    .any(|p| in_crate == *p || in_crate.starts_with(&format!("{p}/")))
-            });
-            let rel = crate::rel_path(root, &file);
-            module_sources.insert(rel.clone(), text.clone());
-            let masked = lock_graph_code(&text);
-            let impls = impl_spans(&masked);
-            let root_lines = module_root_lines(&masked);
-            let ctx = FileCtx {
-                rel: &rel,
-                namespace: Some(v.namespace),
-                impls: &impls,
-                root_lines: &root_lines,
-            };
-            let mut parsed = Vec::new();
-            parse_source_fns(&masked, &rel, &mut parsed);
-            match slice_idx {
-                Some(i) => {
-                    let mut scratch: Vec<AcqSite> = Vec::new();
-                    for f in &parsed {
-                        let _ = scan_fn(&f.name, &f.span, &f.body, &ctx, &mut scratch);
-                    }
-                    per_slice[i] += scratch.len();
-                }
-                None => {
-                    for f in &parsed {
-                        fns.push(scan_fn(&f.name, &f.span, &f.body, &ctx, &mut sites));
-                    }
-                }
+            module_files.insert(file.rel, file.module);
+            field_types.absorb(file.field_types);
+            if let Some((slice, count)) = file.slice {
+                per_slice[slice] += count;
+                continue;
             }
+            let base = sites.len();
+            sites.extend(file.sites);
+            fns.extend(file.fns.into_iter().map(|mut f| {
+                f.rebase(base);
+                f
+            }));
         }
-        for (i, slice) in v.platform_slices.iter().enumerate() {
-            slice_counts.push((v.package.clone(), slice.label, per_slice[i]));
+        if let Some(v) = vendored {
+            for (i, slice) in v.platform_slices.iter().enumerate() {
+                slice_counts.push((v.package.clone(), slice.label, per_slice[i]));
+            }
         }
     }
     let _ = writeln!(
@@ -2705,7 +3046,8 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         .flat_map(|f| f.binding_calls.iter().cloned())
         .collect();
 
-    let mut modules = ModulePaths::new(&module_sources);
+    let mut modules = ModulePaths::new(module_files);
+    modules.read_shadows(&fns);
     let mut by_name: BTreeMap<&str, BTreeMap<Option<&'static str>, Vec<usize>>> = BTreeMap::new();
     for (idx, f) in fns.iter().enumerate() {
         by_name
@@ -3835,6 +4177,113 @@ mod tests {
         assert!(
             acquisitions_on("pub(crate) fn term_lock(term: &Mutex<Terminal>) {", &ctx).is_empty()
         );
+    }
+
+    #[test]
+    fn helper_calls_need_an_identifier_boundary_before_their_symbol() {
+        let aliases = no_aliases();
+        let ctx = bare_ctx(&aliases);
+        let kinds = |line: &str| -> Vec<&'static str> {
+            acquisitions_on(line, &ctx).iter().map(|a| a.kind).collect()
+        };
+        assert!(kinds("let t = xterm_lock(&s.term);").is_empty());
+        assert_eq!(kinds("let p = judge_posts(&s);"), ["judge_posts"]);
+        assert_eq!(
+            kinds("let p = (posts(&s), term_lock(&t));"),
+            ["posts", "term_lock"]
+        );
+    }
+
+    #[test]
+    fn one_lexing_gives_the_lexer_views_and_outer_attributes() {
+        let fixture = "#![allow(dead_code)]\n#[inline] #[cfg(test)]\n\
+                       fn f() { r#type(\"x\", 'y', b\"z\"); }\n\
+                       /* #[not] */ const S: &str = \"#[no]\";\n\
+                       const R: &str = r#\"\n#[nor]\n\"#;\n#[derive(\n    Debug,\n)]\nstruct T;\n";
+        for src in [
+            fixture,
+            include_str!("lex.rs"),
+            include_str!("lock_order.rs"),
+        ] {
+            let lexed = lexed_views(src, &crate::lex::spans(src));
+            let want = crate::lex::lex(src);
+            assert!(lexed.code == want.code, "the code view differs");
+            assert!(lexed.text == want.text, "the text view differs");
+            assert!(
+                outer_attributes_of(&lexed.code) == crate::lex::outer_attributes(src),
+                "the outer attributes differ"
+            );
+        }
+    }
+
+    #[test]
+    fn of_two_attributes_on_one_line_the_later_gates_the_item() {
+        let masked = lock_graph_code(
+            "#[inline] #[cfg(test)]\nfn hidden() {\n    alpha.lock();\n}\n\
+             fn shipped() {\n    beta.lock();\n}\n",
+        );
+        assert!(!masked.contains("fn hidden"), "{masked}");
+        assert!(masked.contains("fn shipped"), "{masked}");
+        let kept = lock_graph_code("#[cfg(test)] #[inline]\nfn shown() {\n    alpha.lock();\n}\n");
+        assert!(kept.contains("fn shown"), "{kept}");
+    }
+
+    #[test]
+    fn unsafe_and_default_impls_open_impl_spans() {
+        let spans: Vec<(usize, usize)> = impl_spans(
+            "unsafe impl Send for Spill {}\n    default impl<T> Fill for Wrap<T> {\n        \
+             fn f(&self) {}\n    }\n// impl Gone {\nimplied();\n",
+        )
+        .iter()
+        .map(|span| (span.start, span.end))
+        .collect();
+        assert_eq!(spans, [(1, 1), (2, 4)]);
+    }
+
+    #[test]
+    fn line_helpers_cut_comments_join_continuations_and_split_ascii_words() {
+        assert_eq!(before_double_slash("a / b // c // d"), "a / b ");
+        assert_eq!(before_double_slash("x/y/"), "x/y/");
+        assert_eq!(before_double_slash("//"), "");
+        let body: Vec<String> = ["    let g = alpha", "        .lock()", "", "    drop(g);"]
+            .map(String::from)
+            .to_vec();
+        let lines: Vec<(String, usize)> = logical_lines(&body, 7)
+            .into_iter()
+            .map(|line| (line.text, line.lineno))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("let g = alpha.lock()".to_string(), 7),
+                ("drop(g);".to_string(), 10)
+            ]
+        );
+        assert_eq!(
+            ascii_words("std2::é9x _").collect::<Vec<_>>(),
+            ["std2", "9x", "_"]
+        );
+        let src = include_str!("lock_order.rs");
+        let split: Vec<&str> = src
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| !word.is_empty())
+            .collect();
+        assert!(
+            ascii_words(src).eq(split),
+            "ascii_words differs from a split"
+        );
+    }
+
+    #[test]
+    fn a_raw_identifier_spelling_a_root_never_proves_it_external() {
+        let raw = "fn f() { r#std::thread::yield_now(); }";
+        let facts = ShadowFacts::of(raw);
+        assert!(facts.root_may_be_shadowed(raw, "std"));
+        assert!(facts.module_root_shadowed(raw, "std"));
+        let plain = "fn f() { std::thread::yield_now(); }";
+        let facts = ShadowFacts::of(plain);
+        assert!(!facts.root_may_be_shadowed(plain, "std"));
+        assert!(!facts.module_root_shadowed(plain, "std"));
     }
 
     #[test]

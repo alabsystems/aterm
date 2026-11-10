@@ -5,10 +5,10 @@
 //! the stats deck in motion costs the main thread, from aterm-gui's `deck_frame_cost` bench (the
 //! layout and patch of one needle, grid and new-reading frame, Folded and Full at 2238 device px,
 //! the owner's busy scene), as frames per second of that work (BIGGER-IS-BETTER), plus one
-//! headless `idle` take of `aterm-lab deck-motion` on a release dev-seams build, which is
+//! headless `idle` take of `aterm-lab deck-motion` on an attested debug build, which is
 //! reported and not judged: a shared desk's scheduler moves it before aterm does.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use aterm_json::Value;
 
@@ -35,7 +35,7 @@ pub(crate) const DECK_LANE: FloorLane = FloorLane {
               2238 device px at 2x): for the Folded and Full forms, a needle frame, a grid frame \
               and a new reading's whole card, each as 10^6 / its p50 in us of layout plus patch \
               (frames per second of main-thread work). BIGGER-IS-BETTER. The lane's headless idle \
-              take (aterm-lab deck-motion idle, release dev-seams) is reported, not judged. \
+              take (aterm-lab deck-motion idle, debug lab instance) is reported, not judged. \
               Re-record with targo --unverified verify perf --record deck.",
     cli: "deck",
 };
@@ -182,21 +182,51 @@ fn bench(dir: &Path) -> Result<String, super::floors::MeasureError> {
     })
 }
 
-/// Build aterm release with its dev seams, then take `deck-motion idle` of it; its summary.
+/// Build an attested debug app and lab, then take `deck-motion idle`; its diagnostic summary.
 fn idle_take(dir: &Path) -> Result<String, String> {
+    use super::bench_build::{self, Targo};
+
     let driver = super::driver::cargo_driver()?;
-    let build = ["--release", "-q", "-p", "aterm", "--features", "dev-seams"];
-    eprintln!("  $ {}", driver.display_workspace("build", &build));
-    let built = driver
-        .workspace_command("build")
-        .args(build)
-        .current_dir(workspace_root())
-        .status()
-        .map_err(|e| format!("could not spawn the build: {e}"))?;
-    if !built.success() {
-        return Err(format!("the release build exited {:?}", built.code()));
+    let targo = Targo::new(driver);
+    let build = [
+        "-q",
+        "--profile",
+        "test",
+        "-p",
+        "aterm",
+        "--bin",
+        "aterm",
+        "-p",
+        "aterm-lab",
+        "--bin",
+        "aterm-lab",
+        "--message-format=json-render-diagnostics",
+    ];
+    let flags = bench_build::config_rustflags(&targo)
+        .map_err(|why| format!("debug deck configuration: {why:?}"))?;
+    if let Some(why) = bench_build::flags::refusal(&flags) {
+        return Err(why);
     }
-    let aterm: PathBuf = super::driver::target_dir()?.join("release/aterm");
+    let plan = bench_build::audit(&targo, "build", &build)
+        .map_err(|why| format!("debug deck plan: {why:?}"))?;
+    let promise = bench_build::units::Promise::of(bench_build::bench_profile::Profile::Dev);
+    if let Some(why) = plan.refusal(promise) {
+        return Err(why);
+    }
+    eprintln!("  debug deck fixture plan: {}", plan.summary());
+    eprintln!("  $ {}", targo.display("build", &build));
+    let built = targo
+        .command("build")
+        .args(build)
+        .stderr(aterm_uds::spawnfd::Stdio::inherit())
+        .output()
+        .map_err(|e| format!("could not spawn the build: {e}"))?;
+    if !built.status.success() {
+        return Err(format!("the debug fixture build exited {}", built.status));
+    }
+    let messages = String::from_utf8_lossy(&built.stdout);
+    let aterm = bench_build::built_debug_app(&messages, "aterm")?;
+    let lab = bench_build::built_debug_app(&messages, "aterm-lab")?;
     let out = dir.join("takes");
     let json = dir.join("deck.json");
     let (aterm_s, out_s, json_s) = (
@@ -204,11 +234,7 @@ fn idle_take(dir: &Path) -> Result<String, String> {
         out.to_string_lossy().into_owned(),
         json.to_string_lossy().into_owned(),
     );
-    let lab = [
-        "-q",
-        "-p",
-        "aterm-lab",
-        "--",
+    let args = [
         "deck-motion",
         "--aterm",
         aterm_s.as_str(),
@@ -217,10 +243,13 @@ fn idle_take(dir: &Path) -> Result<String, String> {
         out_s.as_str(),
         "idle",
     ];
-    eprintln!("  $ {}", driver.display_workspace("run", &lab));
-    let took = driver
-        .workspace_command("run")
-        .args(lab)
+    eprintln!(
+        "  debug deck idle diagnostic: {} {}",
+        lab.display(),
+        args.join(" ")
+    );
+    let took = crate::exec::check_command(&lab)
+        .args(args)
         .current_dir(workspace_root())
         .output()
         .map_err(|e| format!("could not spawn aterm-lab: {e}"))?;

@@ -193,7 +193,7 @@ fn leading_version(text: &str) -> Vec<u32> {
 enum Planned {
     /// Not installed: install, then select if nothing is selected.
     Install,
-    /// Installed but no developer directory selected: select.
+    /// Installed but no usable developer directory selected: select.
     Select,
 }
 
@@ -307,7 +307,31 @@ fn selected(sys: &dyn System) -> Result<Option<String>, String> {
         .map_err(|e| format!("{}: {e}", cmd.display()))?;
     if ran.success() {
         let dir = ran.out().trim().to_owned();
-        return Ok((!dir.is_empty()).then_some(dir));
+        if dir.is_empty() {
+            return Ok(None);
+        }
+        for bin in ["usr/bin", aterm_types::clt_shim::DEFAULT_TOOLCHAIN_BIN] {
+            let candidate = Path::new(&dir).join(bin).join("clang");
+            let inspected = sys.canonicalize(&candidate).and_then(|path| {
+                if path.starts_with("/usr/bin") {
+                    return Ok(false);
+                }
+                sys.stat(&path).map(|stat| {
+                    !stat.dir && !stat.symlink && stat.mode & 0o111 != 0 && stat.len > 0
+                })
+            });
+            match inspected {
+                Ok(true) => return Ok(Some(dir)),
+                Ok(false) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(e) => return Err(format!("{}: {e}", candidate.display())),
+            }
+        }
+        return Ok(None);
     }
     if ran.status == Some(2)
         && ran
@@ -776,7 +800,7 @@ impl CommandLineTools {
         Probe::Change {
             from: match planned {
                 Planned::Install => "not installed".to_owned(),
-                Planned::Select => "installed; no developer directory selected".to_owned(),
+                Planned::Select => "installed; no usable developer directory selected".to_owned(),
             },
             to: format!(
                 "installed; selected {}",
@@ -2225,41 +2249,68 @@ Software Update found the following new or updated software:\n\
     }
 
     #[test]
-    fn installed_tools_with_nothing_selected_are_only_selected() {
-        let sys = Fake::root();
-        sys.stat_of(CLT_GIT, git())
-            .stat_of(CLT_CLANG, git())
-            .on("/usr/bin/xcode-select -p", none_selected())
-            .on("/usr/bin/xcode-select -p", none_selected())
-            .on(
-                "/usr/bin/xcode-select -p",
-                Ran::ok("/Library/Developer/CommandLineTools\n"),
+    fn installed_tools_repair_missing_or_unusable_selection_without_downloading() {
+        for stale in [
+            None,
+            Some("/Applications/Removed Xcode.app/Contents/Developer"),
+        ] {
+            let sys = Fake::root();
+            let selection = || stale.map_or_else(none_selected, |dir| Ran::ok(&format!("{dir}\n")));
+            sys.stat_of(CLT_GIT, git())
+                .stat_of(CLT_CLANG, git())
+                .on("/usr/bin/xcode-select -p", selection())
+                .on("/usr/bin/xcode-select -p", selection())
+                .on(
+                    "/usr/bin/xcode-select -p",
+                    Ran::ok("/Library/Developer/CommandLineTools\n"),
+                )
+                .on(
+                    "/usr/bin/xcode-select --switch /Library/Developer/CommandLineTools",
+                    Ran::ok(""),
+                );
+            let items = expand(
+                &Table {
+                    command_line_tools: Some(true),
+                    debugger: None,
+                    ..Table::default()
+                },
+                &ctx(),
             )
-            .on(
-                "/usr/bin/xcode-select --switch /Library/Developer/CommandLineTools",
-                Ran::ok(""),
+            .unwrap();
+            let rows = engine::run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
+            assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:#?}");
+            assert_eq!(
+                rows[0].revert.as_deref(),
+                Some("/usr/bin/xcode-select --reset")
             );
-        let items = expand(
-            &Table {
-                command_line_tools: Some(true),
-                debugger: None,
-                ..Table::default()
-            },
-            &ctx(),
-        )
-        .unwrap();
-        let rows = engine::run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:#?}");
-        assert_eq!(
-            rows[0].revert.as_deref(),
-            Some("/usr/bin/xcode-select --reset")
-        );
-        assert!(sys.calls().iter().all(|c| !c.contains("softwareupdate")));
+            assert!(sys.calls().iter().all(|c| !c.contains("softwareupdate")));
+        }
+    }
+
+    #[test]
+    fn selected_compiler_aliases_are_checked_and_unread_paths_stay_unknown() {
+        let dir = "/Applications/Xcode.app/Contents/Developer";
+        let compiler = format!("{dir}/usr/bin/clang");
+        let sys = Fake::root();
+        sys.on("/usr/bin/xcode-select -p", Ran::ok(dir))
+            .link(&compiler, "/private/compiler")
+            .stat_of("/private/compiler", git());
+        assert_eq!(selected(&sys).unwrap().as_deref(), Some(dir));
+
+        sys.link(&compiler, "/usr/bin/clang")
+            .stat_of("/usr/bin/clang", git());
+        assert_eq!(selected(&sys).unwrap(), None);
+
+        sys.link(&compiler, "/private/compiler")
+            .stat_fails("/private/compiler", std::io::ErrorKind::PermissionDenied);
+        assert!(selected(&sys).is_err());
+        assert!(sys.calls().iter().all(|c| !c.contains("--switch")));
     }
 
     #[test]
     fn a_selected_xcode_is_left_selected_when_the_tools_are_added() {
         let sys = Fake::root();
+        sys.stat_of("/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang", git());
         sys.running(&[]);
         sys.on(
             "/usr/bin/xcode-select -p",

@@ -1382,9 +1382,9 @@ fn native_reads_preserve_exact_raw_objects_and_all_source_state() {
     );
     assert!(remote.blob(&oid, Path::new("../line.toml")).is_err());
     assert!(remote.blob(&oid, Path::new("absent")).is_err());
-    assert_eq!(
-        git(&target, &["for-each-ref", "--format=%(refname)"]),
-        format!("refs/agh/aterm-release/object/{oid}")
+    assert!(
+        git(&target, &["for-each-ref", "--format=%(refname)"]).is_empty(),
+        "a release object read must not publish caller cache refs"
     );
     assert!(!gitdir.join("index").exists());
     assert_eq!(

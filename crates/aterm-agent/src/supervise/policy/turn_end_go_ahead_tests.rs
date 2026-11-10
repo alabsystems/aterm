@@ -3462,3 +3462,69 @@ fn the_act_its_line_left_unsent_sends_answers_the_lines_its_decision_read() {
         }
     }
 }
+
+/// WHAT A PERSON MUST GIVE GETS NO GO-AHEAD BESIDE THE AGENT'S OWN WORK (2026-11-09 audit): a
+/// hostile review wrote replies whose waiting clause follows the agent's own reversible work
+/// while what it waits on is a person's (an outward or paid act, someone else's work or review, a
+/// decline, a condition on others, a credential, a hold named a sentence earlier). Each, with its
+/// work joined by `;` or by `,`, got the go-ahead on 4b6f319047; none may, and each gets the
+/// harness's ordinary turn-end act instead. CONTROL:
+/// `own_work_beside_tools_code_and_offers_still_parks` in `go_ahead_tests.rs`.
+#[test]
+fn a_persons_part_beside_own_work_gets_no_go_ahead() {
+    for reply in [
+        "This checkout is the public mirror. Ready to commit and push; waiting on your sign-off.",
+        "This change touches prod billing. Ready to commit and push; waiting on your sign-off.",
+        "Ready to commit and push, then submit the build to the App Store; waiting for your go-ahead.",
+        "Ready to commit and push, then mail the changelog to everyone on the list; waiting on your sign-off.",
+        "Ready to land this and run the schema change against the live database; waiting on your sign-off.",
+        "Ready to commit and push, then message Alice about the outage; waiting on your go-ahead.",
+        "Ready to commit and push, then flip the feature flag on for all users; waiting on your sign-off.",
+        "Ready to commit and push, then refund the three duplicate orders; waiting on your sign-off.",
+        "The branch is ready to merge into main once the reviewer is happy with it; waiting on their approval.",
+        "Priya's fix is ready to merge into main; waiting on your go-ahead.",
+        "The fix from Priya is ready to merge into main; waiting on your go-ahead.",
+        "My teammate will rebase it onto main; waiting on your go-ahead.",
+        "I won't merge this into main, because I think the approach is wrong; waiting on your go-ahead.",
+        "I'd rather not push this to main until Sam has finished reviewing it; waiting on your go-ahead.",
+        "If the API change is acceptable to the other teams, I can push to main; waiting on your go-ahead.",
+        "You'll need to merge the branch into main yourself; waiting on your go-ahead.",
+        "Dana's review is still pending, though the tests pass; waiting on your go-ahead.",
+        "The new plan limits change what every customer is charged next month, and their invoices go out on the 1st. I'll commit the config and push it to main; waiting on your go-ahead on the pricing.",
+        "The GitHub token on the CI runner expired overnight, so the checks there are red. I can rerun them and push once it's replaced; waiting on your go-ahead.",
+        "You said not to touch the payments module until Thursday. I've got the fix ready to commit and push to main; waiting on your go-ahead.",
+        "My fix rewrites every row of the shared staging database in place, and there is no snapshot to go back to. I can commit it and run it as soon as it's pushed; waiting on your go-ahead.",
+        "I'm ready to commit and push; waiting for your go-ahead once you've unlocked 1Password.",
+        "I can rerun the full benchmark matrix on the rented GPU boxes; waiting on your go-ahead, since each run bills about forty dollars an hour.",
+        "Marcus still has to approve the design; waiting on your go-ahead to commit and push to main.",
+        "The client hasn't approved the mockups yet; waiting on your go-ahead to commit and push to main.",
+        "Ready to commit and push, but you need to pick the default theme; waiting on your go-ahead.",
+        "I've decided not to push this to main, since the approach is unsound; waiting on your go-ahead.",
+        "I don't think we should push this to main, since the approach is unsound; waiting on your go-ahead.",
+        "The vendor has to confirm the API first; waiting on your go-ahead to merge into main.",
+        "Ready to merge into main, pending a review from the platform team; waiting on your go-ahead.",
+        "The commit is ready to push to main, though Ana has not reviewed it yet; waiting on your go-ahead.",
+        "Ready to commit and push, after the client approves the copy; waiting on your go-ahead.",
+        "Ready to commit and push, then file the bug on Apple's Feedback Assistant; waiting on your go-ahead.",
+        "Ready to commit and push, but your manager needs to approve the time off; waiting on your go-ahead.",
+        "This needs your signature on the CLA. I'm ready to commit and push; waiting on your go-ahead.",
+        "Ready to merge into main once the security team gives the green light; waiting on your go-ahead.",
+        "Ready to merge into main once Priya OKs it; waiting on your go-ahead.",
+        "Ready to merge into main once Priya has had a look; waiting on your go-ahead.",
+        "Ready to merge into main, but Lena asked to review it first; waiting on your go-ahead.",
+        "Ready to merge into main once the team lead approves; waiting on your go-ahead.",
+        "I am not going to push this to main because it breaks the build; waiting on your go-ahead.",
+        "Ready to commit and push, then respond to the reviewer on GitHub; waiting on your go-ahead.",
+        "Ready to commit and push, then invite Bob to the repo; waiting on your go-ahead.",
+        "Ready to commit and push, then transfer ownership of the repo to the org; waiting on your go-ahead.",
+    ] {
+        for said in [
+            reply.to_owned(),
+            reply.replacen("; waiting", ", waiting", 1),
+        ] {
+            let mut st = TurnEndState::default();
+            let a = act(&mut st, &idle(&said, Some(3 * MIN)), t0());
+            assert!(!is_go_ahead(&a), "a go-ahead for: {said}");
+        }
+    }
+}

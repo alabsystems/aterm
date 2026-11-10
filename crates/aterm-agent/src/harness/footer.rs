@@ -107,8 +107,15 @@ pub struct FooterFacts {
     pub effort_for: Option<String>,
     /// Whose facts these are, when the registry named a session.
     pub owner: Option<FactsOwner>,
-    /// The roster's label for the login this process runs under.
+    /// The roster's label for the login this process runs under: the row its login file names
+    /// (`super::accounts::footer_account`), never a row its environment alone suggests.
     pub account: Option<String>,
+    /// The login email this process's login file names, where one was read: an account no
+    /// roster row lists is named by it.
+    pub account_email: Option<String>,
+    /// Where the observation and the belief disagree, the account title's clause that says so:
+    /// `believed m22 (…), observed … from ~/.claude.json, read 12 s ago`.
+    pub account_detail: Option<String>,
     /// How this process authenticates, once its exec environment and settings are read
     /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.10: a survey row's `auth=` and
     /// `token=`, a status line's `auth=`): `None` before a read.
@@ -1786,9 +1793,9 @@ impl Said {
 /// What the end of a transcript says about the model and effort.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TailFacts {
-    /// The model: the newest of an answer's `message.model` and a model result's name (`Opus 5.5`), as the footer shows it.
+    /// The model: the newest of an answer's `message.model`, a main-thread request's `params.model` and a model result's name (`Opus 5.5`), as the footer shows it.
     pub model: Said,
-    /// The effort: the newest of a main-thread row's `effort`, an `/effort` result and a model result's `with … effort`.
+    /// The effort: the newest of a main-thread row's `effort`, a main-thread request's `params.output_config.effort`, an `/effort` result and a model result's `with … effort`.
     pub effort: Said,
     /// A model switch that named no effort while the effort was open, and the
     /// model switched to.
@@ -1862,6 +1869,12 @@ const MODEL_COMMAND: &str = "<command-name>/model</command-name>";
 const EFFORT_COMMAND: &str = "<command-name>/effort</command-name>";
 
 const COMMAND_NAME: &str = "<command-name>";
+
+/// The `type` of the row Claude Code writes as it sends a request (2.1.321).
+const API_REQUEST: &str = "\"type\":\"api-request\"";
+
+/// The `querySource` of a request on the conversation's own thread (2.1.321).
+const MAIN_THREAD_QUERY: &str = "repl_main_thread";
 
 const COMMAND_STDOUT: &str = "<local-command-stdout>";
 
@@ -2106,7 +2119,8 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
         }
         let command = line.contains(COMMAND_STDOUT) || line.contains(COMMAND_NAME);
         let model_open = !facts.model.decided() || facts.effort_for.is_some();
-        let wants_model = model_open && (command || line.contains("\"assistant\""));
+        let request = line.contains(API_REQUEST);
+        let wants_model = model_open && (command || request || line.contains("\"assistant\""));
         let wants_effort = !facts.effort.decided() && (command || line.contains("\"effort\""));
         if !wants_model && !wants_effort {
             continue;
@@ -2165,6 +2179,33 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
                 continue;
             }
         }
+        // A main-thread request names the model and effort Claude Code sent it with, the moment
+        // it is sent: a switch no command row records (the top-effort key, an effort changed
+        // mid-turn) reads here, not only once the reply's first row lands minutes later. A side
+        // query (a title, a compaction) may run on another model, so only the main thread counts.
+        if kind == Some("api-request") {
+            if obj.get("querySource").and_then(Value::as_str) != Some(MAIN_THREAD_QUERY) {
+                continue;
+            }
+            let params = obj.get("params");
+            if let Some(model) = params
+                .and_then(|p| p.get("model"))
+                .and_then(Value::as_str)
+                .filter(|m| is_word(m))
+            {
+                facts.meet_model(Said::Is(model_display(model)));
+            }
+            if !facts.effort.decided()
+                && let Some(effort) = params
+                    .and_then(|p| p.get("output_config"))
+                    .and_then(|c| c.get("effort"))
+                    .and_then(Value::as_str)
+                    .filter(|e| is_word(e))
+            {
+                facts.decide_effort(Said::Is(effort_level(effort).unwrap_or(effort).to_owned()));
+            }
+            continue;
+        }
         if kind == Some("assistant")
             && let Some(model) = obj
                 .get("message")
@@ -2218,6 +2259,39 @@ pub fn model_display(id: &str) -> String {
         name.push_str(&version.join("."));
     }
     name
+}
+
+/// The model id `/model` takes for a footer's display name, [`model_display`] read backward:
+/// `Opus 5.5` is `claude-opus-5-5`, an id passes as itself. `None` for a name no Claude alias
+/// spells (`gpt-5-codex`'s display is its id, which is no Claude id). The alias names no date
+/// and no `[1m]`, which the display name has already dropped.
+#[must_use]
+pub fn model_id_of_display(display: &str) -> Option<String> {
+    let name = display.trim();
+    if name.starts_with("claude-") && is_word(name) {
+        return Some(name.to_owned());
+    }
+    let (family, version) = name.split_once(' ').unwrap_or((name, ""));
+    if family.is_empty() || !family.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let parts: Vec<&str> = if version.is_empty() {
+        Vec::new()
+    } else {
+        version.split('.').collect()
+    };
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || p.len() >= 8 || !p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let mut id = format!("claude-{}", family.to_ascii_lowercase());
+    for part in parts {
+        id.push('-');
+        id.push_str(part);
+    }
+    (model_display(&id) == name).then_some(id)
 }
 
 /// The branch `cwd` is in, read from `.git` without running `git`.
@@ -2504,6 +2578,8 @@ fn facts_for_entry_from(
             session_id: entry.session_id.clone(),
         }),
         account: None,
+        account_email: None,
+        account_detail: None,
         route: None,
         account_progress: None,
         account_progress_busy: false,
@@ -3754,23 +3830,20 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
         })
     };
     let plain = |mark: char, text: Option<String>| text.map(|text| Segment::plain(mark, text));
-    // The wall leads: the account is out now, and until when, its words in the warn ink and bold
-    // behind `⧗` (§4.1, §4.3), the one fact here a person can act on. The unit follows it, where
-    // line E is not the glass's quota row (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
-    // §1.2); the plan is not on the rule (the hover title and the Accounts card say it).
-    let mut out: Vec<Segment> = usage
-        .and_then(|u| u.wall.as_ref())
-        .map(|wall| Segment {
-            tone: Tone::Warn,
-            bold: true,
-            ..Segment::plain(WALL_MARK, super::session_usage::wall_text(wall))
-        })
-        .into_iter()
-        .collect();
+    // Model and effort lead, the fact a person reads first and the last to give way; the wall
+    // follows: the account is out now, and until when, its words in the warn ink and bold behind
+    // `⧗` (§4.1, §4.3), the one fact here a person can act on. The unit follows it, where line E
+    // is not the glass's quota row (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2); the
+    // plan is not on the rule (the hover title and the Accounts card say it).
+    let mut out: Vec<Segment> = model_effort_segment(facts, stubs).into_iter().collect();
+    out.extend(usage.and_then(|u| u.wall.as_ref()).map(|wall| Segment {
+        tone: Tone::Warn,
+        bold: true,
+        ..Segment::plain(WALL_MARK, super::session_usage::wall_text(wall))
+    }));
     out.extend(account_unit(facts).into_iter().next().unwrap_or_default());
     out.extend(
         [
-            model_effort_segment(facts, stubs),
             hidable(FactKind::Path, &facts.path),
             hidable(FactKind::Branch, &facts.branch),
             hidable(FactKind::Context, &facts.context),
@@ -3798,19 +3871,23 @@ fn unit_figure(facts: &FooterFacts) -> Option<&str> {
 }
 
 /// The name a pane with no quota view gives its account on the glass, in line D's unit
-/// ([`account_unit`]) and at the head of the account's title: its roster label, else
-/// [`super::quota_view::THIS_LOGIN`] for a login the roster cannot name (one with a figure, or
-/// one its profile names by email); `None` with neither. Never the email or its local part
-/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.5): those are the Accounts card's.
+/// ([`account_unit`]) and at the head of the account's title: the email its profile names, else
+/// the one its login file names (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.5, owner
+/// ruling 2026-11-09: an account is named by its email, whether or not a roster lists it), else
+/// its roster label; [`super::quota_view::THIS_LOGIN`] only for a login with a figure that
+/// neither an address nor a row names; `None` with none of these.
 #[must_use]
 pub fn unit_name(facts: &FooterFacts) -> Option<&str> {
-    let signed_in = facts
+    let email = facts
         .subscription
         .as_ref()
-        .is_some_and(|s| s.email.is_some());
-    facts.account.as_deref().or_else(|| {
-        (unit_figure(facts).is_some() || signed_in).then_some(super::quota_view::THIS_LOGIN)
-    })
+        .and_then(|s| s.email.as_deref())
+        .filter(|e| !e.is_empty());
+    let observed = facts.account_email.as_deref().filter(|e| !e.is_empty());
+    email
+        .or(observed)
+        .or(facts.account.as_deref())
+        .or_else(|| unit_figure(facts).map(|_| super::quota_view::THIS_LOGIN))
 }
 
 /// Line D's account unit (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2, §5.2): its
@@ -3819,12 +3896,13 @@ pub fn unit_name(facts: &FooterFacts) -> Option<&str> {
 /// row ([`FooterFacts::line_e`]), which names the account itself.
 ///
 /// The forms are the pane's quota view's ([`super::quota_view::QuotaView::fallback`]: name,
-/// figure, `↺`, verdict; name, figure, verdict; name and figure; name). A pane with no view (agy
+/// figure, `↺`, verdict; name, figure, verdict; name and figure; the name's local part and
+/// figure; the local part). A pane with no view (agy
 /// and Muse Code, whose weeks no outlook replays, or a pane whose roster is not read) names its
-/// roster label, or [`super::quota_view::THIS_LOGIN`] for a login the roster cannot name (one
-/// with a figure, or one its profile names by email) ([`unit_name`]), then its profile's own
-/// figure where it has one ([`super::profile::weekly_figure_words`]). The email leaves the
-/// glass, the account's hover title included: it is the Accounts card's.
+/// profile's email where the roster names its login, else its roster label, else
+/// [`super::quota_view::THIS_LOGIN`] for a login the roster cannot name ([`unit_name`]), then
+/// its profile's own figure where it has one ([`super::profile::weekly_figure_words`]); its
+/// narrowest forms name the email's local part.
 #[must_use]
 pub fn account_unit(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     use super::quota_view::{Piece, Role};
@@ -3842,12 +3920,23 @@ pub fn account_unit(facts: &FooterFacts) -> Vec<Vec<Segment>> {
                 bold: role == Role::Warn,
             };
             name.map(|name| {
+                let local = piece(super::quota_view::short(name), Role::Lit);
                 let name = piece(super::quota_view::cut(name), Role::Lit);
-                let mut forms = Vec::new();
-                if let Some(figure) = figure {
-                    forms.push(vec![name.clone(), piece(figure.to_owned(), Role::Value)]);
+                // Widest first: the email with its figure, its local part with it, then the
+                // name alone, the local part last (§2.5).
+                let mut forms: Vec<Vec<Piece>> = Vec::new();
+                for who in [&name, &local] {
+                    let form = match figure {
+                        Some(figure) => vec![who.clone(), piece(figure.to_owned(), Role::Value)],
+                        None => vec![who.clone()],
+                    };
+                    if forms.last() != Some(&form) {
+                        forms.push(form);
+                    }
                 }
-                forms.push(vec![name]);
+                if figure.is_some() {
+                    forms.push(vec![local]);
+                }
                 forms
             })
             .unwrap_or_default()
@@ -4245,7 +4334,7 @@ fn rule_width(
 fn top_of(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
     let unit = rung.iter().any(|s| s.mark == ACCOUNT_MARK);
     rung.iter().filter(move |s| {
-        s.mark == WALL_MARK || (!unit && s.mark == MODEL_MARK) || (unit && s.mark == ACCOUNT_MARK)
+        s.mark == MODEL_MARK || s.mark == WALL_MARK || (unit && s.mark == ACCOUNT_MARK)
     })
 }
 
@@ -4313,72 +4402,99 @@ fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     if let Some(rung) = runtime {
         push(rung);
     }
-    for wall in [wall.as_ref(), None] {
-        let rung = |model: Option<&Segment>, path: Option<&Segment>, branch: Option<&Segment>| {
-            [wall, model, path, branch]
-                .into_iter()
-                .flatten()
-                .cloned()
-                .collect::<Vec<Segment>>()
-        };
-        let model_effort = model_effort.as_ref();
-        let steps = [
-            Some((model_effort, path.as_ref(), branch.as_ref())),
-            short
-                .as_ref()
-                .map(|s| (model_effort, Some(s), branch.as_ref())),
-            Some((model_effort, path.as_ref(), None)),
-            short.as_ref().map(|s| (model_effort, Some(s), None)),
-            Some((model_effort, None, None)),
-            Some((model.as_ref(), None, None)),
-        ];
-        for (model, path, branch) in steps.into_iter().flatten() {
-            push(rung(model, path, branch));
-        }
-        if let Some(wall) = wall {
-            push(vec![wall.clone()]);
-        }
+    let rung = |model: Option<&Segment>, path: Option<&Segment>, branch: Option<&Segment>| {
+        [model, wall.as_ref(), path, branch]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<Segment>>()
+    };
+    let model_effort = model_effort.as_ref();
+    let steps = [
+        Some((model_effort, path.as_ref(), branch.as_ref())),
+        short
+            .as_ref()
+            .map(|s| (model_effort, Some(s), branch.as_ref())),
+        Some((model_effort, path.as_ref(), None)),
+        short.as_ref().map(|s| (model_effort, Some(s), None)),
+        Some((model_effort, None, None)),
+    ];
+    for (model, path, branch) in steps.into_iter().flatten() {
+        push(rung(model, path, branch));
     }
+    floor(model_effort, model.as_ref())
+        .into_iter()
+        .for_each(push);
     out
+}
+
+/// The last rungs of a rule, once every other fact and the wall have given way: the model with
+/// its effort, then the model alone (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2: the
+/// wall goes before the effort, and the model outlasts every other fact).
+fn floor(model_effort: Option<&Segment>, model: Option<&Segment>) -> Vec<Vec<Segment>> {
+    [model_effort, model]
+        .into_iter()
+        .flatten()
+        .map(|segment| vec![segment.clone()])
+        .collect()
 }
 
 /// The rungs of a rule with the account unit ([`account_unit`]'s `forms`), widest first
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2): the other facts give way first, then
-/// the unit narrows by its own forms, never shown in part. A wall stands beside the unit to the
-/// unit's narrowest form, then alone, then the unit's ladder without it.
+/// the unit narrows by its own forms, never shown in part, then goes; then the wall, and the
+/// model, at the far left, last of all.
 fn unit_ladder(facts: &FooterFacts, forms: &[Vec<Segment>]) -> Vec<Vec<Segment>> {
     let mut rung = fact_segments(facts, false);
     let mut out = vec![rung.clone()];
     let push = |out: &mut Vec<Vec<Segment>>, rung: &[Segment]| {
-        if out.last().map(Vec::as_slice) != Some(rung) {
+        if !out.iter().any(|seen| seen.as_slice() == rung) {
             out.push(rung.to_vec());
         }
     };
-    for mark in [CONTEXT_MARK, USAGE_MARK, BRANCH_MARK, PATH_MARK, MODEL_MARK] {
+    for mark in [CONTEXT_MARK, USAGE_MARK, BRANCH_MARK, PATH_MARK] {
         rung.retain(|segment| segment.mark != mark);
         push(&mut out, &rung);
     }
     for form in forms.iter().skip(1) {
-        rung.retain(|segment| segment.mark == WALL_MARK);
+        rung.retain(|segment| segment.mark != ACCOUNT_MARK);
         rung.extend(form.iter().cloned());
         push(&mut out, &rung);
     }
-    if let Some(wall) = rung.iter().find(|s| s.mark == WALL_MARK).cloned() {
-        out.push(vec![wall]);
-        let mut without_wall = facts.clone();
-        if let Some(usage) = &mut without_wall.usage {
-            usage.wall = None;
-        }
-        out.extend(unit_ladder(&without_wall, forms));
+    rung.retain(|segment| segment.mark != ACCOUNT_MARK);
+    if !rung.is_empty() {
+        push(&mut out, &rung);
+    }
+    let model_effort = rung.iter().find(|s| s.mark == MODEL_MARK).cloned();
+    let model = model_alone(facts);
+    let walled = walled_floor(facts);
+    if !walled.is_empty() {
+        push(&mut out, &walled);
+    }
+    for last in floor(model_effort.as_ref(), model.as_ref()) {
+        push(&mut out, &last);
     }
     out
 }
 
-/// The cells the account unit's essentials take beside the controls: its narrowest form that
-/// still says a figure (else its name alone), behind the wall where one stands, where that
-/// leaves the controls a few cells in a rule of `room` cells. Else the wall alone, which
-/// outranks the unit (as in [`unit_ladder`]) and is reserved as it is with no unit
-/// ([`chips_room`]); else none.
+/// The narrowest rung that keeps the wall: the model with its effort behind it, at the far left
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2: the wall goes before the effort);
+/// none without a wall.
+fn walled_floor(facts: &FooterFacts) -> Vec<Segment> {
+    let segments = fact_segments(facts, false);
+    if !segments.iter().any(|s| s.mark == WALL_MARK) {
+        return Vec::new();
+    }
+    segments
+        .into_iter()
+        .filter(|s| s.mark == MODEL_MARK || s.mark == WALL_MARK)
+        .collect()
+}
+
+/// The cells the account unit's essentials take beside the controls: the model and the wall that
+/// lead it, then its narrowest form that still says a figure (else its name alone), where that
+/// leaves the controls a few cells in a rule of `room` cells. Else the wall's floor
+/// ([`walled_floor`]), which outranks the controls as it does with no unit ([`chips_room`]);
+/// else none: beside the unit the controls outlast the model.
 fn unit_reservation(facts: &FooterFacts, forms: &[Vec<Segment>], room: usize) -> usize {
     let essentials = forms
         .iter()
@@ -4386,17 +4502,15 @@ fn unit_reservation(facts: &FooterFacts, forms: &[Vec<Segment>], room: usize) ->
         .find(|form| form.iter().skip(1).any(|s| s.tone != Tone::Quiet))
         .or_else(|| forms.last())
         .map_or(&[][..], Vec::as_slice);
-    let wall: Vec<Segment> = fact_segments(facts, false)
+    let lead: Vec<Segment> = fact_segments(facts, false)
         .into_iter()
-        .filter(|s| s.mark == WALL_MARK)
+        .filter(|s| s.mark == MODEL_MARK || s.mark == WALL_MARK)
+        .chain(essentials.iter().cloned())
         .collect();
-    let with_wall: Vec<Segment> = wall.iter().chain(essentials).cloned().collect();
     let width = |segments: &[Segment]| rule_width(segments, TitleFit::None, false, None);
-    let fits = |width: usize| width + RULE_SEP + 3 <= room;
-    match (width(&with_wall), wall.is_empty()) {
-        (both, _) if both > 0 && fits(both) => both,
-        (_, true) => 0,
-        (_, false) => width(&wall),
+    match width(&lead) {
+        both if both > 0 && both + RULE_SEP + 3 <= room => both,
+        _ => width(&walled_floor(facts)),
     }
 }
 
@@ -4409,8 +4523,16 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
     let chips = lights.is_some();
     let reason = lights.is_some_and(|l| l.reason);
     let whole = ladder[0].as_slice();
+    // A wall without the controls comes before the controls, alone or beside the model: the
+    // person at the tab can act on a wall (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+    // §5.1). So while a wall stands the controls first take only rungs that keep it; every such
+    // rung holds the model and its effort, and once none fits, with or without the controls,
+    // the rungs past the wall's floor and the last rungs below decide, as with no wall.
+    let has_wall = whole.iter().any(|s| s.mark == WALL_MARK);
+    let walls = |rung: &Vec<Segment>| rung.iter().any(|s| s.mark == WALL_MARK);
     let alone = ladder
         .iter()
+        .filter(|rung| !has_wall || walls(rung))
         .map(Vec::as_slice)
         .find(|rung| rule_width(rung, TitleFit::None, chips, lights) <= room);
     let has = |title: TitleFit| match (title, lights) {
@@ -4436,18 +4558,18 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
         .map(|rung| (rung.as_slice(), TitleFit::Short, chips));
     let bare = ladder
         .iter()
+        .filter(|rung| !has_wall || walls(rung))
         .map(|rung| (rung.as_slice(), TitleFit::None, chips));
-    // A wall without the controls comes before the controls alone: the person at the tab can
-    // act on a wall (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1). Only after no
-    // rung with the wall fits may the controls alone take its room.
-    let has_wall = whole.iter().any(|s| s.mark == WALL_MARK);
     let walled = ladder
         .iter()
-        .filter(|rung| has_wall && rung.iter().any(|s| s.mark == WALL_MARK))
+        .filter(|rung| walls(rung))
         .map(|rung| (rung.as_slice(), TitleFit::None, false));
-    let controls = std::iter::once((&[][..], TitleFit::None, true)).filter(|_| has_wall && chips);
+    let unwalled = ladder
+        .iter()
+        .filter(|rung| has_wall && !walls(rung))
+        .map(|rung| (rung.as_slice(), TitleFit::None, chips));
     // Under a subscription or beside the account unit the controls outlast the model; else the
-    // model the controls.
+    // model the controls, wall or none.
     let last = if unit || facts.subscription.is_some() {
         [(&[][..], true), (model.as_slice(), false)]
     } else {
@@ -4460,7 +4582,7 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
         .chain(reasons)
         .chain(bare)
         .chain(walled)
-        .chain(controls)
+        .chain(unwalled)
         .chain(last)
         .find(|&(segments, title, chips)| rule_width(segments, title, chips, lights) <= room)
         .unwrap_or((&[], TitleFit::None, false));
@@ -4475,20 +4597,22 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
 #[must_use]
 pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
     let unit = account_unit(facts);
-    let wall: Vec<Segment> = fact_segments(facts, false)
-        .into_iter()
-        .filter(|s| s.mark == WALL_MARK)
-        .collect();
-    // As in `fit_rule`'s last rungs: under a subscription or beside the unit the controls
-    // outlast the model, so only the model's own rule reserves it.
-    let reserved = if !unit.is_empty() {
-        unit_reservation(facts, &unit, room)
-    } else if !wall.is_empty() {
-        rule_width(&wall, TitleFit::None, false, None)
-    } else if facts.subscription.is_some() {
-        0
+    let width = |segments: &[Segment]| rule_width(segments, TitleFit::None, false, None);
+    // As in `fit_rule`'s last rungs: a wall's rungs outrank the controls, and every one of them
+    // holds the model; past the wall's floor, and with no wall, under a subscription or beside
+    // the unit the controls outlast the model, so only the model's own rule reserves it.
+    let reserved = if unit.is_empty() {
+        let model = if facts.subscription.is_some() {
+            0
+        } else {
+            width(model_alone(facts).as_slice())
+        };
+        [width(&walled_floor(facts)), model]
+            .into_iter()
+            .find(|&w| w > 0 && w <= room)
+            .unwrap_or(0)
     } else {
-        rule_width(model_alone(facts).as_slice(), TitleFit::None, false, None)
+        unit_reservation(facts, &unit, room)
     };
     let beside = if reserved > 0 && reserved <= room {
         reserved + RULE_SEP

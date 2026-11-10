@@ -36,6 +36,9 @@ aterm-hash = { workspace = true }
 # every compile-time read: one list, the one release_env and `ship dev-app` set them from. No
 # dependencies of its own.
 aterm-stamp = { workspace = true }
+# SHA-256, which keys the census memo (the code that judges, each file a unit read, and the
+# record's seal, `memo`) and fingerprints a reader's captured inputs (`inputs`).
+aterm-digest = { workspace = true }
 
 [dev-dependencies]
 # The checkout the tests read, named when they run (`manifest_dir`); std-only too.

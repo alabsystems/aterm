@@ -19,7 +19,7 @@ pub(super) const INSTALLER_NETWORK: Rule = Rule {
 const INSTALLER: &str = "tools/install.sh";
 
 fn installer_network(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    match tree.corpus.scripts.iter().find(|s| s.rel == INSTALLER) {
+    match tree.corpus.scripts().iter().find(|s| s.rel == INSTALLER) {
         Some(script) => out.extend(fences(script)),
         None => out.push(Finding {
             rule: INSTALLER_NETWORK.id,

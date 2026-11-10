@@ -771,7 +771,7 @@ fn strip_targets(export: &Path) -> Result<Vec<(String, String, String)>, String>
     Ok(dropped)
 }
 
-/// [`rewrite`] over every text file of the tree (a file holding a NUL is binary and
+/// [`rewrite_cow`] over every text file of the tree (a file holding a NUL is binary and
 /// left alone; symlinks are not followed).
 fn rewrite_tree(dir: &Path) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;

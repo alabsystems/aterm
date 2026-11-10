@@ -182,7 +182,7 @@ pub(crate) fn usage_source_transition(
                 &[],
                 NOW,
                 &captured,
-                &who,
+                (&who, &crate::harness::observe::Observation::Unread),
                 |state| {
                     written = true;
                     Ok(note_wall(
@@ -275,7 +275,7 @@ fn missing_roster_receipts_recover_only_while_the_source_stays_missing() {
                     &[],
                     NOW,
                     &captured,
-                    &who,
+                    (&who, &crate::harness::observe::Observation::Unread),
                     |state| {
                         Ok(note_wall(
                             state,
@@ -358,7 +358,7 @@ fn usage_recovers_legacy_receipts_through_the_original_parent_alias() {
             &[],
             NOW,
             &captured,
-            &who,
+            (&who, &crate::harness::observe::Observation::Unread),
             |state| {
                 Ok(note_wall(
                     state,
@@ -406,7 +406,7 @@ fn an_absent_roster_cannot_alias_an_uncreated_state_file_through_a_parent_link()
                 &[],
                 NOW,
                 &captured,
-                &who,
+                (&who, &crate::harness::observe::Observation::Unread),
                 |state| {
                     Ok(note_wall(
                         state,

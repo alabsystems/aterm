@@ -71,7 +71,7 @@ const MESSAGE_USAGE: Shape = Shape::Object(&[
     ),
 ]);
 
-const METADATA_FIELDS: [Field; 7] = [
+const METADATA_FIELDS: [Field; 9] = [
     ("type", Shape::Scalar),
     ("isSidechain", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -79,9 +79,18 @@ const METADATA_FIELDS: [Field; 7] = [
     ("cwd", Shape::Scalar),
     ("effort", Shape::Scalar),
     ("message", Shape::Object(&[("model", Shape::Scalar)])),
+    // An `api-request` row: the model and effort a request was sent with, and whose it was.
+    ("querySource", Shape::Scalar),
+    (
+        "params",
+        Shape::Object(&[
+            ("model", Shape::Scalar),
+            ("output_config", Shape::Object(&[("effort", Shape::Scalar)])),
+        ]),
+    ),
 ];
 const METADATA: Shape = Shape::Object(&METADATA_FIELDS);
-const COMMAND_FIELDS: [Field; 7] = {
+const COMMAND_FIELDS: [Field; 9] = {
     let mut fields = METADATA_FIELDS;
     fields[6] = (
         "message",

@@ -9,6 +9,7 @@ use crate::harness::headless_oauth::{
 };
 use aterm_secrets::age::Identity;
 use aterm_secrets::swarm_roster::{SwarmMember, SwarmRoster};
+use aterm_uds::stop::Stop;
 use std::time::Duration;
 
 fn deterministic_identity(seed: u8) -> Identity {
@@ -385,9 +386,8 @@ mod unix_relay_tests {
     };
     use aterm_secrets::swarm_roster::ROSTER_ENTRY;
     use aterm_secrets::text::Audience;
-    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     const HANG: Duration = Duration::from_secs(60);
     const OPS: &[FleetOp] = &[FleetOp::Survey, FleetOp::MailCode];
@@ -532,7 +532,7 @@ warm = ["m1"]
         let secret = FleetSecret::new(&secret_bytes).unwrap();
         let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = tcp_listener.local_addr().unwrap();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let listening = Listening {
             secret: secret.clone(),
             scope: FleetScope::Facts,
@@ -542,14 +542,14 @@ warm = ["m1"]
             per_source: 16,
             lifetime: HANG,
         };
-        let run_flag = Arc::clone(&running);
+        let serve_stop = Arc::clone(&stop);
         let st_dir = steward_state.clone();
         let st_home = steward_home.clone();
         let server_thread = std::thread::spawn(move || {
             aterm_net::fleet::serve_with_handshake(
                 &tcp_listener,
                 &listening,
-                &run_flag,
+                &serve_stop,
                 HANG,
                 move |served, op| {
                     assert_eq!(op, FleetOp::MailCode);
@@ -688,8 +688,7 @@ warm = ["m1"]
             Err(MailCodeRefusal::NotSteward)
         );
 
-        running.store(false, Ordering::Release);
-        let _ = TcpStream::connect(addr);
+        stop.set();
         let _ = server_thread.join();
     }
 

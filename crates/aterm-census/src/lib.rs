@@ -3,17 +3,21 @@
 // Author: Andrew Yates
 
 //! Lexical source censuses and guards over an aterm checkout.
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub mod export;
 pub mod export_scan;
 mod guards;
 mod held_guard;
+pub mod inputs;
 pub mod items;
 mod lazy_init;
 mod lex;
 mod lock_order;
+mod memo;
 pub mod mirror;
 pub mod scan_set;
 mod scope_census;
@@ -24,6 +28,7 @@ mod wasm_cfg;
 pub use guards::{Finding, GUARDS, GuardReport, Rule, run_guards};
 pub use lazy_init::{LAZY_INIT_PRECISION_NOTE, run_lazy_init_census};
 pub use lock_order::run_lock_order_census;
+pub use memo::{Memo, MemoReport, Rejudged, pin_code};
 pub use scope_census::{SCOPE_PRECISION_NOTE, run_scope_census};
 /// Browser `cdylib` root crates re-exported for `aterm-forge`'s `[OB-17]` check.
 pub use wasm_census::WASM_ROOT_CRATES;
@@ -39,7 +44,7 @@ pub struct CensusOutcome {
     pub log: String,
     /// Floor ranges checked on a clean walk.
     pub floors: Vec<Floor>,
-    title: &'static str,
+    title: Cow<'static, str>,
 }
 
 impl CensusOutcome {
@@ -61,7 +66,50 @@ impl CensusOutcome {
             verdict,
             log,
             floors: Vec::new(),
-            title,
+            title: Cow::Borrowed(title),
+        }
+    }
+
+    /// The outcome as a memo record keeps it.
+    fn kept(&self) -> memo::KeptOutcome {
+        memo::KeptOutcome {
+            ok: self.ok,
+            verdict: self.verdict.clone(),
+            log: self.log.clone(),
+            title: self.title.to_string(),
+            floors: self
+                .floors
+                .iter()
+                .map(|f| {
+                    (
+                        f.what.to_string(),
+                        f.seen,
+                        *f.range.start(),
+                        *f.range.end(),
+                        f.missed.to_string(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The outcome a memo record kept ([`Self::kept`]).
+    fn from_kept(kept: &memo::KeptOutcome) -> Self {
+        Self {
+            ok: kept.ok,
+            verdict: kept.verdict.clone(),
+            log: kept.log.clone(),
+            floors: kept
+                .floors
+                .iter()
+                .map(|(what, seen, min, max, missed)| Floor {
+                    what: Cow::Owned(what.clone()),
+                    seen: *seen,
+                    range: *min..=*max,
+                    missed: Cow::Owned(missed.clone()),
+                })
+                .collect(),
+            title: Cow::Owned(kept.title.clone()),
         }
     }
 
@@ -99,13 +147,13 @@ impl CensusOutcome {
 #[derive(Debug, Clone)]
 pub struct Floor {
     /// Description of the counted item.
-    pub what: &'static str,
+    pub what: Cow<'static, str>,
     /// Observed count.
     pub seen: usize,
     /// Required inclusive range.
     pub range: std::ops::RangeInclusive<usize>,
     /// Explanation and repair when `seen` falls outside `range`.
-    pub missed: &'static str,
+    pub missed: Cow<'static, str>,
 }
 
 impl Floor {
@@ -117,20 +165,20 @@ impl Floor {
         missed: &'static str,
     ) -> Self {
         Self {
-            what,
+            what: Cow::Borrowed(what),
             seen,
             range: min..=usize::MAX,
-            missed,
+            missed: Cow::Borrowed(missed),
         }
     }
 
     /// Requires `seen` to be zero.
     pub(crate) const fn none(what: &'static str, seen: usize, missed: &'static str) -> Self {
         Self {
-            what,
+            what: Cow::Borrowed(what),
             seen,
             range: 0..=0,
-            missed,
+            missed: Cow::Borrowed(missed),
         }
     }
 
@@ -169,8 +217,65 @@ pub struct Census {
     pub name: &'static str,
     /// Short description for `--help`.
     pub about: &'static str,
-    /// Runner over a checkout root, with the engine's baseline its caller read.
-    pub run: fn(&Path, &EngineBaseline) -> CensusOutcome,
+    /// Runner over one walk of a checkout.
+    run: fn(&Walk<'_>) -> CensusOutcome,
+}
+
+/// What one census run reads: the checkout root, the engine's baseline its caller read, the
+/// run's snapshot of the checkout's source ([`Walk::snapshot`]), and the memo run that keeps a
+/// record of it, when one does.
+pub(crate) struct Walk<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) engine: &'a EngineBaseline,
+    pub(crate) source: &'a OnceLock<std::sync::Arc<memo::Snapshot>>,
+    pub(crate) run: Option<&'a memo::Run>,
+}
+
+impl<'a> Walk<'a> {
+    /// The run's snapshot of the checkout's source: a memo run's, read at its start, else read
+    /// when a census first asks for it, so a census that reads none (all but the guards) reads
+    /// only what it walks.
+    pub(crate) fn snapshot(&self) -> &'a memo::Snapshot {
+        self.source
+            .get_or_init(|| std::sync::Arc::new(memo::Snapshot::read(self.root)))
+    }
+
+    /// `judge`'s outcome as one memo unit, `id`: the outcome the memo run kept for it while
+    /// every question it asked keeps its answer, else judged now and kept. A census that panics
+    /// keeps nothing.
+    fn whole(&self, id: &str, judge: impl FnOnce() -> CensusOutcome) -> CensusOutcome {
+        let Some(run) = self.run else {
+            return judge();
+        };
+        let why = match run.reusable(id, self.snapshot()) {
+            Ok(record) => match &record.result {
+                memo::Verdict::Outcome(kept) => {
+                    let outcome = CensusOutcome::from_kept(kept);
+                    run.keep_reused(record);
+                    return outcome;
+                }
+                memo::Verdict::Findings(_) => Rejudged::Changed("its record is a guard's".into()),
+            },
+            Err(why) => why,
+        };
+        let (judged, trace) = memo::unit(&run.shared, || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(judge))
+        });
+        match judged {
+            Ok(outcome) => {
+                run.keep_judged(
+                    id,
+                    why,
+                    Some((trace, memo::Verdict::Outcome(outcome.kept()))),
+                );
+                outcome
+            }
+            Err(panic) => {
+                run.keep_judged(id, why, None);
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
 }
 
 /// Every census, in the order a run prints them (they run in parallel).
@@ -179,27 +284,27 @@ pub const CENSUSES: &[Census] = &[
         name: "mainloop",
         about: "main-thread reach to unbounded work or a frame wait; unbounded work under a held \
                 `term` guard (OB-1..OB-6, OB-22, OB-23)",
-        run: |root, _| run_mainloop_census(root),
+        run: |walk| walk.whole("census:mainloop", || run_mainloop_census(walk.root)),
     },
     Census {
         name: "locks",
         about: "lock-order cycles across the GUI process (OB-7)",
-        run: |root, _| run_lock_order_census(root),
+        run: |walk| walk.whole("census:locks", || run_lock_order_census(walk.root)),
     },
     Census {
         name: "wasm",
         about: "wasm reach to unbounded work; no threads (OB-8..OB-10, OB-12)",
-        run: |root, _| run_wasm_census(root),
+        run: |walk| walk.whole("census:wasm", || run_wasm_census(walk.root)),
     },
     Census {
         name: "scope",
         about: "window-scoped enforcers that multiply (OB-13..OB-16)",
-        run: |root, _| run_scope_census(root),
+        run: |walk| walk.whole("census:scope", || run_scope_census(walk.root)),
     },
     Census {
         name: "lazy-init",
         about: "lazy cells re-entered by their own initializer (OB-19..OB-21)",
-        run: |root, _| run_lazy_init_census(root),
+        run: |walk| walk.whole("census:lazy-init", || run_lazy_init_census(walk.root)),
     },
     Census {
         name: "guards",
@@ -209,21 +314,47 @@ pub const CENSUSES: &[Census] = &[
 ];
 
 /// Runs `selected` censuses in parallel over `root`, with the engine's baseline `engine`, and
-/// enforces their floors.
+/// enforces their floors. With `memo`, each guard rule and each other census reuses the result
+/// the memo kept for it while every question it asked of the checkout keeps its answer, and the
+/// run keeps its own record there ([`Memo`]); the report says what was reused.
 #[must_use]
 pub fn run_censuses(
     root: &Path,
     selected: &[&Census],
     engine: &EngineBaseline,
-) -> Vec<CensusOutcome> {
-    std::thread::scope(|scope| {
+    memo: Option<&Memo>,
+) -> (Vec<CensusOutcome>, Option<MemoReport>) {
+    let Some(memo) = memo else {
+        let walk = Walk {
+            root,
+            engine,
+            source: &OnceLock::new(),
+            run: None,
+        };
+        return (walk_censuses(&walk, selected), None);
+    };
+    let (run, snapshot) = memo::Run::start(root, Some(memo), engine);
+    let source = OnceLock::from(std::sync::Arc::clone(&snapshot));
+    let walk = Walk {
+        root,
+        engine,
+        source: &source,
+        run: run.keeps().then_some(&run),
+    };
+    let outcomes = memo::loader(&run.shared, || walk_censuses(&walk, selected));
+    let report = run.finish(&snapshot);
+    (outcomes, Some(report))
+}
+
+/// `selected` over `walk`, each on its own thread, floors enforced.
+fn walk_censuses(walk: &Walk<'_>, selected: &[&Census]) -> Vec<CensusOutcome> {
+    memo::threads(|scope| {
         let running: Vec<_> = selected
             .iter()
             .map(|&census| {
-                std::thread::Builder::new()
-                    .name(format!("census-{}", census.name))
-                    .stack_size(8 << 20)
-                    .spawn_scoped(scope, move || (census.run)(root, engine))
+                scope.spawn_named(format!("census-{}", census.name), 8 << 20, move || {
+                    (census.run)(walk)
+                })
             })
             .collect();
         running
@@ -248,6 +379,25 @@ pub fn run_censuses(
     })
 }
 
+/// Run one census on the calling thread, with no memo, enforcing the same floor and panic policy
+/// as the parallel runner. Its reads stay on this thread and the threads it starts through
+/// [`memo::threads`], so an input capture around the call ([`inputs::capture`]) holds every one.
+pub fn run_census(root: &Path, census: &Census, engine: &EngineBaseline) -> CensusOutcome {
+    let walk = Walk {
+        root,
+        engine,
+        source: &OnceLock::new(),
+        run: None,
+    };
+    let mut outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (census.run)(&walk)))
+            .unwrap_or_else(|_| {
+                CensusOutcome::red(census.name, String::new(), "it panicked (message above)")
+            });
+    outcome.hold_floors();
+    outcome
+}
+
 /// Runs every census over `root` in parallel and returns each outcome under its
 /// name, in [`CENSUSES`] order.
 #[must_use]
@@ -256,7 +406,7 @@ pub fn run_all(root: &Path, engine: &EngineBaseline) -> Vec<(&'static str, Censu
     CENSUSES
         .iter()
         .map(|c| c.name)
-        .zip(run_censuses(root, &every, engine))
+        .zip(run_censuses(root, &every, engine, None).0)
         .collect()
 }
 
@@ -431,6 +581,33 @@ const OFF_LOOP_ENTRIES: &[WholeFrameGate] = &[
     },
 ];
 
+/// Whether `fits` holds at the start of one of `needle`'s non-overlapping matches in `hay`,
+/// tried left to right: the starts `hay.match_indices(needle)` yields. A `memchr` scan for
+/// `needle`'s first char finds them, where `match_indices` builds a two-way searcher per call
+/// whose setup outweighs the scan of one short line.
+fn any_match(hay: &str, needle: &str, mut fits: impl FnMut(usize) -> bool) -> bool {
+    let Some(first) = needle.chars().next() else {
+        return hay.match_indices(needle).any(|(at, _)| fits(at));
+    };
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(first) {
+        let at = from + rel;
+        if !hay[at..].starts_with(needle) {
+            from = at + first.len_utf8();
+        } else if fits(at) {
+            return true;
+        } else {
+            from = at + needle.len();
+        }
+    }
+    false
+}
+
+/// Whether `needle` occurs in `hay`: [`str::contains`] by [`any_match`]'s scan.
+fn mentions(hay: &str, needle: &str) -> bool {
+    any_match(hay, needle, |_| true)
+}
+
 fn first_naming<'a>(
     body: &'a [String],
     names: &[&str],
@@ -440,7 +617,7 @@ fn first_naming<'a>(
     body.iter()
         .find(|line| {
             names.iter().any(|name| {
-                line.match_indices(name).any(|(at, _)| {
+                any_match(line, name, |at| {
                     line[..at].chars().next_back().is_none_or(|c| !ident(c))
                         && fits(&line[..at], &line[at + name.len()..])
                 })
@@ -934,6 +1111,11 @@ struct TermHopHazard {
 }
 
 fn term_hop_calls(body: &[String]) -> (Vec<TermHopHazard>, usize) {
+    // Every acquire `guard_vars` binds and every chain read below names `term_lock`: a body
+    // that never does holds no guard and chains on none.
+    if !body.iter().any(|line| mentions(line, "term_lock")) {
+        return (Vec::new(), 0);
+    }
     let guards = guard_vars(body);
     let mut hazards = Vec::new();
     let mut offloads = 0usize;
@@ -1125,8 +1307,91 @@ fn append_why_and_repair(log: &mut String) {
 
 const MAINLOOP: &str = "main-loop census";
 
+/// A breadth-first walk over fns by index: the fn each reached fn was first reached from (`None`
+/// for a root).
+struct Reach {
+    from: Vec<Option<Option<usize>>>,
+    reached: usize,
+}
+
+impl Reach {
+    fn new(fns: usize) -> Self {
+        Self {
+            from: vec![None; fns],
+            reached: 0,
+        }
+    }
+
+    /// Records `idx` as reached from `from`; `false` when it already was.
+    fn reach(&mut self, idx: usize, from: Option<usize>) -> bool {
+        if self.from[idx].is_some() {
+            return false;
+        }
+        self.from[idx] = Some(from);
+        self.reached += 1;
+        true
+    }
+
+    fn contains(&self, idx: usize) -> bool {
+        self.from[idx].is_some()
+    }
+
+    /// The names along the walk from its root to `idx`, joined by ` -> `.
+    fn path(&self, fns: &[GuiFn], mut idx: usize) -> String {
+        let mut path = vec![fns[idx].name.clone()];
+        while let Some(Some(p)) = self.from[idx] {
+            path.push(fns[p].name.clone());
+            idx = p;
+        }
+        path.reverse();
+        path.join(" -> ")
+    }
+}
+
+/// OB-22's held-guard walk ([`held_guard::scan_tree`]) on a thread of its own, beside the
+/// call-graph checks, which share none of its work. The thread carries the census's memo scope
+/// ([`memo::threads`]), so what the walk reads is the census unit's question.
+struct HeldGuardWalk<'scope>(
+    Option<std::thread::ScopedJoinHandle<'scope, Result<held_guard::HeldGuardScan, String>>>,
+);
+
+impl<'scope> HeldGuardWalk<'scope> {
+    fn start(scope: memo::Threads<'scope, '_>, root: &'scope Path) -> Self {
+        let walk = scope.spawn_named(
+            "census-mainloop-held-guard".to_string(),
+            8 << 20,
+            move || held_guard::scan_tree(root),
+        );
+        Self(walk.ok())
+    }
+
+    /// The walk's result, run here when its thread could not start; its panic resumes here.
+    fn result(mut self, root: &Path) -> Result<held_guard::HeldGuardScan, String> {
+        match self.0.take() {
+            Some(walk) => walk
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            None => held_guard::scan_tree(root),
+        }
+    }
+}
+
+impl Drop for HeldGuardWalk<'_> {
+    /// The census gives its verdict without the walk when no main-thread root resolves: the
+    /// walk's outcome, a panic included, is then dropped and cannot change that verdict.
+    fn drop(&mut self) {
+        if let Some(walk) = self.0.take() {
+            let _ = walk.join();
+        }
+    }
+}
+
 /// Runs the main-loop census (`OB-1`..`OB-6`, `OB-22`, `OB-23`) over `root`.
 pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
+    memo::threads(|scope| mainloop_census(scope, root))
+}
+
+fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path) -> CensusOutcome {
     let mut log = String::new();
     let mut failures = 0usize;
     let _ = writeln!(
@@ -1149,6 +1414,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             return CensusOutcome::red(MAINLOOP, log, "1 obligation violation(s).");
         }
     };
+    let held_walk = HeldGuardWalk::start(scope, root);
     let _ = writeln!(
         log,
         "    marker sweep: the DERIVED GUI-process closure ({} workspace crates, src/ \
@@ -1235,14 +1501,14 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     let offload_sites: usize = hop.iter().map(|(_, n)| *n).sum();
     let hazards: Vec<&Vec<TermHopHazard>> = hop.iter().map(|(h, _)| h).collect();
 
-    let mut parent: std::collections::BTreeMap<usize, Option<usize>> = Default::default();
+    let mut parent = Reach::new(fns.len());
     let mut queue: std::collections::VecDeque<usize> = Default::default();
     let mut roots_found = 0;
     for r in MAIN_THREAD_ROOTS {
         if let Some(indices) = by_name.get(*r) {
             roots_found += 1;
             for &idx in indices {
-                if parent.insert(idx, None).is_none() {
+                if parent.reach(idx, None) {
                     queue.push_back(idx);
                 }
             }
@@ -1268,30 +1534,31 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             format!("{} obligation violation(s).", failures + 1),
         );
     }
+    // Each fn's callees that name a GUI fn, in `edges` order, with the fns so named: both walks
+    // below follow these, so each name is looked up once.
+    let calls: Vec<Vec<(&str, &[usize])>> = edges
+        .iter()
+        .map(|callees| {
+            callees
+                .iter()
+                .filter_map(|c| by_name.get(c).map(|defs| (c.as_str(), defs.as_slice())))
+                .collect()
+        })
+        .collect();
     while let Some(cur) = queue.pop_front() {
-        for callee in &edges[cur] {
-            for &cidx in by_name.get(callee).map(Vec::as_slice).unwrap_or(&[]) {
-                if let std::collections::btree_map::Entry::Vacant(slot) = parent.entry(cidx) {
-                    slot.insert(Some(cur));
+        for &(_, defs) in &calls[cur] {
+            for &cidx in defs {
+                if parent.reach(cidx, Some(cur)) {
                     queue.push_back(cidx);
                 }
             }
         }
     }
-    let path_in = |parents: &std::collections::BTreeMap<usize, Option<usize>>, mut idx: usize| {
-        let mut path = vec![fns[idx].name.clone()];
-        while let Some(Some(p)) = parents.get(&idx) {
-            path.push(fns[*p].name.clone());
-            idx = *p;
-        }
-        path.reverse();
-        path.join(" -> ")
-    };
-    let reconstruct = |idx: usize| path_in(&parent, idx);
+    let reconstruct = |idx: usize| parent.path(&fns, idx);
 
     let mut hazard_hits = 0usize;
     for idx in 0..fns.len() {
-        if !parent.contains_key(&idx) || hazards[idx].is_empty() {
+        if !parent.contains(idx) || hazards[idx].is_empty() {
             continue;
         }
         for hz in hazards[idx] {
@@ -1327,7 +1594,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     }
 
     for idx in 0..fns.len() {
-        if !parent.contains_key(&idx) {
+        if !parent.contains(idx) {
             continue;
         }
         for sink in UNBOUNDED_REGISTRY {
@@ -1395,22 +1662,21 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             failures += 1;
         }
     }
-    let mut on_loop: std::collections::BTreeMap<usize, Option<usize>> = Default::default();
+    let mut on_loop = Reach::new(fns.len());
     let mut queue: std::collections::VecDeque<usize> = MAIN_THREAD_ROOTS
         .iter()
         .filter_map(|r| by_name.get(*r))
         .flatten()
         .copied()
-        .filter(|&idx| on_loop.insert(idx, None).is_none())
+        .filter(|&idx| on_loop.reach(idx, None))
         .collect();
     while let Some(cur) = queue.pop_front() {
-        for callee in &edges[cur] {
+        for &(callee, defs) in &calls[cur] {
             if OFF_LOOP_ENTRIES.iter().any(|e| e.symbol == callee) {
                 continue;
             }
-            for &cidx in by_name.get(callee).map(Vec::as_slice).unwrap_or(&[]) {
-                if let std::collections::btree_map::Entry::Vacant(slot) = on_loop.entry(cidx) {
-                    slot.insert(Some(cur));
+            for &cidx in defs {
+                if on_loop.reach(cidx, Some(cur)) {
                     queue.push_back(cidx);
                 }
             }
@@ -1419,7 +1685,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     let mut frame_waits = 0usize;
     for (idx, f) in fns.iter().enumerate() {
         let name = f.name.as_str();
-        if !on_loop.contains_key(&idx)
+        if !on_loop.contains(idx)
             || WHOLE_FRAME_WAITS.contains(&name)
             || WHOLE_FRAME_GATES.iter().any(|g| g.symbol == name)
         {
@@ -1439,7 +1705,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
              for the next poll on an unfinished frame), or pass a `ReadOn` whose event-loop arm \
              gives `term_lock_whole_when` a false `needs` and register the fn in \
              WHOLE_FRAME_GATES (crates/aterm-census/src/lib.rs) with its justification.",
-            path_in(&on_loop, idx),
+            on_loop.path(&fns, idx),
             f.span,
             f.name,
         );
@@ -1447,7 +1713,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         frame_waits += 1;
     }
 
-    let held = match held_guard::scan_tree(root) {
+    let held = match held_walk.result(root) {
         Ok(scan) => {
             if scan.acquires == 0 {
                 let _ = writeln!(
@@ -1532,7 +1798,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
          registered; {} boundaries defined and justified; {} out-of-closure marker(s) \
          reported; {held_acquires} `term` acquire(s), none holding unbounded work; no \
          whole-frame read reached but through {} gate(s) defined and justified.",
-        parent.len(),
+        parent.reached,
         UNBOUNDED_REGISTRY.len(),
         OFFLOAD_ALLOWLIST.len(),
         out_markers.len(),
@@ -1761,10 +2027,10 @@ include!("commented.rs");
 
     #[test]
     fn run_censuses_keeps_the_given_order_and_turns_a_panic_red() {
-        fn clean(_: &Path, _: &EngineBaseline) -> CensusOutcome {
+        fn clean(_: &Walk<'_>) -> CensusOutcome {
             CensusOutcome::green("a", String::new(), "clean")
         }
-        fn broken(_: &Path, _: &EngineBaseline) -> CensusOutcome {
+        fn broken(_: &Walk<'_>) -> CensusOutcome {
             panic!("a walker bug")
         }
         let a = Census {
@@ -1777,7 +2043,8 @@ include!("commented.rs");
             about: "",
             run: broken,
         };
-        let out = run_censuses(Path::new("."), &[&b, &a], &Err(String::new()));
+        let (out, report) = run_censuses(Path::new("."), &[&b, &a], &Err(String::new()), None);
+        assert!(report.is_none(), "no memo, no report");
         assert!(
             !out[0].ok && out[0].log.contains("b census"),
             "{}",
@@ -1788,13 +2055,13 @@ include!("commented.rs");
 
     #[test]
     fn run_censuses_turns_a_missed_floor_red() {
-        fn thin(_: &Path, _: &EngineBaseline) -> CensusOutcome {
+        fn thin(_: &Walk<'_>) -> CensusOutcome {
             CensusOutcome::green("thin", "=== thin ===\n".to_string(), "1 site").with_floors(vec![
                 Floor::at_least("sites read", 1, 100, "the walk went blind"),
                 Floor::at_least("files read", 3, 1, "no files"),
             ])
         }
-        fn red(_: &Path, _: &EngineBaseline) -> CensusOutcome {
+        fn red(_: &Walk<'_>) -> CensusOutcome {
             CensusOutcome::red("red", String::new(), "1 violation").with_floors(vec![
                 Floor::at_least("sites read", 0, 100, "the walk went blind"),
             ])
@@ -1811,11 +2078,14 @@ include!("commented.rs");
                 run: red,
             },
         );
-        assert!(
-            thin(Path::new("."), &Err(String::new())).ok,
-            "the bare walk holds no floors"
-        );
-        let out = run_censuses(Path::new("."), &[&a, &b], &Err(String::new()));
+        let walk = Walk {
+            root: Path::new("."),
+            engine: &Err(String::new()),
+            source: &OnceLock::from(std::sync::Arc::new(memo::Snapshot::empty())),
+            run: None,
+        };
+        assert!(thin(&walk).ok, "the bare walk holds no floors");
+        let (out, _) = run_censuses(Path::new("."), &[&a, &b], &Err(String::new()), None);
         assert!(!out[0].ok, "{}", out[0].log);
         assert!(
             out[0].log.contains("[floor] sites read") && !out[0].log.contains("files read"),
@@ -1974,6 +2244,37 @@ fn table() -> [f32; 256] {
             1,
             "chained term_lock_whole_when(..).resize( must flag"
         );
+    }
+
+    #[test]
+    fn any_match_tries_exactly_the_starts_match_indices_yields() {
+        for (hay, needle) in [
+            ("aaaa", "aa"),
+            ("tttterm term", "term"),
+            ("ééx é", "éx"),
+            ("ReadOn::Control, ReadOn::Committed)", "ReadOn::C"),
+            ("ab", ""),
+            ("", "x"),
+        ] {
+            let mut tried = Vec::new();
+            assert!(!any_match(hay, needle, |at| {
+                tried.push(at);
+                false
+            }));
+            let starts: Vec<usize> = hay.match_indices(needle).map(|(at, _)| at).collect();
+            assert_eq!(tried, starts, "{needle:?} in {hay:?}");
+            assert_eq!(
+                mentions(hay, needle),
+                hay.contains(needle),
+                "{needle:?} in {hay:?}"
+            );
+        }
+        let mut tried = Vec::new();
+        assert!(any_match("f(a(b(", "(", |at| {
+            tried.push(at);
+            at == 3
+        }));
+        assert_eq!(tried, [1, 3], "the scan stops at the first start that fits");
     }
 
     #[test]

@@ -1996,6 +1996,7 @@ impl App {
             self.boot_health_confirmation_dispatched = true;
             self.boot_health_confirmation_retry_at = None;
             self.boot_health_confirmation_backoff = crate::BOOT_HEALTH_RETRY_MIN;
+            self.try_pending_native_auto_apply(false);
         } else {
             self.boot_health_confirmation_dispatched = false;
             self.arm_boot_health_retry(now);
@@ -8453,6 +8454,11 @@ impl App {
         let Some(mut intent) = self.auto_apply_intent else {
             return;
         };
+        // An installed build must prove its own health before it can chain another update.
+        // Confirmation releases this intent through finish_native_boot_health_confirmation.
+        if !self.boot_health_confirmation_dispatched {
+            return;
+        }
         let now = std::time::Instant::now();
         let deadline_ready = now >= intent.retry_at;
         if deadline_ready {

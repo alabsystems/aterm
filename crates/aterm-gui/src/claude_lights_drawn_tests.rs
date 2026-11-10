@@ -446,7 +446,7 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
         lights.drawn_chip(3, 0, |row| Some(row) == covered)
     };
     let off = HarnessSwitch::Off(SwitchOff::Master);
-    for program in [Program::Agy] {
+    for program in [Program::Claude, Program::Agy, Program::Muse] {
         for face in [
             off,
             HarnessSwitch::Off(SwitchOff::Agent(program)),
@@ -455,7 +455,7 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
             assert_eq!(
                 read(&[switch(program, face, 3)], None),
                 Drawn::SwitchOnly,
-                "{program:?} {face:?}: agy's footer left bare, codex-alab's chip stood down"
+                "{program:?} {face:?}: every agent's footer is left bare under its off switch"
             );
         }
     }
@@ -465,7 +465,7 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
         Drawn::NoRule,
         "no switch drawn: a tab behind"
     );
-    for program in [Program::Agy] {
+    for program in [Program::Claude, Program::Agy, Program::Muse] {
         for face in [HarnessSwitch::On, HarnessSwitch::TurningOff] {
             assert_eq!(
                 read(&[switch(program, face, 3)], None),
@@ -473,13 +473,6 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
                 "{program:?} {face:?}: a switch the harness is on under leaves no line bare"
             );
         }
-    }
-    for program in [Program::Claude, Program::Muse] {
-        assert_eq!(
-            read(&[switch(program, off, 3)], None),
-            Drawn::NoRule,
-            "{program:?} keeps its footer and its chip"
-        );
     }
     assert_eq!(
         read(&[switch(Program::Agy, off, 3)], Some(7)),

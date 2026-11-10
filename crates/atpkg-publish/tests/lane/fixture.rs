@@ -373,6 +373,7 @@ impl Fx {
             &slug,
             tag,
             FakeRelease {
+                published_at: None,
                 draft: false,
                 prerelease: how.prerelease,
                 assets,

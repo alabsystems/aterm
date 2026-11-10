@@ -4,21 +4,23 @@
 //! Network listener slot admission ([`Slots`], [`pick_displaced`]) and unauthenticated
 //! [`HandshakeWatchdog`] deadline for [`crate::fleet`].
 
-#[cfg(any(unix, windows))]
+#[cfg(any(windows, all(unix, any(test, debug_assertions))))]
 use aterm_uds::deadline::poll_timeout_ms;
 use std::io;
-use std::net::{IpAddr, Ipv6Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv6Addr, TcpStream};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-/// How often a listener's accept loop wakes to re-check its `running` flag.
-pub(crate) const ACCEPT_POLL: Duration = Duration::from_millis(200);
+/// How long [`Slots::make_room`] waits for the handshake it evicted to free its slot.
+const EVICTION_WAIT: Duration = Duration::from_millis(200);
 
-/// Wait until a non-blocking listener may accept, or until `timeout` expires.
-#[cfg(unix)]
+/// Wait until a non-blocking listener may accept, or until `timeout` expires. On unix only tests
+/// and [`crate::lan::Listener::pending_within`] wait on a listener alone: the accept loop polls its
+/// stop's bell beside it (`fleet::wait_for_a_connection`).
+#[cfg(all(unix, any(test, debug_assertions)))]
 pub(crate) fn wait_listener_readable(
-    listener: &TcpListener,
+    listener: &std::net::TcpListener,
     timeout: Duration,
 ) -> io::Result<bool> {
     use std::os::fd::AsRawFd as _;
@@ -56,7 +58,7 @@ pub(crate) fn wait_listener_readable(
 
 #[cfg(windows)]
 pub(crate) fn wait_listener_readable(
-    listener: &TcpListener,
+    listener: &std::net::TcpListener,
     timeout: Duration,
 ) -> io::Result<bool> {
     use aterm_win32::Win32::Networking::WinSock::{
@@ -98,7 +100,7 @@ pub(crate) fn wait_listener_readable(
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn wait_listener_readable(
-    _listener: &TcpListener,
+    _listener: &std::net::TcpListener,
     timeout: Duration,
 ) -> io::Result<bool> {
     std::thread::sleep(timeout);
@@ -221,7 +223,7 @@ impl Slots {
         }
         let (held, _) = self
             .freed
-            .wait_timeout_while(held, ACCEPT_POLL, |held| held.len() >= self.capacity)
+            .wait_timeout_while(held, EVICTION_WAIT, |held| held.len() >= self.capacity)
             .unwrap_or_else(PoisonError::into_inner);
         held.len() < self.capacity
     }
@@ -565,7 +567,7 @@ pub(crate) mod tests {
     use super::*;
     use aterm_spec::wait::MUST_HAPPEN;
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     const CAP: usize = crate::fleet::MAX_SLOTS;
@@ -612,13 +614,14 @@ pub(crate) mod tests {
 
     #[test]
     fn idle_listener_readiness_wait_is_bounded_without_spinning() {
+        const TIMEOUT: Duration = Duration::from_millis(200);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let started = Instant::now();
-        assert!(!wait_listener_readable(&listener, ACCEPT_POLL).unwrap());
+        assert!(!wait_listener_readable(&listener, TIMEOUT).unwrap());
         let elapsed = started.elapsed();
         assert!(
             elapsed < MUST_HAPPEN,
-            "the readiness timeout must retain the {ACCEPT_POLL:?} shutdown bound ({elapsed:?})"
+            "an idle readiness wait must end at its {TIMEOUT:?} timeout ({elapsed:?})"
         );
         assert_eq!(
             aterm_uds::accept(
@@ -914,7 +917,7 @@ pub(crate) mod tests {
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
                 while !done.load(Ordering::SeqCst) {
-                    if !wait_listener_readable(&listener, ACCEPT_POLL).unwrap() {
+                    if !wait_listener_readable(&listener, Duration::from_millis(200)).unwrap() {
                         continue;
                     }
                     while let Ok((tcp, _)) = aterm_uds::accept(

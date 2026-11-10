@@ -2281,6 +2281,34 @@ fn boot_health_failure_rearms_bounded_retry_then_success_closes_latch() {
 }
 
 #[test]
+fn automatic_apply_waits_for_boot_health_and_confirmation_releases_it_now() {
+    let mut app = App::headless_for_test();
+    app.native_updater_service =
+        crate::native_updater_service::NativeUpdaterService::new(12, "1.0.12", true);
+    app.boot_health_confirmation_dispatched = false;
+    let now = std::time::Instant::now();
+    app.auto_apply_intent = Some(crate::AutoApplyIntent {
+        build: 12,
+        dmg_sha256: [0xab; 32],
+        retry_at: now,
+        attempts: 0,
+        held: crate::native_update_lane_hold::NamedHold::default(),
+    });
+
+    app.try_pending_native_auto_apply(false);
+    assert!(
+        app.auto_apply_intent.is_some(),
+        "an unconfirmed build must not spend an automatic apply attempt"
+    );
+
+    app.finish_native_boot_health_confirmation(true, now);
+    assert!(
+        app.auto_apply_intent.is_none(),
+        "confirmation must release the retained intent immediately, not after a retry cooldown"
+    );
+}
+
+#[test]
 fn regional_damage_rejects_theme_or_font_paint_revision_changes() {
     let previous = NativeUiCompileStamp {
         instance: crate::tab_model::AppInstanceId::from_stored(1),

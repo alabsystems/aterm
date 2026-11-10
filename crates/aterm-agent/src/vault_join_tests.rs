@@ -367,7 +367,7 @@ type Seen = Arc<Mutex<Vec<(bool, [u8; 32])>>>;
 /// re-admission itself is `client::readmit`'s, tested there on real vault folders).
 struct Member {
     port: u16,
-    running: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<aterm_uds::stop::Stop>,
     serving: Option<std::thread::JoinHandle<()>>,
     seen: Seen,
 }
@@ -379,7 +379,7 @@ impl Member {
         let desk = Arc::new(Mutex::new(Desk::new(local(root, "m22"))));
         let paths = Paths::for_home(&root.join("m22"));
         let seen: Seen = Arc::default();
-        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stop = Arc::new(aterm_uds::stop::Stop::new());
         let config = aterm_net::fleet::Listening {
             secret: listening.clone(),
             scope: aterm_net::fleet::FleetScope::Facts,
@@ -428,12 +428,12 @@ impl Member {
             }
         };
         let serving = std::thread::spawn({
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             move || {
                 aterm_net::fleet::serve_with_handshake(
                     &listener,
                     &config,
-                    &running,
+                    &stop,
                     HANG,
                     hand_over,
                     |_| {},
@@ -442,7 +442,7 @@ impl Member {
         });
         Self {
             port,
-            running,
+            stop,
             serving: Some(serving),
             seen,
         }
@@ -455,12 +455,7 @@ impl Member {
 
 impl Drop for Member {
     fn drop(&mut self) {
-        self.running
-            .store(false, std::sync::atomic::Ordering::Release);
-        drop(std::net::TcpStream::connect((
-            std::net::Ipv4Addr::LOCALHOST,
-            self.port,
-        )));
+        self.stop.set();
         if let Some(serving) = self.serving.take() {
             drop(serving.join());
         }

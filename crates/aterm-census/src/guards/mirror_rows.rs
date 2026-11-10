@@ -68,7 +68,7 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     };
     let mut mentions: BTreeMap<String, Vec<Mention>> = BTreeMap::new();
     let mut specs_by_pkg: BTreeMap<String, String> = BTreeMap::new();
-    for (manifest, _) in &tree.corpus.manifests {
+    for (manifest, _) in tree.corpus.manifests() {
         let Some(package) = manifest.strip_suffix("/Cargo.toml") else {
             continue;
         };
@@ -127,7 +127,7 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
     let manifests = || {
         tree.corpus
-            .manifests
+            .manifests()
             .iter()
             .map(|(r, t)| (r.as_str(), t.as_str()))
     };

@@ -341,6 +341,31 @@ fn model_ids_read_as_the_vendor_spells_them() {
 }
 
 #[test]
+fn a_display_name_reads_back_to_the_id_model_takes() {
+    for id in [
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-fable-5-1",
+        "claude-sonnet-5",
+    ] {
+        assert_eq!(model_id_of_display(&model_display(id)).as_deref(), Some(id));
+    }
+    assert_eq!(
+        model_id_of_display("claude-haiku-4-5-20251001").as_deref(),
+        Some("claude-haiku-4-5-20251001"),
+        "an id passes as itself"
+    );
+    assert_eq!(model_id_of_display("gpt-5-codex"), None);
+    assert_eq!(model_id_of_display("Opus 5.x"), None);
+    assert_eq!(
+        model_id_of_display("opus 5.5"),
+        None,
+        "not a display spelling"
+    );
+    assert_eq!(model_id_of_display(""), None);
+}
+
+#[test]
 fn a_registry_entry_must_name_the_pid_it_is_filed_under() {
     let text =
         r#"{"pid":7214,"sessionId":"28b6a7bd-7021","cwd":"/Users//ana/aterm","status":"busy"}"#;
@@ -377,6 +402,51 @@ fn the_slug_matches_claude_codes_project_directories() {
         )),
         "-home-me-repo--claude-worktrees-kitty-motion-wave"
     );
+}
+
+/// 2.1.321's request row, in the shape it writes (trimmed of betas and context management).
+fn request(source: &str, model: &str, effort: &str) -> String {
+    format!(
+        r#"{{"type":"api-request","sessionId":"e1b4","timestamp":"2026-11-10T00:11:47.081Z","version":"2.1.321","querySource":"{source}","params":{{"model":"{model}","max_tokens":128000,"thinking":{{"type":"adaptive"}},"output_config":{{"effort":"{effort}"}}}}}}"#
+    )
+}
+
+#[test]
+fn a_main_thread_request_shows_a_switch_before_its_reply() {
+    // Measured 2026-11-09 on 2.1.321: the top-effort key turned on mid-turn wrote no command
+    // row, and the next request carried `xhigh` minutes before the reply's first row.
+    let answer = r#"{"type":"assistant","effort":"medium","message":{"model":"claude-fable-5-2"}}"#;
+    let sent = format!(
+        "{answer}\n{}\n",
+        request("repl_main_thread", "claude-fable-5-2", "xhigh")
+    );
+    let facts = tail_facts(sent.as_bytes(), None);
+    assert_eq!(facts.model.shown(), Some("Fable 5.2"));
+    assert_eq!(facts.effort.shown(), Some("xhigh"));
+
+    let switched = format!(
+        "{answer}\n{}\n",
+        request("repl_main_thread", "claude-opus-5-5", "high")
+    );
+    let facts = tail_facts(switched.as_bytes(), None);
+    assert_eq!(facts.model.shown(), Some("Opus 5.5"));
+    assert_eq!(facts.effort.shown(), Some("high"));
+
+    // A side query on another model and effort says nothing of the conversation's.
+    let side = format!(
+        "{answer}\n{}\n",
+        request("compact", "claude-haiku-4-5", "low")
+    );
+    let facts = tail_facts(side.as_bytes(), None);
+    assert_eq!(facts.model.shown(), Some("Fable 5.2"));
+    assert_eq!(facts.effort.shown(), Some("medium"));
+
+    // A newer `/effort` result outranks the request before it.
+    let set = format!(
+        "{sent}{}\n",
+        r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set effort level to low</local-command-stdout>"}}"#
+    );
+    assert_eq!(tail_facts(set.as_bytes(), None).effort.shown(), Some("low"));
 }
 
 #[test]
@@ -1921,8 +1991,10 @@ fn the_path_shows_home_as_a_tilde() {
     assert_eq!(path("/Users//ana/a\u{1b}[2J"), None);
 }
 
+/// LINE D LEADS WITH THE MODEL (owner, 2026-11-09; glass design §1.2): model and effort stand at
+/// the far left, then the wall, then the account unit, then the workspace facts.
 #[test]
-fn the_account_stands_after_the_wall_and_before_the_model() {
+fn the_model_leads_then_the_wall_then_the_account() {
     use crate::harness::session_usage::{ModelTokens, UsageFacts, Wall};
     let plain = FooterFacts {
         model: Some("Opus 5.5".into()),
@@ -1955,16 +2027,16 @@ fn the_account_stands_after_the_wall_and_before_the_model() {
     assert_eq!(
         marks(&facts),
         [
+            MODEL_MARK,
             WALL_MARK,
             ACCOUNT_MARK,
-            MODEL_MARK,
             PATH_MARK,
             BRANCH_MARK,
             USAGE_MARK
         ]
     );
     assert_eq!(
-        segments(&facts)[1],
+        segments(&facts)[2],
         Segment {
             tone: Tone::Lit,
             ..Segment::plain(ACCOUNT_MARK, "work-2")
@@ -1975,7 +2047,7 @@ fn the_account_stands_after_the_wall_and_before_the_model() {
     // not a value beside the path. NEGATIVE CONTROL (run once, restored): a plain wall segment
     // (`Segment::plain`, the value ink, regular) fails here.
     assert_eq!(
-        segments(&facts)[0],
+        segments(&facts)[1],
         Segment {
             tone: Tone::Warn,
             bold: true,
@@ -1988,10 +2060,10 @@ fn the_account_stands_after_the_wall_and_before_the_model() {
         account: Some("work-2".into()),
         ..FooterFacts::default()
     };
-    assert_eq!(marks(&bare), [ACCOUNT_MARK, MODEL_MARK]);
+    assert_eq!(marks(&bare), [MODEL_MARK, ACCOUNT_MARK]);
     assert_eq!(
         marks(&plain),
-        [WALL_MARK, MODEL_MARK, PATH_MARK, BRANCH_MARK, USAGE_MARK]
+        [MODEL_MARK, WALL_MARK, PATH_MARK, BRANCH_MARK, USAGE_MARK]
     );
 }
 /// End to end over a temp Claude directory: the fold reads the transcript
@@ -2889,8 +2961,8 @@ fn the_facts_are_set_as_a_line_of_type() {
     };
     check(
         &unit,
-        "\u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 04:00   \
-         \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main",
+        "\u{25C6} Opus 5.5 xhigh   \u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \
+         \u{2573} ~Thu 12 Nov 04:00   \u{2302} ~/aterm   \u{2387} main",
     );
     assert!(set_facts(&[]).glyphs.is_empty());
     assert_eq!(set_facts(&[]).cells, 0);
@@ -2925,6 +2997,7 @@ fn native_footer_text_preserves_combining_and_joined_graphemes_when_set_and_elid
     }
     // The unit's label is cut whole clusters at a time (negative control: a cut by chars splits
     // the accent from its letter and the emoji's joiner from its second half).
+    // The narrowest form's 12 cells (`quota_view::SHORT_CELLS`).
     for (label, expected, cells) in [
         ("1234567890e\u{0301}xyz", "1234567890e\u{0301}…", 12),
         ("123456789👩‍💻xyz", "123456789👩‍💻…", 12),
@@ -2936,6 +3009,7 @@ fn native_footer_text_preserves_combining_and_joined_graphemes_when_set_and_elid
             ..FooterFacts::default()
         };
         let unit = account_unit(&facts);
+        assert_eq!(unit[0][0].text, label, "{label:?}: the widest form whole");
         let name = &unit.last().expect("a unit")[0];
         assert_eq!(name.text, expected, "{label:?}");
         assert_eq!(text_width(&name.text), cells, "{label:?}");
@@ -3300,8 +3374,8 @@ fn unit_text(rung: &[Segment]) -> Option<String> {
 /// LINE D'S FALLBACK UNIT READS NAME, FIGURE, THEN ITS MILESTONES (glass design §1.2): where line
 /// E is not the glass's, one `⎆` leads the roster label, then the week's figure, `↺` and its
 /// reset, and the verdict, each part attached to the one before and each `·` quiet; the name and
-/// `↺` are lit, the figure and the time values, the gap warn. The unit stands after the wall and
-/// before the model as one fact's span. Negative control: the retired unit's words (the email's
+/// `↺` are lit, the figure and the time values, the gap warn. The unit stands after the model and
+/// the wall as one fact's span. Negative control: the retired unit's words (the email's
 /// name, the plan, `weekly … left`) are nowhere on the rule.
 #[test]
 fn the_fallback_unit_reads_name_figure_then_milestones() {
@@ -3327,8 +3401,8 @@ fn the_fallback_unit_reads_name_figure_then_milestones() {
     let marks: Vec<char> = shown.iter().map(|s| s.mark).collect();
     assert_eq!(
         marks[..unit.len() + 1],
-        [[ACCOUNT_MARK; 7].as_slice(), &[MODEL_MARK]].concat(),
-        "the unit leads, the model follows: {marks:?}"
+        [[MODEL_MARK].as_slice(), &[ACCOUNT_MARK; 7]].concat(),
+        "the model leads, the unit follows: {marks:?}"
     );
     let set = set_facts(&shown);
     assert_eq!(
@@ -3352,14 +3426,19 @@ fn the_fallback_unit_reads_name_figure_then_milestones() {
         ..facts
     };
     let marks: Vec<char> = segments(&walled).iter().map(|s| s.mark).collect();
-    assert_eq!(marks[..2], [WALL_MARK, ACCOUNT_MARK], "the wall leads");
+    assert_eq!(
+        marks[..3],
+        [MODEL_MARK, WALL_MARK, ACCOUNT_MARK],
+        "the wall stands between the model and the unit"
+    );
 }
 
-/// THE FALLBACK UNIT NARROWS AFTER THE FACTS (§1.2): walking a rule down, the branch, the path
-/// and the model give way while the unit stays whole; then the unit takes its forms in order
-/// (name, figure, `↺`, verdict; name, figure, verdict; name and figure; name), each whole, never
-/// wider than the room. Negative control: the widest rule shows the model beside the whole
-/// unit, so a fact does give way before the unit shortens.
+/// THE FALLBACK UNIT NARROWS AFTER THE FACTS (§1.2): walking a rule down, the branch and the path
+/// give way while the unit stays whole; then the unit takes its forms in order (name, figure,
+/// `↺`, verdict; name, figure, verdict; name and figure; name), each whole, never wider than the
+/// room, the model beside every one; then the unit goes and the model stands alone (owner,
+/// 2026-11-09: the model is the last fact to give way). Negative control: the widest rule shows
+/// the path beside the whole unit, so a fact does give way before the unit shortens.
 #[test]
 fn the_fallback_unit_narrows_after_the_facts() {
     let facts = unit_facts();
@@ -3383,13 +3462,21 @@ fn the_fallback_unit_narrows_after_the_facts() {
         assert!(fit.width(None) <= room, "{room}: {fit:?}");
         let Some(unit) = unit_text(&fit.segments) else {
             assert!(
-                fit.segments.is_empty(),
-                "{room}: the unit goes last: {fit:?}"
+                fit.segments.iter().all(|s| s.mark == MODEL_MARK),
+                "{room}: the model outlasts the unit: {fit:?}"
             );
             continue;
         };
         assert!(forms.contains(&unit), "{room}: never cut: {unit:?}");
-        if fit.segments.iter().any(|s| s.mark != ACCOUNT_MARK) {
+        assert_eq!(
+            fit.segments[0].mark, MODEL_MARK,
+            "{room}: the model leads every form: {fit:?}"
+        );
+        if fit
+            .segments
+            .iter()
+            .any(|s| s.mark != ACCOUNT_MARK && s.mark != MODEL_MARK)
+        {
             assert_eq!(
                 unit, forms[0],
                 "{room}: a fact beside a narrowed unit: {fit:?}"
@@ -3404,24 +3491,32 @@ fn the_fallback_unit_narrows_after_the_facts() {
         fit_rule(&facts, full, None)
             .segments
             .iter()
-            .any(|s| s.mark == MODEL_MARK),
-        "NEGATIVE CONTROL: the model stands beside the whole unit"
+            .any(|s| s.mark == PATH_MARK),
+        "NEGATIVE CONTROL: the path stands beside the whole unit"
+    );
+    assert!(
+        (0..=full).any(|room| {
+            let fit = fit_rule(&facts, room, None);
+            !fit.segments.is_empty() && fit.segments.iter().all(|s| s.mark == MODEL_MARK)
+        }),
+        "the model stands alone once the unit has gone"
     );
 }
 
-/// THE FALLBACK UNIT NAMES THE ROSTER LABEL (§2.5): a pane with no quota view (agy, Muse Code, a
-/// roster not read yet) says its roster label, cut as the glass cuts one, and its profile's own
-/// figure (exact, a lower bound, a wall's `out`); a login the roster cannot name (one with a
-/// figure, or one the profile names by email) reads `this login`; a label with no figure stands
-/// alone. With a view the name is the view's own. Negative control: the email the profile names
-/// is on no rung.
+/// THE FALLBACK UNIT NAMES THE EMAIL (§2.5, owner ruling 2026-11-09): a pane with no quota view
+/// (agy, Muse Code, a roster not read yet) names a login the roster names by the email its
+/// profile names, whether or not the roster names it, else by its roster label (cut as the glass
+/// cuts one), and a login with a figure that neither names `this login`; then its
+/// profile's own figure (exact, a lower bound, a wall's `out`); a name with no figure stands
+/// alone. Its narrowest rung names the email's local part. With a view the name is the view's
+/// own. Negative control: naming the roster label first leaves the email unsaid.
 #[test]
-fn the_fallback_unit_names_the_roster_label() {
+fn the_fallback_unit_names_the_email() {
     use super::super::profile::{SubscriptionDisplay, WEEKLY_OUT};
-    let with = |account: Option<&str>, weekly: Option<&str>| FooterFacts {
+    let with = |account: Option<&str>, email: Option<&str>, weekly: Option<&str>| FooterFacts {
         account: account.map(str::to_owned),
         subscription: Some(SubscriptionDisplay {
-            email: Some("owner@example.com".into()),
+            email: email.map(str::to_owned),
             plan: Some("Max 20x".into()),
             weekly: weekly.map(str::to_owned),
             ..Default::default()
@@ -3429,27 +3524,71 @@ fn the_fallback_unit_names_the_roster_label() {
         ..narrow_rule_facts()
     };
     let widest = |facts: &FooterFacts| account_unit(facts).first().and_then(|f| unit_text(f));
-    let long = "a-long-account-label-0123456789";
-    for (account, weekly, said) in [
-        (Some("work-2"), Some("weekly 38% used"), Some("work-2 38%")),
+    let narrowest = |facts: &FooterFacts| account_unit(facts).last().and_then(|f| unit_text(f));
+    let owner = Some("owner@example.com");
+    let long = "a-long-account-label-0123456789-0123456789";
+    for (account, email, weekly, said, last) in [
         (
             Some("work-2"),
-            Some("weekly \u{2265}38% used"),
-            Some("work-2 \u{2265}38%"),
+            owner,
+            Some("weekly 38% used"),
+            "owner@example.com 38%",
+            "owner",
         ),
-        (Some("work-2"), Some(WEEKLY_OUT), Some("work-2 out")),
-        (None, Some("weekly 22% used"), Some("this login 22%")),
-        (Some("work-2"), None, Some("work-2")),
-        (None, None, Some("this login")),
+        (
+            Some("work-2"),
+            owner,
+            Some("weekly \u{2265}38% used"),
+            "owner@example.com \u{2265}38%",
+            "owner",
+        ),
+        (
+            Some("work-2"),
+            owner,
+            Some(WEEKLY_OUT),
+            "owner@example.com out",
+            "owner",
+        ),
+        (
+            None,
+            owner,
+            Some("weekly 22% used"),
+            "owner@example.com 22%",
+            "owner",
+        ),
+        (Some("work-2"), owner, None, "owner@example.com", "owner"),
+        (None, owner, None, "owner@example.com", "owner"),
+        (
+            Some("work-2"),
+            None,
+            Some("weekly 38% used"),
+            "work-2 38%",
+            "work-2",
+        ),
+        (
+            None,
+            None,
+            Some("weekly 22% used"),
+            "this login 22%",
+            "this login",
+        ),
+        (Some("work-2"), None, None, "work-2", "work-2"),
     ] {
+        let facts = with(account, email, weekly);
         assert_eq!(
-            widest(&with(account, weekly)).as_deref(),
-            said,
-            "{account:?} {weekly:?}"
+            widest(&facts).as_deref(),
+            Some(said),
+            "{account:?} {email:?} {weekly:?}"
+        );
+        assert_eq!(
+            narrowest(&facts).as_deref(),
+            Some(last),
+            "{account:?} {email:?} {weekly:?}"
         );
     }
+    assert_eq!(widest(&with(None, None, None)), None);
     assert_eq!(
-        widest(&with(Some(long), Some("weekly 38% used"))),
+        widest(&with(Some(long), None, Some("weekly 38% used"))),
         Some(format!("{} 38%", super::super::quota_view::cut(long)))
     );
     let viewed = FooterFacts {
@@ -3460,14 +3599,40 @@ fn the_fallback_unit_names_the_roster_label() {
         widest(&viewed).is_some_and(|unit| unit.starts_with("main 63%")),
         "the view names its own row"
     );
-    for facts in [with(Some("work-2"), Some("weekly 38% used")), unit_facts()] {
-        for rung in plain_ladder(&facts) {
-            assert!(
-                !rung.iter().any(|s| s.text.contains("owner")),
-                "NEGATIVE CONTROL: {rung:?}"
-            );
-        }
-    }
+}
+
+/// THE UNIT NAMES THE ADDRESS THE LOGIN FILE NAMES (owner ruling 2026-11-09;
+/// `docs/DESIGN-account-discovery-2026-11-09.md`): with no profile email, a login is named by the
+/// address its login file names ([`FooterFacts::account_email`]), ahead of a roster label and
+/// with no roster row at all (a Mac with no roster file); the profile's email, where both are
+/// read, is the one said. Negative control: with the observed address left out of `unit_name`,
+/// the first case reads `this login 22%` and the second `work-2`.
+#[test]
+fn the_unit_names_the_address_its_login_file_names() {
+    use super::super::profile::SubscriptionDisplay;
+    let with = |account: Option<&str>, email: Option<&str>, weekly: Option<&str>| FooterFacts {
+        account: account.map(str::to_owned),
+        account_email: Some("seen@example.com".into()),
+        subscription: Some(SubscriptionDisplay {
+            email: email.map(str::to_owned),
+            weekly: weekly.map(str::to_owned),
+            ..Default::default()
+        }),
+        ..narrow_rule_facts()
+    };
+    let widest = |facts: &FooterFacts| account_unit(facts).first().and_then(|f| unit_text(f));
+    assert_eq!(
+        widest(&with(None, None, Some("weekly 22% used"))).as_deref(),
+        Some("seen@example.com 22%")
+    );
+    assert_eq!(
+        widest(&with(Some("work-2"), None, None)).as_deref(),
+        Some("seen@example.com")
+    );
+    assert_eq!(
+        widest(&with(None, Some("owner@example.com"), None)).as_deref(),
+        Some("owner@example.com")
+    );
 }
 
 /// THE RULE CARRIES NO ACCOUNT WHILE THE ROW DOES (§1.2, §5.2): with line E the glass's quota row
@@ -3745,11 +3910,12 @@ fn subscription_keeps_a_standing_limit_and_controls_before_secondary_facts() {
         }),
         ..narrow_rule_walled()
     };
-    let wall: Vec<_> = segments(&facts)
-        .into_iter()
-        .filter(|s| s.mark == WALL_MARK)
-        .collect();
-    assert_eq!(wall.len(), 1);
+    // The wall's floor: the model alone, which outlasts it, then the wall (§1.2).
+    let wall = walled_floor(&facts);
+    assert_eq!(
+        wall.iter().map(|s| s.mark).collect::<Vec<_>>(),
+        [MODEL_MARK, WALL_MARK]
+    );
     for chips in [1, 3, 8, 10, 14] {
         let lights = Some(LightsWidth {
             chips,
@@ -5490,9 +5656,9 @@ fn fact_spans_split_model_and_effort_by_their_glyphs() {
     assert_eq!(
         kinds,
         [
-            FactKind::Account,
             FactKind::Model,
             FactKind::Effort,
+            FactKind::Account,
             FactKind::Path,
             FactKind::Branch,
             FactKind::Usage
@@ -6300,11 +6466,11 @@ fn an_unobserved_recovery_keeps_its_reset_in_disclosure_and_the_rule_its_wall() 
             }),
             ..Default::default()
         }),
-        model: Some("a model that yields to the wall".into()),
+        model: Some("Opus 5.5".into()),
         path: Some("/a/long/path/that/yields".into()),
         ..Default::default()
     };
-    for room in [30, 60, 256] {
+    for room in [40, 60, 256] {
         let fit = fit_rule(&facts, room, None);
         assert!(fit.width(None) <= room);
         let wall = fit
@@ -6467,18 +6633,18 @@ fn a_wall_outlasts_chips_until_no_wall_fits() {
 
         let cramped = lights(30);
         assert!(
-            fit_rule(&facts, 40, None)
+            fit_rule(&facts, 48, None)
                 .segments
                 .iter()
                 .any(|s| s.mark == WALL_MARK)
         );
-        let fit = fit_rule(&facts, 40, Some(cramped));
+        let fit = fit_rule(&facts, 48, Some(cramped));
         assert!(
             !fit.chips,
             "the wall fits alone and takes priority over the controls"
         );
         assert!(fit.segments.iter().any(|s| s.mark == WALL_MARK));
-        assert!(fit.width(Some(cramped)) <= 40);
+        assert!(fit.width(Some(cramped)) <= 48);
 
         let fit = fit_rule(&facts, 256, Some(tiny));
         assert!(fit.chips);
@@ -6486,6 +6652,73 @@ fn a_wall_outlasts_chips_until_no_wall_fits() {
         assert!(fit.width(Some(tiny)) <= 256);
     }
 }
+/// Below the wall's floor a walled rule narrows as one with no wall: the wall goes before the
+/// effort, the effort never comes back once gone, and with no unit and no subscription the model
+/// outlasts the controls (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2).
+#[test]
+fn below_the_walls_floor_the_model_outlasts_the_controls_and_the_effort_stays_gone() {
+    let facts = FooterFacts {
+        path: None,
+        branch: None,
+        usage: narrow_rule_walled().usage.map(|mut usage| {
+            usage.runtime = None;
+            usage
+        }),
+        ..narrow_rule_facts()
+    };
+    let marks = |fit: &RuleFit| fit.segments.iter().map(|s| s.mark).collect::<Vec<_>>();
+    let (mut effort_gone, mut wall_gone) = (false, false);
+    for room in (1..=80).rev() {
+        let fit = fit_rule(&facts, room, None);
+        let effort = fit
+            .segments
+            .iter()
+            .any(|s| s.mark == MODEL_MARK && s.shown_part().1.contains("xhigh"));
+        let wall = marks(&fit).contains(&WALL_MARK);
+        assert!(!(wall_gone && wall), "room {room}: the wall came back");
+        assert!(
+            !(effort_gone && effort),
+            "room {room}: the effort came back"
+        );
+        assert!(
+            !(wall && !effort),
+            "room {room}: the effort went before the wall"
+        );
+        wall_gone |= !wall && marks(&fit).contains(&MODEL_MARK);
+        effort_gone |= !effort && marks(&fit).contains(&MODEL_MARK);
+    }
+    assert!(wall_gone && effort_gone);
+    let model = rule_width(
+        &[Segment::plain(MODEL_MARK, "Opus 5.5")],
+        TitleFit::None,
+        false,
+        None,
+    );
+    let floor = fit_rule(&facts, 80, None)
+        .segments
+        .iter()
+        .filter(|s| s.mark == MODEL_MARK || s.mark == WALL_MARK)
+        .cloned()
+        .collect::<Vec<_>>();
+    let room = rule_width(&floor, TitleFit::None, false, None) - 1;
+    assert!(model < room);
+    let lights = |chips| LightsWidth {
+        chips,
+        title: 0,
+        lean: [0; LEAN_FORMS],
+        short: 0,
+        reason: false,
+    };
+    let budget = chips_room(&facts, room);
+    assert_eq!(budget, room - model - RULE_SEP - 2, "the model is reserved");
+    let fit = fit_rule(&facts, room, Some(lights(budget)));
+    assert!(fit.chips);
+    assert_eq!(marks(&fit), [MODEL_MARK], "the model beside the controls");
+    let fit = fit_rule(&facts, room, Some(lights(budget + 1)));
+    assert!(!fit.chips, "too wide controls give way to the model");
+    assert_eq!(marks(&fit), [MODEL_MARK]);
+}
+
 #[test]
 fn the_advertised_chip_budget_agrees_with_the_shortest_wall_that_fits() {
     let walled = narrow_rule_walled();
@@ -6788,4 +7021,39 @@ fn recovery_event_time_does_not_depend_on_the_observation_age() {
     assert_eq!(event, account_progress_text(&later));
     later.next_at = None;
     assert_ne!(event, account_progress_text(&later));
+}
+
+/// The rotation's words name its accounts as the glass names them, by email (§2.5): a switch's
+/// and a sign-in's target, the decided account and each pool sign-in, renamed by the shown name;
+/// a label with no shown name keeps its label. Negative control: unnamed, they say the labels.
+#[test]
+fn the_rotation_words_name_accounts_by_their_shown_names() {
+    use super::super::account_progress::{AccountProgress, ActiveSignIn, ProgressPhase};
+    let mut progress = AccountProgress::unknown(100);
+    progress.account = Some("m22".into());
+    progress.phase = ProgressPhase::Switching { to: "m22".into() };
+    progress.independent_work = vec![ActiveSignIn {
+        label: "pool-B".into(),
+        route: None,
+        observed_at: 100,
+    }];
+    let email = |label: &str| match label {
+        "m22" => "m22@example.com".to_owned(),
+        other => other.to_owned(),
+    };
+    let named = progress.named(email);
+    assert_eq!(named.account.as_deref(), Some("m22@example.com"));
+    let words = rotation_words(&named, |at| at.to_string());
+    assert!(words.contains("switching to m22@example.com"), "{words}");
+    assert!(words.contains("local pool sign-in: pool-B"), "{words}");
+    let raw = rotation_words(&progress, |at| at.to_string());
+    assert!(!raw.contains('@'), "NEGATIVE CONTROL: {raw}");
+    progress.phase = ProgressPhase::SigningIn {
+        label: "m22".into(),
+        route: Some("browser".into()),
+    };
+    assert_eq!(
+        account_progress_phase(&progress.named(email)),
+        "Signing in m22@example.com via browser"
+    );
 }

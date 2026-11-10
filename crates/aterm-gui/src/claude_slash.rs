@@ -39,6 +39,59 @@ pub(crate) enum Slash {
     EffortPicker,
     /// `/compact`: compact the conversation context.
     Compact,
+    /// `/model <id>`, `/model default` for `None`: the model switch's first step
+    /// (`crate::claude_facts`'s [`App::switch_model`]).
+    Model(Option<ModelArg>),
+    /// `/effort <level>`: the model switch's second step, typed once its `/model` is answered.
+    Effort(&'static str),
+}
+
+/// A `/model` argument (`claude-opus-5-5`, `default`), held inline so [`Slash`] stays `Copy`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ModelArg {
+    len: u8,
+    bytes: [u8; ModelArg::MAX],
+}
+
+impl ModelArg {
+    /// The longest argument held: a model id is a word of at most 64 bytes.
+    const MAX: usize = 64;
+
+    /// `id` as an argument, where it is a nonempty word of at most [`Self::MAX`] bytes of
+    /// ASCII letters, digits and `-._[]`.
+    #[must_use]
+    pub(crate) fn new(id: &str) -> Option<Self> {
+        let ok = (1..=Self::MAX).contains(&id.len())
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '[' | ']'));
+        if !ok {
+            return None;
+        }
+        let mut bytes = [0; Self::MAX];
+        bytes[..id.len()].copy_from_slice(id.as_bytes());
+        Some(Self {
+            len: u8::try_from(id.len()).ok()?,
+            bytes,
+        })
+    }
+
+    /// The argument as typed.
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
+    }
+
+    /// What `/model` is given for `id`: `default` for none.
+    fn typed(id: &Option<Self>) -> &str {
+        id.as_ref().map_or("default", Self::as_str)
+    }
+}
+
+impl std::fmt::Debug for ModelArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ModelArg").field(&self.as_str()).finish()
+    }
 }
 
 impl Slash {
@@ -53,11 +106,17 @@ impl Slash {
             Slash::ModelPicker => "/model".to_owned(),
             Slash::EffortPicker => "/effort".to_owned(),
             Slash::Compact => "/compact".to_owned(),
+            Slash::Model(id) => format!("/model {}", ModelArg::typed(&id)),
+            Slash::Effort(level) => format!("/effort {level}"),
         }
     }
 
+    /// Typed with no argument: the slash menu's pointed entry is the command itself.
     const fn bare(self) -> bool {
-        !matches!(self, Slash::TopEffort(_))
+        !matches!(
+            self,
+            Slash::TopEffort(_) | Slash::Model(_) | Slash::Effort(_)
+        )
     }
 
     /// Its part of a menu row's stable key (`fact-menu/<fact>/type/<this>`).
@@ -69,6 +128,8 @@ impl Slash {
             Slash::ModelPicker => "model",
             Slash::EffortPicker => "effort",
             Slash::Compact => "compact",
+            Slash::Model(_) => "set-model",
+            Slash::Effort(_) => "set-effort",
         }
     }
 
@@ -83,6 +144,8 @@ impl Slash {
             Slash::ModelPicker => "opening /model\u{2026}".to_owned(),
             Slash::EffortPicker => "opening /effort\u{2026}".to_owned(),
             Slash::Compact => "running /compact\u{2026}".to_owned(),
+            Slash::Model(id) => format!("switching to {}\u{2026}", ModelArg::typed(&id)),
+            Slash::Effort(level) => format!("setting effort {level}\u{2026}"),
         }
     }
 
@@ -97,6 +160,8 @@ impl Slash {
             )),
             Slash::ModelPicker | Slash::EffortPicker => None,
             Slash::Compact => Some("\u{2713} /compact sent".to_owned()),
+            Slash::Model(id) => Some(format!("\u{2713} model {}", ModelArg::typed(&id))),
+            Slash::Effort(level) => Some(format!("\u{2713} effort {level}")),
         }
     }
 }
@@ -544,7 +609,9 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
                     }
                 }),
                 Slash::ModelPicker | Slash::EffortPicker if screen.is_none() => Some(Step::Done),
-                Slash::Compact if !held => Some(Step::Done),
+                // Claude runs a typed command with its argument at once: the composer let go
+                // of it is the answer (the footer's next read says what it set).
+                Slash::Compact | Slash::Model(_) | Slash::Effort(_) if !held => Some(Step::Done),
                 _ => None,
             };
             match answered {
@@ -1095,6 +1162,8 @@ impl App {
         self.refresh_fact_readings(session);
         self.refresh_fact_menu(session);
         self.redraw_claude_footer(session);
+        // A model switch's `/effort` follows its answered `/model`.
+        self.switch_after(press.wid, session, press.slash, end);
     }
 
     /// Ask the resolver to read `session`'s footer now (the account card's store look rides it).

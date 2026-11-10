@@ -153,6 +153,7 @@ impl WriteWorld for FakeWorld {
             &slug(),
             tag,
             FakeRelease {
+                published_at: None,
                 draft,
                 prerelease: true,
                 assets: assets
@@ -1581,6 +1582,7 @@ fn a_draft_seed_is_not_found() {
         &seed,
         "seed-1",
         FakeRelease {
+            published_at: None,
             draft: true,
             prerelease: true,
             assets: BTreeMap::new(),
@@ -1655,6 +1657,7 @@ fn seed_fixture(label: &str, ledger_owner: &str) -> SeedFixture {
 
 fn seed_release(draft: bool) -> FakeRelease {
     FakeRelease {
+        published_at: None,
         draft,
         prerelease: true,
         assets: BTreeMap::from([("stage0.tar.xz".to_string(), b"x".to_vec())]),
@@ -1918,6 +1921,7 @@ fn published_only_sites_read_as_read() {
             &index,
             &atpkg_publish::quad::index_tag(n),
             FakeRelease {
+                published_at: None,
                 draft,
                 prerelease: true,
                 assets: BTreeMap::new(),

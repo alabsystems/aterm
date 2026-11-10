@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One GNU FIFO jobserver for a release's branches (`docs/DESIGN-fast-build-release-2026-11-05.md`,
-//! A11 and B4). Each client reserves its implicit token before spawning; Cargo and rustc borrow
-//! every additional token from this FIFO.
+//! GNU FIFO jobservers (`docs/DESIGN-fast-build-release-2026-11-05.md`, A11 and B4).
+//! Qualify partitions its Release grant with [`crate::BranchShares`], so an exiting branch's
+//! lost tokens cannot starve another branch. Within each FIFO, clients reserve their implicit
+//! token before spawning; Cargo and rustc borrow every additional token from that FIFO.
 //!
-//! THE POOL AND ITS BRANCHES. The release makes the pool once ([`Jobserver::new`], `S` tokens for
-//! its Release core claim of `S`) and hands it to each branch child ([`Jobserver::hand_to`], or a
+//! THE POOL AND ITS CLIENTS. A coordinator makes a pool ([`Jobserver::new`]) and hands it to
+//! its child ([`Jobserver::hand_to`], or a
 //! share of fewer slots with [`Jobserver::hand_share_to`]: [`POOL_ENV`] is `<slots>:<absolute FIFO
 //! path>`, the FIFO always by the pool's own path). A branch adopts it ([`Jobserver::inherited`])
 //! and charges every client it starts from it: a Cargo through [`Jobserver::attach_cargo`] (its
@@ -24,6 +25,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::Condvar;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 #[cfg(unix)]
@@ -71,6 +73,7 @@ pub struct Jobserver {
     #[cfg(unix)]
     wait: File,
     slots: u32,
+    observed_slots: AtomicU32,
     /// Whether this handle made the FIFO ([`Self::new`]), and so removes it when dropped; a
     /// handle adopted from [`POOL_ENV`] leaves it to its creator.
     created: bool,
@@ -123,7 +126,18 @@ impl Jobserver {
     /// # Errors
     /// The token count or FIFO path cannot be represented, or creating/opening it fails.
     pub fn new(path: &Path, slots: u32) -> io::Result<Self> {
+        Self::seeded(path, slots, slots)
+    }
+
+    /// Create a FIFO with a bounded initial allocation, for an isolated branch pool.
+    pub(crate) fn seeded(path: &Path, slots: u32, tokens: u32) -> io::Result<Self> {
         representable(path, slots)?;
+        if tokens > slots {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "allocation exceeds slots",
+            ));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt as _;
@@ -140,7 +154,7 @@ impl Jobserver {
             }
             let opened = open(&path).and_then(|mut file| {
                 let wait = blocking_twin(&path, &file)?;
-                file.write_all(&[b'+'; MAX_SLOTS as usize][..slots as usize])?;
+                file.write_all(&[b'+'; MAX_SLOTS as usize][..tokens as usize])?;
                 Ok((file, wait))
             });
             let (file, wait) = match opened {
@@ -236,6 +250,7 @@ impl Jobserver {
             file,
             wait,
             slots,
+            observed_slots: AtomicU32::new(slots),
             created,
             partial: Mutex::new(()),
             waiters: Mutex::default(),
@@ -245,8 +260,24 @@ impl Jobserver {
 
     /// The Release grant this pool bounds.
     #[must_use]
-    pub const fn slots(&self) -> u32 {
-        self.slots
+    pub fn slots(&self) -> u32 {
+        if self.created {
+            return self.slots;
+        }
+        // An isolated branch's allocation only grows while it is alive. Its coordinator
+        // publishes that growth so later test plans can use returned shares as Cargo does.
+        let observed = std::fs::read_to_string(self.path.with_extension("slots"))
+            .ok()
+            .and_then(|value| {
+                let (grant, allocated) = value.split_once(':')?;
+                let grant = grant.parse::<u32>().ok()?;
+                let allocated = allocated.parse::<u32>().ok()?;
+                (grant <= MAX_SLOTS && allocated <= grant && grant >= self.slots)
+                    .then_some(allocated.max(self.slots))
+            })
+            .unwrap_or(self.slots);
+        self.observed_slots.fetch_max(observed, Ordering::Relaxed);
+        self.observed_slots.load(Ordering::Relaxed)
     }
 
     /// The FIFO this pool's tokens are in, by the one absolute path every child of this handle is
@@ -259,7 +290,7 @@ impl Jobserver {
     /// [`POOL_ENV`]'s value for this pool: `<slots>:<absolute FIFO path>`.
     #[must_use]
     pub fn handed(&self) -> OsString {
-        self.value(self.slots)
+        self.value(self.slots())
     }
 
     /// [`POOL_ENV`]'s value for a share of this pool, `slots` of its tokens: [`Self::handed`]'s
@@ -270,7 +301,7 @@ impl Jobserver {
     /// `slots` is 0, which [`Self::adopt`] refuses, or more than [`Self::slots`], which would let
     /// the child wait for tokens the pool does not have.
     pub fn handed_share(&self, slots: u32) -> io::Result<OsString> {
-        if slots == 0 || slots > self.slots {
+        if slots == 0 || slots > self.slots() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -334,7 +365,7 @@ impl Jobserver {
             .env("MAKEFLAGS", &flags)
             .env("CARGO_MAKEFLAGS", flags)
             .arg("-j")
-            .arg(self.slots.to_string());
+            .arg(self.slots().to_string());
         Ok(token)
     }
 
@@ -375,7 +406,35 @@ impl Jobserver {
     /// even when a token reaches the wait after the stop (STOPPED BEFORE EVERY TOKEN at
     /// `acquire_waking`).
     pub fn acquire(&self, stopped: &dyn Fn() -> bool) -> io::Result<Token<'_>> {
-        self.acquire_waking(stopped, WAKE_EVERY, &|| {})
+        self.acquire_notifying(stopped, Duration::from_secs(30), &|elapsed| {
+            let allocation = std::fs::read_to_string(self.path.with_extension("allocation"))
+                .unwrap_or_else(|error| format!("allocation_record_unavailable={error}"));
+            eprintln!("jobserver empty wait: waited_s={} waiter_pid={} dispatch_slots={} fifo={} {allocation}",
+                elapsed.as_secs(), std::process::id(), self.slots, self.path.display());
+        })
+    }
+
+    fn acquire_notifying(
+        &self,
+        stopped: &dyn Fn() -> bool,
+        after: Duration,
+        notify: &dyn Fn(Duration),
+    ) -> io::Result<Token<'_>> {
+        let started = std::time::Instant::now();
+        let stated = std::cell::Cell::new(false);
+        self.acquire_waking(stopped, WAKE_EVERY, &|| {
+            if started.elapsed() >= after && !stated.replace(true) {
+                notify(started.elapsed());
+            }
+        })
+    }
+
+    /// Re-mint an allocation whose former branch has drained. Only the share accountant calls
+    /// this; returning a token from a live client must use its guard instead.
+    pub(crate) fn remint(&self, tokens: u32) {
+        for _ in 0..tokens {
+            self.give(b'+');
+        }
     }
 
     /// [`Self::acquire`], asking `stopped` at least once every `wake`, and telling `waiting` each
@@ -637,7 +696,7 @@ impl Jobserver {
     /// # Errors
     /// FIFO IO fails, or the caller ends the wait; the tokens taken so far are returned.
     pub fn acquire_many(&self, n: u32, stopped: &dyn Fn() -> bool) -> io::Result<Vec<Token<'_>>> {
-        let n = n.min(self.slots) as usize;
+        let n = n.min(self.slots()) as usize;
         let _one = self.partial.lock().unwrap_or_else(PoisonError::into_inner);
         let mut held = Vec::with_capacity(n);
         while held.len() < n {

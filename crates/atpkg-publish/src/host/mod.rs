@@ -60,6 +60,8 @@ pub struct Release {
     pub draft: bool,
     /// A prerelease.
     pub prerelease: bool,
+    /// The release host's UTC publication timestamp, when known; never derived from a build id.
+    pub published_at: Option<String>,
     /// Its asset names.
     pub assets: Vec<String>,
 }

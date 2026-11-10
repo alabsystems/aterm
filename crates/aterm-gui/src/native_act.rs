@@ -7,6 +7,9 @@
 //! Outcome disposal and predecessor waits hold none of those locks. The table, rather than
 //! a request/connection stack, owns every started operation, including a lost final ACK.
 
+#[cfg(unix)]
+#[path = "native_recipient_recovery.rs"]
+mod recipient_recovery;
 #[path = "native_source_restart.rs"]
 mod source_restart;
 
@@ -234,6 +237,7 @@ pub(crate) fn serve_codex_exec_handoff(_: &Arc<crate::SessionCtx>, _: i32, _: &s
 }
 
 const DENIED: &str = "ERR denied native operation authority\n";
+const RECIPIENT_WRITER_UNAVAILABLE: &str = "ERR native complete-recipient writer unavailable\n";
 const UNKNOWN: &str = "OK native-act state=unknown\n";
 const NOEXEC: &str = "OK native-act state=retired reason=no-exec-grant\n";
 #[cfg(test)]
@@ -1241,7 +1245,11 @@ trait Kernel {
     fn foreground(&self, master: i32) -> Option<u32>;
     fn own_target(&self, holder: &str, target: &Image) -> bool;
     fn own_launcher(&self, image: &Image) -> bool;
-    fn birth_alive(&self, process: &Process) -> Option<bool>;
+    fn birth_alive(&self, process: &Process) -> Option<bool> {
+        self.birth_is_alive(process.pid, process.birth)
+    }
+    /// A positive identity observation; unreadable is unknown, never death.
+    fn birth_is_alive(&self, pid: u32, birth: u64) -> Option<bool>;
     fn signal(&self, master: i32, process: &Process, ctx: &crate::SessionCtx) -> String;
     fn watch(&self, process: &Process) -> Option<DeathWatch>;
     /// Whether `group` can no longer act ([`crate::native_observe::cohort_gone`] ships).
@@ -1695,8 +1703,8 @@ impl Kernel for System<'_> {
             .is_some_and(|(row, _)| self.0.target_image(row, target))
     }
 
-    fn birth_alive(&self, process: &Process) -> Option<bool> {
-        process_birth_alive(process)
+    fn birth_is_alive(&self, pid: u32, birth: u64) -> Option<bool> {
+        process_birth_alive(pid, birth)
     }
     fn signal(&self, master: i32, process: &Process, _ctx: &crate::SessionCtx) -> String {
         #[cfg(unix)]
@@ -2355,6 +2363,11 @@ fn prepare_inner(
     kernel: &dyn Kernel,
     account: Option<AccountContinuation>,
 ) -> String {
+    // Recognize complete-recipient recipes for historical reads, but do not admit
+    // their writer until cross-image compatibility and namespace ownership are proven.
+    if request.receipt_mode.is_some() {
+        return RECIPIENT_WRITER_UNAVAILABLE.into();
+    }
     let renewal = ctx
         .fenced_writes
         .native
@@ -4443,6 +4456,7 @@ fn serve_with_publication(
     // own durable envelope before they can use ordinary historical fallback.
     if historical_reader
         && (reply == DENIED
+            || reply == RECIPIENT_WRITER_UNAVAILABLE
             || reply == "ERR native host epoch changed\n"
             || reply == DEADLINE
             || reply == "ERR native constructor disabled\n")
@@ -4481,8 +4495,8 @@ fn historical(ctx: &crate::SessionCtx, saved: &Request, kernel: &dyn Kernel) -> 
     }
 }
 
-/// `lapsed` for a refused restart prepare no exec grant was or can be issued under, from
-/// facts this host reads now; `None` keeps the refusal. It writes, reserves and admits
+/// `lapsed` for a refused restart prepare when no grant under it can leave an agent running,
+/// from facts this host reads now; `None` keeps the refusal. It writes, reserves and admits
 /// nothing, and claims nothing about the old operation's other resources.
 ///
 /// Only a cold or supported typed asked restart from the built-in harness qualifies (the
@@ -4508,8 +4522,11 @@ fn historical(ctx: &crate::SessionCtx, saved: &Request, kernel: &dyn Kernel) -> 
 ///    possible execution or a seal), or an absence from the journal its `custody=` stamp
 ///    names, `lapsed` at any clock:
 ///    every process of that boot has ended, and no host of this boot admits the stamp;
-/// 6. anything else keeps the refusal: possible execution on this boot, another record of
-///    the id, an unreadable journal, a deadline still ahead, or an unstamped absence.
+/// 6. a complete recipient history can lapse on this boot after the deadline when every
+///    recorded birth and process group has positively retired; its own reader keeps unknown
+///    probes, foreign clocks and inconsistent histories held;
+/// 7. anything else keeps the refusal: legacy possible execution on this boot, another record
+///    of the id, an unreadable journal, a deadline still ahead, or an unstamped absence.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -4594,6 +4611,14 @@ fn historical(ctx: &crate::SessionCtx, saved: &Request, kernel: &dyn Kernel) -> 
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "NativeHistoricalClosure",
+        action = "DeliverRollback",
+        reason = "After the forward recipient and its group retire, rollback delivery uses the same MayExecute record and re-reads the original deadline"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
         action = "SealOpen",
         reason = "A seal after Prepared reads as sealed with no possible execution, and nothing follows a seal"
     )
@@ -4642,6 +4667,14 @@ fn historical(ctx: &crate::SessionCtx, saved: &Request, kernel: &dyn Kernel) -> 
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "NativeHistoricalClosure",
+        action = "RollbackExits",
+        reason = "The rollback grantee the launcher exec'd exits independently of the forward recipient"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
         action = "Reboot",
         reason = "The machine boots again, which ends every process of the old boot"
     )
@@ -4660,6 +4693,14 @@ fn historical(ctx: &crate::SessionCtx, saved: &Request, kernel: &dyn Kernel) -> 
         machine = "NativeHistoricalClosure",
         action = "Fresh",
         reason = "The harness ends its lapsed record and plans afresh (native_restart::lapsed, bound by NativeRetirementDebt)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "RecipientClosure",
+        action = "ReadClock",
+        project = "aterm_gui::native_act::tests::recipient_recovery::World::probe"
     )
 )]
 fn historical_prepare(
@@ -4702,9 +4743,10 @@ fn historical_prepare(
     }
     let closure = kernel.historical_closure(prepare).ok()?;
     let expired = clock_us >= prepare.deadline_us;
+    let current_boot = prepare.boot.as_ref().and_then(|_| kernel.boot());
     let other_boot = prepare.boot.as_ref().is_some_and(|stamp| {
-        kernel
-            .boot()
+        current_boot
+            .as_ref()
             .is_some_and(|here| here.host == stamp.host && here.boot != stamp.boot)
     });
     let lapsed = match closure {
@@ -4716,6 +4758,16 @@ fn historical_prepare(
             prepare.custody.is_some() && custody == prepare.custody && (expired || other_boot)
         }
         Closure::Other => false,
+        #[cfg(unix)]
+        Closure::Recipients(history) => {
+            return recipient_recovery::answer(
+                prepare,
+                &history,
+                clock_us,
+                current_boot.as_ref(),
+                kernel,
+            );
+        }
     };
     if lapsed {
         aterm_agent::harness::native_act::lapsed_reply(&prepare.id)
@@ -5494,10 +5546,13 @@ fn untyped_required(
 }
 
 #[cfg(unix)]
-fn process_birth_alive(process: &Process) -> Option<bool> {
-    let pid = i32::try_from(process.pid).ok()?;
+fn process_birth_alive(pid: u32, birth: u64) -> Option<bool> {
+    if pid <= 1 || birth == 0 {
+        return None;
+    }
+    let pid = i32::try_from(pid).ok()?;
     if let Some(actual) = aterm_uds::process::read_birth(pid) {
-        return Some(actual.0 == process.birth);
+        return Some(actual.0 == birth);
     }
     // SAFETY: signal zero observes existence without mutating the positive original pid.
     let rc = unsafe { libc::kill(pid, 0) };
@@ -5509,7 +5564,7 @@ fn process_birth_alive(process: &Process) -> Option<bool> {
 }
 
 #[cfg(not(unix))]
-fn process_birth_alive(_: &Process) -> Option<bool> {
+fn process_birth_alive(_: u32, _: u64) -> Option<bool> {
     None
 }
 

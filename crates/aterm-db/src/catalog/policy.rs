@@ -5,7 +5,7 @@ use super::*;
 
 /// Local subscription policy. This never grants access to another network.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Policy {
+pub struct Policy {
     pub enabled: bool,
     pub excluded: BTreeSet<Digest>,
 }
@@ -20,7 +20,8 @@ impl Default for Policy {
 impl Policy {
     /// Whether local sharing includes `table`: disabling sharing or excluding its catalog
     /// excludes every table, and an individual exclusion excludes only that table.
-    pub(crate) fn includes(&self, catalog: Digest, table: Digest) -> bool {
+    #[must_use]
+    pub fn includes(&self, catalog: Digest, table: Digest) -> bool {
         self.enabled && !self.excluded.contains(&catalog) && !self.excluded.contains(&table)
     }
 
@@ -28,6 +29,9 @@ impl Policy {
     /// (a dotfiles checkout, home-manager) is followed to a file this user or root owns and
     /// others cannot write ([`aterm_secrets::fsx::read_aterm_config`]), as `[swarm] enabled` is
     /// read ([`aterm_secrets::swarm::enabled_at`]).
+    ///
+    /// # Errors
+    /// Unsafe or unreadable configuration files, invalid TOML, or invalid subscription settings.
     pub fn read(path: &Path) -> Result<Self> {
         let bytes = aterm_secrets::fsx::read_aterm_config(path, 1024 * 1024).map_err(|why| {
             Error::new(&format!(
@@ -42,7 +46,19 @@ impl Policy {
             std::str::from_utf8(&bytes).map_err(|_| Error::new("invalid Commons configuration"))?;
         let value: aterm_toml::Value =
             aterm_toml::from_str(text).map_err(|_| Error::new("invalid Commons configuration"))?;
-        let swarm = aterm_secrets::swarm::enabled_in_value(&value)
+        Self::from_value(&value)
+    }
+
+    /// Parse the subscription policy from an already admitted configuration document,
+    /// allowing an application to evaluate all its local settings from one file read.
+    ///
+    /// # Errors
+    /// A non-table document or invalid swarm or Commons settings.
+    pub fn from_value(value: &aterm_toml::Value) -> Result<Self> {
+        if value.as_table().is_none() {
+            return Err(Error::new("invalid Commons configuration"));
+        }
+        let swarm = aterm_secrets::swarm::enabled_in_value(value)
             .map_err(|why| Error::new(&why.to_string()))?;
         let Some(commons) = value.get("commons") else {
             return Ok(Self {

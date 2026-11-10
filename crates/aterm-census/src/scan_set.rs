@@ -110,7 +110,7 @@ pub fn reviewed_forks(root: &Path) -> Result<Vec<ReviewedFork>, String> {
 /// # Errors
 /// The fork ledger or an absorbed crate's manifest cannot be read or parsed.
 pub fn fork_packages(root: &Path) -> Result<Vec<String>, String> {
-    if !root.join(FORK_LEDGER).is_file() {
+    if !crate::tree::is_file(&root.join(FORK_LEDGER)) {
         return Err(format!(
             "cannot read {FORK_LEDGER}: the authoritative fork ledger is missing (fail-closed)"
         ));

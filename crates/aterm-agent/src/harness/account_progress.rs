@@ -121,6 +121,35 @@ pub struct AccountProgress {
 }
 
 impl AccountProgress {
+    /// This progress as the glass shows it: each account it names by roster label (the decided
+    /// account, a switch's or a sign-in's target, each independent sign-in) renamed by `name`,
+    /// the label's shown name (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.5, owner
+    /// ruling 2026-11-09: an account is named by its email wherever it is shown). Display only:
+    /// the labels stay the keys everywhere else.
+    #[must_use]
+    pub fn named(&self, name: impl Fn(&str) -> String) -> Self {
+        let mut out = self.clone();
+        if let Some(account) = &mut out.account {
+            *account = name(account);
+        }
+        match &mut out.phase {
+            ProgressPhase::Switching { to } | ProgressPhase::Verifying { to } => *to = name(to),
+            ProgressPhase::SigningIn { label, .. } => *label = name(label),
+            ProgressPhase::Unknown
+            | ProgressPhase::Paused
+            | ProgressPhase::Watching
+            | ProgressPhase::Disabled
+            | ProgressPhase::Limited
+            | ProgressPhase::Waiting
+            | ProgressPhase::Probing
+            | ProgressPhase::Ready => {}
+        }
+        for work in &mut out.independent_work {
+            work.label = name(&work.label);
+        }
+        out
+    }
+
     #[must_use]
     pub fn unknown(observed_at: i64) -> Self {
         Self {

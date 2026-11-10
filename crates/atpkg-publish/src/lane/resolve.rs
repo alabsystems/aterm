@@ -59,7 +59,16 @@ pub fn resolve_commit(clone: &Path, want: Build) -> Result<String> {
             "resolve: no first-parent bracket for count {want}"
         )));
     };
-    let span = git::run(clone, &["rev-list", &format!("{older}..{newer}")])?;
+    // Bound Git's capture too, rather than only the loop after the whole merge span
+    // has been allocated. One extra OID preserves the existing overflow refusal.
+    let span = git::run(
+        clone,
+        &[
+            "rev-list",
+            &format!("--max-count={}", SPAN_LIMIT + 1),
+            &format!("{older}..{newer}"),
+        ],
+    )?;
     for (n, cand) in span.lines().enumerate() {
         if n >= SPAN_LIMIT {
             return Err(Error::refused(format!(

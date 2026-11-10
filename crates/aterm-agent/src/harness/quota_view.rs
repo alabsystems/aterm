@@ -35,11 +35,13 @@ const WEEK: i64 = accounts::WEEK_WINDOW_S;
 pub const PER_DAY: [u8; 5] = [12, 8, 6, 4, 3];
 /// The most accounts the row names (§2.5); the others fold into `+N` and are never dropped.
 pub const NAMED_MAX: usize = 3;
-/// A name is cut to this many cells, its last an ellipsis (§2.5). A name is a roster label, whose
-/// grammar ([`accounts::label_refusal`], `[a-z0-9][a-z0-9._-]{0,63}`, held by the roster reader
-/// and the lab's roster writer alike) admits only ASCII, one cell a character, so a name's
-/// characters are its cells, and so are [`THIS_LOGIN`]'s.
-pub const NAME_CELLS: usize = 12;
+/// A name is cut to this many cells, its last an ellipsis (§2.5). A name is an account's email
+/// (the roster label where its row has none, [`accounts::Row::shown_name`]), and 32 cells hold
+/// a typical one whole; a longer email gives way to its local part before it is cut ([`cut`]).
+pub const NAME_CELLS: usize = 32;
+/// A name's narrow form ([`short`]) is cut to this many cells: an email's local part, or a
+/// label, as the glass cut every name before names were emails.
+pub const SHORT_CELLS: usize = 12;
 /// The blanks between the row's groups (§4.3).
 pub const GROUP_GAP: usize = 2;
 /// Case (d)'s short words (§1.3): this tab's week has no figure yet.
@@ -97,8 +99,10 @@ pub struct QuotaView {
 /// A named account (§2.5).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Named {
-    /// Its roster label ([`THIS_LOGIN`] for a login the roster cannot name), uncut.
+    /// Its roster label ([`THIS_LOGIN`] for a login the roster cannot name), uncut: its key.
     pub label: String,
+    /// What the glass names it by, uncut: its email, else its label ([`Outlook::name_of`]).
+    pub name: String,
     /// It is this tab's account.
     pub this_tab: bool,
     /// It carries the work now.
@@ -139,6 +143,8 @@ pub struct Chart {
 pub struct Run {
     /// The account.
     pub label: String,
+    /// What the glass names it by ([`Outlook::name_of`]).
+    pub name: String,
     /// From.
     pub from: i64,
     /// To.
@@ -165,9 +171,10 @@ impl Run {
 pub enum Mark {
     /// `↺`: a vendor reset of the account the chart draws at that instant.
     Reset,
-    /// `→name`: the work moves to this account.
+    /// `→name`: the work moves to this account, as the glass names it ([`Outlook::name_of`]).
     Handoff(String),
-    /// `→name?`: the work moves to this account, which aterm cannot read; `┄` follows.
+    /// `→name?`: the work moves to this account (its glass name), which aterm cannot read; `┄`
+    /// follows.
     Lean(String),
 }
 
@@ -263,6 +270,8 @@ impl Cell {
 pub struct Burn {
     /// The account.
     pub label: String,
+    /// What the glass names it by ([`Outlook::name_of`]).
+    pub name: String,
     /// Its week began (`renews` − 7 d).
     pub start: i64,
     /// Its week resets; at or before now where no reset is known ahead (nothing projected).
@@ -447,19 +456,43 @@ enum TailForm {
     T2,
 }
 
-/// The ladder of §2.4, widest first: the lead, the chart's cells a day (0, none) and the tail.
-const LADDER: [(Lead, u8, TailForm); 10] = [
-    (Lead::Full, 12, TailForm::T0),
-    (Lead::Full, 8, TailForm::T0),
-    (Lead::Full, 8, TailForm::T1),
-    (Lead::Full, 6, TailForm::T1),
-    (Lead::Fold, 6, TailForm::T1),
-    (Lead::Fold, 4, TailForm::T1),
-    (Lead::Fold, 4, TailForm::T2),
-    (Lead::Fold, 3, TailForm::T2),
-    (Lead::Tab, 3, TailForm::T2),
-    (Lead::Tab, 0, TailForm::T2),
+/// How a rung names its accounts (§2.5): each email whole ([`cut`]), or its local part
+/// ([`short`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Names {
+    /// The email, whole where it fits [`NAME_CELLS`].
+    Whole,
+    /// The email's local part.
+    Local,
+}
+
+/// The ladder of §2.4, widest first: the lead, how it names, the chart's cells a day (0, none)
+/// and the tail. The names give way to their local parts before the lead folds, the other
+/// accounts' figures being worth more than their domains, and stay so on every narrower rung,
+/// so each rung's parts are a subset of the rung before.
+const LADDER: [(Lead, Names, u8, TailForm); 11] = [
+    (Lead::Full, Names::Whole, 12, TailForm::T0),
+    (Lead::Full, Names::Whole, 8, TailForm::T0),
+    (Lead::Full, Names::Whole, 8, TailForm::T1),
+    (Lead::Full, Names::Whole, 6, TailForm::T1),
+    (Lead::Full, Names::Local, 6, TailForm::T1),
+    (Lead::Fold, Names::Local, 6, TailForm::T1),
+    (Lead::Fold, Names::Local, 4, TailForm::T1),
+    (Lead::Fold, Names::Local, 4, TailForm::T2),
+    (Lead::Fold, Names::Local, 3, TailForm::T2),
+    (Lead::Tab, Names::Local, 3, TailForm::T2),
+    (Lead::Tab, Names::Local, 0, TailForm::T2),
 ];
+
+impl Names {
+    /// `name` as this form lays it.
+    fn lay(self, name: &str) -> String {
+        match self {
+            Names::Whole => cut(name),
+            Names::Local => short(name),
+        }
+    }
+}
 
 /// The level of `x10` tenths used (§2.2): `clamp(round(x·8/100), 1, 7)`, and 8 only at 1000 (a
 /// reading of 100, or a projected fill), so 63% and 98% are levels 5 and 7.
@@ -489,15 +522,41 @@ pub fn lane_level(x10: u16) -> u8 {
     }
 }
 
-/// A name cut to at most [`NAME_CELLS`] cells, its last an ellipsis, between whole grapheme
-/// clusters: an accent stays on its letter and a joined emoji goes whole or not at all.
+/// A name as the glass lays it in at most [`NAME_CELLS`] cells: whole where it fits; an email
+/// that does not gives way to its local part ([`local`]) before anything is cut; what is still
+/// too wide is cut, its last cell an ellipsis.
 #[must_use]
 pub fn cut(name: &str) -> String {
     if aterm_grapheme::str_grid_columns(name) <= NAME_CELLS {
         return name.to_owned();
     }
+    cells(local(name), NAME_CELLS)
+}
+
+/// A name's narrow form (§2.4, §2.5): an email's local part, the words before its `@`, cut to
+/// [`SHORT_CELLS`]; any other name cut so.
+#[must_use]
+pub fn short(name: &str) -> String {
+    cells(local(name), SHORT_CELLS)
+}
+
+/// An email's local part (`owner` of `owner@example.com`); a name with no `@` past its first
+/// character whole.
+fn local(name: &str) -> &str {
+    match name.split_once('@') {
+        Some((head, _)) if !head.is_empty() => head,
+        _ => name,
+    }
+}
+
+/// `name` cut to at most `max` cells, its last an ellipsis, between whole grapheme clusters: an
+/// accent stays on its letter and a joined emoji goes whole or not at all.
+fn cells(name: &str, max: usize) -> String {
+    if aterm_grapheme::str_grid_columns(name) <= max {
+        return name.to_owned();
+    }
     aterm_grapheme::grid_graphemes(name)
-        .take_while(|cluster| cluster.end_col < NAME_CELLS)
+        .take_while(|cluster| cluster.end_col < max)
         .map(|cluster| cluster.text)
         .chain(std::iter::once("\u{2026}"))
         .collect()
@@ -553,8 +612,8 @@ impl Chart {
     /// inside it. A future cell shows one glyph by priority, `╳` > `→` > `↺` > `$` > `┄` > level:
     /// `╳` where a stop covers at least half of it (a stop that covers no cell that much takes
     /// the cell that holds its start); `→` where a hand-off falls inside it, moved to the first
-    /// cell after a gap that displaces it, the target's name after it where the run up to the
-    /// next mark holds the name and one cell more; `↺` at a reset; `$` under credits; `┄` past
+    /// cell after a gap that displaces it, the target's name after it in the widest of its forms
+    /// ([`cut`], else [`short`]) the run up to the next mark holds with one cell more; `↺` at a reset; `$` under credits; `┄` past
     /// [`Chart::unknown_from`]; else the drawn account's fill at the cell's end.
     pub fn cells(&self, per_day: u8, out: &mut Vec<Cell>) {
         out.clear();
@@ -578,7 +637,7 @@ impl Chart {
         for &(from, to, credits) in &self.stops {
             self.cover(s, from, to, if credits { &mut paid } else { &mut gap });
         }
-        let mut arrow: Vec<Option<(String, bool)>> = vec![None; n];
+        let mut arrow: Vec<Option<(&str, bool)>> = vec![None; n];
         let mut reset = vec![false; n];
         for (t, mark) in &self.marks {
             let Some(mut j) = future_index(self.now, s, n, *t) else {
@@ -592,7 +651,7 @@ impl Chart {
                         j += 1;
                     }
                     if j < n {
-                        arrow[j] = Some((cut(name), matches!(mark, Mark::Lean(_))));
+                        arrow[j] = Some((name.as_str(), matches!(mark, Mark::Lean(_))));
                     }
                 }
             }
@@ -619,8 +678,11 @@ impl Chart {
                 .iter()
                 .take_while(|c| matches!(c, Cell::Ahead(_) | Cell::Blank | Cell::Unknown))
                 .count();
-            let len = name.chars().count() + usize::from(*lean);
-            if room > len {
+            // The name whole where it fits, else its narrow form (an email's local part,
+            // §2.5): an email seldom fits between two marks, and an arrow with no name says
+            // nothing of where the work goes.
+            let fits = |name: &String| room > name.chars().count() + usize::from(*lean);
+            if let Some(name) = [cut(name), short(name)].iter().find(|name| fits(name)) {
                 let tail = lean.then_some('?');
                 for (cell, c) in future[j + 1..].iter_mut().zip(name.chars().chain(tail)) {
                     *cell = Cell::Name(c);
@@ -943,8 +1005,12 @@ fn phrase_of(words: &Words<'_>, verdict: &Verdict, carrier: bool) -> Option<Phra
             phrase(full, short, Role::Warn, true)
         }
         Verdict::Lean { until, row, .. } => phrase(
-            format!("? {} unread from {}", cut(row), words.about(*until)),
-            format!("? {} {}", cut(row), words.about(*until)),
+            format!(
+                "? {} unread from {}",
+                cut(words.name(row)),
+                words.about(*until)
+            ),
+            format!("? {} {}", cut(words.name(row)), words.about(*until)),
             Role::Value,
             true,
         ),
@@ -960,6 +1026,9 @@ fn phrase_of(words: &Words<'_>, verdict: &Verdict, carrier: bool) -> Option<Phra
 /// The words of one view: the outlook's clock and this tab.
 struct Words<'a> {
     out: &'a Outlook,
+    /// The words are the glass's, which name each account by its email ([`Outlook::name_of`]);
+    /// the CLI's ([`Outlook::verdict_phrase`]) name its roster label.
+    glass: bool,
     tab: &'a str,
     tab_reset: Option<i64>,
     single: bool,
@@ -983,6 +1052,15 @@ impl Words<'_> {
 
     fn spoken_when(&self, t: i64) -> String {
         spoken_when(t, self.out.as_of, &self.out.offsets)
+    }
+
+    /// How these words name the row `label`: the glass by its email, the CLI by the label.
+    fn name<'b>(&'b self, label: &'b str) -> &'b str {
+        if self.glass {
+            self.out.name_of(label)
+        } else {
+            label
+        }
     }
 
     /// `~T` of a forecast start, rounded down by its lead.
@@ -1011,7 +1089,7 @@ impl Words<'_> {
         Some(if self.single {
             "its reset".to_owned()
         } else {
-            format!("{}'s reset", row.label)
+            format!("{}'s reset", self.name(&row.label))
         })
     }
 
@@ -1102,7 +1180,7 @@ impl Words<'_> {
             s.push_str(", a 5-hour limit");
         }
         if let Some(row) = lean {
-            s.push_str(&format!(", whatever {row} holds"));
+            s.push_str(&format!(", whatever {} holds", self.name(row)));
         }
         s
     }
@@ -1127,7 +1205,7 @@ impl Words<'_> {
             });
         }
         if let Some(row) = stop.lean {
-            s.push_str(&format!(", whatever {row} holds"));
+            s.push_str(&format!(", whatever {} holds", self.name(row)));
         }
         s
     }
@@ -1154,16 +1232,16 @@ impl Words<'_> {
             if prev == Some(link.label.as_str()) && !after_stop {
                 continue;
             }
+            let name = self.name(&link.label);
             if moves.is_empty() {
                 moves = if clauses.is_empty() {
-                    link.label.clone()
+                    name.to_owned()
                 } else {
-                    format!("then {}", link.label)
+                    format!("then {name}")
                 };
             } else {
                 moves.push_str(&format!(
-                    ", then {} from {}",
-                    link.label,
+                    ", then {name} from {}",
                     self.spoken_about(link.from)
                 ));
             }
@@ -1173,7 +1251,7 @@ impl Words<'_> {
         if let Some(lean) = &week.lean {
             let lean = format!(
                 "{}, which aterm cannot read, from {}",
-                lean.row,
+                self.name(&lean.row),
                 self.spoken_about(lean.at)
             );
             if moves.is_empty() {
@@ -1233,6 +1311,7 @@ impl Outlook {
             .map(|pick| match pick {
                 None => Named {
                     label: THIS_LOGIN.to_owned(),
+                    name: THIS_LOGIN.to_owned(),
                     this_tab: true,
                     carrier: false,
                     figure: tab_figure,
@@ -1244,6 +1323,7 @@ impl Outlook {
                     let this_tab = Some(*i) == tab_row;
                     Named {
                         label: row.label.clone(),
+                        name: row.name.clone(),
                         this_tab,
                         carrier: Some(*i) == carrier_row,
                         figure: if this_tab {
@@ -1299,6 +1379,7 @@ impl Outlook {
     pub fn verdict_phrase(&self) -> Option<Phrase> {
         let words = Words {
             out: self,
+            glass: false,
             tab: "",
             tab_reset: None,
             single: self.rows.len() <= 1,
@@ -1316,6 +1397,7 @@ impl Outlook {
             .and_then(|row| reset_ahead(row, self.as_of));
         Words {
             out: self,
+            glass: true,
             tab,
             tab_reset,
             single: self.rows.len() <= 1,
@@ -1391,7 +1473,7 @@ impl Outlook {
             let then = carried
                 .filter(|_| !words.single)
                 .and_then(|p| p.chain.iter().find(|l| l.from >= from && l.to > l.from))
-                .map(|l| l.label.clone());
+                .map(|l| words.name(&l.label).to_owned());
             let mut forms = Vec::new();
             if let Some(next) = &then {
                 forms.push(format!("{}, then {next}", out_words(&full)));
@@ -1439,21 +1521,25 @@ impl Outlook {
                     None,
                 )
             }
-            Verdict::Walled { to: Some(to), .. } => (
-                vec![
-                    format!("{HANDOFF_MARK} out now: the work moves to {to} at the turn's end"),
-                    format!("{HANDOFF_MARK} the work moves to {to}"),
-                ],
-                format!("Out now: the work moves to {to} at the turn's end."),
-                Role::Value,
-                None,
-            ),
+            Verdict::Walled { to: Some(to), .. } => {
+                let to = words.name(&to);
+                (
+                    vec![
+                        format!("{HANDOFF_MARK} out now: the work moves to {to} at the turn's end"),
+                        format!("{HANDOFF_MARK} the work moves to {to}"),
+                    ],
+                    format!("Out now: the work moves to {to} at the turn's end."),
+                    Role::Value,
+                    None,
+                )
+            }
             Verdict::Lean {
                 until,
                 row,
                 stop: s,
                 ..
             } => {
+                let row = words.name(&row).to_owned();
                 let worst = s.map(|(from, end)| {
                     let (forms, spoken) = stop(from, end, PassKind::Week, None);
                     let (_, short) = words.stop_phrase(from, end);
@@ -1672,9 +1758,10 @@ impl Outlook {
         let mut prev = tab.to_owned();
         for link in &week.chain {
             if link.label != prev {
-                chart
-                    .marks
-                    .push((link.from, Mark::Handoff(link.label.clone())));
+                chart.marks.push((
+                    link.from,
+                    Mark::Handoff(self.name_of(&link.label).to_owned()),
+                ));
                 prev.clone_from(&link.label);
             }
             if link.to <= link.from {
@@ -1687,6 +1774,7 @@ impl Outlook {
                 .unwrap_or_default();
             chart.runs.push(Run {
                 label: link.label.clone(),
+                name: self.name_of(&link.label).to_owned(),
                 from: link.from,
                 to: link.to,
                 knots,
@@ -1727,7 +1815,9 @@ impl Outlook {
             }
         }
         if let Some(lean) = &week.lean {
-            chart.marks.push((lean.at, Mark::Lean(lean.row.clone())));
+            chart
+                .marks
+                .push((lean.at, Mark::Lean(self.name_of(&lean.row).to_owned())));
         }
         chart.unknown_from = [week.lean.as_ref().map(|l| l.at), week.cut_at]
             .into_iter()
@@ -1784,6 +1874,7 @@ impl Outlook {
         let Some(renews) = reset_ahead(row, as_of) else {
             return Burn {
                 label: row.label.clone(),
+                name: row.name.clone(),
                 start: as_of - WEEK,
                 renews: as_of,
                 read: Vec::new(),
@@ -1808,6 +1899,7 @@ impl Outlook {
         };
         Burn {
             label: row.label.clone(),
+            name: row.name.clone(),
             start: renews - WEEK,
             renews,
             read: row
@@ -1900,7 +1992,7 @@ impl Outlook {
         let Some(tab) = view.named.iter().find(|n| n.this_tab) else {
             return String::new();
         };
-        let mut parts = vec![tab.label.clone()];
+        let mut parts = vec![tab.name.clone()];
         parts.extend(tab.plan.clone());
         parts.push(match tab.figure {
             Figure::Exact(_) => format!("{} of its week used, read now", tab.figure.words()),
@@ -1927,7 +2019,7 @@ impl Outlook {
                 .chain
                 .windows(2)
                 .filter(|w| w[0].label != w[1].label)
-                .map(|w| format!("{} {}", w[1].label, words.about(w[1].from)))
+                .map(|w| format!("{} {}", words.name(&w[1].label), words.about(w[1].from)))
                 .collect();
             if !moves.is_empty() {
                 parts.push(format!("the work moves to {}", moves.join(", then ")));
@@ -1937,7 +2029,7 @@ impl Outlook {
             parts.extend(self.pace_title());
         }
         for other in view.named.iter().filter(|n| !n.this_tab) {
-            parts.push(format!("{} {}", other.label, other.figure.words()));
+            parts.push(format!("{} {}", other.name, other.figure.words()));
         }
         if !view.folded.is_empty() {
             parts.push(format!("+{} more", view.folded.len()));
@@ -1952,9 +2044,10 @@ impl Outlook {
                 "the work waits until {}",
                 until.map_or_else(|| "its reset".to_owned(), |u| words.when(words.resumes(u)))
             )),
-            Verdict::Walled { to: Some(to), .. } => {
-                Some(format!("the work moves to {to} at the turn's end"))
-            }
+            Verdict::Walled { to: Some(to), .. } => Some(format!(
+                "the work moves to {} at the turn's end",
+                words.name(to)
+            )),
             Verdict::Stop {
                 pass,
                 from,
@@ -1972,7 +2065,7 @@ impl Outlook {
             Verdict::Lean {
                 until, row, stop, ..
             } => {
-                let mut s = format!("{row} unread from {}", words.about(*until));
+                let mut s = format!("{} unread from {}", words.name(row), words.about(*until));
                 if let Some((from, end)) = stop {
                     s.push_str(&format!(
                         "; if it has nothing, {}",
@@ -2022,7 +2115,7 @@ impl Outlook {
         for n in &view.named {
             let pct = |x10: u16| x10.min(1000) / 10;
             if n.this_tab {
-                s.push_str(&format!(" {}, this tab, ", n.label));
+                s.push_str(&format!(" {}, this tab, ", n.name));
                 s.push_str(&match n.figure {
                     Figure::Exact(_) => format!(
                         "{} percent of its week used",
@@ -2041,7 +2134,7 @@ impl Outlook {
             } else {
                 s.push_str(&format!(
                     " {} {}.",
-                    n.label,
+                    n.name,
                     match n.figure {
                         Figure::Exact(x10) => format!("{} percent", whole_spoken(x10)),
                         Figure::AtLeast(x10) => format!("at least {} percent", pct(x10)),
@@ -2075,7 +2168,8 @@ impl Outlook {
                 )
             )),
             Verdict::Walled { to: Some(to), .. } if movable => s.push_str(&format!(
-                " Out now: the work moves to {to} at the turn's end."
+                " Out now: the work moves to {} at the turn's end.",
+                words.name(to)
             )),
             _ => {}
         }
@@ -2118,7 +2212,7 @@ impl Outlook {
                     },
                     true,
                 );
-                s.push_str(&format!(" If {row} has nothing: {said}."));
+                s.push_str(&format!(" If {} has nothing: {said}.", words.name(row)));
             }
             Verdict::Credits { at }
                 if !drawn
@@ -2165,6 +2259,7 @@ impl QuotaView {
         QuotaView {
             named: vec![Named {
                 label: "main".into(),
+                name: "main".into(),
                 this_tab: true,
                 carrier: true,
                 figure: Figure::Exact(630),
@@ -2223,17 +2318,21 @@ impl QuotaView {
     }
 
     /// Lays the row into `out` at the widest rung of §2.4 that fits `room` cells: `false`, with
-    /// `out` empty, where none does. Case (d) has its own two forms: this tab's name with its
-    /// words full, then short.
+    /// `out` empty, where none does. Case (d) has its own three forms: this tab's name with its
+    /// words full, then short, then its name's local part with the short words.
     pub fn lay(&self, room: usize, out: &mut QuotaLine) -> bool {
         let Some(tab) = self.tab() else {
             out.clear();
             return false;
         };
         if self.waiting() {
-            for full in [true, false] {
+            for (full, names) in [
+                (true, Names::Whole),
+                (false, Names::Whole),
+                (false, Names::Local),
+            ] {
                 out.clear();
-                out.put(&cut(&tab.label), Role::Lit, true);
+                out.put(&names.lay(&tab.name), Role::Lit, true);
                 out.lead = 0..out.cells.len();
                 if let Some(words) = &self.tail.verdict {
                     out.gap();
@@ -2253,9 +2352,9 @@ impl QuotaView {
             return false;
         }
         let mut chart = Vec::new();
-        for (lead, per_day, tail) in LADDER {
+        for (lead, names, per_day, tail) in LADDER {
             out.clear();
-            self.write_lead(lead, out);
+            self.write_lead(lead, names, out);
             out.lead = 0..out.cells.len();
             if per_day > 0 {
                 out.gap();
@@ -2285,10 +2384,10 @@ impl QuotaView {
         false
     }
 
-    fn write_lead(&self, lead: Lead, out: &mut QuotaLine) {
+    fn write_lead(&self, lead: Lead, names: Names, out: &mut QuotaLine) {
         let one = |n: &Named, out: &mut QuotaLine| {
             let role = if n.this_tab { Role::Lit } else { Role::Value };
-            out.put(&cut(&n.label), role, n.this_tab);
+            out.put(&names.lay(&n.name), role, n.this_tab);
             out.put(" ", Role::Quiet, false);
             out.put(&n.figure.words(), role, n.this_tab);
         };
@@ -2368,7 +2467,7 @@ impl QuotaView {
         let k = usize::from(per_day);
         let s = DAY / i64::from(per_day);
         let now = chart.now;
-        let tab = self.tab().map_or(THIS_LOGIN, |n| n.label.as_str());
+        let tab = self.tab().map_or(THIS_LOGIN, |n| n.name.as_str());
         let span = span_dated(a, b, offsets);
         let about = |t: i64| format!("~{}", when(round_down(t, now, offsets), now, offsets));
         if cell < k {
@@ -2392,7 +2491,7 @@ impl QuotaView {
             self.named
                 .iter()
                 .find(|n| n.reset.is_some_and(|r| (t - r).rem_euclid(WEEK) == 0))
-                .map(|n| cut(&n.label))
+                .map(|n| cut(&n.name))
         };
         let run_at = |t: i64| {
             chart
@@ -2457,7 +2556,7 @@ impl QuotaView {
                     })?;
                 match mark {
                     Mark::Handoff(to) => {
-                        let from = chart.runs.iter().find(|r| r.to == *t && &r.label != to);
+                        let from = chart.runs.iter().find(|r| r.to == *t && &r.name != to);
                         // A projected fill is never said as 100% (§2.1): one that reaches it is
                         // `out`, as a level's title says. A move at a vendor reset is said
                         // exactly, as the vendor says it (§2.3); any other is a forecast.
@@ -2478,7 +2577,7 @@ impl QuotaView {
                         match from {
                             Some(from) => format!(
                                 "{at}{SEP}the work moves from {}{pct} to {}",
-                                cut(&from.label),
+                                cut(&from.name),
                                 cut(to)
                             ),
                             None => format!("{at}{SEP}the work moves to {}", cut(to)),
@@ -2499,7 +2598,7 @@ impl QuotaView {
                     .find(|(t, m)| matches!(m, Mark::Reset) && (a..b).contains(t))
                     .map_or(a, |(t, _)| *t);
                 let label = reset_of(t)
-                    .or_else(|| run_at(t + 1).map(|r| cut(&r.label)))
+                    .or_else(|| run_at(t + 1).map(|r| cut(&r.name)))
                     .unwrap_or_else(|| cut(tab));
                 format!("{}{SEP}{label}'s week resets", when(t, now, offsets))
             }
@@ -2507,11 +2606,11 @@ impl QuotaView {
                 let run = run_at(b)?;
                 match run.at(b.min(run.to)) {
                     Some(x10) if x10 >= 1000 => {
-                        format!("~{span}{SEP}{} out (projected)", cut(&run.label))
+                        format!("~{span}{SEP}{} out (projected)", cut(&run.name))
                     }
                     Some(x10) => format!(
                         "~{span}{SEP}{} ~{}% (projected)",
-                        cut(&run.label),
+                        cut(&run.name),
                         whole_under_full(x10)
                     ),
                     None => format!("~{span}{SEP}not projected"),
@@ -2526,22 +2625,28 @@ impl QuotaView {
     }
 
     /// Line D's words-only unit (§1.2), for a pane whose line E is not the glass's: its forms,
-    /// widest first: name, figure, `↺`, verdict; name, figure, verdict; name and figure; name.
-    /// The facts drop before the unit shortens; each form is its runs of words with their inks.
+    /// widest first: name, figure, `↺`, verdict; name, figure, verdict; name and figure; the
+    /// name's local part and figure; the local part alone (§2.5). The facts drop before the unit
+    /// shortens; each form is its runs of words with their inks.
     #[must_use]
     pub fn fallback(&self) -> Vec<Vec<Piece>> {
         let Some(tab) = self.tab() else {
             return Vec::new();
         };
-        let name = Piece::new(cut(&tab.label), Role::Lit);
+        let name = Piece::new(cut(&tab.name), Role::Lit);
+        let local = Piece::new(short(&tab.name), Role::Lit);
         if self.waiting() {
-            return vec![
+            let mut forms = vec![
                 vec![
                     name.clone(),
                     Piece::new(format!(" {NO_FIGURE}"), Role::Quiet),
                 ],
                 vec![name],
             ];
+            if forms.last() != Some(&vec![local.clone()]) {
+                forms.push(vec![local]);
+            }
+            return forms;
         }
         let figure = [
             Piece::new(" ", Role::Quiet),
@@ -2561,7 +2666,12 @@ impl QuotaView {
             ]
         });
         let mut forms: Vec<Vec<Piece>> = Vec::new();
-        for (with_reset, with_verdict) in [(true, true), (false, true), (false, false)] {
+        for (with_reset, with_verdict, name) in [
+            (true, true, &name),
+            (false, true, &name),
+            (false, false, &name),
+            (false, false, &local),
+        ] {
             let mut form = vec![name.clone()];
             form.extend(figure.iter().cloned());
             if with_reset && let Some(r) = &reset {
@@ -2574,7 +2684,7 @@ impl QuotaView {
                 forms.push(form);
             }
         }
-        forms.push(vec![name]);
+        forms.push(vec![local]);
         forms
     }
 }

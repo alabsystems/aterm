@@ -106,6 +106,8 @@ mod codex_rig;
 #[cfg(target_os = "macos")]
 mod codex_source_proof;
 #[cfg(target_os = "macos")]
+mod cold_retirement;
+#[cfg(target_os = "macos")]
 mod commons_lan;
 #[cfg(target_os = "macos")]
 mod commons_startup;
@@ -754,6 +756,7 @@ usage: targo --unverified lab <command> [tag] [args]
   sleep [tag] --for SECS [--hold SECS] [--at-act [--rule RULE] [--within SECS]]
                                  emulate macOS sleep on a LAB_CLOCK=1 lab: SIGSTOP aterm, advance clock offset by SECS,
                                  hold --hold SECS, and SIGCONT (--at-act waits for first CONTINUED journal act)
+  cold-retirement [tag]         stop a cold relaunch's shell past its native deadline, then prove one Claude resumes
   muse-relaunch [tag] [--keep]   live Muse Code crash/resume/aterm-restart lane (~4 min)
   muse-upgrade [tag] [--keep]    live Muse Code quiet upgrade lane across idle, background shell, and mid-turn (~9 min)
   agy-upgrade [tag] [--keep]     live agy quiet upgrade lane across idle, background/subagent/daemon tasks, and mid-turn (~12 min)
@@ -1250,6 +1253,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "outlook-perf" => outlook_captures::cmd_outlook_perf(args),
         "muse-selftest" => muse_proof::cmd_muse_selftest(args),
         "muse-relaunch" => relaunch_muse::cmd_muse_relaunch(args),
+        "cold-retirement" => cold_retirement::cmd(args),
         "muse-upgrade" => upgrade_muse::cmd_muse_upgrade(args),
         "kimi" => kimi::cmd_kimi(args),
         "agy-upgrade" => upgrade_agy::cmd_agy_upgrade(args),
@@ -1588,8 +1592,9 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(3)
 }
 
-/// Create a short `.noindex` temporary directory for unit tests in this crate.
-#[cfg(test)]
+/// Create a short `.noindex` temporary directory for unit tests in this crate, whose every user
+/// is a macOS module.
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
     let short = &tag[..tag.floor_char_boundary(8)];
     let builder = aterm_tempfile::Builder::new()
@@ -1604,13 +1609,13 @@ pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
 
 /// A canonicalized `.noindex` test scratch directory that dereferences to [`std::path::Path`] and
 /// removes itself on drop.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) struct TestScratch {
     _dir: aterm_tempfile::TempDir,
     path: std::path::PathBuf,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 impl TestScratch {
     pub(crate) fn new(tag: &str) -> Self {
         let dir = test_scratch_dir(tag);
@@ -1623,7 +1628,7 @@ impl TestScratch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 impl std::ops::Deref for TestScratch {
     type Target = std::path::Path;
 
@@ -1632,7 +1637,7 @@ impl std::ops::Deref for TestScratch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 impl AsRef<std::path::Path> for TestScratch {
     fn as_ref(&self) -> &std::path::Path {
         &self.path

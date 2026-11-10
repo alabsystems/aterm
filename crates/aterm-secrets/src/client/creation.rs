@@ -797,17 +797,18 @@ fn finish(paths: &Paths, context: [u8; 32], pending: Pending) -> crate::Result<C
             let held = state
                 .digest
                 .ok_or_else(|| Error::new("creation state has no version digest"))?;
-            let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)?;
-            let verified = cached.and_then(|bytes| {
+            let cached = super::chain_cache::held(&paths.cache_file())?;
+            let verified = cached.and_then(|parsed| {
+                let bytes = parsed.bytes();
                 let (env, _, _) = envelope::verify_for_reader(
-                    bytes.as_slice(),
+                    bytes,
                     &current.name,
                     &current.signer.unwrap(),
                     &current.followed,
                     Some(&Floor::below(&first)),
                 )
                 .ok()?;
-                (env.seq == state.seq && env.digest() == held).then(|| bytes.as_slice().to_vec())
+                (env.seq == state.seq && env.digest() == held).then(|| bytes.to_vec())
             });
             verified.or_else(|| {
                 (state.seq == 1 && held == first.digest()).then(|| pending.envelope.clone())

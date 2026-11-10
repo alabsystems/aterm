@@ -10,6 +10,71 @@ use aterm_types::land_trailer::KEYS;
 use std::cell::RefCell;
 use std::path::PathBuf;
 
+#[test]
+fn native_judgment_bootstrap_uses_its_selected_build_directory() {
+    let env = crate::EnvSnapshot::capture();
+    let workspace = aterm_tempfile::manifest_dir()
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let tools = crate::preflight(&env, &workspace).unwrap();
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let physical = scratch.path().canonicalize().unwrap();
+    let root = physical.as_path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::create_dir(root.join(".cargo")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='land-placement-probe'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("build.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"OUT_DIR\")); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".cargo/config.toml"),
+        "[alias]\nverify=['run','--quiet','--']\n",
+    )
+    .unwrap();
+    let selected = root.join(".ubd/bootstrap.noindex");
+    let config = format!("build.build-dir='{}'", selected.display());
+    let run = |placement| {
+        let mut command = judgment_command(
+            &tools.targo,
+            root,
+            "main",
+            &root.join("events"),
+            aterm_capacity::Admit::Wait,
+            placement,
+        );
+        command
+            .env_remove(aterm_toolchain::build_cache::BUILD_DIR_ENV)
+            .env_remove("CARGO_TARGET_DIR");
+        let out =
+            aterm_uds::deadline::output_within(&mut command, Duration::from_secs(60)).unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
+    };
+    let plain = run(None);
+    assert!(
+        plain.starts_with(root.join("target")),
+        "negative control: {plain:?}"
+    );
+    let placed = run(Some(config.as_str()));
+    assert!(
+        placed.starts_with(&selected),
+        "selected bootstrap was ignored: {placed:?}"
+    );
+    assert!(!placed.starts_with(root.join("target")));
+}
+
 #[path = "land_rejudge_tests.rs"]
 mod rejudge;
 
@@ -186,6 +251,7 @@ fn resource_admission_cannot_replace_the_landing_check_scope() {
         "main-sha",
         Path::new("/events"),
         aterm_capacity::Admit::Now,
+        None,
     );
     assert_eq!(
         cmd.get_args()

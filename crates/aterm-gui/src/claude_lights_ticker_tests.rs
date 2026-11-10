@@ -765,6 +765,11 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     let switch = of(&chips, HarnessChip::Switch).expect("the off switch");
     assert_eq!(switch.label, format!("{label} off: harness"));
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::False));
+    assert_eq!(
+        chips.iter().map(|c| c.chip).collect::<Vec<_>>(),
+        [HarnessChip::Switch],
+        "under the switch off a reader meets the switch alone: {chips:?}"
+    );
 }
 
 #[cfg(a11y_tree)]
@@ -809,12 +814,27 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
     assert_eq!(pinned(&app), None);
     app.switch_tab_in(wid, 0);
     frame(&mut app, wid);
+    // The switch stands for an agent the timeline names.
+    app.pool
+        .get(session)
+        .expect("session")
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .set_program(super::gesture_tests::PGID, Some("claude".into()));
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
     frame(&mut app, wid);
-    rename(&mut app, "reader off chip");
-    app.press_claude_chip_for_reader(wid, session, HarnessChip::Autopilot);
+    rename(&mut app, "reader off switch");
+    assert!(
+        app.claude_chips_a11y(wid)
+            .iter()
+            .all(|c| c.chip != HarnessChip::Autopilot),
+        "under the switch off no Autopilot chip stands for a reader"
+    );
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Switch);
     assert_ne!(
         app.windows[&wid].tab_set.active().map(|tab| tab.focus),
         Some(settings),
@@ -822,7 +842,7 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
     );
     assert_eq!(app.focused_session_id(wid), Some(session));
     assert!(app.inline_rename_edit(wid).is_none());
-    assert_eq!(pinned(&app).as_deref(), Some("reader off chip"));
+    assert_eq!(pinned(&app).as_deref(), Some("reader off switch"));
 }
 
 #[test]

@@ -764,12 +764,7 @@ fn the_record_is_read_only_while_its_process_runs() {
         .spawn()
         .expect("spawn sleep");
     let pid = child.id();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while !atpkg::caller_shell::process_args(pid).is_some_and(|a| a.argv.first() == Some(&sleep_s))
-    {
-        assert!(std::time::Instant::now() < deadline, "sleep never ran");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    aterm_uds::deadline::execd(pid as i32, &sleep);
     let start = super::super::restart_stamp::kernel_start(pid).expect("its start");
     let path = record_path(&home, pid);
     std::fs::create_dir_all(path.parent().expect("dir")).expect("sessions dir");
@@ -850,19 +845,13 @@ fn the_idle_point_is_read_live_from_the_record_of_a_running_process() {
         "/bin/sleep",
     )))
     .expect("the kept stand-in");
-    let sleep_s = sleep.to_string_lossy().into_owned();
     let mut child = aterm_uds::spawnfd::command(&sleep)
         .arg("60")
         .env("CODEX_HOME", &home)
         .spawn()
         .expect("spawn sleep");
     let pid = child.id();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while !atpkg::caller_shell::process_args(pid).is_some_and(|a| a.argv.first() == Some(&sleep_s))
-    {
-        assert!(std::time::Instant::now() < deadline, "sleep never ran");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    aterm_uds::deadline::execd(pid as i32, &sleep);
     let start = super::super::restart_stamp::kernel_start(pid).expect("its start");
     let path = record_path(&home, pid);
     std::fs::create_dir_all(path.parent().expect("dir")).expect("sessions dir");

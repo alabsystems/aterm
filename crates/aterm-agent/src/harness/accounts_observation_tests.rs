@@ -106,6 +106,7 @@ pub(crate) fn observation_transition(
                     roster_path: &path,
                     row: &captured,
                     who: &who,
+                    seen: &crate::harness::observe::Observation::Unread,
                 },
                 |state, logins| {
                     written = true;

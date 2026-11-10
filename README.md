@@ -45,6 +45,12 @@ and notarization, puts `aterm.app` in `/Applications` (or `~/Applications`) and
 links the `aterm` command and its man pages under `~/.local`. The ALab
 toolchain installs itself on first launch, with its progress in the app.
 
+aterm starts Mac setup on first launch, and System State shows its progress.
+Missing Command Line Tools, developer mode and the local network helper share
+one administrator password request, which macOS owns. `aterm init --check
+--json --only base.clt` reads the developer-tool setup row without changing
+anything or asking for a password; `aterm init --help` explains its output.
+
 Flags go after `bash -s --`; `--help` lists them (`--dry-run`, `--uninstall`,
 `--no-toolchain`, …). `--no-toolchain` also writes `[packages] auto_install =
 false` into `aterm.toml`, so the app skips the toolchain too. The toolchain

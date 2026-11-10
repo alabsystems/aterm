@@ -456,8 +456,8 @@ fn an_ask_for_the_records_outside_a_look_asks_their_memo() {
 }
 
 /// What a table session's open and the checks a local batch makes at once after it ask
-/// (`aterm-db`'s `Replica::observe`), through `look`: the custody, the access, and the access's
-/// currency twice. The access it opened, and each check's answer.
+/// (`aterm-db`'s `Replica::observe`), through `look`: the custody, the access, the access's
+/// currency twice, and the peer's roster. The access it opened, and each check's answer.
 fn a_session_through(vault: &Vault, look: &client::VaultLook<'_>) -> SessionJudged {
     let custody = vault.bootstrap.revalidate_custody_in(look);
     let access = vault
@@ -470,10 +470,12 @@ fn a_session_through(vault: &Vault, look: &client::VaultLook<'_>) -> SessionJudg
         )),
         _ => None,
     };
+    let roster = look.swarm_roster_until(std::time::Instant::now());
     SessionJudged {
         custody,
         access,
         checks,
+        roster,
     }
 }
 
@@ -488,10 +490,12 @@ fn a_session_on_own_calls(vault: &Vault) -> SessionJudged {
         )),
         _ => None,
     };
+    let roster = client::swarm_roster_now_until(&vault.paths, std::time::Instant::now());
     SessionJudged {
         custody,
         access,
         checks,
+        roster,
     }
 }
 
@@ -500,6 +504,7 @@ struct SessionJudged {
     custody: crate::Result<()>,
     access: crate::Result<Option<Access>>,
     checks: Option<(bool, crate::Result<bool>)>,
+    roster: crate::Result<Option<crate::swarm_roster::SwarmRoster>>,
 }
 
 impl SessionJudged {
@@ -517,20 +522,23 @@ impl SessionJudged {
             self.checks
                 .as_ref()
                 .map(|(current, observed)| (*current, observed.as_ref().map_err(kind).copied())),
+            self.roster.as_ref().map_err(kind).cloned(),
         )
     }
 }
 
 /// A warm table session's look ([`client::VaultLook`]: `Bootstrap::revalidate_custody_in`,
-/// `Bootstrap::access_observed_in_look`, `Access::is_current_in` and
-/// `Access::is_current_observed_in`) observes the state lock once for the open and both checks,
+/// `Bootstrap::access_observed_in_look`, `Access::is_current_in`,
+/// `Access::is_current_observed_in` and `VaultLook::swarm_roster_until`) observes the state lock
+/// once for the open and its checks,
 /// takes one stamping `lstat` of each file they stamp (the custody's digests of its immutable
 /// files look at those once more, as on their own call), opens no file the asks on their own
 /// calls do not, and answers as those calls do; the next look looks again.
 /// NEGATIVE CONTROLS (2026-11-09): with `Access::is_current_observed_in` on its own call, a
 /// session observes the lock three times (`a session look's observations`); with
 /// `Bootstrap::access_observed_in_look` on its own call, twice; with
-/// `Bootstrap::revalidate_custody_in` on its own call, twice.
+/// `Bootstrap::revalidate_custody_in` on its own call, twice; with `VaultLook::swarm_roster_until`
+/// asking its memo on its own call, twice.
 #[test]
 fn a_session_look_observes_once_and_judges_as_its_own_calls() {
     let vault = Vault::new();

@@ -64,6 +64,52 @@ fn a_build_inside_a_merge_is_found_in_the_one_bracketing_span() {
 }
 
 #[test]
+fn an_octopus_span_finds_side_builds_without_inventing_a_missing_count() {
+    let tmp = scratch("resolve-octopus");
+    let origin = tmp.path().join("origin");
+    repo(&origin, 0);
+    let a = commit(&origin, "A", None);
+    commit(&origin, "B", None);
+    let main = commit(&origin, "C", None);
+    git(&origin, &["checkout", "-q", "--detach", &a]);
+    commit(&origin, "S1", None);
+    commit(&origin, "S2", None);
+    let side = commit(&origin, "S3", None);
+    git(&origin, &["checkout", "-q", "--detach", &a]);
+    let third = commit(&origin, "T1", None);
+    let tree = git(&origin, &["rev-parse", "HEAD^{tree}"]);
+    let merged = git(
+        &origin,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &main,
+            "-p",
+            &side,
+            "-p",
+            &third,
+            "-m",
+            "archive",
+        ],
+    );
+    git(&origin, &["update-ref", "refs/heads/main", &merged]);
+    git(&origin, &["checkout", "-q", "main"]);
+    let clone = clone_of(&origin, tmp.path());
+    assert_eq!(count(&clone, "origin/main"), 8);
+    assert_eq!(resolve_commit(&clone, 4).unwrap(), side);
+    assert_eq!(resolve_commit(&clone, 8).unwrap(), merged);
+    // NEGATIVE CONTROL: ancestry has no count 5; the octopus's build is not a
+    // linear first-parent distance and may not stand in for that missing build.
+    assert!(
+        resolve_commit(&clone, 5)
+            .unwrap_err()
+            .to_string()
+            .contains("has rev-list count 5")
+    );
+}
+
+#[test]
 fn a_count_no_commit_has_is_refused_naming_the_span() {
     let tmp = scratch("resolve-none");
     let (clone, _) = merged(tmp.path());

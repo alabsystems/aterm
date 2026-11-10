@@ -2039,12 +2039,73 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         return;
     };
     let borrowed = crate::fmt::borrowed_suffix(ctx, crate::toolchain::TIPPY);
-    if ctx.release || (ctx.input_paths.is_some() && ctx.carry_context.is_some()) {
+    if ctx.input_paths.is_some() && ctx.carry_context.is_some() {
+        preflight_lint(ctx, r, &bin);
+    } else if ctx.release {
         tippy_release_content(ctx, r, &bin, &borrowed);
     } else {
         let scope = ctx.scope.clone();
         let _ = tippy_scope(ctx, r, &bin, &scope, &borrowed);
     }
+}
+
+fn preflight_lint(ctx: &Ctx, r: &mut Report, bin: &std::path::Path) {
+    let mut packages = crate::preflight_lint::Packages::default();
+    let commands = preflight_lint_commands(ctx, bin);
+    for (label, command) in commands {
+        let Compile {
+            mut run,
+            stdout,
+            line,
+            events,
+        } = run_compile(ctx, step_of(r), &label, &command);
+        for event in events {
+            r.raw(event);
+        }
+        if let Ok(stdout) = &stdout {
+            packages.observe(ctx, stdout);
+            rejoin(&mut run, crate::compile_account::human(stdout));
+        }
+        r.raw(run.output.as_str());
+        r.raw(line);
+        r.decide_child(&run, &label);
+        if !run.ok {
+            crate::red_now(ctx, crate::checks::Check::Lint, r);
+            return;
+        }
+    }
+    packages.finish(ctx, r);
+}
+
+fn preflight_lint_commands(ctx: &Ctx, bin: &std::path::Path) -> Vec<(String, Cmd)> {
+    lint_invocations(&ctx.scope, &gated_lint_features(&ctx.root))
+        .into_iter()
+        .map(|pass| {
+            let mut args = pass.args;
+            args.insert(0, "--unverified".into());
+            // Cargo validates freshness here; preserve ordinary scheduling instead of
+            // freezing the command shape used by manually bounded release receipts.
+            let mut command =
+                crate::compile_account::with_message_format(tippy_cmd(ctx, bin, args));
+            let removed: std::collections::BTreeSet<_> = std::env::vars_os()
+                .map(|(name, _)| name)
+                .chain(ctx.exec_env().add_env.iter().map(|(name, _)| name.clone()))
+                .chain(command.envs.iter().map(|(name, _)| name.clone()))
+                .filter(|name| {
+                    name.to_str()
+                        .is_some_and(|name| name.starts_with("TRUST_TARGO_"))
+                })
+                .collect();
+            command.envs.retain(|(name, _)| !removed.contains(name));
+            for name in removed {
+                command = command.remove_env(name);
+            }
+            (
+                format!("preflight tippy {} -D warnings", pass.label),
+                command,
+            )
+        })
+        .collect()
 }
 
 fn tippy_scope(
@@ -2081,41 +2142,28 @@ fn exact_package_tippy_commands(
     bin: &std::path::Path,
     spec: &str,
 ) -> Result<Vec<Cmd>, String> {
-    lint_invocations(
-        &lint_package_scope(ctx, &[spec.to_owned()]),
-        &gated_lint_features(&ctx.root),
-    )
-    .into_iter()
-    .map(|TippyPass { mut args, .. }| {
-        args.insert(0, "--unverified".into());
-        let mut command = crate::compile_account::with_message_format(tippy_cmd(ctx, bin, args));
-        // Content-keyed lint commands use one stable process shape. Utility-QoS wrapping and
-        // per-spawn wait-marker paths are scheduling behavior, not compiler inputs.
-        command.demoted = false;
-        command.waits_count = true;
-        let mut command = exec::materialize_exact_command(command, ctx.exec_env())?;
-        // Each outer Targo invocation creates a different authority endpoint. This child
-        // names its own lane, so remove that capability from its actual environment as well
-        // as its proof. Keeping it would defeat reuse across separate preflight processes.
-        command.envs.retain(|(name, _)| {
-            !name
-                .to_str()
-                .is_some_and(|name| name.starts_with("TRUST_TARGO_"))
-        });
-        exec::finalize_exact_command(command, ctx.exec_env())
-    })
-    .collect()
+    lint_invocations(&Scope::crate_only(spec), &gated_lint_features(&ctx.root))
+        .into_iter()
+        .map(|TippyPass { mut args, .. }| {
+            args.insert(0, "--unverified".into());
+            exact_lint_command(
+                ctx,
+                crate::compile_account::with_message_format(tippy_cmd(ctx, bin, args)),
+            )
+        })
+        .collect()
 }
 
-fn lint_package_scope(ctx: &Ctx, specs: &[String]) -> Scope {
-    if ctx.input_paths.is_some()
-        && let Scope::Changed(mut changed) = ctx.scope.clone()
-    {
-        changed.crates.retain(|spec| specs.contains(spec));
-        Scope::Changed(changed)
-    } else {
-        Scope::packages(specs)
-    }
+fn exact_lint_command(ctx: &Ctx, mut command: Cmd) -> Result<Cmd, String> {
+    command.demoted = false;
+    command.waits_count = true;
+    let mut command = exec::materialize_exact_command(command, ctx.exec_env())?;
+    command.envs.retain(|(name, _)| {
+        !name
+            .to_str()
+            .is_some_and(|name| name.starts_with("TRUST_TARGO_"))
+    });
+    exec::finalize_exact_command(command, ctx.exec_env())
 }
 
 fn unbounded_lint_evidence(reason: impl Into<String>) -> crate::lint_content::Evidence {
@@ -2375,7 +2423,7 @@ impl LintScheduleOps for RealLintScheduleOps<'_> {
             .iter()
             .map(|package| package.spec.clone())
             .collect();
-        let scope = lint_package_scope(self.ctx, &specs);
+        let scope = Scope::packages(&specs);
         let began = std::time::Instant::now();
         let passed = tippy_scope(self.ctx, self.report, self.bin, &scope, self.borrowed);
         let execution_s = began.elapsed().as_secs_f64() / packages.len() as f64;
@@ -2510,13 +2558,20 @@ fn in_checkout(ctx: &Ctx, r: &mut Report, what: &str) -> bool {
 
 /// Every walk of [`aterm_census::CENSUSES`], each once, after Census's shared checkout
 /// prerequisite has passed and holding `capture-privacy` to the baseline of the engine's commit
-/// ([`census_baseline`]).
+/// ([`census_baseline`]). Each guard rule and census reuses the result the checkout's memo
+/// under the state directory kept for it while every question it asked keeps its answer
+/// ([`aterm_census::Memo`]); the transcript says what it reused.
 fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
+    if ctx.input_paths.is_some() && ctx.carry_context.is_some() {
+        preflight_censuses(ctx, r, check);
+        return;
+    }
     let selected: Vec<&aterm_census::Census> = aterm_census::CENSUSES.iter().collect();
     let root = ctx.root.clone();
     let var = engine_vars(ctx);
-    let outcomes = match exec::bounded(ctx.child_ceiling, move || {
-        census_walk(&root, &var, &selected)
+    let memo = aterm_census::Memo::for_root(&ctx.state_dir(), &ctx.root);
+    let (outcomes, report) = match exec::bounded(ctx.child_ceiling, move || {
+        census_walk(&root, &var, &selected, Some(&memo))
     }) {
         Ok(o) => o,
         Err(why) => {
@@ -2533,6 +2588,83 @@ fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
             r.raw(outcome.log.trim_end().to_string());
         }
     }
+    if let Some(report) = report {
+        r.raw(report.line());
+    }
+}
+
+fn preflight_censuses(ctx: &Ctx, r: &mut Report, check: &str) {
+    let root = ctx.root.clone();
+    let baseline = census_baseline(&root, &engine_vars(ctx));
+    let prior: std::collections::BTreeMap<_, _> = aterm_census::CENSUSES
+        .iter()
+        .filter_map(|census| {
+            crate::input_content::prior(ctx, check, census.name)
+                .map(|proof| (census.name, proof.clone()))
+        })
+        .collect();
+    let memo = aterm_census::Memo::for_root(&ctx.state_dir(), &ctx.root);
+    let result = exec::bounded(ctx.child_ceiling, move || {
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = aterm_census::CENSUSES
+                .iter()
+                .map(|census| {
+                    let root = &root;
+                    let baseline = &baseline;
+                    let memo = &memo;
+                    let cached = prior.get(census.name).cloned();
+                    scope.spawn(move || {
+                        if let Some(proof) = cached {
+                            return (census.name, None, None, Some(proof), None);
+                        }
+                        // Guards include parallel and publication readers; their aggregate stays
+                        // unbounded, and this tree's census memo keeps each rule's record
+                        // instead. The five lexical graph censuses use the typed tree reader.
+                        if census.name == "guards" {
+                            let (mut outcomes, report) =
+                                aterm_census::run_censuses(root, &[census], baseline, Some(memo));
+                            return (census.name, outcomes.pop(), None, None, report);
+                        }
+                        let (outcome, inputs) = aterm_census::inputs::capture(root, || {
+                            aterm_census::run_census(root, census, baseline)
+                        });
+                        (census.name, Some(outcome), inputs, None, None)
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|job| job.join().expect("census panic is contained"))
+                .collect::<Vec<_>>()
+        })
+    });
+    let outcomes = match result {
+        Ok(outcomes) => outcomes,
+        Err(why) => {
+            r.cannot_run(format!("{check} — {}", why.sentence()));
+            return;
+        }
+    };
+    for (name, outcome, inputs, carried, memo) in outcomes {
+        if let Some(memo) = memo {
+            r.raw(memo.line());
+        }
+        if let Some(proof) = carried {
+            r.pass(format!("{name}: reused complete package input snapshots"));
+            r.raw(crate::input_content::event(ctx, &proof, true));
+        } else if let Some(outcome) = outcome {
+            r.raw(outcome.log.trim_end().to_owned());
+            if outcome.ok {
+                r.pass(outcome.verdict);
+                if let Some(proof) = inputs
+                    .and_then(|inputs| crate::input_content::Proof::new(ctx, check, name, inputs))
+                {
+                    r.raw(crate::input_content::event(ctx, &proof, false));
+                }
+            } else {
+                r.fail(outcome.verdict);
+            }
+        }
+    }
 }
 
 /// The engine-naming variables of `ctx`'s environment ([`crate::EnvSnapshot::engine_var`]),
@@ -2547,13 +2679,17 @@ fn engine_vars(ctx: &Ctx) -> impl Fn(&str) -> Option<std::ffi::OsString> + Send 
 }
 
 /// The `selected` censuses over the checkout at `root`, `capture-privacy` held to the baseline
-/// of the engine's commit `var` names ([`census_baseline`]).
+/// of the engine's commit `var` names ([`census_baseline`]), reusing what `memo` kept.
 fn census_walk(
     root: &std::path::Path,
     var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     selected: &[&aterm_census::Census],
-) -> Vec<aterm_census::CensusOutcome> {
-    aterm_census::run_censuses(root, selected, &census_baseline(root, var))
+    memo: Option<&aterm_census::Memo>,
+) -> (
+    Vec<aterm_census::CensusOutcome>,
+    Option<aterm_census::MemoReport>,
+) {
+    aterm_census::run_censuses(root, selected, &census_baseline(root, var), memo)
 }
 
 /// The forbidden-content baseline of the engine's commit as `var` names the engine for the
@@ -3442,13 +3578,13 @@ mod tests {
         let log = |outcomes: Vec<aterm_census::CensusOutcome>| {
             outcomes.into_iter().map(|o| o.log).collect::<String>()
         };
-        let uncommitted = log(census_walk(&root, &var, &guards));
+        let uncommitted = log(census_walk(&root, &var, &guards, None).0);
         assert!(
             !uncommitted.contains("base.ptylog"),
             "NEGATIVE CONTROL: an uncommitted row is no part of the engine: {uncommitted}"
         );
         git(&engine, &["commit", "-q", "-am", "row"]);
-        let committed = log(census_walk(&root, &var, &guards));
+        let committed = log(census_walk(&root, &var, &guards, None).0);
         assert!(
             committed.contains("base.ptylog"),
             "the committed row holds: {committed}"
@@ -5700,6 +5836,36 @@ mod tests {
         let cmd = tippy_cmd(&c, &own, tippy_args(&c.scope));
         assert_eq!(env_of(&cmd, "TRUST_STAGE2_BIN"), None);
         assert_eq!(crate::fmt::borrowed_suffix(&c, TIPPY), "");
+    }
+
+    #[test]
+    fn preflight_lint_keeps_the_selection_its_resource_claim_covers() {
+        let mut c = ctx(Scope::crate_only("a"));
+        c.child_env_add.push((
+            "TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT".into(),
+            "outer".into(),
+        ));
+        let commands = preflight_lint_commands(&c, std::path::Path::new("tippy"));
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].1.demoted);
+        assert!(
+            commands[0]
+                .1
+                .remove_envs
+                .iter()
+                .any(|name| name == "TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT")
+        );
+        assert!(
+            commands[0]
+                .1
+                .args
+                .windows(2)
+                .any(|args| args == ["-p", "a"])
+        );
+        assert!(!commands[0].1.args.iter().any(|arg| arg == "--workspace"));
+        let all = ctx(Scope::workspace());
+        let commands = preflight_lint_commands(&all, std::path::Path::new("tippy"));
+        assert!(commands[0].1.args.iter().any(|arg| arg == "--workspace"));
     }
 
     #[test]

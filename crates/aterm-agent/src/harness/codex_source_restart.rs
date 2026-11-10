@@ -291,7 +291,7 @@ mod tests {
         drop(reservation);
         registry.reap_gone();
         assert!(registry.state.lock().unwrap().launches.is_empty());
-        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
+        drop(crate::harness::codex_source_gate::PublicationLock::released_for_home(home.path()));
 
         let (registry, reservation, home) = pending();
         reservation.grant(&reservation.native.child).unwrap();
@@ -306,10 +306,10 @@ mod tests {
     #[test]
     fn granted_child_exec_is_not_death_and_actual_exit_releases_constructor_gate() {
         use std::io::Write as _;
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut child = aterm_uds::spawnfd::command("/bin/sh")
             .args(["-c", "read gate; exec /bin/cat"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
             .spawn()
             .unwrap();
         let before = Process::observe(child.id()).unwrap();
@@ -318,28 +318,32 @@ mod tests {
         let mut input = child.stdin.take().unwrap();
         input.write_all(b"go\n").unwrap();
         input.flush().unwrap();
-        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        loop {
-            let current = Process::observe(child.id()).unwrap();
-            if current.image != before.image {
-                assert_eq!(current.birth, before.birth);
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "actual child never execed"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        child.stdin = Some(input);
+        // The echo proves cat runs and is waiting for more input. Reading its image
+        // while exec changes the mapping can correctly return no observation.
+        let input = aterm_uds::deadline::cat_echoes(&mut child);
+        let current = Process::observe(child.id()).expect("the echoing cat remains alive");
+        assert_ne!(current.image, before.image);
+        assert_eq!(current.birth, before.birth);
         drop(reservation);
         registry.reap_gone();
         assert_eq!(registry.state.lock().unwrap().launches.len(), 1);
         assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
         drop(input);
-        assert!(child.wait().unwrap().success());
+        let mut exit = aterm_uds::deadline::ExitWait::new(&child);
+        let by = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            let left = by.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "cat exits after its input closes");
+            exit.wait(left);
+        };
+        assert!(status.success());
         registry.reap_gone();
         assert!(registry.state.lock().unwrap().launches.is_empty());
-        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
+        drop(crate::harness::codex_source_gate::PublicationLock::released_for_home(home.path()));
     }
 
     #[test]
@@ -379,7 +383,7 @@ mod tests {
                 NoNativeReaderKind::ApiKey,
             )
             .unwrap();
-        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
+        drop(crate::harness::codex_source_gate::PublicationLock::released_for_home(home.path()));
         assert!(Process::observe(std::process::id()).is_some());
     }
 }

@@ -95,8 +95,8 @@ pub enum GitOp {
         /// Read without any credential, including for a release-tier owner.
         anonymous: bool,
     },
-    /// Fetch an admitted exact snapshot with one network transfer, then atomically
-    /// update only its private cache refs after every expected OID matches.
+    /// Fetch an admitted exact snapshot with one network transfer. Ref batches atomically
+    /// publish their private cache refs after every OID matches; object imports publish none.
     FetchBatch {
         /// The existing checkout or bare repository.
         dir: PathBuf,
@@ -2552,8 +2552,8 @@ mod unix {
         )
     }
 
-    /// Fetch one explicit snapshot into scratch; validate every raw OID before
-    /// importing objects and atomically comparing/updating the caller's cache refs.
+    /// Fetch one explicit snapshot into scratch; validate every raw OID before importing
+    /// objects. Ref-publishing batches then atomically compare/update the caller's cache refs.
     fn fetch_batch(
         children: &Children<'_>,
         run: &GitRun,
@@ -2564,6 +2564,17 @@ mod unix {
         use std::io::Read as _;
         const ZERO: &str = "0000000000000000000000000000000000000000";
         let dir = screened(children, run, dir)?;
+        let sources: Vec<_> = batch
+            .rows()
+            .iter()
+            .map(|row| (row.source.as_str(), row.expected_oid.as_str()))
+            .chain(
+                batch
+                    .object_ids()
+                    .iter()
+                    .map(|oid| (oid.as_str(), oid.as_str())),
+            )
+            .collect();
         let canonical = crate::fx::canon::git_request(run);
         let batch_key = crate::model::Sha256Digest::of(&canonical).hex();
         let step = |name: &str,
@@ -2592,6 +2603,9 @@ mod unix {
         let view = step("common-dir", source_view_args(&dir), None, None)?;
         let (common, shallow) = source_view(&view.stdout)?;
         let check_parents = || -> Result<()> {
+            if batch.rows().is_empty() {
+                return Ok(());
+            }
             let answer =
                 children
                     .gh
@@ -2630,19 +2644,23 @@ mod unix {
         for (index, row) in batch.rows().iter().enumerate() {
             let _ = writeln!(old_input, "{} {index}", row.into);
         }
-        let old = step(
-            "old-values",
-            vec![
-                os("-C"),
-                dir.as_os_str().to_os_string(),
-                os("cat-file"),
-                os("--batch-check=%(objectname) %(rest)"),
-            ],
-            None,
-            Some(old_input.as_bytes()),
-        )?;
-        let old =
-            std::str::from_utf8(&old.stdout).map_err(|_| Error::local("invalid old cache refs"))?;
+        let old = if batch.rows().is_empty() {
+            None
+        } else {
+            Some(step(
+                "old-values",
+                vec![
+                    os("-C"),
+                    dir.as_os_str().to_os_string(),
+                    os("cat-file"),
+                    os("--batch-check=%(objectname) %(rest)"),
+                ],
+                None,
+                Some(old_input.as_bytes()),
+            )?)
+        };
+        let old = std::str::from_utf8(old.as_ref().map_or(&[][..], |out| &out.stdout))
+            .map_err(|_| Error::local("invalid old cache refs"))?;
         let mut before = Vec::with_capacity(batch.rows().len());
         for (index, line) in old.lines().enumerate() {
             let Some(row) = batch.rows().get(index) else {
@@ -2671,8 +2689,8 @@ mod unix {
         step("init", init, None, None)?;
         lend_objects(scratch, common, shallow)?;
         let mut fetch_input = String::new();
-        for (index, row) in batch.rows().iter().enumerate() {
-            let _ = writeln!(fetch_input, "+{}:refs/agh/batch/{index}", row.source);
+        for (index, (source, _)) in sources.iter().enumerate() {
+            let _ = writeln!(fetch_input, "+{source}:refs/agh/batch/{index}");
         }
         step(
             "fetch",
@@ -2709,28 +2727,27 @@ mod unix {
                 .strip_prefix("refs/agh/batch/")
                 .and_then(|index| index.parse::<usize>().ok())
                 .ok_or_else(|| Error::local("unexpected fetched ref"))?;
-            let row = batch
-                .rows()
+            let (_, expected) = sources
                 .get(index)
                 .ok_or_else(|| Error::local("extra fetched ref"))?;
-            if !seen.insert(index) || oid != row.expected_oid {
+            if !seen.insert(index) || oid != *expected {
                 return Err(Error::refused(
                     "fetched source differs from its expected raw object ID; cache refs unchanged",
                 ));
             }
         }
-        if seen.len() != batch.rows().len() {
+        if seen.len() != sources.len() {
             return Err(Error::local(
                 "incomplete fetched snapshot; cache refs unchanged",
             ));
         }
         check_parents()?;
         let mut objects_input = String::new();
-        for index in 0..batch.rows().len() {
+        for index in 0..sources.len() {
             let _ = writeln!(objects_input, "refs/agh/batch/{index}");
         }
         let source = scratch.map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf);
-        step(
+        let imported = step(
             "objects",
             vec![
                 os("-C"),
@@ -2748,6 +2765,9 @@ mod unix {
             None,
             Some(objects_input.as_bytes()),
         )?;
+        if batch.rows().is_empty() {
+            return Ok(imported);
+        }
         check_parents()?;
         let mut transaction = "start\noption no-deref\n".to_string();
         for (row, old) in batch.rows().iter().zip(before) {

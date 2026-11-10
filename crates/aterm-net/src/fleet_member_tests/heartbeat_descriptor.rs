@@ -31,7 +31,7 @@ fn changing_member(
             20,
         )
     };
-    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(Stop::new());
     let listening = Listening {
         secret: secret.clone(),
         scope: FleetScope::Content,
@@ -43,12 +43,12 @@ fn changing_member(
     };
     let state = state.to_path_buf();
     let newer = latest.clone();
-    let worker_running = Arc::clone(&running);
+    let worker_stop = Arc::clone(&stop);
     let serving = std::thread::spawn(move || {
         serve_with_handshake(
             &listener,
             &listening,
-            &worker_running,
+            &worker_stop,
             HANG,
             move |served, op| {
                 let proof = served.peer_node().cloned();
@@ -83,7 +83,7 @@ fn changing_member(
     (
         Issuing {
             port,
-            running,
+            stop,
             serving: Some(serving),
         },
         latest,

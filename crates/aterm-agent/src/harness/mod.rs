@@ -142,6 +142,7 @@ pub mod native_observe;
 mod native_record;
 mod native_restart;
 pub mod netwatch;
+pub mod observe;
 pub mod open_url;
 pub mod outlook;
 pub mod permission_click;

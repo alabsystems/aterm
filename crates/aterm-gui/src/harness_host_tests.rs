@@ -78,7 +78,13 @@ fn account_wall_of(
     read: &WallRead<'_>,
     now: i64,
 ) -> (&'static str, Option<String>) {
-    super::account_wall_of(store, &usage_fixture(store, roster, now), sid, read, now)
+    super::account_wall_of(
+        (store, None),
+        &usage_fixture(store, roster, now),
+        sid,
+        read,
+        now,
+    )
 }
 
 fn account_usage_of(
@@ -93,7 +99,7 @@ fn account_usage_of(
         .parent()
         .expect("the harness state over the store");
     super::account_usage_of(
-        (state, store),
+        (state, store, None),
         &usage_fixture(store, roster, now),
         sid,
         read,
@@ -1050,15 +1056,11 @@ fn a_restored_in_flight_relaunch_stays_eligible_until_stale() {
 }
 
 /// A restored relaunch held on the native operation its ended host kept outlasts the attempt
-/// budget until stale, so the kept operation's deadline can pass and its replay lapse; so do the
-/// lapse itself and a fresh native relaunch's pending outcome. Any other wait keeps the budget.
+/// budget until stale, so the kept operation's deadline can pass and its replay lapse; so does
+/// a fresh native relaunch's pending outcome. Any other in-flight wait keeps the budget.
 #[test]
 fn a_restored_native_wait_stays_eligible_until_stale() {
-    for step in [
-        "wait:native-unresolved-operation",
-        "wait:native-lapsed",
-        "wait:native-outcome",
-    ] {
+    for step in ["wait:native-unresolved-operation", "wait:native-outcome"] {
         let outcome = relaunch::outcome(step);
         assert!(
             restored_retry(
@@ -1088,8 +1090,16 @@ fn a_restored_native_wait_stays_eligible_until_stale() {
 }
 
 #[test]
-fn a_restored_retirement_hold_remains_eligible_after_the_attempt_budget() {
-    for step in ["wait:native-retired-unissued", relaunch::WAIT_ACCOUNT] {
+fn a_restored_no_grant_outcome_remains_eligible_after_the_attempt_budget() {
+    for step in [
+        "wait:native-retired-unissued",
+        "wait:native-lapsed",
+        "wait:native-unadmitted",
+        "wait:native-cancelled",
+        "wait:native-cancelled-before-mutation",
+        "wait:native-aborted-before-signal",
+        relaunch::WAIT_ACCOUNT,
+    ] {
         let outcome = relaunch::outcome(step);
         assert_eq!(outcome, Outcome::Busy);
         assert!(restored_retry(
@@ -1098,6 +1108,15 @@ fn a_restored_retirement_hold_remains_eligible_after_the_attempt_budget() {
             RESTORED_TRIES + 1,
             Duration::MAX
         ));
+        assert!(
+            !restored_retry(
+                step,
+                &Outcome::NotYet(step.into()),
+                RESTORED_TRIES + 1,
+                Duration::MAX
+            ),
+            "negative control: treating {step} as an in-flight failure exhausts the restored attempt"
+        );
     }
     assert!(!restored_retry(
         "wait:resume",
@@ -10303,8 +10322,11 @@ mod account_origin;
 #[path = "harness_account_response_tests.rs"]
 mod account_response;
 
+#[path = "harness_account_observed_tests.rs"]
+mod account_observed;
 #[path = "harness_account_pool_session_tests.rs"]
 mod account_pool_session;
+
 #[path = "harness_account_session_tests.rs"]
 mod account_session;
 
@@ -10846,7 +10868,9 @@ fn recovery_eligibility_follows_the_admitted_wall() {
             );
         }
         let idle = a.worker("s-progress-eligibility", &on());
-        let look = idle.account_look(&a.roster()).unwrap();
+        let look = idle
+            .account_look(&(idle.hooks.acts.account_seat)().unwrap(), &a.roster())
+            .unwrap();
         let expected = standing == "own";
         assert_eq!(
             matches!(
@@ -17727,7 +17751,7 @@ fn the_usage_recorder_reads_the_roster_through_this_machines_logins() {
             answered: &answered,
             said: &said,
         };
-        super::account_usage_of((&a.state_root(), &store), roster, sid, &read, now)
+        super::account_usage_of((&a.state_root(), &store, None), roster, sid, &read, now)
     };
     assert_eq!(read(&file, &renewed, "s-new", now - 60), "not-listed");
     let roster = usage_roster(Some(&path), &store, (false, true), now).expect("bound");
@@ -33966,6 +33990,7 @@ fn the_normal_roster_read_recovers_lifecycle_records_and_preserves_conflicts() {
                         roster_path: &a.roster_path(),
                         row: &row,
                         who: &who,
+                        seen: &aterm_agent::harness::observe::Observation::Unread,
                     },
                     |state, logins| Ok(accounts::note_login_end(state, logins, "main", a.clock()))
                 )
@@ -35713,7 +35738,10 @@ fn a_reading_held_back_for_a_new_login_is_taken_when_served_after_it() {
     assert_eq!(key(), profile::AccountKey::claude(b));
 }
 
-/// A matching profile identifies the attributed row even when other accounts are listed.
+/// A matching profile identifies the attributed row even when other accounts are listed; a
+/// profile naming an account no row lists files nothing under the believed row: observation
+/// beats belief (`docs/DESIGN-account-discovery-2026-11-09.md`), and that reading goes to the
+/// journal under the observed account (`harness_account_observed_tests`).
 #[cfg(unix)]
 #[test]
 fn tap_identity_matches_the_default_row_in_a_multi_account_roster() {
@@ -35733,7 +35761,11 @@ fn tap_identity_matches_the_default_row_in_a_multi_account_roster() {
         let idle = w.worker(&tap_on(), tapped_argv(), true);
         w.tap(10, 42, None);
         idle.usage_tap();
-        assert_eq!(w.sample_of("home-a").unwrap().session_pct, Some(42));
+        assert_eq!(
+            w.sample_of("home-a").and_then(|s| s.session_pct),
+            expected.then_some(42),
+            "{email}"
+        );
         let state = accounts::Store::at(&w.state()).load(w.clock()).unwrap().0;
         assert_eq!(
             state.account("home-a").key,

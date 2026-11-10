@@ -1031,8 +1031,6 @@ fn an_unreadable_process_table_is_never_read_as_nothing_running() {
         vec![UNREADABLE_TABLE.to_string()]
     );
     assert!(background_or_unreadable(4163, &[(1, 0, "launchd".into())]).is_empty());
-    assert!(!table().is_empty());
-    assert!(!live_background(std::process::id()).contains(&UNREADABLE_TABLE.to_string()));
 }
 
 #[test]

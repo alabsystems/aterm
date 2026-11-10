@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::fleet::{FleetEvent, Listening, read_key_file, serve_with_handshake};
+use aterm_uds::stop::Stop;
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -2078,7 +2079,7 @@ const OLDER_OPS: &[FleetOp] = &[FleetOp::Survey, FleetOp::Join];
 
 struct Issuing {
     port: u16,
-    running: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     serving: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -2190,7 +2191,7 @@ impl Issuing {
             .as_ref()
             .filter(|_| log.is_some())
             .map(|me| Peer::own(me, (&issuer.host, port, &issuer.version), 1_760_000_000_000));
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let listening = Listening {
             secret,
             scope: FleetScope::Content,
@@ -2203,12 +2204,12 @@ impl Issuing {
         let (state, issuer) = (state.to_path_buf(), Arc::new(issuer));
         let secret = listening.secret.clone();
         let serving = std::thread::spawn({
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             move || {
                 serve_with_handshake(
                     &listener,
                     &listening,
-                    &running,
+                    &stop,
                     HANG,
                     move |served, op| {
                         let proof = served.peer_node().cloned();
@@ -2253,7 +2254,7 @@ impl Issuing {
         });
         Self {
             port,
-            running,
+            stop,
             serving: Some(serving),
         }
     }
@@ -2261,8 +2262,7 @@ impl Issuing {
 
 impl Drop for Issuing {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
-        let _ = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
+        self.stop.set();
         if let Some(serving) = self.serving.take() {
             let _ = serving.join();
         }
@@ -2334,7 +2334,7 @@ fn a_registration_tells_an_issuers_refusal_from_no_answer() {
     for said in [Some("ERR the book is full\n"), None] {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let listening = Listening {
             secret: secret(6),
             scope: FleetScope::Content,
@@ -2345,12 +2345,12 @@ fn a_registration_tells_an_issuers_refusal_from_no_answer() {
             lifetime: HANG,
         };
         let serving = std::thread::spawn({
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             move || {
                 serve_with_handshake(
                     &listener,
                     &listening,
-                    &running,
+                    &stop,
                     HANG,
                     move |served, _| {
                         served.answer(|stream| {
@@ -2387,7 +2387,7 @@ fn a_registration_tells_an_issuers_refusal_from_no_answer() {
             }
             (said, refused) => panic!("{said:?}: {refused:?}"),
         }
-        running.store(false, Ordering::Release);
+        stop.set();
         serving.join().unwrap();
     }
 }
@@ -5788,14 +5788,14 @@ const DRIBBLE_BYTES: usize = 4_000;
 
 struct Answering {
     port: u16,
-    running: Arc<AtomicBool>,
+    stop: Arc<Stop>,
 }
 
 impl Answering {
     fn start(secret: FleetSecret, scope: FleetScope, answer: Answer) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let listening = Listening {
             secret,
             scope,
@@ -5806,12 +5806,12 @@ impl Answering {
             lifetime: HANG,
         };
         std::thread::spawn({
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             move || {
                 crate::fleet::serve_with_handshake(
                     &listener,
                     &listening,
-                    &running,
+                    &stop,
                     HANG,
                     move |served, _| {
                         served.answer(|stream| {
@@ -5880,13 +5880,13 @@ impl Answering {
                 );
             }
         });
-        Self { port, running }
+        Self { port, stop }
     }
 }
 
 impl Drop for Answering {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
+        self.stop.set();
     }
 }
 
@@ -6143,7 +6143,7 @@ fn at_once_holds_its_limit_and_its_order() {
 }
 
 struct Naming {
-    running: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     /// How many surveys it was asked.
     asked: Arc<AtomicUsize>,
 }
@@ -6172,7 +6172,7 @@ impl Naming {
         me: Option<NodeIdentity>,
         lines: Vec<String>,
     ) -> Self {
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let asked = Arc::new(AtomicUsize::new(0));
         let listening = Listening {
             secret,
@@ -6184,12 +6184,12 @@ impl Naming {
             lifetime: HANG,
         };
         std::thread::spawn({
-            let (running, asked) = (Arc::clone(&running), Arc::clone(&asked));
+            let (stop, asked) = (Arc::clone(&stop), Arc::clone(&asked));
             move || {
                 serve_with_handshake(
                     &listener,
                     &listening,
-                    &running,
+                    &stop,
                     HANG,
                     move |served, _| {
                         served.answer(|stream| {
@@ -6208,7 +6208,7 @@ impl Naming {
                 );
             }
         });
-        Self { running, asked }
+        Self { stop, asked }
     }
 
     fn asked(&self) -> usize {
@@ -6218,7 +6218,7 @@ impl Naming {
 
 impl Drop for Naming {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
+        self.stop.set();
     }
 }
 
@@ -6604,7 +6604,7 @@ fn a_listener_names_only_the_node_its_book_binds_the_proved_key_to() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let (told, judged) = std::sync::mpsc::channel();
-    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(Stop::new());
     let listening = Listening {
         secret: secret(5),
         scope: FleetScope::Facts,
@@ -6615,12 +6615,12 @@ fn a_listener_names_only_the_node_its_book_binds_the_proved_key_to() {
         lifetime: HANG,
     };
     let serving = std::thread::spawn({
-        let (running, dir) = (Arc::clone(&running), state.dir().to_path_buf());
+        let (stop, dir) = (Arc::clone(&stop), state.dir().to_path_buf());
         move || {
             serve_with_handshake(
                 &listener,
                 &listening,
-                &running,
+                &stop,
                 HANG,
                 move |served, _| {
                     let _ = told.send(proven_peer(&served, &dir));
@@ -6655,14 +6655,14 @@ fn a_listener_names_only_the_node_its_book_binds_the_proved_key_to() {
         assert_eq!(judged.recv_timeout(HANG), Ok(want));
         drop(reached);
     }
-    running.store(false, Ordering::Release);
+    stop.set();
     serving.join().unwrap();
 }
 
 fn node_listener(
     me: NodeIdentity,
     serves: &'static [FleetOp],
-) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+) -> (u16, Arc<Stop>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     node_listener_on(listener, me, serves)
 }
@@ -6671,9 +6671,9 @@ fn node_listener_on(
     listener: TcpListener,
     me: NodeIdentity,
     serves: &'static [FleetOp],
-) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+) -> (u16, Arc<Stop>, std::thread::JoinHandle<()>) {
     let port = listener.local_addr().unwrap().port();
-    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(Stop::new());
     let listening = Listening {
         secret: secret(6),
         scope: FleetScope::Content,
@@ -6684,12 +6684,12 @@ fn node_listener_on(
         lifetime: HANG,
     };
     let serving = std::thread::spawn({
-        let running = Arc::clone(&running);
+        let stop = Arc::clone(&stop);
         move || {
             serve_with_handshake(
                 &listener,
                 &listening,
-                &running,
+                &stop,
                 HANG,
                 move |served, op| {
                     served.answer(|stream| {
@@ -6708,7 +6708,7 @@ fn node_listener_on(
             );
         }
     });
-    (port, running, serving)
+    (port, stop, serving)
 }
 
 /// A person's drive is served by a listener that dropped its first connection, as one at its slots
@@ -6749,8 +6749,8 @@ fn a_drive_is_served_by_a_listener_that_hung_up_on_its_first_connection() {
     );
     assert!(driving.is_ok(), "{:?}", driving.err());
     drop(driving);
-    let (_, running, served) = serving.join().unwrap();
-    running.store(false, Ordering::Release);
+    let (_, stop, served) = serving.join().unwrap();
+    stop.set();
     served.join().unwrap();
 }
 
@@ -6962,7 +6962,7 @@ fn a_silent_recorded_address_gives_way_to_a_name_without_losing_the_bound_key() 
         } else {
             identity(host.node(), 5)
         };
-        let (_, running, serving) = node_listener_on(v6, named, &[FleetOp::Drive]);
+        let (_, stop, serving) = node_listener_on(v6, named, &[FleetOp::Drive]);
         let target = Target {
             host: "::1".to_owned(),
             addr: Some(Ipv4Addr::LOCALHOST.into()),
@@ -6984,7 +6984,7 @@ fn a_silent_recorded_address_gives_way_to_a_name_without_losing_the_bound_key() 
             }
             Err(why) => Err(why),
         };
-        running.store(false, Ordering::Release);
+        stop.set();
         serving.join().unwrap();
         assert!(
             silent.overrode().is_some(),
@@ -7018,7 +7018,7 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
     let me = identity(&node_of(0x3a), 8);
     let bound = Keyring::of(&[keyed(0xd7, host.key(), [127, 0, 0, 1], 7100)]);
 
-    let (port, running, serving) = listen(host.clone(), &[FleetOp::Survey, FleetOp::Drive]);
+    let (port, stop, serving) = listen(host.clone(), &[FleetOp::Survey, FleetOp::Drive]);
     let mut driven = drive(
         &target(port),
         &bound,
@@ -7050,10 +7050,10 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
             other.map(|d| d.node.clone())
         ),
     }
-    running.store(false, Ordering::Release);
+    stop.set();
     serving.join().unwrap();
 
-    let (port, running, serving) =
+    let (port, stop, serving) =
         listen(identity(host.node(), 5), &[FleetOp::Survey, FleetOp::Drive]);
     match drive(
         &target(port),
@@ -7067,10 +7067,10 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
             other.map(|d| d.node.clone())
         ),
     }
-    running.store(false, Ordering::Release);
+    stop.set();
     serving.join().unwrap();
 
-    let (port, running, serving) = listen(host.clone(), &[FleetOp::Survey]);
+    let (port, stop, serving) = listen(host.clone(), &[FleetOp::Survey]);
     match drive(
         &target(port),
         &bound,
@@ -7088,7 +7088,7 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
             other.map(|d| d.node.clone())
         ),
     }
-    running.store(false, Ordering::Release);
+    stop.set();
     serving.join().unwrap();
 }
 
@@ -7097,7 +7097,7 @@ fn a_drive_its_deadline_hangs_up_reads_as_that_deadline_never_as_the_peers_cut()
     let host = identity(&node_of(0xd7), 4);
     let me = identity(&node_of(0x3a), 8);
     let bound = Keyring::of(&[keyed(0xd7, host.key(), [127, 0, 0, 1], 7100)]);
-    let (port, running, serving) = node_listener(host.clone(), &[FleetOp::Survey, FleetOp::Drive]);
+    let (port, stop, serving) = node_listener(host.clone(), &[FleetOp::Survey, FleetOp::Drive]);
     let target = Target {
         host: "127.0.0.1".to_owned(),
         addr: None,
@@ -7132,7 +7132,7 @@ fn a_drive_its_deadline_hangs_up_reads_as_that_deadline_never_as_the_peers_cut()
         .and_then(|()| driven.flush());
     assert_eq!(wrote.map_err(|e| e.kind()), Err(io::ErrorKind::TimedOut));
     drop(driven);
-    running.store(false, Ordering::Release);
+    stop.set();
     serving.join().unwrap();
 }
 
@@ -7152,7 +7152,7 @@ fn a_holder_proves_itself_at_any_level_and_only_another_fleet_or_key_disowns_it(
         proves_itself(&target(port), &bound, (secret, &me), HANG).expect_err("it is refused")
     };
 
-    let (port, running, serving) = node_listener(host.clone(), &[FleetOp::Survey, FleetOp::Book]);
+    let (port, stop, serving) = node_listener(host.clone(), &[FleetOp::Survey, FleetOp::Book]);
     assert_eq!(
         proves_itself(&target(port), &bound, (&secret(6), &me), HANG).expect("it proves itself"),
         SocketAddr::from(([127, 0, 0, 1], port)),
@@ -7163,7 +7163,7 @@ fn a_holder_proves_itself_at_any_level_and_only_another_fleet_or_key_disowns_it(
         matches!(rotated, Unreached::Handshake(..)) && rotated.disowns(),
         "another fleet's secret there: {rotated:?}"
     );
-    running.store(false, Ordering::Release);
+    stop.set();
     serving.join().unwrap();
     let stopped = refused(port, &secret(6));
     assert!(
@@ -7171,17 +7171,17 @@ fn a_holder_proves_itself_at_any_level_and_only_another_fleet_or_key_disowns_it(
         "nothing listening says nothing of its drives: {stopped:?}"
     );
 
-    let (port, running, serving) =
+    let (port, stop, serving) =
         node_listener(identity(host.node(), 5), &[FleetOp::Survey, FleetOp::Book]);
     let rekeyed = refused(port, &secret(6));
     assert!(
         matches!(rekeyed, Unreached::Impostor { .. }) && rekeyed.disowns(),
         "{rekeyed:?}"
     );
-    running.store(false, Ordering::Release);
+    stop.set();
     serving.join().unwrap();
 
-    let (port, running, serving) = node_listener(
+    let (port, stop, serving) = node_listener(
         identity(&node_of(0xe8), 9),
         &[FleetOp::Survey, FleetOp::Book],
     );
@@ -7190,7 +7190,7 @@ fn a_holder_proves_itself_at_any_level_and_only_another_fleet_or_key_disowns_it(
         matches!(moved, Unreached::OtherNode { .. }) && !moved.disowns(),
         "another node at its place says nothing of where it went: {moved:?}"
     );
-    running.store(false, Ordering::Release);
+    stop.set();
     serving.join().unwrap();
 
     let at = SocketAddr::from(([192, 168, 1, 23], 7100));
@@ -7954,7 +7954,7 @@ fn a_listener_that_has_not_read_its_deny_list_refuses_every_proven_peer_until_it
     let (refused, refusals) = std::sync::mpsc::channel();
     let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = tcp_listener.local_addr().unwrap();
-    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(Stop::new());
     let listening = Listening {
         secret: secret.clone(),
         scope: FleetScope::Content,
@@ -7965,7 +7965,7 @@ fn a_listener_that_has_not_read_its_deny_list_refuses_every_proven_peer_until_it
         lifetime: HANG,
     };
     let server = std::thread::spawn({
-        let running = Arc::clone(&running);
+        let stop = Arc::clone(&stop);
         let read = Arc::clone(&read);
         move || {
             crate::fleet::serve_offering_with_ask_within(
@@ -7982,7 +7982,7 @@ fn a_listener_that_has_not_read_its_deny_list_refuses_every_proven_peer_until_it
                     }),
                 ),
                 None,
-                &running,
+                &stop,
                 HANG,
                 |served, _| served.answer(|s| s.write_all(b"OK 0\n")),
                 move |event| {
@@ -8034,8 +8034,7 @@ fn a_listener_that_has_not_read_its_deny_list_refuses_every_proven_peer_until_it
         "the listener refused only the two dials before its deny list was read"
     );
 
-    running.store(false, Ordering::Release);
-    let _ = TcpStream::connect(addr);
+    stop.set();
     let _ = server.join();
 }
 
@@ -8054,7 +8053,7 @@ fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
 
     let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = tcp_listener.local_addr().unwrap();
-    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(Stop::new());
     let listening = Listening {
         secret: secret.clone(),
         scope: FleetScope::Content,
@@ -8065,7 +8064,7 @@ fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
         lifetime: HANG,
     };
     let server = std::thread::spawn({
-        let running = Arc::clone(&running);
+        let stop = Arc::clone(&stop);
         let deny = Arc::clone(&deny);
         move || {
             crate::fleet::serve_offering_with_ask_within(
@@ -8076,7 +8075,7 @@ fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
                     Arc::new(move || Arc::clone(&deny)),
                 ),
                 None,
-                &running,
+                &stop,
                 HANG,
                 |served, _| served.answer(|s| s.write_all(b"OK 0\n")),
                 |_| {},
@@ -8152,8 +8151,7 @@ fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
         panic!("good node must be admitted: {err:?}");
     }
 
-    running.store(false, Ordering::Release);
-    let _ = TcpStream::connect(addr);
+    stop.set();
     let _ = server.join();
 }
 
@@ -10911,7 +10909,7 @@ fn facts_mail_code_and_census_enforce_framing_bounds_and_clamp_max_deadlines() {
     // Peer dialers reject unframed/oversize replies and clamp `Duration::MAX` without panicking.
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(Stop::new());
     let next_reply: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let listening = Listening {
         secret: secret(9),
@@ -10923,13 +10921,13 @@ fn facts_mail_code_and_census_enforce_framing_bounds_and_clamp_max_deadlines() {
         lifetime: HANG,
     };
     let server = std::thread::spawn({
-        let running = Arc::clone(&running);
+        let stop = Arc::clone(&stop);
         let next_reply = Arc::clone(&next_reply);
         move || {
             serve_with_handshake(
                 &listener,
                 &listening,
-                &running,
+                &stop,
                 HANG,
                 move |served, op| {
                     let bytes = next_reply.lock().unwrap().clone();
@@ -11030,8 +11028,7 @@ fn facts_mail_code_and_census_enforce_framing_bounds_and_clamp_max_deadlines() {
         .is_err()
     );
 
-    running.store(false, Ordering::Release);
-    let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, port));
+    stop.set();
     let _ = server.join();
 }
 

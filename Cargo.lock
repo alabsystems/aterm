@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.192.0"
+version = "0.193.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -433,6 +433,7 @@ name = "aterm-census"
 version = "0.0.0"
 dependencies = [
  "aterm-codec",
+ "aterm-digest",
  "aterm-hash",
  "aterm-regex",
  "aterm-stamp",
@@ -2120,6 +2121,7 @@ dependencies = [
  "aterm-tempfile",
  "aterm-vitals",
  "libc",
+ "trust-exec-policy",
 ]
 
 [[package]]
@@ -2590,6 +2592,13 @@ version = "0.13.0"
 dependencies = [
  "libc",
  "trust-sha2",
+]
+
+[[package]]
+name = "trust-exec-policy"
+version = "0.13.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

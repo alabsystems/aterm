@@ -2342,15 +2342,19 @@ fn parse_line_reads_every_line_the_tap_prints() {
 fn the_owners_command_reads_the_payload_and_keeps_its_row_and_status() {
     let leftovers = || -> Vec<String> {
         let mine = format!(".aterm-tap-stdin-{}-", std::process::id());
-        std::fs::read_dir(std::env::temp_dir())
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|name| name.starts_with(&mine))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let tmp = std::env::temp_dir();
+        let quiet = aterm_tempfile::quiet_in(&tmp);
+        let mut dirs = vec![tmp];
+        if dirs[0] != quiet {
+            dirs.push(quiet);
+        }
+        dirs.into_iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| name.starts_with(&mine))
+            .collect()
     };
     let echoed = chain_command("\"$ATERM_TEST_CAT\"", PAYLOAD_2_1_310.as_bytes())
         .expect("a command")

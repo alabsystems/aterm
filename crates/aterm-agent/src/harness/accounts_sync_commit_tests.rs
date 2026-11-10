@@ -36,6 +36,7 @@ impl Bed {
         let plan = Plan {
             fleet: None,
             source_policy: None,
+            outbox: None,
             local_logins: false,
             wake: None,
             roster_path: Some(

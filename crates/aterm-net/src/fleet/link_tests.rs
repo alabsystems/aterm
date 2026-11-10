@@ -9,6 +9,7 @@ use super::super::{
     serve_offering_with_ask_within,
 };
 use super::*;
+use aterm_uds::stop::Stop;
 use std::net::TcpListener;
 use std::sync::mpsc;
 
@@ -46,7 +47,7 @@ struct Mac {
     gate: Arc<(Mutex<bool>, Condvar)>,
     addr: SocketAddr,
     admitted: Arc<AtomicU64>,
-    running: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     serving: Option<std::thread::JoinHandle<()>>,
     unread: Arc<Mutex<Vec<super::super::Served>>>,
 }
@@ -128,7 +129,7 @@ impl Mac {
         let table = Neighbours::new(me.clone(), cfg);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let admitted = Arc::new(AtomicU64::new(0));
         let unread = Arc::new(Mutex::new(Vec::new()));
         let listening = Listening {
@@ -142,11 +143,8 @@ impl Mac {
         };
         let serving = {
             let unread = Arc::clone(&unread);
-            let (running, admitted, table) = (
-                Arc::clone(&running),
-                Arc::clone(&admitted),
-                Arc::clone(&table),
-            );
+            let (stop, admitted, table) =
+                (Arc::clone(&stop), Arc::clone(&admitted), Arc::clone(&table));
             let me = me.clone();
             std::thread::spawn(move || {
                 let serves: &'static [FleetOp] = &[FleetOp::Neighbour, FleetOp::Survey];
@@ -158,7 +156,7 @@ impl Mac {
                         deny,
                     ),
                     None,
-                    &running,
+                    &stop,
                     HANG,
                     move |served, op| {
                         if op != FleetOp::Neighbour {
@@ -190,7 +188,7 @@ impl Mac {
             gate,
             addr,
             admitted,
-            running,
+            stop,
             serving: Some(serving),
             unread,
         }
@@ -231,7 +229,7 @@ impl Drop for Mac {
     fn drop(&mut self) {
         self.open_gate();
         self.table.stop();
-        self.running.store(false, Ordering::Release);
+        self.stop.set();
         if let Some(serving) = self.serving.take() {
             let _ = serving.join();
         }

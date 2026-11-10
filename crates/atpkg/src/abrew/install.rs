@@ -12,6 +12,7 @@ use super::formula::{Formula, Requirement, version_cmp};
 use super::machine::Machine;
 use super::prefix::{Installed, Kind, Prefix, symlink_dir, symlink_file};
 
+mod pkg_config;
 #[cfg(unix)]
 mod shared_namespace;
 #[cfg(unix)]
@@ -1428,7 +1429,7 @@ fn replace_text_placeholders(
         if bytes.contains(&0) || !bytes.windows(10).any(|w| w == b"@@HOMEBREW") {
             continue;
         }
-        let mut text = bytes;
+        let mut text = pkg_config::prepare(&path, bytes);
         let mut changed = false;
         for (old, new) in &pairs {
             let old = old.as_bytes();
@@ -1588,7 +1589,7 @@ fn relocate_staged(
                 let _ = file.set_permissions(mode);
             }
         } else if !bytes.contains(&0) {
-            let mut text = bytes;
+            let mut text = pkg_config::prepare(&path, bytes);
             let mut changed = false;
             for (old, new) in &pairs {
                 let old = old.as_bytes();
@@ -4045,6 +4046,29 @@ mod tests {
             assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"user bytes");
             assert_eq!(std::fs::read(left.join("share/vim/left")).unwrap(), b"left");
         }
+    }
+
+    #[test]
+    fn pkg_config_relocation_preserves_spaced_prefix_as_one_flag() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("Application Support/native"));
+        let staged = tmp.path().join("staged");
+        std::fs::create_dir_all(staged.join("lib/pkgconfig")).unwrap();
+        let pc = staged.join("lib/pkgconfig/demo.pc");
+        std::fs::write(&pc, "prefix=@@HOMEBREW_PREFIX@@\nlibdir=${prefix}/lib\nLibs: -L${libdir} -ldemo\nCflags: -I${prefix}/include\n").unwrap();
+        let formula = Formula {
+            name: "demo".to_owned(),
+            ..Formula::default()
+        };
+        replace_text_placeholders(&prefix, &formula, &staged).unwrap();
+        let actual = std::fs::read_to_string(pc).unwrap();
+        assert_eq!(
+            actual,
+            format!(
+                "prefix={}\nlibdir=${{prefix}}/lib\nLibs: \"-L${{libdir}}\" -ldemo\nCflags: \"-I${{prefix}}/include\"\n",
+                prefix.root.display()
+            )
+        );
     }
 
     #[test]

@@ -276,10 +276,10 @@ fn handover_bundle_until(
     if let Some(digest) = state.digest {
         let bytes = super::held_copy(paths, &config, &state)
             .or_else(|| {
-                fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
+                super::chain_cache::held(&paths.cache_file())
                     .ok()
                     .flatten()
-                    .map(|b| b.as_slice().to_vec())
+                    .map(|parsed| parsed.bytes().to_vec())
             })
             .ok_or_else(none)?;
         let (envelope, pinned, verdict) = envelope::verify_for_reader(

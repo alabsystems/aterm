@@ -290,6 +290,7 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         key_row: Some(true),
         note: None,
         typing: false,
+        switch_to: None,
         token: None,
         outlook: None,
         account_row: None,
@@ -559,6 +560,60 @@ fn each_fact_menu_offers_its_rows_and_its_hide() {
             .any(|r| r.contains("repository root"))
     );
     assert!(rows(Fact::Usage, &on).iter().all(|r| !r.selectable()));
+}
+
+#[test]
+fn the_model_and_effort_menus_offer_the_switch_a_click_makes() {
+    use crate::claude_facts::{ModelSwitch, switch_plan};
+    let shown = |model: &str, effort: &str| aterm_agent::harness::footer::FooterFacts {
+        model: Some(model.into()),
+        effort: Some(effort.into()),
+        ..Default::default()
+    };
+    let toward = FactMenuFacts {
+        switch_to: Some(switch_plan(
+            &shown("Sonnet 4.5", "high"),
+            &ModelSwitch::default(),
+        )),
+        ..menu_facts(FactMask::default(), true)
+    };
+    assert_eq!(
+        shown_rows(Fact::Model, &toward)[2],
+        "\u{21c4} Switch to Opus 5.5 xhigh [fact-menu/model/switch-model] true"
+    );
+    assert_eq!(
+        shown_rows(Fact::Effort, &toward)[2],
+        "\u{21c4} Switch to Opus 5.5 xhigh [fact-menu/effort/switch-model] true"
+    );
+    assert!(
+        shown_rows(Fact::Model, &toward)
+            .iter()
+            .any(|r| r.ends_with("[fact-menu/model/type/model] true")),
+        "Change model\u{2026} stays"
+    );
+    let back = FactMenuFacts {
+        switch_to: Some(switch_plan(
+            &shown("Opus 5.5", "xhigh"),
+            &ModelSwitch::default(),
+        )),
+        typing: true,
+        ..menu_facts(FactMask::default(), true)
+    };
+    assert_eq!(
+        shown_rows(Fact::Model, &back)[2],
+        "\u{21c4} Back to the default model at auto effort [fact-menu/model/switch-model] false",
+        "it waits while a press is in flight"
+    );
+    assert!(
+        !shown_rows(Fact::TopEffort, &toward)
+            .iter()
+            .any(|r| r.contains("switch-model")),
+        "the top rule's key menu has no switch"
+    );
+}
+
+fn shown_rows(fact: Fact, facts: &FactMenuFacts) -> Vec<String> {
+    shown(&rows(fact, facts))
 }
 
 #[test]
@@ -1369,17 +1424,23 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
     };
     assert_eq!(
         row(Some("main"), None),
-        ("main \u{b7} preferred \u{b7} 90% used".into(), true),
+        (
+            "main@example.test \u{b7} preferred \u{b7} 90% used".into(),
+            true
+        ),
         "the row its login is judged to takes its newer figure, with no email to match"
     );
     let kept = (
-        "main \u{b7} preferred \u{b7} \u{2265}38% used".to_string(),
+        "main@example.test \u{b7} preferred \u{b7} \u{2265}38% used".to_string(),
         true,
     );
     for label in [Some("main"), None] {
         assert_eq!(
             row(label, Some("canonical@example.test")),
-            ("main \u{b7} preferred \u{b7} 90% used".into(), true),
+            (
+                "main@example.test \u{b7} preferred \u{b7} 90% used".into(),
+                true
+            ),
             "the provider identity selects the alias row's newer figure"
         );
         assert_eq!(
@@ -2302,11 +2363,17 @@ fn no_glass_week_figure_says_left() {
         })
         .collect::<Vec<_>>()
     };
+    // A row with an email is named by it (§2.5), one with none by its roster label.
     let said = |label: &str, week: &str, spoken: &str| {
+        let name = if ["walled", "gone", "away", "away-unread"].contains(&label) {
+            format!("{label}@example.test")
+        } else {
+            label.to_owned()
+        };
         (
-            label.to_owned(),
+            name.clone(),
             week.to_owned(),
-            format!("{label}, pool, {spoken}"),
+            format!("{name}, pool, {spoken}"),
         )
     };
     assert_eq!(
@@ -2335,7 +2402,10 @@ fn no_glass_week_figure_says_left() {
         ]
     );
     for auto_login in [true, false] {
-        for (label, week, spoken) in words(auto_login) {
+        for (name, week, spoken) in words(auto_login) {
+            let label = name
+                .split_once('@')
+                .map_or(name.as_str(), |(label, _)| label);
             let what = format!("{label} (auto-login {auto_login}): {week:?}, {spoken:?}");
             assert!(
                 !week.contains("left") && !spoken.contains("left"),

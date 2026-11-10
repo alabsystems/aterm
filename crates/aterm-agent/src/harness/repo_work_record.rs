@@ -136,6 +136,7 @@ fn work_reads(dir: &Path, reads: &Reads<'_>) -> Option<WorkRecord> {
                 true,
                 None,
                 Diagnostics::Refuse,
+                None,
             );
             let Some(names) = names else {
                 // A listing git refused could name fewer files than the branch changes.

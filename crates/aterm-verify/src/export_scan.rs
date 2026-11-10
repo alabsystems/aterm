@@ -103,7 +103,7 @@ pub fn registry_names(text: &str) -> Result<Vec<String>, String> {
 }
 
 /// What the scan reads: the paths, and whether they are the whole checkout.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listed {
     pub paths: Vec<String>,
     /// The checkout's gitlinks among what changed, or all of them when `whole`.
@@ -670,7 +670,7 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
              ~/publication, or set PUBLICATION_ENGINE to a checkout whose HEAD is judged)"
         ));
     }
-    let listed = match listed_input(
+    let mut listed = match listed_input(
         &ctx.root,
         &ctx.path_env,
         &ctx.scope,
@@ -682,6 +682,34 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
             return;
         }
     };
+    let plans = if ctx.input_paths.is_some() && ctx.carry_context.is_some() {
+        input_plans(ctx, &listed).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let original = listed.clone();
+    let carried: std::collections::BTreeSet<_> = plans
+        .iter()
+        .filter(|plan| crate::input_content::exact(ctx, &plan.proof))
+        .flat_map(|plan| plan.paths.iter().cloned())
+        .collect();
+    if !plans.is_empty() && listed.paths.iter().all(|p| carried.contains(p)) && not_run.is_empty() {
+        r.pass(format!(
+            "export-scan: {} paths reused by package input key",
+            carried.len()
+        ));
+        finish_inputs(ctx, r, &original, plans);
+        return;
+    }
+    if !carried.is_empty() {
+        // A partial scan still needs the shared scanner configuration materialized.
+        listed
+            .paths
+            .retain(|path| path == CONFIG || !carried.contains(path));
+        // The prior successful scan checked the same full-list membership and manifest.
+        // This invocation judges only missing package inputs, so its local subset is not whole.
+        listed.whole = false;
+    }
     let work = ctx.scratch.join("export-scan.noindex");
     let _ = std::fs::remove_dir_all(&work);
     // Canonical, so the paths gitleaks reports start with it.
@@ -758,6 +786,115 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
     for why in not_run {
         r.cannot_run(why);
     }
+    if r.outcomes()
+        .all(|(outcome, _)| outcome == crate::ladder::Outcome::Ok)
+    {
+        finish_inputs(ctx, r, &original, plans);
+    }
+}
+
+fn finish_inputs(ctx: &Ctx, r: &mut Report, listed: &Listed, plans: Vec<InputPlan>) {
+    if plans.is_empty() {
+        return;
+    }
+    let current = input_plans(ctx, listed).unwrap_or_default();
+    for plan in plans {
+        if current.iter().any(|now| now.proof == plan.proof) {
+            let reused = crate::input_content::exact(ctx, &plan.proof);
+            r.raw(crate::input_content::event(ctx, &plan.proof, reused));
+        } else {
+            r.cannot_run("export package inputs changed during the run");
+        }
+    }
+}
+
+struct InputPlan {
+    paths: Vec<String>,
+    proof: crate::input_content::Proof,
+}
+
+/// Policy, full-list membership and every possible binary-clearance input are shared inputs.
+/// Package source bytes are independent; no prior success can conceal a newly selected file.
+fn input_plans(ctx: &Ctx, listed: &Listed) -> Result<Vec<InputPlan>, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let export = committed(&ctx.root, &ctx.path_env)?;
+    let common: BTreeSet<String> = [CONFIG, IGNORE, MANIFEST, rows::EXTRA]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut membership = aterm_digest::Sha256::new();
+    let mut binaries = aterm_digest::Sha256::new();
+    for path in &export {
+        membership.update((path.len() as u64).to_le_bytes());
+        membership.update(path.as_bytes());
+        let file = ctx.root.join(path);
+        if file
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_file())
+        {
+            let bytes = crate::read_regular(&file).map_err(|e| e.to_string())?;
+            if bytes.contains(&0) {
+                binaries.update((path.len() as u64).to_le_bytes());
+                binaries.update(path.as_bytes());
+                binaries.update((bytes.len() as u64).to_le_bytes());
+                binaries.update(&bytes);
+            }
+        }
+    }
+    for path in &listed.gitlinks {
+        membership.update((path.len() as u64).to_le_bytes());
+        membership.update(path.as_bytes());
+    }
+    membership.update([u8::from(listed.whole)]);
+    let membership = aterm_codec::hex::encode_lower(&membership.finalize());
+    let binaries = aterm_codec::hex::encode_lower(&binaries.finalize());
+    let common = common
+        .iter()
+        .map(|path| aterm_census::inputs::file(&ctx.root, path))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("export policy inputs are unbounded")?;
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for path in &listed.paths {
+        let parts: Vec<_> = path.split('/').collect();
+        let package = match parts.as_slice() {
+            ["crates" | "apps", _, ..] => parts[..2].join("/"),
+            ["vendor", _, "crates", _, ..] => parts[..4].join("/"),
+            _ => String::new(),
+        };
+        groups.entry(package).or_default().push(path.clone());
+    }
+    let mut plans = Vec::new();
+    for (package, paths) in groups {
+        let mut inputs = common.clone();
+        if package.is_empty() {
+            let Some(own) = paths
+                .iter()
+                .map(|path| aterm_census::inputs::file(&ctx.root, path))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            inputs.extend(own);
+        } else {
+            let Some(own) = aterm_census::inputs::package(&ctx.root, &package) else {
+                continue;
+            };
+            inputs.push(own);
+        }
+        let mut selection = aterm_digest::Sha256::new();
+        for path in &paths {
+            selection.update((path.len() as u64).to_le_bytes());
+            selection.update(path.as_bytes());
+        }
+        let item = format!(
+            "{package}:{membership}:{binaries}:{}",
+            aterm_codec::hex::encode_lower(&selection.finalize())
+        );
+        if let Some(proof) = crate::input_content::Proof::new(ctx, "export-scan", &item, inputs) {
+            plans.push(InputPlan { paths, proof });
+        }
+    }
+    Ok(plans)
 }
 
 /// gitleaks over the exported `tree`, its report adjudicated: the findings that stand.

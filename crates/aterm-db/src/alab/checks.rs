@@ -8,7 +8,8 @@
 //! columns, never a value.
 
 use super::registry::{
-    ACCOUNT, ADDRESS, COLLECTIONS, MACHINE, MACHINE_FACTS, MAILBOX, MAILBOX_OBS, PREFERENCE,
+    ACCOUNT, ACCOUNT_OBS, ADDRESS, COLLECTIONS, MACHINE, MACHINE_FACTS, MAILBOX, MAILBOX_OBS,
+    PREFERENCE,
 };
 use crate::typed::{
     Kind,
@@ -163,6 +164,66 @@ pub fn mailbox_obs(
                 });
             }
         }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// The rules over observed accounts (`docs/DESIGN-account-discovery-2026-11-09.md`, step 1): a
+/// Mac's `account-obs` row is keyed by the account it names (`account-obs-key-mismatch`); one
+/// naming an account no row holds was marked against a birth the Mac's quota had no room for
+/// (`quota-spent`, a finding and never an alert); and two or more live accounts at one realm that
+/// say one address, by login or identity, leave an observed login of it unmatched, so no
+/// observation is written for it (`account-ambiguous`, naming the address then the accounts).
+pub fn account_obs(read: &OwnedRead, accounts: &Projection) -> Vec<Finding> {
+    let mut found = Vec::new();
+    for (key, row) in &read.rows {
+        let account = row.value.get("account").and_then(Value::as_str);
+        if account.is_none_or(|ac| key.rsplit_once('.').is_none_or(|(prefix, _)| prefix != ac)) {
+            found.push(Finding {
+                kind: "account-obs-key-mismatch",
+                collection: ACCOUNT_OBS.name,
+                pks: vec![key.clone()],
+            });
+        }
+        if let Some(ac) = account
+            && !accounts.rows.contains_key(ac)
+        {
+            found.push(Finding {
+                kind: "quota-spent",
+                collection: ACCOUNT.name,
+                pks: vec![ac.to_owned()],
+            });
+        }
+    }
+    let mut saying: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
+    for (pk, row) in accounts.rows.iter().filter(|(_, row)| row.live()) {
+        let Some(realm) = row
+            .get("realm")
+            .and_then(Value::as_str)
+            .and_then(keys::canonical_realm)
+        else {
+            continue;
+        };
+        for column in ["login", "identity"] {
+            if let Some(address) = row.get(column).and_then(Value::as_str) {
+                saying
+                    .entry((realm, address))
+                    .or_default()
+                    .insert(pk.as_str());
+            }
+        }
+    }
+    for ((_, address), pks) in saying.into_iter().filter(|(_, pks)| pks.len() > 1) {
+        found.push(Finding {
+            kind: "account-ambiguous",
+            collection: ACCOUNT.name,
+            pks: std::iter::once(address)
+                .chain(pks)
+                .map(str::to_owned)
+                .collect(),
+        });
     }
     found.sort_unstable();
     found.dedup();

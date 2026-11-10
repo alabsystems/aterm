@@ -333,6 +333,7 @@ fn unread(dir: &Path) -> Identity {
         route: aterm_agent::harness::accounts::AuthRoute::Outside,
         unoffered: None,
         env_stamp: None,
+        first_seen: None,
     }
 }
 
@@ -1271,11 +1272,14 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
         roster: lone_row,
         ..asks(untapped, stored)
     });
+    // Observation beats belief (`docs/DESIGN-account-discovery-2026-11-09.md`; an account is
+    // its login email and provider): the row's login directory is elsewhere, but the profile
+    // this process reads names the row's address, so the row is this process's account and its
+    // week is the one the store keeps under `main`.
     assert_eq!(
         (shown.email.as_deref(), shown.weekly.as_deref()),
-        (Some("tap@example.test"), None),
-        "the one row is another login's, not the default one this process runs on: no label is \
-         judged, so no store week (never the store's active or `main` by default)"
+        (Some("tap@example.test"), Some("weekly 40% used")),
+        "the one row's address is the login this process runs on: its row's week"
     );
     fn personal() -> Option<accounts::Roster> {
         Some(accounts::Roster {

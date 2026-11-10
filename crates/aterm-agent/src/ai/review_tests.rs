@@ -574,8 +574,7 @@ fn a_codex_review_holds_source_exclusion_until_its_owned_runner_returns() {
             1,
             "must exercise actual run_one runner path"
         );
-        PublicationLock::for_home(&b.home)
-            .unwrap()
+        PublicationLock::released_for_home(&b.home)
             .current()
             .unwrap();
     }

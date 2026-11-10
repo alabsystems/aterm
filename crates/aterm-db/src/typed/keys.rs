@@ -18,6 +18,15 @@ use crate::{Error, Result};
 use aterm_codec::hex;
 use aterm_digest::{Sha256, hmac_sha256_parts};
 
+/// A key as diagnostics print it, concealing credential-shaped values.
+pub(crate) fn safe_key(key: &str) -> &str {
+    if super::guard::credential_shaped(key) {
+        super::grid::REFUSED
+    } else {
+        key
+    }
+}
+
 /// Anthropic's provider word.
 pub const ANTHROPIC: &str = "anthropic";
 /// OpenAI's provider word.

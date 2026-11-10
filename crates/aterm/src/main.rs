@@ -803,6 +803,10 @@ fn front_door_main(
     // it receives (a release build only; the hook is inert in tests and debug builds).
     #[cfg(unix)]
     alab_mailbox::install();
+    // A login a tab's CLI was observed to run on reaches the registry's `account-obs` rows, and
+    // an account no row names is born (a release build only; inert in tests and debug builds).
+    #[cfg(unix)]
+    alab_observed::install();
     // A Mac waiting to be let into ALab proves itself to ALab's members on the LAN from its vault
     // subscriber, then asks those that did not let it in to show its request: about half a
     // minute after its first ask, then after 1, 2, 4 and 8 minutes, then every 15, over the fleet
@@ -16453,6 +16457,9 @@ fn routes_to_doctor(first: &str, rest: &[OsString]) -> bool {
 /// What a Proton mailbox the harness opened for a sign-in code tells the lab registry.
 #[cfg(unix)]
 mod alab_mailbox;
+/// What a tab's CLI was observed to run on tells the lab registry (`account-obs`).
+#[cfg(unix)]
+mod alab_observed;
 /// A Mac's self-registration in the lab registry, woken by the Commons runtime's repair rounds.
 #[cfg(unix)]
 mod alab_register;

@@ -36,7 +36,7 @@ pub(super) fn inspect(tree: &Tree<'_>, dir: &str) -> Vec<Finding> {
         } else {
             match crate::tree::read_to_string(&tree.root.join(&rel)) {
                 Ok(text) => {
-                    owned = SourceFile::new(rel.clone(), text);
+                    owned = SourceFile::outside(rel.clone(), text);
                     &owned
                 }
                 Err(why) => {

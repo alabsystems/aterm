@@ -430,7 +430,7 @@ pub fn pass<D: Driver>(
         }
     };
     status.selected = match &observed {
-        CurrentLocal::Absent => None,
+        CurrentLocal::Absent | CurrentLocal::Foreign(_) => None,
         CurrentLocal::Selected(identity) => Some(identity.clone().into()),
     };
     if let Some(pending) = status.pending {
@@ -513,7 +513,7 @@ pub fn pass<D: Driver>(
                 status.pending = None;
                 status.selected = match driver.current(config) {
                     Ok(CurrentLocal::Selected(identity)) => Some(identity.into()),
-                    Ok(CurrentLocal::Absent) => None,
+                    Ok(CurrentLocal::Absent | CurrentLocal::Foreign(_)) => None,
                     Err(readback) => {
                         status.selected = None;
                         return Err(Error::cannot_run(format!(
@@ -529,7 +529,7 @@ pub fn pass<D: Driver>(
         // Every ACK, including success, is followed by descriptor-based current readback.
         let now = driver.current(config)?;
         status.selected = match now {
-            CurrentLocal::Absent => None,
+            CurrentLocal::Absent | CurrentLocal::Foreign(_) => None,
             CurrentLocal::Selected(identity) => Some(identity.into()),
         };
         if status.selected.as_ref() != Some(&desired) {

@@ -10,6 +10,96 @@ use crate::scope::Scope;
 
 const GIB: u64 = 1 << 30;
 
+/// Recorded workspace peaks on 2026-11-09: the pooled lint must read the history
+/// written by its own width. Removing the pooled lookup makes the first assertion fail;
+/// borrowing it for an unseen width or an unpooled run fails the negative controls.
+#[test]
+fn pooled_lint_claim_reads_its_recorded_width_and_retains_the_peak_margin() {
+    let lint = spec(StageId::Tippy, Lane::TippyTarget);
+    let ordinary = Key {
+        checkout: "/old".into(),
+        ..Key::of(StageId::Tippy, &Scope::workspace())
+    };
+    let pooled = crate::compile_width::record_key(ordinary.clone(), Some(18));
+    let mut records = Records::default();
+    records.push(ordinary.clone(), 32_233_980_136, 1);
+    for peak in [23_196_705_704, 24_190_650_856, 23_279_492_256] {
+        records.push(pooled.clone(), peak, 2);
+    }
+    let key = Key {
+        checkout: "/new".into(),
+        ..ordinary
+    };
+    let claim = |jobs| {
+        need_for_jobs(
+            &records,
+            &Records::default(),
+            &lint,
+            &key,
+            Some(128 * GIB),
+            jobs,
+        )
+        .bytes
+    };
+    assert_eq!(claim(Some(18)), aterm_capacity::peak_claim(24_190_650_856));
+    assert_eq!(claim(Some(9)), aterm_capacity::peak_claim(32_233_980_136));
+    assert_eq!(claim(None), aterm_capacity::peak_claim(32_233_980_136));
+    #[cfg(unix)]
+    {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.json");
+        records.save(&path).unwrap();
+        let mut ctx = crate::Ctx::new(
+            dir.path().to_owned(),
+            Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            dir.path().join("scratch"),
+        )
+        .with_checks(&[crate::Check::Lint]);
+        ctx.memory = Some(Book::at(Some(path), Some(128 * GIB), Some(120 * GIB)));
+        ctx.pool = Some(aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 18).unwrap());
+        let planned = |ctx: &crate::Ctx| {
+            crate::plan::plan(ctx)
+                .into_iter()
+                .find(|stage| stage.id == StageId::Tippy)
+                .unwrap()
+                .mem
+        };
+        assert_eq!(
+            planned(&ctx),
+            claim(Some(18)),
+            "the real planner reads the pooled history"
+        );
+        ctx.env.cargo_build_jobs = Some("9".into());
+        assert_eq!(
+            planned(&ctx),
+            claim(Some(9)),
+            "an unseen width keeps the conservative fallback"
+        );
+        ctx.pool = None;
+        assert_eq!(
+            planned(&ctx),
+            claim(None),
+            "unpooled work keeps its own peak"
+        );
+    }
+    // An observed heavy run of the same width must raise the claim, never be capped
+    // at the historical 27 GiB figure or at the cold estimate.
+    records.push(pooled, 40 * GIB, 3);
+    assert_eq!(
+        need_for_jobs(
+            &records,
+            &Records::default(),
+            &lint,
+            &key,
+            Some(128 * GIB),
+            Some(18)
+        )
+        .bytes,
+        aterm_capacity::peak_claim(40 * GIB),
+    );
+}
+
 #[test]
 fn cpu_observations_survive_exit_without_double_counting_or_hiding_missing_reads() {
     let meter = Meter::new();
@@ -1279,13 +1369,13 @@ fn a_book_keeps_a_metered_stages_peak_for_its_next_run() {
     let path = dir.path().join("stage-memory.json");
     let book = Book::at(Some(path.clone()), Some(24 * GIB), Some(21 * GIB));
     assert_eq!(
-        book.need(&compile(), &over(&compile(), &gui())).how,
+        book.need(&compile(), &over(&compile(), &gui()), None).how,
         How::Cold
     );
     book.keep(&compile(), &over(&compile(), &gui()), 5 * GIB)
         .expect("kept");
     assert_eq!(
-        book.need(&compile(), &over(&compile(), &gui())).bytes,
+        book.need(&compile(), &over(&compile(), &gui()), None).bytes,
         6 * GIB
     );
     let fmt = spec(StageId::Formatting, Lane::Pure);
@@ -1298,7 +1388,9 @@ fn a_book_keeps_a_metered_stages_peak_for_its_next_run() {
         .keep(&compile(), &over(&compile(), &gui()), 5 * GIB)
         .expect("nowhere");
     assert_eq!(
-        nowhere.need(&compile(), &over(&compile(), &gui())).how,
+        nowhere
+            .need(&compile(), &over(&compile(), &gui()), None)
+            .how,
         How::Cold
     );
 }

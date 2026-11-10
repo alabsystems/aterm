@@ -2287,7 +2287,19 @@ const DOG_SKIN: [PetGlyphId; PET_GLYPHS.len()] = {
 /// columns it read `(a, b)` and the page's content sequence it read them on.
 type SinkSeat = ((f32, f32), (f32, f32), u64);
 
-/// The station a tick measured, for the next tick's [`PetBrain::keep_place_on_restation`].
+/// What a tick found as it began, for [`PetBrain::keep_place_on_restation`]: what the tick itself
+/// sets off or places was measured on its own cells and is not carried.
+#[derive(Clone, Copy, Debug)]
+struct TickEntry {
+    /// Where the body stood `(col, row)`.
+    at: (f32, f32),
+    /// The landing `(col, row)` of the flight it was in.
+    landing: Option<(f32, f32)>,
+    /// A split bound's second landing `(col, row)` ([`PetBrain::bound2`]).
+    bound2: Option<(f32, f32)>,
+}
+
+/// The station a tick measured, for a later tick's [`PetBrain::keep_place_on_restation`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SeenStation {
     /// The tick's aim `(col, row)` ([`PetBrain::aim`]).
@@ -2723,10 +2735,10 @@ pub struct PetBrain {
     last_reduced: bool,
     col_at_tick: f32,
     home: f32,
-    /// The station the tick before measured ([`Self::keep_place_on_restation`]): taken as each
-    /// tick begins and set again where the tick measures its own, so it is never older than that
-    /// tick; `None` after a tick that measured none (the caret gone, a tick the console resident
-    /// drew, a reduced-motion tick, a flight set off before the aim).
+    /// The station the last tick that measured one measured ([`Self::keep_place_on_restation`]),
+    /// set again where each tick measures its own. A tick that measures none (no caret in the
+    /// pet's space, a tick the console resident drew, a reduced-motion tick, a flight set off
+    /// before the aim) keeps it.
     station_seen: Option<SeenStation>,
     evicting: bool,
 }
@@ -4561,33 +4573,51 @@ impl PetBrain {
     /// a 2x display, a font step) move every station that reads the width: the wall side's, which
     /// stands the body's right edge off the caret, by the whole change; a console seat centred on
     /// its perch by half; one clamped at the grid's right edge with that edge. Where the station
-    /// this tick measures (`target` on `target_row`, its aim) moved from the one the tick before
-    /// measured (`seen`) by no more than the width's change, for the same caret cell and on the
-    /// same row:
+    /// this tick measures (`target` on `target_row`, its aim) moved from the one the last tick
+    /// that measured one measured (`seen`) by no more than the width's change, for the same caret
+    /// cell and on the same row, on the tick that draws the new cells (`seen` was measured on the
+    /// cells the tick before drew, `drawn` their width):
     /// - a body within [`ARRIVED`] of that station, at rest (no flight, no speed, no brake, not
-    ///   walking, running or landing) and not yet moved this tick (`entry`, where it stood as the
-    ///   tick began), moves with it, its offset from it kept ([`Self::carry_resting_body`]),
+    ///   walking, running or landing) and not yet moved this tick (`entry`, what the tick found
+    ///   as it began), moves with it, its offset from it kept ([`Self::carry_resting_body`]),
     ///   whatever it does there (asleep, purring, crouched in hiding): the frame that draws the
     ///   new cells draws it on its station;
-    /// - a flight coming down within [`ARRIVED`] of that station (or a bound's second landing,
-    ///   [`Self::bound2`]) comes down on the new one, rebased so the drawn body does not move
+    /// - a flight in the air as the tick began, coming down within [`ARRIVED`] of that station,
+    ///   comes down on the new one, rebased so the drawn body does not move
     ///   ([`Self::rebased_from`]), while it has flown no more than [`REAIM_MAX_U`] of its way
-    ///   and the rest fits the animal's pace ([`Self::flight_cap`]).
+    ///   and the rest fits the animal's pace ([`Self::flight_cap`]);
+    /// - a split bound's second landing ([`Self::bound2`]) within [`ARRIVED`] of it, set before
+    ///   the tick, moves with it, the cat in the air or on the touch-down between the bounds.
+    ///
+    /// A flight or a second landing the tick itself sets off before its aim (an eviction's leap)
+    /// was aimed on the new cells and is left as it is: re-aimed by the change again, it came
+    /// down a width change past the new station.
     ///
     /// Left where they were, a resting body glided onto the new station over about 120 frames
     /// (2026-11-09: a wall-side cat 0.374 columns, a cat on top of Claude Code's composer 0.187),
-    /// and a flight came down short of it and glided the rest. Measured against the tick before
-    /// only, never an older one: a body that was off glass is placed by the tick that sees the
-    /// caret again, on the station it measures (the first sighting), and a body that comes back
-    /// to its station later goes there by the locomotion. A station that moved further (the
-    /// wall's law's other side, a clamp at a grid edge that moved), a caret that moved, or
-    /// another row leaves the body to the locomotion, as before. The grid's rows and columns may
-    /// change with the cells: a window dragged between displays keeps its size in points, so its
-    /// grid changes unless its cells scale exactly.
+    /// and a flight came down short of it and glided the rest. The ticks with no caret measure no
+    /// station and keep the last one: a cat whose caret was gone for a frame just before the
+    /// change is carried by the tick that draws the new cells and sees it again (measured against
+    /// the tick before only, it glided the change as before). New cells drawn on a tick with no
+    /// caret draw the body where it stood, and the locomotion takes it on from there: carried on
+    /// a later tick, it would jump the change on cells that did not change, outside the
+    /// no-teleport law's bound for a larger change of aspect (7x15 px cells to 15x29, 0.59
+    /// columns). A dectcem hide on a finished frame is not such a tick: its caret is known,
+    /// undrawn ([`PetSense::caret_drawn`]), and measures its station. A hidden cursor on a frame
+    /// the program has not finished (DEC 2026, drawn past the host's hold) reads the last finished
+    /// frame's caret, and none where the grid changed since: a window dragged between displays
+    /// under such a frame draws its new cells caretless, as above. A body that was off glass is
+    /// placed before the aim by the tick that sees the caret again, on the station it measures (the
+    /// first sighting), so it has moved that tick and is not carried as well; a body that comes
+    /// back to its station later goes there by the locomotion. A station that moved further (the
+    /// wall's law's other side, a clamp at a grid edge that moved), a caret that moved, or another
+    /// row leaves the body to the locomotion, as before. The grid's rows and columns may change
+    /// with the cells: a window dragged between displays keeps its size in points, so its grid
+    /// changes unless its cells scale exactly.
     #[inline]
     const fn keep_place_on_restation(
         &mut self,
-        (seen, entry): (Option<SeenStation>, (f32, f32)),
+        (seen, entry, drawn): (Option<SeenStation>, TickEntry, f32),
         (target, target_row): (f32, f32),
         caret: (u16, u16),
         (width, cols): (f32, u16),
@@ -4597,6 +4627,7 @@ impl PetBrain {
         };
         let shift = target - was.at.0;
         if was.width == width
+            || was.width != drawn
             || was.caret.0 != caret.0
             || was.caret.1 != caret.1
             || (target_row - was.at.1).abs() >= 0.05
@@ -4604,8 +4635,18 @@ impl PetBrain {
         {
             return;
         }
+        if let Some((c2, r2, _)) = &mut self.bound2
+            && matches!(entry.bound2, Some((c, r)) if c == *c2 && r == *r2)
+            && (*c2 - was.at.0).abs() <= ARRIVED
+            && (*r2 - was.at.1).abs() < 0.5
+        {
+            *c2 += shift;
+        }
         if let Some(f) = &mut self.flight {
-            if (f.to_col - was.at.0).abs() <= ARRIVED && (f.to_row - was.at.1).abs() < 0.5 {
+            if matches!(entry.landing, Some((c, r)) if c == f.to_col && r == f.to_row)
+                && (f.to_col - was.at.0).abs() <= ARRIVED
+                && (f.to_row - was.at.1).abs() < 0.5
+            {
                 let to = f.to_col + shift;
                 let u = (f.t / f.dur).clamp(0.0, 1.0);
                 let in_time =
@@ -4618,12 +4659,6 @@ impl PetBrain {
                     f.to_col = to;
                 }
             }
-            if let Some((c2, r2, _)) = &mut self.bound2
-                && (*c2 - was.at.0).abs() <= ARRIVED
-                && (*r2 - was.at.1).abs() < 0.5
-            {
-                *c2 += shift;
-            }
             return;
         }
         if self.speed == 0.0
@@ -4632,8 +4667,8 @@ impl PetBrain {
                 self.action,
                 PetAction::Walk | PetAction::Run | PetAction::Leap | PetAction::Land
             )
-            && self.col == entry.0
-            && self.row == entry.1
+            && self.col == entry.at.0
+            && self.row == entry.at.1
             && (self.row - target_row).abs() < 0.05
             && (self.col - was.at.0).abs() <= ARRIVED
         {
@@ -7033,10 +7068,16 @@ impl PetBrain {
         {
             self.hug_armed = false;
         }
-        // The station the tick before measured, and where the body stood as this tick began
+        // The station the last tick that measured one measured, what this tick found as it began,
+        // and the art's width on the cells the tick before drew
         // ([`Self::keep_place_on_restation`]).
-        let seen = self.station_seen.take();
-        let entry = (self.col, self.row);
+        let seen = self.station_seen;
+        let entry = TickEntry {
+            at: (self.col, self.row),
+            landing: self.flight.map(|f| (f.to_col, f.to_row)),
+            bound2: self.bound2.map(|(c, r, _)| (c, r)),
+        };
+        let drawn = art_cols(self.last_cell_w, self.last_cell_h);
         let elapsed = match self.last_now {
             Some(prev) => sense
                 .now
@@ -8169,7 +8210,7 @@ impl PetBrain {
         };
         self.aim = Some((target, target_row));
         self.keep_place_on_restation(
-            (seen, entry),
+            (seen, entry, drawn),
             (target, target_row),
             (cr, cc),
             (width, sense.cols),
@@ -19838,12 +19879,12 @@ mod tests {
     }
 
     /// A BODY OFF GLASS AS THE CELLS CHANGE IS SEEN AGAIN ON ITS NEW STATION, AND STAYS THERE: the
-    /// re-grid's carry ([`PetBrain::keep_place_on_restation`]) measures against the tick before
-    /// only, and the ticks with the caret gone measure no station, so the tick that sees the caret
-    /// again places the body by the first sighting, on the station it measures on the new cells,
-    /// and carries nothing. Measured against the station a tick long before had measured (the old
-    /// cells' wall side), the body came back a whole width change past its new station and glided
-    /// back over 300 frames, a sleeping cat's way turned from the caret.
+    /// ticks with the caret gone measure no station and keep the last one, the old cells' wall
+    /// side, but the tick that sees the caret again places the body by the first sighting before
+    /// its aim, on the station it measures on the new cells, so the body has moved that tick and
+    /// the re-grid's carry ([`PetBrain::keep_place_on_restation`]) leaves it. Carried as well, the
+    /// body came back a whole width change past its new station and glided back over 300 frames,
+    /// a sleeping cat's way turned from the caret.
     #[test]
     fn a_body_off_glass_through_a_scale_change_is_seen_on_its_new_station() {
         const ONE: (u16, u16) = (7, 14);
@@ -19900,7 +19941,11 @@ mod tests {
     /// landing is re-aimed by the station's move (0.37 columns) and rebased so the drawn body
     /// does not move, every frame within the no-teleport law, and once settled the cat is on its
     /// new station, within a pixel, and stays. Kept on the old station, it came down 0.37 columns
-    /// short and glided them over 199 frames.
+    /// short and glided them over 199 frames. From a stand far enough away the leap splits in two
+    /// ([`PetBrain::bound2`]), its cells changed in the first bound or on the touch-down between
+    /// the bounds: the second landing moves with the station, and the cat settles on the new one.
+    /// Left on the old station, the second bound came down short of it as the single one did
+    /// (moved only in the air, 1x to 2x on the touch-down).
     #[test]
     fn a_flight_through_a_scale_change_comes_down_on_its_new_station() {
         const ONE: (u16, u16) = (7, 14);
@@ -19911,15 +19956,21 @@ mod tests {
             ..sense(t, Some(c))
         };
         for (from, to) in [(ONE, TWO), (TWO, ONE)] {
-            for lag in [1, 3, 10] {
+            // `lag` frames after take-off, in the air, or (`None`) on the touch-down between a
+            // split leap's bounds.
+            for ((stand, split), lag) in [(40u16, false), (12, true)]
+                .into_iter()
+                .flat_map(|s| [Some(1), Some(3), Some(10)].map(|lag| (s, lag)))
+                .chain([((12, true), None)])
+            {
                 let mut pet = PetBrain::default();
                 let mut t = Instant::now();
-                let _ = pet.tick(at(t, (10, 38), from));
+                let _ = pet.tick(at(t, (10, stand - 2), from));
                 t += Duration::from_millis(50);
                 let end = t + Duration::from_secs_f32(SIT_AFTER + 3.0);
                 while t < end {
                     t += Duration::from_millis(16);
-                    let _ = pet.tick(at(t, (10, 40), from));
+                    let _ = pet.tick(at(t, (10, stand), from));
                 }
                 let mut took_off = false;
                 for _ in 0..120 {
@@ -19931,11 +19982,32 @@ mod tests {
                     }
                 }
                 assert!(took_off, "fixture: the cat bounds for the far caret");
-                for _ in 0..lag {
-                    t += Duration::from_millis(16);
-                    let _ = pet.tick(at(t, (10, 96), from));
+                if let Some(lag) = lag {
+                    for _ in 0..lag {
+                        t += Duration::from_millis(16);
+                        let _ = pet.tick(at(t, (10, 96), from));
+                    }
+                    assert!(pet.flight.is_some(), "fixture: in the air at the re-grid");
+                } else {
+                    let mut touched = false;
+                    for _ in 0..240 {
+                        t += Duration::from_millis(16);
+                        let _ = pet.tick(at(t, (10, 96), from));
+                        if pet.flight.is_none() && pet.bound2.is_some() {
+                            touched = true;
+                            break;
+                        }
+                    }
+                    assert!(
+                        touched,
+                        "fixture: on the touch-down between the bounds at the re-grid"
+                    );
                 }
-                assert!(pet.flight.is_some(), "fixture: in the air at the re-grid");
+                assert_eq!(
+                    pet.bound2.is_some(),
+                    split,
+                    "fixture: from col {stand}, a leap in two bounds: {split}"
+                );
                 pet.rebase_geometry();
                 let mut last = (pet.col, pet.row, 100, 30);
                 let frames: Vec<PetFrame> = (0..600)
@@ -19953,13 +20025,304 @@ mod tests {
                 for (i, f) in frames.iter().enumerate().skip(settled) {
                     assert!(
                         (f.col - station).abs() < px,
-                        "{from:?} to {to:?}, {lag} frames after take-off: frame {i} ({:?}) \
-                         stands at col {:.4}, {:.3} columns off the new station {station:.4}",
+                        "{from:?} to {to:?} from col {stand}, re-gridded {lag:?} frames after \
+                         take-off (None: on the touch-down): frame {i} ({:?}) stands at col \
+                         {:.4}, {:.3} columns off the new station {station:.4}",
                         f.action,
                         f.col,
                         f.col - station
                     );
                 }
+            }
+        }
+    }
+
+    /// A CARET GONE JUST BEFORE A SCALE CHANGE LEAVES A RESTING BODY ON ITS STATION
+    /// ([`PetBrain::keep_place_on_restation`]): frames with no caret in the pet's space. The ticks
+    /// with no caret measure no station and keep the last one, so the tick that draws the new
+    /// cells and sees the caret again carries the body: the station's anchor stays within a
+    /// pixel, and from there the body is as still as the same brain given no re-grid. Measured
+    /// against the tick before only, the caretless tick dropped the measure and the body glided
+    /// the width change (0.374 columns at the wall side) over the next 120 frames. Where a tick
+    /// with no caret draws the new cells, the body is drawn on them where it stood and the
+    /// locomotion takes it to its station, every frame within the no-teleport law: carried when
+    /// the caret came back, it jumped the change on cells that had not changed, 0.59 columns from
+    /// 7x15 px cells to 15x29, past the law's bound.
+    #[test]
+    fn a_caret_gone_through_a_scale_change_keeps_a_resting_body_on_its_station() {
+        const ONE: (u16, u16) = (7, 14);
+        const TWO: (u16, u16) = (15, 28);
+        let at = |t, c, px: (u16, u16)| PetSense {
+            cell_w: px.0,
+            cell_h: px.1,
+            ..sense(t, c)
+        };
+        for (from, to) in [(ONE, TWO), (TWO, ONE), ((7, 15), (15, 29))] {
+            let (w0, w1) = (art_cols(from.0, from.1), art_cols(to.0, to.1));
+            let px = 1.0 / f32::from(to.0);
+            for (caret, wall) in [((10u16, 40u16), false), ((10, 96), true)] {
+                // `hidden` ticks with no caret: on the old cells, the re-grid's tick seeing it
+                // again (`before`), or from the re-grid's tick on.
+                for (hidden, before) in [(1u32, true), (3, true), (1, false), (3, false)] {
+                    let what = format!(
+                        "{from:?} to {to:?}, caret {caret:?}, {hidden} tick(s) with no caret {}",
+                        if before {
+                            "before the re-grid"
+                        } else {
+                            "from the re-grid"
+                        }
+                    );
+                    let t0 = Instant::now();
+                    let run = |regrid: bool| {
+                        let cells = if regrid { to } else { from };
+                        let mut pet = PetBrain::default();
+                        let mut t = t0;
+                        let _ = pet.tick(at(t, Some((caret.0, caret.1 - 2)), from));
+                        t += Duration::from_millis(50);
+                        let end = t + Duration::from_secs_f32(SIT_AFTER + 3.0);
+                        let mut rest = pet.tick(at(t, Some(caret), from));
+                        while t < end {
+                            t += Duration::from_millis(16);
+                            rest = pet.tick(at(t, Some(caret), from));
+                        }
+                        if before {
+                            for _ in 0..hidden {
+                                t += Duration::from_millis(16);
+                                let _ = pet.tick(at(t, None, from));
+                            }
+                        }
+                        if regrid {
+                            pet.rebase_geometry();
+                        }
+                        let mut last = (pet.col, pet.row, 100, 30);
+                        let frames: Vec<PetFrame> = (0..400u32)
+                            .map(|i| {
+                                t += Duration::from_millis(16);
+                                let seen = (before || i >= hidden).then_some(caret);
+                                lawful_tick(&mut pet, at(t, seen, cells), &mut last)
+                            })
+                            .collect();
+                        (rest, frames)
+                    };
+                    let (rest, scaled) = run(true);
+                    let (_, control) = run(false);
+                    assert!(
+                        rest.action.settled() && rest.alpha == 255 && rest.lift == 0.0,
+                        "fixture: {what}: at rest on glass, got {:?} alpha {}",
+                        rest.action,
+                        rest.alpha
+                    );
+                    // Where the station's anchor puts the body on the new cells.
+                    let on_station = if wall { rest.col + w0 - w1 } else { rest.col };
+                    if before {
+                        assert!(
+                            (scaled[0].col - on_station).abs() < px,
+                            "{what}: the station's anchor moved {:.3} columns at the re-grid",
+                            scaled[0].col - on_station
+                        );
+                        let offset = scaled[0].col - control[0].col;
+                        for (i, (s, c)) in scaled.iter().zip(&control).enumerate() {
+                            assert!(
+                                (s.col - c.col - offset).abs() < px,
+                                "{what}: frame {i} moved the body: col {:.4} against {:.4} with \
+                                 no re-grid, {:.4} apart where the re-grid's frame stood \
+                                 {offset:.4}",
+                                s.col,
+                                c.col,
+                                s.col - c.col
+                            );
+                        }
+                    } else {
+                        let end = scaled.last().expect("frames");
+                        assert!(
+                            (end.col - on_station).abs() < px,
+                            "{what}: the body ends at col {:.4}, {:.3} columns off its station",
+                            end.col,
+                            end.col - on_station
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// WHAT IS KEPT AT A RESTING BODY MOVES WITH IT WHEN A SCALE CHANGE CARRIES IT
+    /// ([`PetBrain::keep_place_on_restation`], [`PetBrain::carry_resting_body`]): where the last
+    /// tick left it, its home (left behind, a purr or a hide that returns before the walk keeps
+    /// a home a width change off the body: [`PetBrain::needs_frames`] reads it), the seat a held
+    /// look was adopted on (left behind, the look lets go at [`ADOPT_HOLD_REACH`], 0.05 columns,
+    /// and the body re-poses on the frame that draws the new cells), and a departure drawn still
+    /// beside it. A departure on its way is its own and is not moved.
+    #[test]
+    fn a_scale_change_carries_what_is_kept_at_a_resting_body() {
+        const ONE: (u16, u16) = (7, 14);
+        const TWO: (u16, u16) = (15, 28);
+        let (w0, w1) = (art_cols(ONE.0, ONE.1), art_cols(TWO.0, TWO.1));
+        let at = |t, px: (u16, u16)| PetSense {
+            cell_w: px.0,
+            cell_h: px.1,
+            ..sense(t, Some((10, 96)))
+        };
+        let mut pet = PetBrain::default();
+        let mut t = Instant::now();
+        let _ = pet.tick(at(t, ONE));
+        t += Duration::from_millis(50);
+        let end = t + Duration::from_secs_f32(SIT_AFTER + 3.0);
+        while t < end {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(at(t, ONE));
+        }
+        let seen = pet.station_seen;
+        let (col, row, left) = (pet.col, pet.row, pet.col_at_tick);
+        // The wall side's station on the new cells, the width's change from the one seen.
+        let station1 = PetBrain::station(96, 100, w1);
+        let dx = seen.map_or(0.0, |s| station1 - s.at.0);
+        assert!(
+            pet.action.settled()
+                && pet.speed == 0.0
+                && seen.is_some_and(|s| s.width == w0 && (col - s.at.0).abs() < 1.0 / 7.0)
+                && (dx.abs() - (w1 - w0).abs()).abs() < 1e-4,
+            "fixture: at rest on the wall side's station, got {:?} at {col} seen {seen:?}, the \
+             station's move {dx}",
+            pet.action
+        );
+        pet.home = col - 0.25;
+        pet.adopted_look = Some(AdoptedLook {
+            pose: PetGlyphId::PetSit,
+            facing_left: false,
+            stance: Stance::NEUTRAL,
+            eased: 0.5,
+            seat: (col, row),
+            beneath: None,
+        });
+        let born = pet.lane_clock;
+        let departure = |still| Departure {
+            born,
+            id: 0,
+            coat: 0,
+            iris: 0,
+            from_col: col - 7.0,
+            row,
+            edge: col - 1.0,
+            speed: if still { 0.0 } else { DEPART_SPEED },
+            still,
+            facing_left: true,
+            stride0: 0.0,
+            pose0: PetGlyphId::PetSit,
+            stance0: Stance::NEUTRAL,
+            resight: false,
+            own_glass: None,
+            own_clear: false,
+            peak: 1.0,
+            colors: None,
+            surface: None,
+        };
+        pet.departures[0] = Some(departure(true));
+        pet.departures[1] = Some(departure(false));
+        let entry = TickEntry {
+            at: (col, row),
+            landing: None,
+            bound2: None,
+        };
+        pet.keep_place_on_restation((seen, entry, w0), (station1, row), (10, 96), (w1, 100));
+        assert!(
+            (pet.col - (col + dx)).abs() < 1e-4 && (pet.col_at_tick - (left + dx)).abs() < 1e-4,
+            "the body and where the last tick left it move with the station, {dx} columns, got \
+             {} and {} from {col}",
+            pet.col,
+            pet.col_at_tick
+        );
+        assert!(
+            (pet.home - (col - 0.25 + dx)).abs() < 1e-4,
+            "home keeps its offset from the body, got {} for {}",
+            pet.home,
+            col - 0.25 + dx
+        );
+        assert_eq!(
+            pet.adopted_look.map(|l| l.seat),
+            Some((col + dx, row)),
+            "the adopted look's seat goes with the body"
+        );
+        let moved = |i: usize| pet.departures[i].map(|d| (d.from_col, d.edge));
+        assert_eq!(
+            moved(0),
+            Some((col - 7.0 + dx, col - 1.0 + dx)),
+            "a departure drawn still beside the body goes with it"
+        );
+        assert_eq!(
+            moved(1),
+            Some((col - 7.0, col - 1.0)),
+            "a departure on its way is not moved"
+        );
+    }
+
+    /// WHAT THE RE-GRID'S OWN TICK SETS OFF IS NOT CARRIED ([`PetBrain::keep_place_on_restation`]):
+    /// a leap set off on the tick that draws the new cells, before its aim (an eviction's), was
+    /// aimed on those cells, so its landing and its second bound's are left where they are. The
+    /// same leap in the air as the tick began comes down on the moved station (its landing, or
+    /// a split leap's second landing, moved by the station's move). Re-aimed on the tick that set
+    /// it off, the landing came down a width change past the new station.
+    #[test]
+    fn a_scale_change_carries_only_a_leap_in_the_air_as_its_tick_began() {
+        let (w0, w1) = (art_cols(7, 14), art_cols(15, 28));
+        let (s0, s1) = (
+            PetBrain::station(96, 100, w0),
+            PetBrain::station(96, 100, w1),
+        );
+        let seen = Some(SeenStation {
+            at: (s0, 6.0),
+            width: w0,
+            caret: (6, 96),
+        });
+        for (stand, split) in [(40u16, false), (4, true)] {
+            for in_air in [true, false] {
+                let mut pet = PetBrain::default();
+                let _ = awake(&mut pet, Instant::now(), 6, stand);
+                pet.launch_big(s0, 6.0, 100, w0, true);
+                let landing = pet.flight.map(|f| (f.to_col, f.to_row));
+                let second = pet.bound2.map(|(c, r, _)| (c, r));
+                assert!(
+                    landing.is_some() && second.is_some() == split,
+                    "fixture: from col {stand}, a leap ({landing:?}), in two bounds: {split} \
+                     ({second:?})"
+                );
+                let entry = TickEntry {
+                    at: (pet.col, pet.row),
+                    landing: if in_air { landing } else { None },
+                    bound2: if in_air { second } else { None },
+                };
+                pet.keep_place_on_restation((seen, entry, w0), (s1, 6.0), (6, 96), (w1, 100));
+                let what = format!(
+                    "from col {stand}, {}",
+                    if in_air {
+                        "in the air as the tick began"
+                    } else {
+                        "set off this tick"
+                    }
+                );
+                let now = (
+                    pet.flight.map(|f| (f.to_col, f.to_row)),
+                    pet.bound2.map(|(c, r, _)| (c, r)),
+                );
+                // A split leap's first bound comes down mid-field, beyond ARRIVED of the
+                // station: only its second landing is the station's.
+                let moved = |at: Option<(f32, f32)>| at.map(|(c, r)| (c + s1 - s0, r));
+                let want = match (in_air, split) {
+                    (false, _) => (landing, second),
+                    (true, false) => (moved(landing), None),
+                    (true, true) => (landing, moved(second)),
+                };
+                let close = |a: Option<(f32, f32)>, b: Option<(f32, f32)>| match (a, b) {
+                    (Some(a), Some(b)) => (a.0 - b.0).abs() < 1e-4 && (a.1 - b.1).abs() < 1e-4,
+                    (None, None) => true,
+                    _ => false,
+                };
+                assert!(
+                    close(now.0, want.0) && close(now.1, want.1),
+                    "{what}: the landing and the second landing are {now:?}, want {want:?} (the \
+                     station moved {:.3} columns)",
+                    s1 - s0
+                );
             }
         }
     }

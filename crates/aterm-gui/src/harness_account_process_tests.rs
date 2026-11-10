@@ -317,7 +317,12 @@ fn live_account_decisions_refuse_a_different_snapshot_without_writes() {
         idle.kept.lock().unwrap().snapshot = Some(observed.clone());
         let roster = a.roster();
         let accepted = change == "same";
-        assert_eq!(idle.account_look(&roster).is_some(), accepted, "{change}");
+        assert_eq!(
+            idle.account_look(&(idle.hooks.acts.account_seat)().unwrap(), &roster)
+                .is_some(),
+            accepted,
+            "{change}"
+        );
         assert_eq!(idle.latch_key().is_some(), accepted, "{change}");
         assert_eq!(
             applied(&idle, &roster, "main", &observed),
@@ -339,7 +344,10 @@ fn live_account_decisions_refuse_a_different_snapshot_without_writes() {
             idle.hooks.acts.account_env = Arc::new(|snapshot| {
                 atpkg::caller_shell::process_args(snapshot.pid).map(|args| args.env)
             });
-            assert!(idle.account_look(&roster).is_some());
+            assert!(
+                idle.account_look(&(idle.hooks.acts.account_seat)().unwrap(), &roster)
+                    .is_some()
+            );
         }
     }
 }

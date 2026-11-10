@@ -11,6 +11,7 @@ use aterm_json::Value;
 pub mod billing;
 #[cfg(unix)]
 pub mod broker;
+pub mod publication;
 
 #[cfg(unix)]
 pub mod activations;

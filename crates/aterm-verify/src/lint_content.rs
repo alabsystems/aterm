@@ -272,12 +272,6 @@ pub(crate) fn plan(
     let reverse = graph.reverse_packages(&ctx.root, &member_packages);
     let mut packages = Vec::new();
     for (spec, dir) in member_packages {
-        if ctx.input_paths.is_some()
-            && (crate::scope::spec_name(&spec).is_none_or(|name| ctx.scope.spec_of(name).is_none())
-                || matches!(&ctx.scope, crate::Scope::Changed(changed) if !changed.linted().any(|selected| selected == &spec)))
-        {
-            continue;
-        }
         let (evidence, package_commands) = match commands(&spec) {
             Ok(package_commands) => (
                 builder.evidence(&spec, &dir, &package_commands),

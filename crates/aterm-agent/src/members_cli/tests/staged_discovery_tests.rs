@@ -33,7 +33,7 @@ impl MemberDiscovery for HeldDiscovery<'_> {
 /// It refuses the authority extension before possession, so this fixture grants nobody.
 struct CachedMember {
     port: u16,
-    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<aterm_uds::stop::Stop>,
     serving: Option<std::thread::JoinHandle<()>>,
     wire: std::sync::Arc<Mutex<Vec<String>>>,
 }
@@ -61,7 +61,7 @@ impl CachedMember {
         use std::sync::Arc;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stop = Arc::new(aterm_uds::stop::Stop::new());
         let wire = Arc::new(Mutex::new(Vec::new()));
         let listening = Listening {
             secret: secret.clone(),
@@ -73,7 +73,7 @@ impl CachedMember {
             lifetime: aterm_spec::wait::MUST_HAPPEN,
         };
         let serving = std::thread::spawn({
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             let wire = Arc::clone(&wire);
             move || {
                 let ask: Option<aterm_net::fleet::AskHandler> = numeric.then(|| {
@@ -101,7 +101,7 @@ impl CachedMember {
                         Arc::new(Arc::default),
                     ),
                     ask,
-                    &running,
+                    &stop,
                     aterm_spec::wait::MUST_HAPPEN,
                     move |served, _| {
                         assert!(
@@ -130,7 +130,7 @@ impl CachedMember {
         });
         Self {
             port,
-            running,
+            stop,
             serving: Some(serving),
             wire,
         }
@@ -366,12 +366,7 @@ fn native_bootstrap_continues_after_a_guarded_numeric_refusal() {
 
 impl Drop for CachedMember {
     fn drop(&mut self) {
-        self.running
-            .store(false, std::sync::atomic::Ordering::Release);
-        drop(std::net::TcpStream::connect((
-            std::net::Ipv4Addr::LOCALHOST,
-            self.port,
-        )));
+        self.stop.set();
         self.serving.take().unwrap().join().unwrap();
     }
 }

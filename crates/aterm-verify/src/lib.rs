@@ -59,7 +59,9 @@ pub mod exec;
 pub mod export_scan;
 pub mod findings;
 pub mod fmt;
+pub mod git_paths;
 mod harness_debt;
+pub mod input_content;
 pub mod ladder;
 pub mod libtest;
 pub mod libtest_json;
@@ -68,6 +70,7 @@ pub mod memory;
 pub mod own_tests;
 pub mod perf;
 pub mod plan;
+mod preflight_lint;
 #[cfg(unix)]
 pub mod provision;
 pub mod release_input;
@@ -92,6 +95,7 @@ pub mod test_history;
 pub mod test_index;
 pub mod test_plan;
 mod test_progress;
+mod test_shards;
 mod test_workers;
 pub mod testrun;
 pub mod unitgraph;
@@ -683,6 +687,8 @@ pub struct Ctx {
     pub passed_binaries: Option<testrun::Passed>,
     /// Per-package lint successes a release resume may carry by complete content key.
     pub passed_lint_packages: Option<lint_content::Passed>,
+    /// Source-reader candidates from the immediately preceding preflight attempt.
+    pub input_items: Vec<input_content::Proof>,
     /// The release cutter's frozen verifier, seal and toolchain context, salted into each test
     /// binary and lint-package content key (`--carry-context`).
     pub carry_context: Option<String>,
@@ -849,6 +855,7 @@ impl Ctx {
             test_history: None,
             passed_binaries: None,
             passed_lint_packages: None,
+            input_items: Vec::new(),
             carry_context: None,
             events: None,
             hang_samples: None,
@@ -1999,7 +2006,11 @@ fn claim_memory(
         )
         .map(Some);
     }
-    let need = book.need(spec, &memory::Key::of_stage(spec, ctx));
+    let need = book.need(
+        spec,
+        &memory::Key::of_stage(spec, ctx),
+        compile_width::jobs_for(ctx, spec.id),
+    );
     let why = match &spec.part {
         Some(part) => format!("{} {}", aterm_capacity::size(spec.mem), part.said),
         None if need.bytes == spec.mem => need.to_string(),
@@ -2179,11 +2190,7 @@ fn staged(
         }
         let _metering = memory::metering(meter.clone());
         let _covering = memory::covering(claim.as_ref().and_then(ResourceClaim::cover));
-        let jobs = compile_width::stage_jobs(
-            spec.id,
-            ctx.pool.as_ref().map(aterm_capacity::Jobserver::slots),
-            ctx.build_jobs_ceiling(),
-        );
+        let jobs = compile_width::jobs_for(ctx, spec.id);
         let (report, begun, machine) =
             compile_width::run(ctx.pool.as_ref(), jobs, &stopping, || {
                 let begun = Instant::now();
@@ -3087,10 +3094,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             parsed.admit
         }))
         .with_memory(memory::Book::live())
-        .with_test_history(
-            aterm_types::dirs::account_state_dir()
-                .map(|d| d.join(aterm_capacity::book::TEST_HISTORY)),
-        )
+        .with_test_history(test_history::planning_path(
+            parsed.test_history.clone(),
+            aterm_types::dirs::account_state_dir(),
+        ))
         .with_toolchain_lease(lease_said)
         .with_lock_notes(lock_said)
         .with_quiet_tmpdir(&std::env::temp_dir())
@@ -3171,7 +3178,7 @@ fn open_run_log(ctx: &mut Ctx, chosen: Option<&Path>, cwd: &Path) -> Option<run_
     let mut log = run_log::open(
         chosen,
         cwd,
-        &ctx.state_dir().join("logs.noindex"),
+        &run_log::default_dir(&ctx.state_dir()),
         invocation.as_deref(),
     );
     if let Some(retained) = log.as_mut().and_then(run_log::Log::take_events) {

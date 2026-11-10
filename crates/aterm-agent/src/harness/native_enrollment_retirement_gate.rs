@@ -115,28 +115,23 @@ mod tests {
                 .is_none()
         );
         drop(cleanup);
-        assert!(
-            PublicationLock::try_for_home(world.path())
-                .unwrap()
-                .is_some()
-        );
+        drop(PublicationLock::released_for_home(world.path()));
     }
 
     #[test]
     fn an_actual_publisher_still_excludes_metadata_retirement() {
         let world = aterm_tempfile::tempdir().unwrap();
-        let publisher = PublicationLock::for_home(world.path()).unwrap();
+        let publisher = PublicationLock::released_for_home(world.path());
         assert!(
             RetirementTurn::try_acquire(world.path(), &[])
                 .unwrap()
                 .is_none()
         );
         drop(publisher);
-        assert!(
-            RetirementTurn::try_acquire(world.path(), &[])
-                .unwrap()
-                .is_some()
-        );
+        drop(crate::harness::codex_source_gate::released(
+            "metadata retirement",
+            || RetirementTurn::try_acquire(world.path(), &[]).unwrap(),
+        ));
     }
 
     #[test]
@@ -176,7 +171,9 @@ mod tests {
         let request = fixture.requests()[0].clone();
         let before = store.load_logins(env.now).unwrap().0;
         let expected: aterm_json::Value = aterm_json::from_str(&before.to_json()).unwrap();
-        let body = SourceWorkLease::for_home(env.home.as_deref().unwrap()).unwrap();
+        let body = crate::harness::codex_source_gate::released("shared source work", || {
+            SourceWorkLease::try_for_home(env.home.as_deref().unwrap()).unwrap()
+        });
         let lifetime = account_work::Lifetime::default();
         let (work, _) = codex_enrollment::owned_work(request.clone(), lifetime.enter().unwrap());
         assert_eq!(

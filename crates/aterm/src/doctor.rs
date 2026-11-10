@@ -60,6 +60,15 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
+    if let Some(duration) = cli::file_events_duration(&rest) {
+        return match duration {
+            Ok(duration) => file_events(duration),
+            Err(usage) => {
+                eprintln!("{usage}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let args = match cli::args(&rest) {
         Ok(args) => args,
         Err(usage) => {
@@ -127,6 +136,64 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
         },
     );
     cli::answer(&ran.text, ran.code, ran.stdout, ran.hand_over)
+}
+
+/// On-demand diagnostic only: no subscription runs in the idle window or normal doctor.
+fn file_events(duration: std::time::Duration) -> ExitCode {
+    let footprint = || match aterm_uds::services::look(&aterm_uds::services::FSEVENTSD) {
+        aterm_uds::services::Look::Running(service, _) if service.live == 1 => {
+            Some((service.pid, service.start_s, service.footprint))
+        }
+        _ => None,
+    };
+    let before = footprint();
+    let start = std::time::Instant::now();
+    let census = match aterm_sysprobe::file_events::capture(duration) {
+        Ok(census) => census,
+        Err(error) => {
+            eprintln!("file-events: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let elapsed = start.elapsed().as_secs_f64();
+    let mut roots: Vec<_> = [
+        aterm_types::dirs::aterm_config_dir(),
+        aterm_types::dirs::account_state_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        roots.push(home.join(".local/state/aterm-release"));
+        roots.push(home.join("Library/Caches/aterm"));
+        roots.push(home.join("Library/Logs/aterm"));
+        roots.push(home.join(".local/share/aterm-fabric"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.extend(cli::checkout_event_roots(&cwd));
+    }
+    roots.push(std::env::temp_dir().join("aterm"));
+    let roots: Vec<_> = roots
+        .into_iter()
+        .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+        .collect();
+    println!(
+        "file-events: delivered destinations, not writer attribution; seconds={elapsed:.3} dropped_markers={} overflow={}; fseventsd (pid,start_s,bytes) before={before:?} after={:?}",
+        census.dropped,
+        census.overflow,
+        footprint()
+    );
+    for (path, count) in census.ranked(&roots).into_iter().take(20) {
+        println!(
+            "{count} events, {:.1}/hour: {path:?}",
+            count as f64 * 3600.0 / elapsed
+        );
+    }
+    println!(
+        "Prevention: move reproducible churn under .ubd while keeping *.noindex; no unprivileged operation restarts fseventsd."
+    );
+    ExitCode::SUCCESS
 }
 
 /// The develop layer as `reading` composes it, for [`Develop::compose`].

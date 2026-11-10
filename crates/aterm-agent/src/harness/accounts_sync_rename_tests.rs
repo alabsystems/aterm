@@ -668,6 +668,7 @@ fn renamed_accounts_refuse_stale_completions_for_the_reused_label() {
                     roster_path: &bed.path,
                     row: &old_row,
                     who: &who,
+                    seen: &crate::harness::observe::Observation::Unread,
                 },
                 |_, _| {
                     called = true;

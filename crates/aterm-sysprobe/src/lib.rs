@@ -24,6 +24,7 @@ pub mod coalition_heat;
 pub mod coalitions;
 pub mod cpu_hardware;
 pub mod cpu_policy;
+pub mod file_events;
 mod process_thermal;
 pub use process_thermal::{ProcessThermal, ProcessThermalState, process_thermal};
 pub mod identity;

@@ -25,7 +25,15 @@ pub(super) fn record_wall(
     now: i64,
 ) -> Recorded {
     let (_directory, captured) = usage_fixture(store, roster);
-    super::record_wall(store, &captured, sid, who, wall, started, now)
+    super::record_wall(
+        store,
+        &captured,
+        sid,
+        (who, &crate::harness::observe::Observation::Unread),
+        wall,
+        started,
+        now,
+    )
 }
 
 pub(super) fn record_usage(
@@ -37,7 +45,14 @@ pub(super) fn record_usage(
     now: i64,
 ) -> Recorded {
     let (_directory, captured) = usage_fixture(store, roster);
-    super::record_usage(store, &captured, sid, who, said, now)
+    super::record_usage(
+        store,
+        &captured,
+        sid,
+        (who, &crate::harness::observe::Observation::Unread),
+        said,
+        now,
+    )
 }
 
 fn tmp(tag: &str) -> Tmp {
@@ -6217,9 +6232,30 @@ fn the_footer_names_an_account_only_where_two_are_listed() {
         ("work-2", Class::Preferred, Some(at!("/logins/work-2"))),
     ]);
     let on_work = env_of(&[(LOGIN_ENV, at!("/logins/work-2"))]);
-    assert_eq!(footer_label(&two, &stored()), Some("main"));
-    assert_eq!(footer_label(&two, &on_work), Some("work-2"));
-    assert_eq!(footer_label(&three(), &on_work), Some("work-2"));
+    assert_eq!(
+        footer_label(
+            &two,
+            &stored(),
+            &crate::harness::observe::Observation::Unread
+        ),
+        Some("main")
+    );
+    assert_eq!(
+        footer_label(
+            &two,
+            &on_work,
+            &crate::harness::observe::Observation::Unread
+        ),
+        Some("work-2")
+    );
+    assert_eq!(
+        footer_label(
+            &three(),
+            &on_work,
+            &crate::harness::observe::Observation::Unread
+        ),
+        Some("work-2")
+    );
 
     for one in [
         roster(&[("main", Class::Preferred, None)]),
@@ -6231,20 +6267,43 @@ fn the_footer_names_an_account_only_where_two_are_listed() {
             on_work.clone()
         };
         assert!(judged_label(&one, &who).is_some(), "control: it is judged");
-        assert_eq!(footer_label(&one, &who), None, "{one:?}");
+        assert_eq!(
+            footer_label(&one, &who, &crate::harness::observe::Observation::Unread),
+            None,
+            "{one:?}"
+        );
     }
-    assert_eq!(footer_label(&Roster::default(), &stored()), None);
+    assert_eq!(
+        footer_label(
+            &Roster::default(),
+            &stored(),
+            &crate::harness::observe::Observation::Unread
+        ),
+        None
+    );
 
     assert_eq!(
-        footer_label(&two, &env_of(&[(LOGIN_ENV, at!("/logins/work-2/"))])),
+        footer_label(
+            &two,
+            &env_of(&[(LOGIN_ENV, at!("/logins/work-2/"))]),
+            &crate::harness::observe::Observation::Unread
+        ),
         None
     );
     assert_eq!(
-        footer_label(&two, &env_of(&[(HOME_ENV, "/elsewhere")])),
+        footer_label(
+            &two,
+            &env_of(&[(HOME_ENV, "/elsewhere")]),
+            &crate::harness::observe::Observation::Unread
+        ),
         None
     );
     assert_eq!(
-        footer_label(&two, &env_of(&[("ANTHROPIC_API_KEY", "k")])),
+        footer_label(
+            &two,
+            &env_of(&[("ANTHROPIC_API_KEY", "k")]),
+            &crate::harness::observe::Observation::Unread
+        ),
         None
     );
 }
@@ -8628,6 +8687,64 @@ fn a_drop_beside_another_accounts_reading_is_no_refill() {
     assert_eq!(resets(&events), 1, "{events:?}");
 }
 
+/// A tap reading whose login file names another account than the row it would be filed under
+/// never reaches that row's record: the record keeps its figure and its key, and no epoch is
+/// written (`docs/DESIGN-account-discovery-2026-11-09.md`, decision 7; the m65 live bug, where
+/// unicorn's reading cleared `m22`'s record and adopted unicorn's key).
+/// NEGATIVE CONTROL: with the `ReadingOwner::Another` guard removed, the record adopts the other
+/// key: `` left: Some(c-2222…) right: Some(c-1111…) ``.
+#[test]
+fn reading_of_another_observed_account_keeps_record() {
+    use crate::harness::profile::AccountKey;
+    let (a, b) = (
+        AccountKey::claude("11111111-1111-4111-8111-111111111111"),
+        AccountKey::claude("22222222-2222-4222-8222-222222222222"),
+    );
+    let reset = NOW + 2 * HOUR;
+    let read = |pct_x10: u32, at: i64, key| TapRead {
+        key,
+        ..five(win(pct_x10, reset, None), at, true)
+    };
+    let mut s = state();
+    note_reading(&mut s, "main", &read(500, NOW - HOUR, a), NOW - HOUR);
+    let (events, held) = note_reading_held(
+        &mut s,
+        "main",
+        &read(900, NOW, b),
+        NOW,
+        ReadingOwner::Another,
+    );
+    assert_eq!((events.len(), held), (0, false), "{events:?}");
+    assert_eq!(s.accounts["main"].key, a);
+    assert_eq!(s.accounts["main"].windows[SESSION_LIMIT].pct_x10, 500);
+    assert_eq!(s.accounts["main"].cleared_at, None);
+}
+
+/// A re-created account (the same address, a new account uuid) still resets its record when the
+/// login file names that same account.
+/// NEGATIVE CONTROL: with `ReadingOwner::This` treated as `Another`, nothing is filed:
+/// `` left: Some(c-1111…) right: Some(c-2222…) ``.
+#[test]
+fn recreated_account_still_resets() {
+    use crate::harness::profile::AccountKey;
+    let (a, b) = (
+        AccountKey::claude("11111111-1111-4111-8111-111111111111"),
+        AccountKey::claude("22222222-2222-4222-8222-222222222222"),
+    );
+    let reset = NOW + 2 * HOUR;
+    let read = |pct_x10: u32, at: i64, key| TapRead {
+        key,
+        ..five(win(pct_x10, reset, None), at, true)
+    };
+    let mut s = state();
+    note_reading(&mut s, "main", &read(500, NOW - HOUR, a), NOW - HOUR);
+    let (events, _) =
+        note_reading_held(&mut s, "main", &read(100, NOW, b), NOW, ReadingOwner::This);
+    assert_eq!(s.accounts["main"].key, b);
+    assert_eq!(s.accounts["main"].cleared_at, Some(NOW));
+    assert!(events.iter().any(|e| e.kind == Kind::Epoch), "{events:?}");
+}
+
 #[test]
 fn a_first_reading_of_a_process_begun_after_the_epoch_is_taken() {
     let reset = NOW + 2 * HOUR;
@@ -8656,10 +8773,22 @@ fn a_first_reading_of_a_process_begun_after_the_epoch_is_taken() {
     let pct = |s: &State| s.accounts["main"].windows[SESSION_LIMIT].pct_x10;
     for born in [Some(epoch - 1), None] {
         let mut before = s.clone();
-        let (_, held) = note_reading_held(&mut before, "main", &first(born), NOW);
+        let (_, held) = note_reading_held(
+            &mut before,
+            "main",
+            &first(born),
+            NOW,
+            ReadingOwner::Unobserved,
+        );
         assert_eq!((pct(&before), held), (50, true), "{born:?}");
     }
-    let (_, held) = note_reading_held(&mut s, "main", &first(Some(epoch)), NOW);
+    let (_, held) = note_reading_held(
+        &mut s,
+        "main",
+        &first(Some(epoch)),
+        NOW,
+        ReadingOwner::Unobserved,
+    );
     assert_eq!((pct(&s), held), (80, false));
 }
 

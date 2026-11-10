@@ -327,6 +327,7 @@ fn terminal_projection_index(
         .position(|tab| tab.id == id)
 }
 
+#[cfg(test)]
 fn terminal_tab_ids(
     tabs: &crate::tab_model::TabSet,
     views: &crate::tab_model::ViewStore,
@@ -383,22 +384,19 @@ pub(crate) fn reorder_with_projection(
     moved: crate::tab_model::TabId,
     change: impl FnOnce(&mut crate::tab_model::TabSet) -> bool,
 ) -> bool {
-    let terminal_before = terminal_tab_ids(&ws.tab_set, views);
-    let held = terminal_before.get(ws.tabs.active).copied();
+    let held = terminal_tab_id_at(&ws.tab_set, views, ws.tabs.active);
+    let old = terminal_projection_index(&ws.tab_set, views, moved);
     if !change(&mut ws.tab_set) {
         return false;
     }
-    let terminal_after = terminal_tab_ids(&ws.tab_set, views);
-    if let (Some(old), Some(new)) = (
-        terminal_before.iter().position(|id| *id == moved),
-        terminal_after.iter().position(|id| *id == moved),
-    ) && old != new
+    if let (Some(old), Some(new)) = (old, terminal_projection_index(&ws.tab_set, views, moved))
+        && old != new
     {
         let tree = ws.layouts.remove(old);
         ws.layouts.insert(new, tree);
     }
     if let Some(held) = held
-        && let Some(index) = terminal_after.iter().position(|id| *id == held)
+        && let Some(index) = terminal_projection_index(&ws.tab_set, views, held)
     {
         ws.tabs.active = index;
     }
@@ -1522,9 +1520,8 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return Vec::new();
         };
-        let live: std::collections::HashSet<u64> =
-            read.iter().filter_map(|(_, sid, _)| *sid).collect();
-        ws.tab_title_cache.retain(|sid, _| live.contains(sid));
+        ws.tab_title_cache
+            .retain(|sid, _| read.iter().any(|(_, live, _)| *live == Some(*sid)));
         read.into_iter()
             .map(|(fallback, sid, fresh)| {
                 let Some(sid) = sid else {
@@ -1558,23 +1555,26 @@ impl App {
     }
 
     fn stamp_tab_connection_roles(&mut self, wid: WindowId) {
-        let roles = if self.config.tab_connection_badge_or_default() {
-            crate::connections::roles_by_local(&self.store)
-        } else {
-            std::collections::HashMap::new()
-        };
-        let Some(ws) = self.windows.get(&wid) else {
+        let roles = self
+            .config
+            .tab_connection_badge_or_default()
+            .then(|| crate::connections::roles_by_local(&self.store));
+        let Self {
+            windows,
+            view_store,
+            ..
+        } = self;
+        let Some(ws) = windows.get_mut(&wid) else {
             return;
         };
-        let per_tab: Vec<Option<crate::tab_model::TabConnRole>> = ws
-            .tab_set
-            .tabs()
-            .iter()
-            .map(|tab| {
-                let (mut outbound, mut inbound) = (false, false);
-                tab.root.any_leaf(&mut |view| {
-                    if let Some(session) = self
-                        .view_store
+        for index in 0..ws.tab_set.len() {
+            let Some(tab) = ws.tab_set.tab_at_mut(index) else {
+                continue;
+            };
+            let (mut outbound, mut inbound) = (false, false);
+            if let Some(roles) = roles.as_ref() {
+                tab.root.visit(&mut |view| {
+                    if let Some(session) = view_store
                         .get(*view)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
@@ -1583,17 +1583,9 @@ impl App {
                         outbound |= role.outbound;
                         inbound |= role.inbound;
                     }
-                    false
                 });
-                crate::tab_model::TabConnRole::from_flags(outbound, inbound)
-            })
-            .collect();
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            for (index, conn) in per_tab.into_iter().enumerate() {
-                if let Some(tab) = ws.tab_set.tab_at_mut(index) {
-                    tab.presentation.conn = conn;
-                }
             }
+            tab.presentation.conn = crate::tab_model::TabConnRole::from_flags(outbound, inbound);
         }
     }
 
@@ -1660,10 +1652,11 @@ impl App {
         // session's entry). The live-id set is collected first so the retain
         // closure borrows no field.
         if self.session_chrome.len() > 64 {
-            let live: std::collections::HashSet<u64> = self.pool.iter().map(|s| s.id).collect();
-            self.session_chrome.retain(|sid, _| live.contains(sid));
+            let pool = &self.pool;
+            self.session_chrome
+                .retain(|sid, _| pool.get(*sid).is_some());
         }
-        let tabs: Vec<(
+        let mut tabs: Vec<(
             Option<crate::session_chrome::TerminalMenuOrigin>,
             Option<String>,
             Option<crate::tab_model::TabId>,
@@ -1697,7 +1690,7 @@ impl App {
         });
         let mut edges = None;
         let ext: Vec<crate::session_chrome::TabChromeExt> = tabs
-            .iter()
+            .iter_mut()
             .enumerate()
             .map(
                 |(i, (origin, presentation_tooltip, menu_tab))| match origin {
@@ -1710,7 +1703,7 @@ impl App {
                         ext
                     }
                     None => crate::session_chrome::TabChromeExt {
-                        tooltip: presentation_tooltip.clone(),
+                        tooltip: presentation_tooltip.take(),
                         menu: Vec::new(),
                         menu_tab: None,
                     },
@@ -1903,7 +1896,14 @@ impl App {
             return c.ext.clone();
         }
         let activity = self.session_status_text(session);
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let (icon, description, attention) = {
+            let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                meta.presentation_value("icon"),
+                meta.presentation_value("description"),
+                meta.presentation_value("attention"),
+            )
+        };
         let native_cwd = |t: &aterm_core::terminal::Terminal| {
             use crate::cwd_native::ReportedCwd as _;
             t.native_working_directory()
@@ -1959,11 +1959,15 @@ impl App {
                 .menu_for(sid.as_str(), crate::upgrade_host::now_s())
         });
         let agent = self.agent_menu_facts(session);
+        let (clause_key, clause) = match clause {
+            Some((key, line)) => (Some(key), Some(line)),
+            None => (None, None),
+        };
         let input = chrome::SessionChromeInput {
             can_rename,
             label: label.to_string(),
-            icon: meta.presentation_value("icon"),
-            description: meta.presentation_value("description"),
+            icon,
+            description,
             activity,
             goal,
             cwd,
@@ -1973,10 +1977,10 @@ impl App {
             timeline,
             connections,
             upgrade,
-            attention: meta.presentation_value("attention"),
+            attention,
             agent,
             sid,
-            clause: clause.as_ref().map(|(_, line)| line.clone()),
+            clause,
             rewind: self.session_records(session),
         };
         let ext = chrome::TabChromeExt {
@@ -1984,19 +1988,20 @@ impl App {
             menu: chrome::compose_tab_menu(&input),
             menu_tab: None,
         };
+        let expires_ms = chrome::clock_expiry_ms(now, &input);
         self.session_chrome.insert(
             session,
             chrome::CachedChrome {
                 high_id,
-                label: label.to_string(),
+                label: input.label,
                 can_rename,
                 activity_revision,
                 connections_revision,
                 upgrade_revision,
                 goal: goal_term,
-                expires_ms: chrome::clock_expiry_ms(now, &input),
-                clause: clause.as_ref().map(|(key, _)| key.clone()),
-                clause_line: input.clause.clone(),
+                expires_ms,
+                clause: clause_key,
+                clause_line: input.clause,
                 ext: ext.clone(),
             },
         );
@@ -2016,7 +2021,7 @@ impl App {
             in_any: bool,
             in_write: bool,
         }
-        let mut peers: std::collections::BTreeMap<String, (aterm_session::SessionId, Halves)> =
+        let mut peers: std::collections::BTreeMap<&str, (&aterm_session::SessionId, Halves)> =
             std::collections::BTreeMap::new();
         for edge in edges {
             // Distinct branch.
@@ -2024,15 +2029,15 @@ impl App {
                 continue;
             }
             let (peer, outbound) = if edge.src == *sid {
-                (edge.dst.clone(), true)
+                (&edge.dst, true)
             } else if edge.dst == *sid {
-                (edge.src.clone(), false)
+                (&edge.src, false)
             } else {
                 continue;
             };
             let write = matches!(edge.op, aterm_session::Op::WriteInput);
             let entry = &mut peers
-                .entry(peer.as_str().to_string())
+                .entry(peer.as_str())
                 .or_insert_with(|| (peer, Halves::default()))
                 .1;
             if outbound {
@@ -2050,7 +2055,7 @@ impl App {
         peers
             .into_values()
             .map(|(peer, halves)| {
-                let peer_title = g.by_sid(&peer).map_or_else(
+                let peer_title = g.by_sid(peer).map_or_else(
                     || "unknown".to_string(),
                     crate::session_store::SessionHandle::display_title,
                 );
@@ -2060,7 +2065,7 @@ impl App {
                     _ => (ConnDirection::Inbound, halves.in_write),
                 };
                 ConnectionFact {
-                    peer_sid: peer,
+                    peer_sid: peer.clone(),
                     peer_title,
                     direction,
                     kind: if push { ConnFlow::Push } else { ConnFlow::Pull },
@@ -4360,18 +4365,6 @@ impl App {
         &mut self,
         wid: WindowId,
     ) -> (Vec<String>, Vec<crate::tab_bar::TabStripMetadata>) {
-        let label_sessions: Vec<Option<u64>> = self.windows.get(&wid).map_or_else(Vec::new, |ws| {
-            ws.tab_set
-                .tabs()
-                .iter()
-                .map(|tab| {
-                    self.view_store
-                        .get(tab.focus)
-                        .copied()
-                        .and_then(crate::tab_model::View::terminal_session)
-                })
-                .collect()
-        });
         self.reap_stale_rename_edit(wid);
         let titles = self.tab_titles(wid);
         let mut chrome_titles = crate::chrome_label::capped_labels(&titles);
@@ -4399,14 +4392,26 @@ impl App {
             self.windows.get(&wid).map_or_else(Vec::new, |ws| {
                 ws.tab_set.tabs().iter().map(|tab| tab.id).collect()
             });
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        let Self {
+            windows,
+            view_store,
+            ..
+        } = self;
+        if let Some(ws) = windows.get_mut(&wid) {
+            let tab_session = |tab: &crate::tab_model::Tab| {
+                view_store
+                    .get(tab.focus)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+            };
+            let tabs = ws.tab_set.tabs();
             ws.strip_shadow.set((shown, active));
             ws.tab_title_epochs
-                .retain(|sid, _| label_sessions.contains(&Some(*sid)));
+                .retain(|sid, _| tabs.iter().any(|tab| tab_session(tab) == Some(*sid)));
             ws.tab_chrome_titles
-                .retain(|sid, _| label_sessions.contains(&Some(*sid)));
-            for (session, title) in label_sessions.iter().copied().zip(&titles) {
-                if let Some(session) = session {
+                .retain(|sid, _| tabs.iter().any(|tab| tab_session(tab) == Some(*sid)));
+            for (tab, title) in tabs.iter().zip(&titles) {
+                if let Some(session) = tab_session(tab) {
                     ws.tab_chrome_titles
                         .entry(session)
                         .or_default()
@@ -4415,15 +4420,11 @@ impl App {
             }
             ws.tab_chrome_titles_by_tab
                 .retain(|tab_id, _| ids.contains(tab_id));
-            for ((tab_id, session), title) in ids
-                .iter()
-                .copied()
-                .zip(label_sessions.iter().copied())
-                .zip(chrome_titles.iter())
-            {
+            for (tab, title) in tabs.iter().zip(chrome_titles.iter()) {
+                let session = tab_session(tab);
                 let entry = ws
                     .tab_chrome_titles_by_tab
-                    .entry(tab_id)
+                    .entry(tab.id)
                     .or_insert_with(|| (session, String::new()));
                 entry.0 = session;
                 entry.1.clone_from(title);
@@ -4455,21 +4456,7 @@ impl App {
 
     /// Repaint everything a session's user metadata feeds, after the change was stored and recorded.
     pub(crate) fn refresh_meta_dependent_chrome(&mut self, session: u64) {
-        let label_windows: Vec<WindowId> = self
-            .windows
-            .iter()
-            .filter(|(_, ws)| {
-                ws.tab_set.tabs().iter().any(|tab| {
-                    self.view_store
-                        .get(tab.focus)
-                        .copied()
-                        .and_then(crate::tab_model::View::terminal_session)
-                        == Some(session)
-                })
-            })
-            .map(|(wid, _)| *wid)
-            .collect();
-        for wid in label_windows {
+        for wid in self.windows_with_focused_session(session) {
             let focused = self.focused_session_id(wid) == Some(session);
             let (titles, metadata) = self.refresh_window_tabs(wid);
             let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata);
@@ -6253,12 +6240,12 @@ impl App {
             return Some(format!("frontmost_window {fid:?} names no live window"));
         }
         self.windows.iter().find_map(|(wid, ws)| {
-            let terminal_tabs: Vec<&crate::tab_model::Tab> = ws
-                .tab_set
-                .tabs()
-                .iter()
-                .filter(|tab| is_terminal_tab(tab, &self.view_store))
-                .collect();
+            let terminal_tabs = || {
+                ws.tab_set
+                    .tabs()
+                    .iter()
+                    .filter(|tab| is_terminal_tab(tab, &self.view_store))
+            };
             let active_tab = ws.tab_set.active();
             let front_truth = match active_tab.and_then(|tab| {
                 self.view_store
@@ -6293,11 +6280,8 @@ impl App {
                     ws.pending_close && ws.front_content.is_none() && ws.active_terminal.is_none()
                 }
             };
-            let active_terminal = active_tab.and_then(|active| {
-                terminal_tabs
-                    .iter()
-                    .position(|candidate| candidate.id == active.id)
-            });
+            let active_terminal = active_tab
+                .and_then(|active| terminal_tabs().position(|candidate| candidate.id == active.id));
             let focus_truth = match ws.window_focus {
                 crate::front_content::WindowFocus::Content(view) => {
                     ws.front_content
@@ -6324,10 +6308,10 @@ impl App {
                     ws.layouts.len(),
                 ));
             }
-            if terminal_tabs.len() != ws.layouts.len() {
+            let terminal_tab_count = terminal_tabs().count();
+            if terminal_tab_count != ws.layouts.len() {
                 return Some(format!(
-                    "{wid:?}: {} all-terminal tabs project onto {} layouts",
-                    terminal_tabs.len(),
+                    "{wid:?}: {terminal_tab_count} all-terminal tabs project onto {} layouts",
                     ws.layouts.len(),
                 ));
             }
@@ -6374,14 +6358,19 @@ impl App {
                     ));
                 }
             }
-            for (index, (layout, tab)) in ws.layouts.iter().zip(&terminal_tabs).enumerate() {
-                let projected = tab.root.map(&mut |view| {
+            for (index, (layout, tab)) in ws.layouts.iter().zip(terminal_tabs()).enumerate() {
+                if !layout.matches_projected(&tab.root, &|view| {
                     self.view_store
-                        .get(*view)
+                        .get(view)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
-                });
-                if projected != layout.map_sessions(Some) {
+                }) {
+                    let projected = tab.root.map(&mut |view| {
+                        self.view_store
+                            .get(*view)
+                            .copied()
+                            .and_then(crate::tab_model::View::terminal_session)
+                    });
                     return Some(format!(
                         "{wid:?}: tab {:?}'s pane tree does not project onto layouts[{index}] — \
                          tab sessions {:?} vs layout sessions {:?}",

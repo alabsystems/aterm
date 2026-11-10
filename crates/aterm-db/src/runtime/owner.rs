@@ -107,7 +107,9 @@ pub(super) struct WindowClaim {
 }
 impl WindowClaim {
     pub(super) fn acquire(dir: &Path) -> Result<Self> {
-        private_file::create_private_dir(dir)?;
+        // Only the observer prepares or migrates its directory. A pre-open claim
+        // must not create a legacy directory beside a concurrently prepared fence.
+        private_file::check_private_dir(dir)?;
         aterm_secrets::fsx::write_new(&dir.join("window.lock"), b"", 0o600)
             .map_err(|_| Error::new("Commons window claim cannot be created"))?;
         let (file, _) = aterm_uds::kept_out(|| private_file::open_private(dir, "window.lock"))
@@ -150,5 +152,24 @@ pub(super) fn window_claimed(dir: &Path) -> bool {
         }
         Err(std::fs::TryLockError::WouldBlock) => true,
         Err(std::fs::TryLockError::Error(_)) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_window_claim_never_creates_the_observers_directory() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = root.path().join("network-state");
+        assert!(WindowClaim::acquire(&dir).is_err());
+        assert!(!dir.exists(), "the observer alone prepares its directory");
+
+        private_file::create_private_dir(&dir).unwrap();
+        let claim = WindowClaim::acquire(&dir).unwrap();
+        assert!(window_claimed(&dir));
+        drop(claim);
+        assert!(!window_claimed(&dir));
     }
 }

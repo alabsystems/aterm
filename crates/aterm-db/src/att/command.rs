@@ -347,13 +347,7 @@ pub fn run(
     }
 }
 
-pub(crate) fn safe_key(key: &str) -> &str {
-    if crate::typed::guard::credential_shaped(key) {
-        grid::REFUSED
-    } else {
-        key
-    }
-}
+pub(crate) use crate::typed::keys::safe_key;
 
 /// A field as JSON for scripts: a value (addresses masked unless `reveal`), a conflict's
 /// candidates, or a set's members.

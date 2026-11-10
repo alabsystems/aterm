@@ -9,13 +9,17 @@
 //! targo --unverified run -q -p aterm-census -- --guards          # just the source guards
 //! targo --unverified run -q -p aterm-census -- --locks --scope   # just these two
 //! targo --unverified run -q -p aterm-census -- --all <root>      # everything, another checkout
+//! targo --unverified run -q -p aterm-census -- --memo <file>     # reuse what still holds
 //! targo --unverified run -q -p aterm-census -- mirror record …    # the mirror-proof registry
 //! ```
 //!
 //! Bare `aterm-census` is `--all`; census flags combine. In
 //! [`aterm_census::CENSUSES`] order, a clean census prints its verdict line
 //! and a failed one its transcript and the command that reruns just it
-//! (`--verbose` prints every transcript); a summary line ends the run.
+//! (`--verbose` prints every transcript); a summary line ends the run. With
+//! `--memo <file>`, each guard rule and census reuses the result the file kept for
+//! it while every question it asked of the checkout keeps its answer, and the run
+//! keeps its own record there ([`aterm_census::Memo`]); a line says what it reused.
 //! Exit 0 = every selected census clean, 1 = a census failed (a finding, a
 //! missed floor, or a walk that could not run), 2 = usage, or the root is not
 //! a checkout.
@@ -28,7 +32,7 @@ use aterm_census::{CENSUSES, Census};
 
 fn usage() -> String {
     let mut text = String::from(
-        "usage: aterm-census [--all | --<census>...] [-v] [<root>]\n\n\
+        "usage: aterm-census [--all | --<census>...] [-v] [--memo <file>] [<root>]\n\n\
          Runs the L0 censuses and the source guards over the aterm checkout at\n\
          <root> (default: the checkout holding the current directory). A clean\n\
          census prints its verdict; a failed one prints its findings and how to\n\
@@ -40,6 +44,7 @@ fn usage() -> String {
     }
     text.push_str(
         "  -v, --verbose  every census's full transcript, clean or not\n\
+         \x20 --memo <file>  reuse each result the file kept while its answers hold; keep this run's\n\
          \x20 -h, --help     this text\n\n\
          Census flags combine. Exit: 0 clean, 1 a census failed, 2 usage or bad <root>.\n",
     );
@@ -51,6 +56,7 @@ struct Invocation {
     selected: Vec<&'static Census>,
     root: Option<PathBuf>,
     verbose: bool,
+    memo: Option<PathBuf>,
 }
 
 /// `Ok(None)` is `--help`; `Err` is a usage error to report.
@@ -58,12 +64,19 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Invocation>, S
     let mut selected: Vec<&'static Census> = Vec::new();
     let mut root: Option<PathBuf> = None;
     let mut verbose = false;
-    for arg in args {
+    let mut memo = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         if arg == "-h" || arg == "--help" {
             return Ok(None);
         }
         if arg == "-v" || arg == "--verbose" {
             verbose = true;
+        } else if arg == "--memo" {
+            let file = args.next().ok_or("--memo names the file it keeps")?;
+            memo = Some(PathBuf::from(file));
+        } else if let Some(file) = arg.strip_prefix("--memo=") {
+            memo = Some(PathBuf::from(file));
         } else if arg == "--all" {
             selected.extend(CENSUSES);
         } else if let Some(name) = arg.strip_prefix("--") {
@@ -93,6 +106,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Invocation>, S
         selected,
         root,
         verbose,
+        memo,
     }))
 }
 
@@ -134,9 +148,11 @@ fn shell_word(path: &Path) -> String {
 const STANDALONE: &str = "aterm-census reads no engine; `targo --unverified verify census` \
                           holds captures to one commit's baseline";
 
-fn run(selected: &[&'static Census], root: &Path, verbose: bool) -> bool {
+fn run(selected: &[&'static Census], root: &Path, verbose: bool, memo: Option<&Path>) -> bool {
     let started = Instant::now();
-    let outcomes = aterm_census::run_censuses(root, selected, &Err(STANDALONE.into()));
+    let memo = memo.map(aterm_census::Memo::at);
+    let (outcomes, report) =
+        aterm_census::run_censuses(root, selected, &Err(STANDALONE.into()), memo.as_ref());
     let mut verdicts = Vec::new();
     for (census, outcome) in selected.iter().zip(&outcomes) {
         if outcome.ok && !verbose {
@@ -157,6 +173,9 @@ fn run(selected: &[&'static Census], root: &Path, verbose: bool) -> bool {
             census.name,
             if outcome.ok { "ok" } else { "FAIL" }
         ));
+    }
+    if let Some(report) = report {
+        println!("{report}");
     }
     let ok = outcomes.iter().all(|o| o.ok);
     println!(
@@ -192,6 +211,7 @@ fn mirror(args: &[String]) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    aterm_census::pin_code();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("mirror") {
         return mirror(&args[1..]);
@@ -216,7 +236,12 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    if run(&invocation.selected, &root, invocation.verbose) {
+    if run(
+        &invocation.selected,
+        &root,
+        invocation.verbose,
+        invocation.memo.as_deref(),
+    ) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -260,6 +285,17 @@ mod tests {
     }
 
     #[test]
+    fn memo_takes_the_next_word_as_its_file_not_as_the_root() {
+        for args in [&["--memo", "/m", "/x"][..], &["--memo=/m", "/x"]] {
+            let parsed = parse(args.iter().map(|a| (*a).to_string()))
+                .expect("parses")
+                .expect("not --help");
+            assert_eq!(parsed.memo.as_deref(), Some(Path::new("/m")));
+            assert_eq!(parsed.root.as_deref(), Some(Path::new("/x")));
+        }
+    }
+
+    #[test]
     fn verbose_is_a_flag_not_a_root() {
         for flag in ["-v", "--verbose"] {
             let parsed = parse([flag.to_string()])
@@ -280,6 +316,7 @@ mod tests {
         assert!(parse(["--lock".to_string()]).is_err());
         assert!(parse(["-x".to_string()]).is_err());
         assert!(parse(["a".to_string(), "b".to_string()]).is_err());
+        assert!(parse(["--memo".to_string()]).is_err());
         assert!(matches!(parse(["--help".to_string()]), Ok(None)));
     }
 }

@@ -123,6 +123,9 @@ const USAGE: &str =
   aterm db <table> [--show-addresses]
                     every row, each column as the grid shows it: addresses masked, a password
                     or number as •••••• when set, a conflict as ⚠ a ‖ b
+                    (`ai-accounts` adds seen_on, the Macs a tab ran it on in the last two
+                    hours, and last_seen, from every Mac's account-obs rows and the journal's
+                    seen events; a pending account a Mac runs reads `signed in · on <mac>`)
   aterm db emails --show-passwords | aterm db phones --show-numbers
                     the same with the secret column in plaintext: only in a person's own aterm
                     tab or terminal (not one `aterm ctl spawn` started, held, driven, or running
@@ -304,6 +307,9 @@ pub fn run(paths: &Paths, noun: Noun, words: &[String], io: &mut ViewIo<'_>) -> 
         let unbound = seats(paths, &view, &mut rows)?;
         rows.extend(unbound);
     }
+    if noun == Noun::AiAccounts {
+        seen_columns(paths, &view, &mut rows, io.now_ms);
+    }
     let mut out = Map::new();
     out.insert("complete".to_owned(), json!(view.complete));
     out.insert("table".to_owned(), json!(noun.word()));
@@ -366,6 +372,220 @@ fn reveal_all(
         surface,
         io.now_ms,
     )
+}
+
+/// How long a sighting keeps an account on a Mac: two of a running tab's hourly `seen`
+/// refreshes (`docs/DESIGN-account-discovery-2026-11-09.md`, "In use on <mac>").
+const SEEN_LIVE_MS: u64 = 2 * 3_600_000;
+
+/// Where and when one account was observed running (`account-obs` and heard `seen` events,
+/// `docs/DESIGN-account-discovery-2026-11-09.md`): each Mac it runs on now by name with its tabs,
+/// and the newest sighting anywhere.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SeenOn {
+    /// Each Mac a tab runs it on now, by name, with how many tabs.
+    macs: BTreeMap<String, u64>,
+    /// The newest sighting on any Mac, Unix milliseconds.
+    last_ms: u64,
+}
+
+/// One journal event a view folds: a tab's `seen`, or the `session-end` that closes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Heard {
+    /// The writer's Commons uuid, 32 hex.
+    uuid: String,
+    account: String,
+    tab: String,
+    /// When, Unix milliseconds.
+    t_ms: u64,
+    /// A `session-end` of that tab, rather than a sighting.
+    ended: bool,
+}
+
+/// The `seen` and tabbed `session-end` events of the journal window this Mac holds at `now_ms`;
+/// none where it holds no Commons or the window cannot be read (the view still shows the rows).
+fn heard(paths: &Paths, now_ms: u64) -> Vec<Heard> {
+    use crate::alab::journal::{Kind, seen};
+    let Ok(Some(window)) = seen::read(paths, None, now_ms / 1_000) else {
+        return Vec::new();
+    };
+    window
+        .events
+        .iter()
+        .filter_map(|logged| {
+            let event = &logged.event;
+            let ended = match event.kind {
+                Kind::Seen => false,
+                Kind::SessionEnd => true,
+                _ => return None,
+            };
+            Some(Heard {
+                uuid: logged.uuid.clone(),
+                account: event.account.as_ref()?.as_str().to_owned(),
+                tab: event.tab.as_ref()?.as_str().to_owned(),
+                t_ms: event.t.saturating_mul(1_000),
+                ended,
+            })
+        })
+        .collect()
+}
+
+/// Every account's [`SeenOn`] at `now_ms` from the `account-obs` rows `obs` and the heard events
+/// `heard`, each Mac named by `name` (from its Commons uuid). A Mac runs an account now where its
+/// row says `running` with a tab and was written within [`SEEN_LIVE_MS`], or where one of its tabs
+/// was seen on it within that span and has not ended since; its tabs are the more of the row's
+/// count and the distinct tabs heard. A row whose key does not end in a uuid, or whose prefix is
+/// not the account it names, is no Mac's word and is skipped, as the collection's writers rule
+/// admits only its signer's own suffix. Every row and sighting dates `last_ms`, however old.
+fn seen_on(
+    obs: &crate::typed::owned::OwnedRead,
+    heard: &[Heard],
+    name: &dyn Fn(&str) -> String,
+    now_ms: u64,
+) -> BTreeMap<String, SeenOn> {
+    let live = |at: u64| now_ms.saturating_sub(at) <= SEEN_LIVE_MS;
+    let mut out: BTreeMap<String, SeenOn> = BTreeMap::new();
+    for (key, row) in &obs.rows {
+        let row = &row.value;
+        let Some(account) = row.get("account").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((prefix, uuid)) = key.rsplit_once('.') else {
+            continue;
+        };
+        if prefix != account || crate::typed::keys::parse_uuid32(uuid).is_none() {
+            continue;
+        }
+        let at = row.get("at").and_then(Value::as_u64).unwrap_or(0);
+        let running = row.get("state").and_then(Value::as_str) == Some("running");
+        let tabs = row.get("tabs").and_then(Value::as_u64).unwrap_or(0);
+        let seen = out.entry(account.to_owned()).or_default();
+        seen.last_ms = seen.last_ms.max(at);
+        if running && tabs > 0 && live(at) {
+            let mac = seen.macs.entry(name(uuid)).or_default();
+            *mac = (*mac).max(tabs);
+        }
+    }
+    // Each (account, Mac, tab)'s newest word: a sighting, or its session's end.
+    let mut tabs: BTreeMap<(&str, &str, &str), (u64, bool)> = BTreeMap::new();
+    for event in heard {
+        let newest = tabs
+            .entry((&event.account, &event.uuid, &event.tab))
+            .or_insert((event.t_ms, event.ended));
+        if event.t_ms >= newest.0 {
+            *newest = (event.t_ms, event.ended);
+        }
+        if !event.ended {
+            let seen = out.entry(event.account.clone()).or_default();
+            seen.last_ms = seen.last_ms.max(event.t_ms);
+        }
+    }
+    let mut running: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+    for ((account, uuid, _), (at, ended)) in tabs {
+        if !ended && live(at) {
+            *running.entry((account, uuid)).or_default() += 1;
+        }
+    }
+    for ((account, uuid), n) in running {
+        let mac = out
+            .entry(account.to_owned())
+            .or_default()
+            .macs
+            .entry(name(uuid))
+            .or_default();
+        *mac = (*mac).max(n);
+    }
+    out
+}
+
+/// An age as the view says it: `12 s`, `4 min`, `3 h`, `2 d`.
+fn age(ms: u64) -> String {
+    let secs = ms / 1_000;
+    match secs {
+        0..60 => format!("{secs} s"),
+        60..3_600 => format!("{} min", secs / 60),
+        3_600..86_400 => format!("{} h", secs / 3_600),
+        _ => format!("{} d", secs / 86_400),
+    }
+}
+
+/// A Mac's name in the view: `m65 (cheetah)` from its machine row, else its label, else the
+/// first 8 digits of its Commons uuid.
+fn mac_name(lab: &LabView, uuid: &str) -> String {
+    let machine = lab.bound.get(uuid).and_then(|pk| lab.machines.get(pk));
+    match machine.map(|m| (m.label.as_deref(), &m.nickname)) {
+        Some((Some(label), crate::alab::view::MachineNickname::Named { word, .. })) => {
+            format!("{label} ({word})")
+        }
+        Some((Some(label), _)) => label.to_owned(),
+        _ => uuid.chars().take(8).collect(),
+    }
+}
+
+/// `ai-accounts`: the derived `seen_on` and `last_seen` columns, never typed, from every Mac's
+/// `account-obs` rows and the journal's heard `seen` events ([`seen_on`]); and where a Mac runs
+/// the account now, `status` says so ahead of a catalog `pending`: observation wins over belief.
+fn seen_columns(paths: &Paths, view: &att::View, rows: &mut [Value], now_ms: u64) {
+    let empty = crate::typed::owned::OwnedRead::default();
+    let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
+    let lab = LabView::read(
+        &view.cells,
+        owned(registry::MACHINE_FACTS.name),
+        owned(registry::MAILBOX_OBS.name),
+        None,
+    );
+    let seen = seen_on(
+        owned(registry::ACCOUNT_OBS.name),
+        &heard(paths, now_ms),
+        &|uuid| mac_name(&lab, uuid),
+        now_ms,
+    );
+    shown_seen(rows, &seen, now_ms);
+}
+
+/// [`seen_columns`] over `seen`, by each row's account key.
+fn shown_seen(rows: &mut [Value], seen: &BTreeMap<String, SeenOn>, now_ms: u64) {
+    for row in rows {
+        let Some(fields) = row.as_object_mut() else {
+            continue;
+        };
+        let held = fields
+            .get(ACCOUNT.prefix)
+            .and_then(Value::as_str)
+            .and_then(|pk| seen.get(pk));
+        let (on, last) = match held {
+            Some(held) => (
+                held.macs
+                    .iter()
+                    .map(|(mac, tabs)| format!("{mac} \u{d7}{tabs}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                age(now_ms.saturating_sub(held.last_ms)),
+            ),
+            None => (String::new(), String::new()),
+        };
+        let running = held.and_then(|held| held.macs.keys().next());
+        if let Some(mac) = running
+            && fields
+                .get("status")
+                .is_none_or(|status| status.is_null() || status.as_str() == Some("pending"))
+        {
+            fields.insert(
+                "status".to_owned(),
+                json!(format!("signed in \u{b7} on {mac}")),
+            );
+        }
+        for (column, value) in [("seen_on", on), ("last_seen", last)] {
+            fields.insert(
+                column.to_owned(),
+                if value.is_empty() {
+                    Value::Null
+                } else {
+                    json!(value)
+                },
+            );
+        }
+    }
 }
 
 /// `computers`: each machine row with the Commons seats bound to it, then each live seat no

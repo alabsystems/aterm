@@ -115,6 +115,9 @@ USAGE:
                                                  its ledger and journal lines
     aterm harness accounts refresh --cli kimi [--json]
                                                  read fresh Kimi /usage in a temporary tab
+    aterm harness accounts observed [--json]
+                                                 each login place here: the account it really holds,
+                                                 the row aterm believed, its tabs and source
     aterm harness accounts add <label> [--pool] [--email <e>] [--browser <b>]
                                                  create login directory and append roster row
     aterm harness accounts adopt-default <label> --email <e> [--browser <b>]
@@ -1419,6 +1422,13 @@ pub enum AccountsCmd {
         /// `--rows`: the stored series rows inside the span too, exactly as stored.
         rows: bool,
     },
+    /// `accounts observed [--json]`: what each login place on this Mac really holds, beside the
+    /// row the roster believes is there ([`run_accounts_observed`];
+    /// `docs/DESIGN-account-discovery-2026-11-09.md`). Claude Code's places in this build.
+    Observed {
+        /// The JSON form.
+        json: bool,
+    },
     /// `accounts token <label|email> [--replace | --remove]`: make, store and record a Claude Code
     /// setup-token for one account in one step, or remove it from the vault
     /// ([`super::accounts_tokens::run`], `docs/DESIGN-claude-setup-token-2026-11-05.md` §4.6).
@@ -2223,6 +2233,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                     rows: std::mem::take(&mut rows),
                 },
                 ["refresh"] => AccountsCmd::Refresh { json },
+                ["observed"] => AccountsCmd::Observed { json },
                 ["token", name] => AccountsCmd::Token {
                     name: (*name).to_string(),
                     mode: match (std::mem::take(&mut replace), std::mem::take(&mut remove)) {
@@ -2344,6 +2355,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                         | AccountsCmd::Table { .. }
                         | AccountsCmd::Stats { .. }
                         | AccountsCmd::History { .. }
+                        | AccountsCmd::Observed { .. }
                         | AccountsCmd::Refresh { .. }
                         | AccountsCmd::Sync { .. }
                 )
@@ -2351,8 +2363,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 return Err(
                     "--json is the report's form (`aterm harness accounts --json`), \
                      `accounts table --json`, `accounts stats --json`, `accounts history \
-                     [<label|key>] --json`, `accounts refresh --cli kimi --json`, and `accounts \
-                     sync --json`: the other forms print lines"
+                     [<label|key>] --json`, `accounts observed --json`, `accounts refresh --cli \
+                     kimi --json`, and `accounts sync --json`: the other forms print lines"
                         .to_string(),
                 );
             }
@@ -3062,6 +3074,7 @@ fn accounts_of(
         | AccountsCmd::History { .. }
         | AccountsCmd::Refresh { .. }
         | AccountsCmd::Sync { .. } => None,
+        AccountsCmd::Observed { .. } => Some("observed"),
     };
     if let Some(verb) = verb {
         return Err(format!(
@@ -3289,8 +3302,9 @@ impl ClaudeProcess for LiveClaude {
 }
 
 /// The roster label of the account this session's Claude Code runs under, where its own
-/// transcript and its process prove it on a roster of two or more rows
-/// ([`accounts::footer_label`]); `None` elsewhere, and the line names it [`USAGE_ACCOUNT`].
+/// transcript and its process prove it and the footer would name it ([`accounts::footer_label`]:
+/// a roster of two or more rows, or one whose belief the process's login file contradicts);
+/// `None` elsewhere, and the line names it [`USAGE_ACCOUNT`].
 fn usage_account(env: &Env, pick: &Pick, process: &dyn ClaudeProcess) -> Option<String> {
     let Pick::Named { path, .. } = pick else {
         return None;
@@ -3300,13 +3314,15 @@ fn usage_account(env: &Env, pick: &Pick, process: &dyn ClaudeProcess) -> Option<
         .accounts_store()
         .read_roster(env.accounts_roster().as_deref(), env.now)
         .ok()
-        .filter(Roster::several)?;
-    let who = accounts::ProcessLogin::of_exec_env(&process.exec_env(pid)?)?;
+        .filter(|roster| !roster.rows.is_empty())?;
+    let exec_env = process.exec_env(pid)?;
+    let who = accounts::ProcessLogin::of_exec_env(&exec_env)?;
     let started = process.started(pid)?;
     let entry = footer::session_of_pid(&env.claude_dir()?, pid, Some(started))?;
     let folded = path.file_stem().and_then(|stem| stem.to_str());
     let proven = entry.proc_start == Some(started) && folded == Some(entry.session_id.as_str());
-    accounts::footer_label(&roster, &who)
+    let seen = claude_observation(env, &exec_env, &who, &roster);
+    accounts::footer_label(&roster, &who, &seen)
         .filter(|_| proven)
         .map(str::to_owned)
 }
@@ -3388,16 +3404,35 @@ fn usage_held(
 /// row where `roster` is empty), and whether it runs on the default home's own login: no
 /// [`accounts::LOGIN_ENV`], one login on the machine, and the judged row is the default-login row.
 fn usage_judged(env: &Env, roster: &Roster, process: &dyn ClaudeProcess) -> Option<(String, bool)> {
-    let who = accounts::ProcessLogin::of_exec_env(&process.exec_env(env.claude_pid?)?)?;
+    let pid = env.claude_pid?;
+    let exec_env = process.exec_env(pid)?;
+    let who = accounts::ProcessLogin::of_exec_env(&exec_env)?;
     let own = Roster::own();
     let roster = if roster.rows.is_empty() { &own } else { roster };
-    let label = accounts::judged_label(roster, &who)?;
+    let seen = claude_observation(env, &exec_env, &who, roster);
+    // Observation beats belief (`docs/DESIGN-account-discovery-2026-11-09.md`): the account the
+    // process's login file names, never the row its environment alone suggests.
+    let label = accounts::observed_label(roster, &who, &seen)?;
     let home = !roster.several()
         && who.login.as_deref().is_none_or(str::is_empty)
         && roster
             .row_for_login(None)
             .is_some_and(|row| row.label == label);
     Some((label.to_owned(), home))
+}
+
+/// What a Claude Code process with exec environment `exec_env` really runs on
+/// ([`super::observe::claude`]), read in the user home this command runs for.
+fn claude_observation(
+    env: &Env,
+    exec_env: &[String],
+    who: &accounts::ProcessLogin,
+    roster: &Roster,
+) -> super::observe::Observation {
+    let Some(home) = env.home.as_deref() else {
+        return super::observe::Observation::Unread;
+    };
+    super::observe::claude(exec_env, home, who.route, Some(roster))
 }
 
 fn usage_reading(env: &Env, process: &dyn ClaudeProcess) -> Option<super::tap::Reading> {
@@ -4016,7 +4051,9 @@ fn codex_usage_label(env: &Env) -> String {
             .accounts_store_for(Cli::Codex)?
             .read_roster(env.accounts_roster_for(Cli::Codex).as_deref(), env.now)
             .ok()?;
-        accounts::footer_label(&roster, who).map(str::to_owned)
+        // Codex's observer is step 2's: its belief stands until then.
+        accounts::footer_label(&roster, who, &super::observe::Observation::Unread)
+            .map(str::to_owned)
     };
     label().unwrap_or_else(|| USAGE_CODEX_ACCOUNT.to_owned())
 }
@@ -18583,6 +18620,7 @@ pub fn run_accounts(
         }
         AccountsCmd::Auto => run_accounts_use((Cli::Claude, host), env, None, out, err),
         AccountsCmd::Stats { json, since_s } => run_accounts_stats(env, *json, *since_s, out),
+        AccountsCmd::Observed { json } => run_accounts_observed(env, *json, out),
         AccountsCmd::History {
             name,
             json,
@@ -18883,7 +18921,7 @@ pub fn run_accounts_of(
             out,
             err,
         ),
-        AccountsCmd::Serve { .. } | AccountsCmd::Token { .. } => {
+        AccountsCmd::Serve { .. } | AccountsCmd::Token { .. } | AccountsCmd::Observed { .. } => {
             let _ = writeln!(
                 err,
                 "aterm harness accounts: {}'s pool takes {OTHER_POOL_VERBS} in this build",
@@ -19228,6 +19266,164 @@ fn home_profile(env: &Env) -> Result<profile::Profile, profile::NoProfile> {
         .as_deref()
         .map(|own| profile::effective(own, env.claude_dir().as_deref(), env.claude_custom_oauth))
         .map_or(Err(profile::NoProfile::NoHome), |file| profile::read(&file))
+}
+
+/// One login place on this Mac and what it holds ([`run_accounts_observed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaceSeen {
+    /// The CLI's word.
+    pub cli: &'static str,
+    /// The login file, `~`-relative where it is under the user home.
+    pub place: String,
+    /// The login email the file names; `None` where it names none or is absent.
+    pub observed: Option<String>,
+    /// The roster row that names this place, the belief.
+    pub believed: Option<String>,
+    /// Whether the observed login answers to the believed row; `None` where either is missing
+    /// or the row names no address.
+    pub agrees: Option<bool>,
+    /// The sessions this Mac's store holds on the believed row.
+    pub tabs: Vec<String>,
+    /// The file's modification age, seconds.
+    pub written_s: Option<i64>,
+    /// Where it was read (`profile`).
+    pub src: &'static str,
+}
+
+/// Every Claude Code login place `roster` names on this Mac, each as its file holds it now:
+/// the default home's profile for the row with no `dir` (and for no row), each row's own
+/// directory otherwise. The tabs are the store's sessions on that row.
+#[must_use]
+pub fn places_seen(
+    roster: &Roster,
+    state: &accounts::State,
+    user_home: &Path,
+    now: i64,
+) -> Vec<PlaceSeen> {
+    let shown = |path: &Path| match path.strip_prefix(user_home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    };
+    let mut places: Vec<(Option<&accounts::Row>, Option<String>)> = Vec::new();
+    if roster.row_for_login(None).is_none() {
+        places.push((None, None));
+    }
+    for row in &roster.rows {
+        places.push((Some(row), row.dir.clone()));
+    }
+    places
+        .into_iter()
+        .filter_map(|(row, dir)| {
+            let path = match dir.as_deref() {
+                None => super::profile::effective_of(&[], user_home)?,
+                Some(dir) => super::profile::profile_in_home(Path::new(dir)),
+            };
+            let record = super::profile::record_at(&path).ok().flatten();
+            let written_s = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|at| i64::try_from(at.as_secs()).ok())
+                .map(|at| now.saturating_sub(at).max(0));
+            let observed = record.map(|record| record.email);
+            let agrees = match (
+                row.and_then(accounts::Row::expected_identity_email),
+                &observed,
+            ) {
+                (Some(expected), Some(seen)) => Some(accounts::email_matches(expected, seen)),
+                _ => None,
+            };
+            let tabs = row.map_or_else(Vec::new, |row| {
+                state
+                    .sessions
+                    .iter()
+                    .filter(|(_, session)| session.account == row.label)
+                    .map(|(sid, _)| sid.clone())
+                    .collect()
+            });
+            Some(PlaceSeen {
+                cli: Cli::Claude.id(),
+                place: shown(&path),
+                observed,
+                believed: row.map(|row| row.label.clone()),
+                agrees,
+                tabs,
+                written_s,
+                src: super::journal::ObservedSrc::Profile.word(),
+            })
+        })
+        .collect()
+}
+
+/// `aterm harness accounts observed [--json]`: one row per Claude Code login place on this Mac,
+/// what its file names beside what the roster believes is there, `✗` where they disagree.
+fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
+    let Some(user_home) = env.home.as_deref() else {
+        let _ = writeln!(out, "aterm harness accounts observed: no home is known");
+        return ExitCode::from(1);
+    };
+    let store = env.accounts_store();
+    let (roster, state) =
+        match store.read_account_records(env.accounts_roster().as_deref(), env.now) {
+            Ok(records) => (records.roster, records.state),
+            Err(_) => (Roster::default(), accounts::State::default()),
+        };
+    let rows = places_seen(&roster, &state, user_home, env.now);
+    if json {
+        let value = Value::Array(
+            rows.iter()
+                .map(|row| {
+                    aterm_json::json!({
+                        "cli": row.cli,
+                        "place": row.place,
+                        "observed": row.observed,
+                        "believed": row.believed,
+                        "agrees": row.agrees,
+                        "tabs": row.tabs,
+                        "written_s": row.written_s,
+                        "source": row.src,
+                    })
+                })
+                .collect(),
+        );
+        let _ = writeln!(out, "{value}");
+        return ExitCode::SUCCESS;
+    }
+    let _ = writeln!(
+        out,
+        "{:<7} {:<26} {:<34} {:<12} {:<12} {:<10} SOURCE",
+        "CLI", "PLACE", "OBSERVED", "BELIEVED", "TABS", "SEEN"
+    );
+    for row in &rows {
+        let believed = match (&row.believed, row.agrees) {
+            (Some(label), Some(true)) => format!("{label} ✓"),
+            (Some(label), Some(false)) => format!("{label} ✗"),
+            (Some(label), None) => label.clone(),
+            (None, _) => "—".to_owned(),
+        };
+        let tabs = match row.tabs.as_slice() {
+            [] => "—".to_owned(),
+            [one] => format!("@{one} ×1"),
+            [first, rest @ ..] => format!("@{first} ×{}", rest.len() + 1),
+        };
+        let seen = match (row.tabs.is_empty(), row.written_s) {
+            (true, _) => "idle".to_owned(),
+            (false, Some(age)) => format!("{} ago", super::observe::age_words(age)),
+            (false, None) => "now".to_owned(),
+        };
+        let _ = writeln!(
+            out,
+            "{:<7} {:<26} {:<34} {:<12} {:<12} {:<10} {}",
+            row.cli,
+            row.place,
+            row.observed.as_deref().unwrap_or("signed out"),
+            believed,
+            tabs,
+            seen,
+            row.src
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_accounts_stats(env: &Env, json: bool, since_s: i64, out: &mut dyn Write) -> ExitCode {

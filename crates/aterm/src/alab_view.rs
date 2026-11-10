@@ -2,12 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! LabView's cache (`docs/DESIGN-alab-lab-model-2026-11-01.md` §7, step 11): the harness's
-//! `aterm_agent::harness::alab_roster::Source`, filled from `aterm_db::alab::Registry::lab`.
+//! `aterm_agent::harness::alab_roster::Source`, filled from
+//! `aterm_db::alab::Registry::observe_source`.
 //!
 //! A projection is read as an observer, writes nothing and calls no provider. The first caller in
 //! a process projects once; after that a background thread reads the registry's log and its
-//! inventory every five minutes and projects again only when the inventory moved
-//! (`LabRead::Unchanged`), while every caller gets the held projection at once. A failed or partial
+//! source revision every five minutes, while every caller gets the held projection at once.
+//! Each projection keeps the exact native source it came from. A failed or partial
 //! read retains an existing projection. Without one the source is pending, so neither naming
 //! nor account discovery can interpret uncertainty as an absent registry binding,
 //! and a caller looks again after 15 seconds. Syncs, the accounts list, mail routes and first-name
@@ -39,21 +40,24 @@ use aterm_agent::{
     },
     machine_name::RegistryName,
 };
+#[cfg(test)]
+use aterm_db::alab::Inventory;
 use aterm_db::alab::{
-    Inventory, LabRead, Registry,
+    Registry, SourceRead,
     journal::place::Places,
     mail,
     registry::AddressIndex,
     secret::Journal,
     view::{LabView, MachineNickname},
 };
+use aterm_db::catalog::Policy;
 use aterm_secrets::client::Paths;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// The least time between two looks at the registry's inventory.
+/// The least time between two looks at the registry's source.
 const LOOK_EVERY: Duration = Duration::from_secs(300);
 
 /// The least time between two looks while no projection is held because a read failed: until
@@ -88,14 +92,20 @@ pub(crate) enum LocalRosterPolicy {
 /// Only a missing file or key inherits the enabled default; an unreadable or invalid policy
 /// cannot authorize either the cached lab or an automatic fallback source.
 pub(crate) fn roster_policy(config: &Path) -> LocalRosterPolicy {
-    let text = match aterm_types::dirs::read_aterm_config_text(config) {
-        Ok(None) => return LocalRosterPolicy::Enabled,
-        Ok(Some(text)) => text,
-        Err(_) => return LocalRosterPolicy::Unavailable,
-    };
-    let Ok(table) = aterm_toml::from_str::<aterm_toml::Table>(&text) else {
+    let Ok(table) = policy_document(config) else {
         return LocalRosterPolicy::Unavailable;
     };
+    roster_policy_value(&table)
+}
+
+fn policy_document(config: &Path) -> Result<aterm_toml::Value, ()> {
+    let text = aterm_types::dirs::read_aterm_config_text(config)
+        .map_err(|_| ())?
+        .unwrap_or_default();
+    aterm_toml::from_str(&text).map_err(|_| ())
+}
+
+fn roster_policy_value(table: &aterm_toml::Value) -> LocalRosterPolicy {
     let Some(alab) = table.get("alab") else {
         return LocalRosterPolicy::Enabled;
     };
@@ -124,14 +134,6 @@ fn settled_in(alab_dir: &Path, table: &[u8; 32]) -> bool {
     !trimmed.iter().any(u8::is_ascii_uppercase)
         && aterm_codec::hex::decode_into(trimmed, &mut decoded)
         && &decoded == table
-}
-
-/// Whether a peer matched this Mac's inventory of the registry table it holds now.
-fn settled(registry: &Registry, dir: Option<&Path>) -> bool {
-    let (Some(dir), Ok(Some(table))) = (dir, registry.table()) else {
-        return false;
-    };
-    settled_in(dir, &table)
 }
 
 /// One completed repair round: where it showed an authenticated peer holding exactly this Mac's
@@ -393,76 +395,35 @@ fn registry_name(view: &LabView) -> Option<Result<RegistryName, String>> {
     })())
 }
 
-struct Held {
-    lab: Option<Arc<Lab>>,
-    /// The held projection's addresses, each to the mailbox key the lab places it in: the
-    /// mailbox logins are named again at every look ([`mailbox_names`]), so a mailbox added to
-    /// or removed from `ai-mailbox.toml` is seen with the registry unchanged.
-    placed: BTreeMap<String, String>,
-    /// The held projection's registry mailboxes ([`lab_mail`]), read with it.
-    mail: Vec<LabMailbox>,
-    /// The held projection's `address` rows by what they say now, read with [`Self::mail`]: what
-    /// names a version-1 mailbox's login ([`mailbox_logins`]).
-    addresses: AddressIndex,
-    inventory: Option<Inventory>,
+#[derive(Clone)]
+struct Projected<S> {
+    lab: Arc<Lab>,
+    source: S,
+}
+
+struct Held<S> {
+    /// A projection and its source are installed, retained and cleared together.
+    projected: Option<Projected<S>>,
     looked: Option<Instant>,
     /// No complete projection or successful absence has been observed, or an unreadable,
-    /// partial or unchanged read left no projection to use.
+    /// partial read left no projection to use.
     pending: bool,
 }
 
-/// One look's change to what is held, from what it `read` (a failed read as its error's words),
-/// this Mac's `settled` witness and mailbox `logins`, at `now`. Only a complete projection
+impl<S> Held<S> {
+    #[cfg(test)]
+    fn lab(&self) -> Option<&Arc<Lab>> {
+        self.projected.as_ref().map(|projected| &projected.lab)
+    }
+}
+
+/// One look's change to what is held, from what it `read`, at `now`. Only a complete projection
 /// or a successful absence resolves a first read. Uncertainty retains an existing projection.
-fn look(
-    held: &mut Held,
-    read: Result<Option<LabRead>, String>,
-    settled: bool,
-    toml_logins: &BTreeMap<String, String>,
-    now: Instant,
-) {
+fn look<S>(held: &mut Held<S>, read: Result<Option<Projected<S>>, String>, now: Instant) {
     held.looked = Some(now);
-    held.pending = matches!(
-        read,
-        Err(_) | Ok(Some(LabRead::Partial | LabRead::Unchanged))
-    ) && held.lab.is_none();
+    held.pending = read.is_err() && held.projected.is_none();
     match read {
-        Ok(Some(LabRead::Projected(view, inventory))) => {
-            held.inventory = Some(inventory);
-            held.placed = view.mailboxes();
-            let logins = logins_of(&held.mail, toml_logins);
-            held.lab = Some(Arc::new(harness_lab_with_placed(
-                &view,
-                &held.placed,
-                settled,
-                &logins,
-            )));
-        }
-        Ok(Some(LabRead::Unchanged)) => {
-            if let Some(lab) = held.lab.as_mut() {
-                let logins = logins_of(&held.mail, toml_logins);
-                let mailboxes = named_mailboxes(&held.placed, &logins);
-                if lab.settled != settled || lab.mailboxes != mailboxes {
-                    let lab = Arc::make_mut(lab);
-                    lab.settled = settled;
-                    lab.mailboxes = mailboxes;
-                }
-            } else {
-                // Request a complete projection on the next look if an inventory token
-                // survived without the projection it described.
-                held.inventory = None;
-            }
-        }
-        Ok(None) => {
-            held.inventory = None;
-            held.placed.clear();
-            held.mail.clear();
-            held.addresses = AddressIndex::default();
-            held.lab = None;
-        }
-        // A partial history keeps what was held; the next look reads again.
-        Ok(Some(LabRead::Partial)) => {}
-        // A failed read keeps what was held; the next look reads again.
+        Ok(projected) => held.projected = projected,
         Err(why) => {
             aterm_log::debug!("lab view: {why}");
         }
@@ -475,18 +436,60 @@ fn due(looked: Option<Instant>, pending: bool, now: Instant) -> bool {
     looked.is_none_or(|at| pending && now.saturating_duration_since(at) >= RETRY_FAILED)
 }
 
-struct Cache {
+struct Cache<S = SourceRead> {
     paths: Paths,
     config: PathBuf,
-    held: Mutex<Held>,
+    settled: Option<PathBuf>,
+    held: Mutex<Held<S>>,
     /// Keep an older in-flight read from replacing a newer projection.
     refreshing: Mutex<()>,
     refresher: OnceLock<()>,
 }
 
-impl Cache {
+/// A source's immutable scope identity, without opening its native storage.
+trait CachedSource: Clone {
+    fn included_by(&self, policy: &Policy) -> bool;
+}
+
+impl CachedSource for SourceRead {
+    fn included_by(&self, policy: &Policy) -> bool {
+        SourceRead::included_by(self, policy)
+    }
+}
+
+#[cfg(test)]
+impl CachedSource for Inventory {
+    fn included_by(&self, policy: &Policy) -> bool {
+        policy.includes([0; 32], self.0)
+    }
+}
+
+/// Both local roster selection and Commons subscriptions must currently permit
+/// a cached source. This reads configuration only, never vault or table storage.
+fn cache_policy(config: &Path) -> Result<Policy, SourceSnapshot> {
+    let document = policy_document(config).map_err(|()| SourceSnapshot::Pending)?;
+    match roster_policy_value(&document) {
+        LocalRosterPolicy::Unavailable => return Err(SourceSnapshot::Pending),
+        LocalRosterPolicy::Disabled => return Err(SourceSnapshot::Disabled),
+        LocalRosterPolicy::Enabled => {}
+    }
+    let policy = Policy::from_value(&document).map_err(|_| SourceSnapshot::Pending)?;
+    if policy.enabled {
+        Ok(policy)
+    } else {
+        Err(SourceSnapshot::Disabled)
+    }
+}
+
+impl<S: CachedSource> Cache<S> {
     /// Read policy while the held view is fixed, then return one immutable decision input.
     /// Tests inspect prepared state here without opening the live registry.
+    fn projection(&self) -> SourceSnapshot {
+        self.capture().0
+    }
+
+    /// Keep the policy decision and the source of the returned lab in one observation.
+    /// A retained token grants no write authority; native admission must validate it again.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -495,71 +498,85 @@ impl Cache {
             project = "aterm::alab_view::source_model_tests::project"
         )
     )]
-    fn projection(&self) -> SourceSnapshot {
+    fn capture(&self) -> (SourceSnapshot, Option<Projected<S>>) {
         let held = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match roster_policy(&self.config) {
-            LocalRosterPolicy::Unavailable => SourceSnapshot::Pending,
-            LocalRosterPolicy::Disabled => SourceSnapshot::Disabled,
-            LocalRosterPolicy::Enabled => match &held.lab {
-                Some(lab) => SourceSnapshot::Present(lab.clone()),
-                None if held.pending => SourceSnapshot::Pending,
-                None => SourceSnapshot::Absent,
+        match cache_policy(&self.config) {
+            Err(observation) => (observation, None),
+            Ok(policy) => match &held.projected {
+                Some(projected) if !projected.source.included_by(&policy) => {
+                    (SourceSnapshot::Disabled, None)
+                }
+                Some(projected) => (
+                    SourceSnapshot::Present(projected.lab.clone()),
+                    Some(projected.clone()),
+                ),
+                None if held.pending => (SourceSnapshot::Pending, None),
+                None => (SourceSnapshot::Absent, None),
             },
         }
     }
 
-    /// Project again where the inventory moved since the held projection; where it did not,
-    /// only the held lab's `settled` is brought up to date.
-    fn refresh(&self) {
+    /// Serialize complete reads and install the projection with its source in one step.
+    fn refresh_with(&self, read: impl FnOnce() -> Result<Option<Projected<S>>, String>) {
         let _refresh = self
             .refreshing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let policy = roster_policy(&self.config);
-        if !matches!(policy, LocalRosterPolicy::Enabled) {
+        if cache_policy(&self.config).is_err() {
             return;
         }
-        let registry = Registry::at(self.paths.clone());
-        let was = self
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .inventory;
-        let read = registry
-            .lab(&self.config, was)
-            .map_err(|why| why.to_string());
-        let admitted = matches!(read, Ok(Some(LabRead::Projected(..) | LabRead::Unchanged)));
-        // A new projection reads the registry's mailboxes and address rows too: names and
-        // patterns, never a value (`mail::sign_in_read`). One that does not read keeps the held
-        // ones.
-        let mail = matches!(read, Ok(Some(LabRead::Projected(..))))
-            .then(|| mail::sign_in_read(&registry).ok())
-            .flatten()
-            .map(|(found, addresses)| (lab_mail(&found), addresses));
-        let dir = settled_dir();
-        let settled = admitted && settled(&registry, dir.as_deref());
-        let toml = if admitted {
-            mailbox_names(&self.paths)
-        } else {
-            Vec::new()
-        };
+        let read = read();
         let mut held = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((mail, addresses)) = mail {
-            held.mail = mail;
-            held.addresses = addresses;
-        }
-        let logins = if toml.is_empty() {
-            BTreeMap::new()
-        } else {
-            mailbox_logins(&held.addresses, &toml)
+        let Ok(policy) = cache_policy(&self.config) else {
+            return;
         };
-        look(&mut held, read, settled, &logins, Instant::now());
+        // An excluded old generation must not prevent discovering an included successor.
+        // But policy-induced absence is not evidence to erase that old observation.
+        if (matches!(&read, Ok(None))
+            && held
+                .projected
+                .as_ref()
+                .is_some_and(|held| !held.source.included_by(&policy)))
+            || read
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .is_some_and(|read| !read.source.included_by(&policy))
+        {
+            return;
+        }
+        look(&mut held, read, Instant::now());
+    }
+}
+
+impl Cache {
+    fn refresh(&self) {
+        self.refresh_with(|| {
+            let Some(source) = Registry::at(self.paths.clone())
+                .observe_source(&self.config)
+                .map_err(|why| why.to_string())?
+            else {
+                return Ok(None);
+            };
+            let settled = self
+                .settled
+                .as_ref()
+                .is_some_and(|dir| settled_in(dir, &source.table()));
+            let mail = lab_mail(source.mailboxes());
+            let toml = mailbox_logins(source.addresses(), &mailbox_names(&self.paths));
+            let lab = Arc::new(harness_lab(
+                source.view(),
+                settled,
+                &logins_of(&mail, &toml),
+            ));
+            Ok(Some(Projected { lab, source }))
+        });
     }
 
     fn start_refresher(&'static self) {
@@ -574,10 +591,7 @@ impl Cache {
                 });
         });
     }
-}
-
-impl alab_roster::Source for &'static Cache {
-    fn snapshot(&self) -> SourceSnapshot {
+    fn refresh_if_due(&'static self) {
         let due = {
             let held = self
                 .held
@@ -589,18 +603,21 @@ impl alab_roster::Source for &'static Cache {
             self.refresh();
             self.start_refresher();
         }
+    }
+}
+
+impl alab_roster::Source for &'static Cache {
+    fn snapshot(&self) -> SourceSnapshot {
+        self.refresh_if_due();
         self.projection()
     }
 
     fn mail(&self) -> Vec<LabMailbox> {
-        if self.snapshot().lab().is_none() {
-            return Vec::new();
-        }
-        self.held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .mail
-            .clone()
+        self.refresh_if_due();
+        self.capture()
+            .1
+            .map(|projected| lab_mail(projected.source.mailboxes()))
+            .unwrap_or_default()
     }
 
     fn reveal_bound(
@@ -689,12 +706,9 @@ pub(crate) fn install() {
     let cache = CACHE.get_or_init(|| Cache {
         paths: Paths::for_home(&home),
         config,
+        settled: settled_dir(),
         held: Mutex::new(Held {
-            lab: None,
-            placed: BTreeMap::new(),
-            mail: Vec::new(),
-            addresses: AddressIndex::default(),
-            inventory: None,
+            projected: None,
             looked: None,
             pending: true,
         }),
@@ -771,13 +785,9 @@ mod tests {
         );
     }
 
-    pub(super) fn nothing_held() -> Held {
+    pub(super) fn nothing_held() -> Held<Inventory> {
         Held {
-            lab: None,
-            placed: BTreeMap::new(),
-            mail: Vec::new(),
-            addresses: AddressIndex::default(),
-            inventory: None,
+            projected: None,
             looked: None,
             pending: true,
         }
@@ -791,23 +801,25 @@ mod tests {
         let config = dir.path().join("aterm.toml");
         aterm_uds::atomic_file::write(&config, b"[alab]\nroster = true\n", 0o600).unwrap();
         let mut held = nothing_held();
-        look(
-            &mut held,
-            Ok(Some(naming(Some("m3")))),
-            false,
-            &BTreeMap::new(),
-            Instant::now(),
-        );
+        look(&mut held, Ok(Some(naming(Some("m3")))), Instant::now());
         let cache = Cache {
             paths: Paths::for_home(dir.path()),
             config: config.clone(),
+            settled: None,
             held: Mutex::new(held),
             refreshing: Mutex::new(()),
             refresher: OnceLock::new(),
         };
         let observed = cache.projection();
         let original = observed.lab().unwrap();
-        let inventory = cache.held.lock().unwrap().inventory;
+        let revision = cache
+            .held
+            .lock()
+            .unwrap()
+            .projected
+            .as_ref()
+            .unwrap()
+            .source;
         assert!(!cache.projection().pending());
 
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o664)).unwrap();
@@ -821,10 +833,20 @@ mod tests {
             "unknown policy cannot select a sheet instead"
         );
         assert!(Arc::ptr_eq(
-            cache.held.lock().unwrap().lab.as_ref().unwrap(),
+            cache.held.lock().unwrap().lab().unwrap(),
             &original
         ));
-        assert_eq!(cache.held.lock().unwrap().inventory, inventory);
+        assert_eq!(
+            cache
+                .held
+                .lock()
+                .unwrap()
+                .projected
+                .as_ref()
+                .unwrap()
+                .source,
+            revision
+        );
 
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
         for invalid in ["[alab", "[alab]\nroster = 'off'\n"] {
@@ -833,14 +855,13 @@ mod tests {
             assert!(cache.projection().pending());
         }
         std::fs::write(&config, "[alab]\nroster = false\n").unwrap();
-        cache.refresh();
+        cache.refresh_with(|| panic!("excluded policy must not read the source"));
         assert!(
             cache
                 .held
                 .lock()
                 .unwrap()
-                .lab
-                .as_ref()
+                .lab()
                 .is_some_and(|lab| Arc::ptr_eq(lab, &original)),
             "a disabled background refresh must preserve the view for re-enablement"
         );
@@ -862,11 +883,15 @@ mod tests {
 
     /// A projection whose facts row binds this Mac to a machine labelled `label` (`None`: the
     /// label is conflicted).
-    pub(super) fn naming(label: Option<&str>) -> LabRead {
-        LabRead::Projected(
-            Box::new(naming_view(label, MachineNickname::Unset)),
-            Inventory([7; 32]),
-        )
+    pub(super) fn naming(label: Option<&str>) -> Projected<Inventory> {
+        Projected {
+            lab: Arc::new(harness_lab(
+                &naming_view(label, MachineNickname::Unset),
+                false,
+                &BTreeMap::new(),
+            )),
+            source: Inventory([7; 32]),
+        }
     }
 
     fn naming_view(label: Option<&str>, nickname: MachineNickname) -> LabView {
@@ -1029,16 +1054,11 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let config = root.path().join("aterm.toml");
         let mut held = nothing_held();
-        look(
-            &mut held,
-            Ok(Some(naming(Some("m86")))),
-            false,
-            &BTreeMap::new(),
-            Instant::now(),
-        );
+        look(&mut held, Ok(Some(naming(Some("m86")))), Instant::now());
         let cache = Cache {
             paths: Paths::for_home(root.path()),
             config: config.clone(),
+            settled: None,
             held: Mutex::new(held),
             refreshing: Mutex::new(()),
             refresher: OnceLock::new(),
@@ -1048,8 +1068,6 @@ mod tests {
         look(
             &mut cache.held.lock().unwrap(),
             Err("temporarily unavailable".into()),
-            false,
-            &BTreeMap::new(),
             Instant::now(),
         );
         assert_eq!(cache.projection().machine_name(), expected);
@@ -1065,15 +1083,9 @@ mod tests {
         assert_eq!(cache.projection().machine_name(), RegistryNameRead::Unbound);
         for read in [
             Err("first read unavailable".into()),
-            Ok(Some(LabRead::Partial)),
+            Err("source history incomplete".into()),
         ] {
-            look(
-                &mut cache.held.lock().unwrap(),
-                read,
-                false,
-                &BTreeMap::new(),
-                Instant::now(),
-            );
+            look(&mut cache.held.lock().unwrap(), read, Instant::now());
             assert_eq!(
                 cache.projection().machine_name(),
                 RegistryNameRead::Pending,
@@ -1096,13 +1108,14 @@ mod tests {
         assert!(!marker_dir.exists());
         for read in [
             Err("registry is temporarily unreadable".to_owned()),
-            Ok(Some(LabRead::Partial)),
+            Err("source history incomplete".to_owned()),
         ] {
             let mut held = nothing_held();
-            look(&mut held, read, false, &BTreeMap::new(), Instant::now());
+            look(&mut held, read, Instant::now());
             let cache = Cache {
                 paths: Paths::for_home(root.path()),
                 config: root.path().join("aterm.toml"),
+                settled: None,
                 held: Mutex::new(held),
                 refreshing: Mutex::new(()),
                 refresher: OnceLock::new(),
@@ -1116,67 +1129,286 @@ mod tests {
         }
     }
 
-    /// Failed and partial reads preserve the exact projection. Only a successful absence
-    /// clears it; an unchanged read without a projection forces a complete retry.
+    /// Failed and partial reads preserve the exact projection and its source. Only a
+    /// successful complete read replaces the pair, and successful absence clears it.
     #[test]
     fn a_look_preserves_a_projection_and_keeps_unknown_absence_pending() {
-        let logins = BTreeMap::new();
         let now = Instant::now();
-        let failed = || Err::<Option<LabRead>, String>("custody unreadable".into());
+        let failed = || Err::<Option<Projected<Inventory>>, String>("custody unreadable".into());
         for (read, what) in [
             (failed(), "a failed read"),
-            (Ok(Some(LabRead::Partial)), "a partial history"),
-            (
-                Ok(Some(LabRead::Unchanged)),
-                "unchanged without a projection",
-            ),
+            (Err("source history incomplete".into()), "a partial history"),
         ] {
             let mut held = nothing_held();
-            held.inventory = Some(Inventory([7; 32]));
-            look(&mut held, read.clone(), false, &logins, now);
+            look(&mut held, read, now);
             assert!(held.pending, "{what}");
-            assert!(held.lab.is_none(), "{what}");
+            assert!(held.projected.is_none(), "{what}");
             assert_eq!(held.looked, Some(now), "{what}");
-            if matches!(read, Ok(Some(LabRead::Unchanged))) {
-                assert!(held.inventory.is_none(), "the next look must project again");
-            }
         }
 
         let mut held = nothing_held();
-        look(&mut held, Ok(Some(naming(Some("m3")))), false, &logins, now);
-        let lab = held.lab.clone().expect("the projection is held");
+        look(&mut held, Ok(Some(naming(Some("m3")))), now);
+        let lab = held.lab().cloned().expect("the projection is held");
         assert_eq!(
             lab.me.as_ref().and_then(|me| me.label.as_deref()),
             Some("m3")
         );
         assert_eq!(lab.me.as_ref().map(|me| me.key.as_str()), Some("pk-me"));
         assert!(!lab.settled && !held.pending);
-        assert_eq!(held.inventory, Some(Inventory([7; 32])));
+        assert_eq!(held.projected.as_ref().unwrap().source, Inventory([7; 32]));
         for (read, what) in [
-            (Ok(Some(LabRead::Partial)), "a partial history"),
+            (Err("source history incomplete".into()), "a partial history"),
             (failed(), "a failed read"),
         ] {
-            look(&mut held, read, false, &logins, now);
+            look(&mut held, read, now);
             assert!(
-                held.lab
-                    .as_ref()
-                    .is_some_and(|kept| Arc::ptr_eq(kept, &lab)),
+                held.lab().is_some_and(|kept| Arc::ptr_eq(kept, &lab)),
                 "{what} keeps the lab"
             );
             assert!(!held.pending, "{what}: a held lab is not pending");
-            assert_eq!(held.inventory, Some(Inventory([7; 32])), "{what}");
+            assert_eq!(
+                held.projected.as_ref().unwrap().source,
+                Inventory([7; 32]),
+                "{what}"
+            );
         }
-        look(&mut held, Ok(Some(LabRead::Unchanged)), true, &logins, now);
+        let mut next = naming(Some("m3"));
+        Arc::make_mut(&mut next.lab).settled = true;
+        next.source = Inventory([8; 32]);
+        look(&mut held, Ok(Some(next)), now);
         assert!(
-            held.lab.as_ref().is_some_and(|lab| lab.settled),
-            "an unchanged read brings the held lab's witness up to date"
+            held.lab().is_some_and(|lab| lab.settled),
+            "a complete read installs local overlays with the new source"
         );
-        look(&mut held, Ok(None), true, &logins, now);
+        assert_eq!(held.projected.as_ref().unwrap().source, Inventory([8; 32]));
+        assert!(!Arc::ptr_eq(held.lab().unwrap(), &lab));
+        look(&mut held, Ok(None), now);
         assert!(
-            held.lab.is_none() && held.inventory.is_none() && held.placed.is_empty(),
-            "no lab clears what was held"
+            held.projected.is_none(),
+            "absence clears the projection and its source together"
         );
         assert!(!held.pending, "a successful absence resolves uncertainty");
+    }
+
+    #[test]
+    fn current_commons_policy_hides_a_source_and_preserves_its_history() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let cache = Cache {
+            paths: Paths::for_home(root.path()),
+            config: root.path().join("aterm.toml"),
+            settled: None,
+            held: Mutex::new(nothing_held()),
+            refreshing: Mutex::new(()),
+            refresher: OnceLock::new(),
+        };
+        cache.refresh_with(|| Ok(Some(naming(Some("m3")))));
+        let original = cache.capture().1.unwrap();
+        let exclusion = |scope: [u8; 32]| {
+            format!(
+                "[commons]\nexclude_tables = [\"{}\"]\n",
+                aterm_codec::hex::encode_lower(&scope)
+            )
+        };
+        for (text, pending, scan) in [
+            ("[commons]\nenabled = false\n".to_owned(), false, false),
+            ("[swarm]\nenabled = false\n".to_owned(), false, false),
+            (exclusion([0; 32]), false, true),
+            (exclusion([7; 32]), false, true),
+            ("[commons]\nenabled = 'yes'\n".to_owned(), true, false),
+            (
+                "[commons]\nexclude_tables = ['invalid']\n".to_owned(),
+                true,
+                false,
+            ),
+        ] {
+            aterm_uds::atomic_file::write(&cache.config, text.as_bytes(), 0o600).unwrap();
+            let (snapshot, projected) = cache.capture();
+            assert!(projected.is_none());
+            assert_eq!(snapshot.pending(), pending);
+            assert_eq!(snapshot.disabled(), !pending);
+            let called = std::cell::Cell::new(false);
+            cache.refresh_with(|| {
+                called.set(true);
+                Ok(None)
+            });
+            assert_eq!(
+                called.get(),
+                scan,
+                "only an enabled scope scan may discover an included successor"
+            );
+            let held = cache.held.lock().unwrap();
+            assert!(Arc::ptr_eq(held.lab().unwrap(), &original.lab));
+            assert_eq!(held.projected.as_ref().unwrap().source, original.source);
+        }
+        aterm_uds::atomic_file::write(&cache.config, b"", 0o600).unwrap();
+        cache.refresh_with(|| {
+            aterm_uds::atomic_file::write(&cache.config, exclusion([7; 32]).as_bytes(), 0o600)
+                .unwrap();
+            Ok(None)
+        });
+        assert!(cache.capture().0.disabled());
+        assert!(Arc::ptr_eq(
+            cache.held.lock().unwrap().lab().unwrap(),
+            &original.lab
+        ));
+
+        // A different table can become excluded while an older held table is included.
+        aterm_uds::atomic_file::write(&cache.config, exclusion([9; 32]).as_bytes(), 0o600).unwrap();
+        cache.refresh_with(|| {
+            let mut next = naming(Some("m4"));
+            next.source = Inventory([9; 32]);
+            Ok(Some(next))
+        });
+        let kept = cache.capture().1.unwrap();
+        assert!(Arc::ptr_eq(&kept.lab, &original.lab));
+        assert_eq!(kept.source, original.source);
+        aterm_uds::atomic_file::write(&cache.config, exclusion([7; 32]).as_bytes(), 0o600).unwrap();
+        cache.refresh_with(|| {
+            let mut next = naming(Some("m4"));
+            next.source = Inventory([9; 32]);
+            Ok(Some(next))
+        });
+        assert_eq!(
+            cache.capture().1.unwrap().source,
+            Inventory([9; 32]),
+            "an excluded old generation must not freeze a permitted new one"
+        );
+    }
+
+    #[test]
+    fn native_cache_projects_mail_and_settlement_from_its_captured_source() {
+        use aterm_db::alab::registry::{ADDRESS, MAILBOX};
+        use aterm_db::typed::{cell, keys};
+        use aterm_json::json;
+        use aterm_secrets::commons::roster::Role;
+
+        let lab = aterm_db::table::fixture::Lab::new(&[Role::Writer]);
+        let paths = &lab.paths[0];
+        let registry = Registry::at(paths.clone());
+        let table = registry.open().unwrap();
+        let login = keys::address_pk("owner@example.test").unwrap();
+        let alias = keys::address_pk("ai@example.test").unwrap();
+        let mailbox = keys::mailbox_pk(&login).unwrap();
+        let changes = [
+            (
+                &ADDRESS,
+                login.as_str(),
+                "addr",
+                json!("owner@example.test"),
+            ),
+            (&ADDRESS, alias.as_str(), "addr", json!("ai@example.test")),
+            (&ADDRESS, alias.as_str(), "mailbox", json!(mailbox)),
+            (&MAILBOX, mailbox.as_str(), "login", json!(login)),
+        ]
+        .into_iter()
+        .map(|(collection, pk, col, value)| {
+            cell::change(
+                collection,
+                cell::CellKey {
+                    pk,
+                    col,
+                    elem: None,
+                },
+                &cell::CellValue::owner(1, value),
+            )
+            .unwrap()
+        })
+        .collect();
+        registry.write(vec![changes]).unwrap();
+        let config = paths.home.join("aterm.toml");
+        let source = registry.observe_source(&config).unwrap().unwrap();
+        let settled = paths.home.join("settled-observation");
+        aterm_types::fs_restricted::ensure_private_dir(&settled).unwrap();
+        aterm_uds::atomic_file::write(
+            &settled.join("settled"),
+            aterm_codec::hex::encode_lower(&table.digest()).as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let cache = Cache {
+            paths: paths.clone(),
+            config,
+            settled: Some(settled.clone()),
+            held: Mutex::new(Held {
+                projected: None,
+                looked: None,
+                pending: true,
+            }),
+            refreshing: Mutex::new(()),
+            refresher: OnceLock::new(),
+        };
+        aterm_uds::atomic_file::write(
+            &cache.config,
+            format!(
+                "[commons]\nexclude_tables = [\"{}\"]\n",
+                aterm_codec::hex::encode_lower(&table.digest())
+            )
+            .as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        cache.refresh();
+        assert!(
+            cache.capture().0.pending(),
+            "a cold excluded registry must not become proof of absence"
+        );
+        aterm_uds::atomic_file::write(&cache.config, b"", 0o600).unwrap();
+        cache.refresh();
+        let (snapshot, projected) = cache.capture();
+        let projected = projected.unwrap();
+        assert!(Arc::ptr_eq(&snapshot.lab().unwrap(), &projected.lab));
+        assert_eq!(projected.source.revision(), source.revision());
+        assert_eq!(projected.source.mailboxes()[0].pk, mailbox);
+        assert_eq!(
+            projected.lab.mailboxes["ai@example.test"],
+            "owner@example.test"
+        );
+        assert!(projected.lab.settled);
+        aterm_uds::atomic_file::write(
+            &settled.join("settled"),
+            aterm_codec::hex::encode_lower(&[0; 32]).as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        cache.refresh();
+        assert!(
+            !cache.capture().1.unwrap().lab.settled,
+            "a different table's settlement cannot attach to this source"
+        );
+    }
+
+    #[test]
+    fn equal_visible_labs_keep_the_source_of_each_complete_refresh() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let cache = Cache {
+            paths: Paths::for_home(root.path()),
+            config: root.path().join("aterm.toml"),
+            settled: None,
+            held: Mutex::new(nothing_held()),
+            refreshing: Mutex::new(()),
+            refresher: OnceLock::new(),
+        };
+        cache.refresh_with(|| Ok(Some(naming(Some("m3")))));
+        let (snapshot, captured) = cache.capture();
+        let captured = captured.unwrap();
+        assert!(Arc::ptr_eq(&snapshot.lab().unwrap(), &captured.lab));
+        let mut later = naming(Some("m3"));
+        later.source = Inventory([9; 32]);
+        cache.refresh_with(|| Ok(Some(later)));
+        let current = cache.capture().1.unwrap();
+        assert_eq!(captured.lab, current.lab);
+        assert_ne!(captured.source, current.source);
+        assert_eq!(captured.source, Inventory([7; 32]));
+        cache.refresh_with(|| Err("temporary native source failure".into()));
+        let kept = cache.capture().1.unwrap();
+        assert!(Arc::ptr_eq(&kept.lab, &current.lab));
+        assert_eq!(kept.source, current.source);
+        aterm_uds::atomic_file::write(&cache.config, b"[alab]\nroster = false\n", 0o600).unwrap();
+        let (disabled, hidden) = cache.capture();
+        assert!(disabled.disabled() && hidden.is_none());
+        aterm_uds::atomic_file::write(&cache.config, b"[alab\n", 0o600).unwrap();
+        let (pending, hidden) = cache.capture();
+        assert!(pending.pending() && hidden.is_none());
     }
 
     /// A caller looks at the first look and, while a failed look left the source pending, again

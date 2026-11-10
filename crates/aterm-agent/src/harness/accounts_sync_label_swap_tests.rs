@@ -1895,6 +1895,7 @@ fn a_departing_accounts_provider_key_preserves_its_record_before_label_reuse() {
                                 default_home: false,
                                 route: crate::harness::accounts::AuthRoute::Stored,
                             },
+                            seen: &crate::harness::observe::Observation::Unread,
                         },
                         |_, _| {
                             called = true;

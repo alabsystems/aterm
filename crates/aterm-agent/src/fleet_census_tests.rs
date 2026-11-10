@@ -10,6 +10,7 @@ use crate::harness::ai_pool::{Pool, PoolAccount};
 use crate::harness::claims;
 use crate::survey_facts::{ServerHeardFact, SurveyAccountFact, SwarmSurveyFacts};
 use aterm_secrets::swarm_roster::{SwarmMember, SwarmRoster};
+use aterm_uds::stop::Stop;
 
 #[cfg(unix)]
 #[test]
@@ -1111,9 +1112,9 @@ fn every_mac_computes_its_census_from_its_own_book_and_dials_no_member() {
     use aterm_net::fleet_member::{
         Began, Peer, SECRET_LEN, Via, node_identity, serve_census, write_held,
     };
-    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let now_s = 1_793_310_000_u64;
     let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1147,7 +1148,7 @@ fn every_mac_computes_its_census_from_its_own_book_and_dials_no_member() {
     // Another member listens and counts each census asked of it.
     let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = tcp.local_addr().unwrap();
-    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(Stop::new());
     let server_dials = Arc::new(AtomicUsize::new(0));
     let listening = Listening {
         secret: secret.clone(),
@@ -1158,7 +1159,7 @@ fn every_mac_computes_its_census_from_its_own_book_and_dials_no_member() {
         per_source: 16,
         lifetime: Duration::from_secs(60),
     };
-    let run_flag = Arc::clone(&running);
+    let serve_stop = Arc::clone(&stop);
     let dials_flag = Arc::clone(&server_dials);
     let st_state = steward_state.clone();
     let st_home = steward_home.clone();
@@ -1166,7 +1167,7 @@ fn every_mac_computes_its_census_from_its_own_book_and_dials_no_member() {
         aterm_net::fleet::serve(
             &tcp,
             &listening,
-            &run_flag,
+            &serve_stop,
             move |served, _| {
                 dials_flag.fetch_add(1, Ordering::SeqCst);
                 let s = st_state.clone();
@@ -1264,8 +1265,7 @@ fn every_mac_computes_its_census_from_its_own_book_and_dials_no_member() {
         local_inputs.fleet_book
     );
 
-    running.store(false, Ordering::Release);
-    let _ = TcpStream::connect(addr);
+    stop.set();
     let _ = srv.join();
 }
 

@@ -472,7 +472,13 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
             born: None,
             key: None,
         };
-        let _ = accounts::note_reading_held(&mut state, label, &read, at);
+        let _ = accounts::note_reading_held(
+            &mut state,
+            label,
+            &read,
+            at,
+            accounts::ReadingOwner::Unobserved,
+        );
     }
     store.save(&state).map_err(|e| io("store", e))?;
     for &(offset, pct_x10) in &plan.series {
@@ -1498,7 +1504,11 @@ mod tests {
         let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
         seed(&world, &plan, now).expect("seeded");
         let ours = outlook_of(&world, now);
-        let case = quota_scenes::case_c().outlook();
+        // The world's own row names the profile's address, and an account is named by its
+        // email (design §2.5, 2026-11-09), so case (c)'s own row names it too.
+        let mut case = quota_scenes::case_c();
+        case.roster.rows[0].email = Some(ME_EMAIL.into());
+        let case = case.outlook();
         for room in [60, 44] {
             let rows = ours.card_rows("main", None, true, room, None);
             assert_eq!(
@@ -1520,7 +1530,7 @@ mod tests {
             let text: String = work.iter().map(|c| c.0).collect();
             assert!(
                 [HANDOFF_MARK, GAP_MARK].iter().all(|m| text.contains(*m))
-                    && text.contains("main")
+                    && text.contains(&format!("{HANDOFF_MARK}me"))
                     && text.contains("alt1")
                     && work.iter().any(|c| c.1 == CardInk::Ahead)
                     && !ticks.is_empty(),

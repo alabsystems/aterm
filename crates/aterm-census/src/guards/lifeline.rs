@@ -39,7 +39,7 @@ fn headless_lifeline(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             out.extend(lifeline_findings(file));
         }
     }
-    for script in &tree.corpus.scripts {
+    for script in tree.corpus.scripts() {
         if launcher_script(&script.rel) && script.raw.contains("--headless") {
             out.extend(script_findings(script));
         }
@@ -135,7 +135,7 @@ const WAIVER_REACH: usize = 8;
 const ARGS_REACH: usize = 40;
 
 fn lifeline_findings(file: &SourceFile) -> Vec<Finding> {
-    let raw: Vec<&str> = file.raw.lines().collect();
+    let raw: Vec<&str> = file.raw().lines().collect();
     let text: Vec<&str> = file.lexed().text.lines().collect();
     let waived = |i: usize| {
         raw[i.saturating_sub(WAIVER_REACH)..=i]
@@ -364,7 +364,7 @@ mod tests {
     use super::*;
 
     fn launches(path: &str, src: &str) -> Vec<String> {
-        lifeline_findings(&SourceFile::new(path.to_string(), src.to_string()))
+        lifeline_findings(&SourceFile::outside(path.to_string(), src))
             .into_iter()
             .map(|f| format!(":{}:{}", f.line, f.detail))
             .collect()

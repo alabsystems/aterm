@@ -1344,7 +1344,7 @@ pub fn seal(
                              save of its own first)",
                             collection.name,
                             edit.column,
-                            crate::att::command::safe_key(pk)
+                            super::keys::safe_key(pk)
                         )));
                     }
                     let value = super::secret::Secret::new(text.clone());

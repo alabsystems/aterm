@@ -984,7 +984,7 @@ pub fn chain_command(cmd: &str, payload: &[u8]) -> io::Result<aterm_uds::spawnfd
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let path = std::env::temp_dir().join(format!(
+    let path = aterm_tempfile::quiet_in(&std::env::temp_dir()).join(format!(
         ".aterm-tap-stdin-{}-{seq}-{stamp}",
         std::process::id()
     ));

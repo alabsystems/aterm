@@ -3611,7 +3611,7 @@ fn serve_one_node_generation(
         admission: advertiser.admission_announcer(addr.port()),
         automatic_joins: None,
     };
-    let running = Arc::new(AtomicBool::new(true));
+    let listener_stop = Arc::new(Stop::new());
     let open_table = Arc::new(NodeOpenTable::default());
     let windows = WindowRelays::new(cfg.relay_dir.clone(), Arc::clone(&cfg.launcher));
     announcing.automatic_joins = match cfg
@@ -3745,7 +3745,7 @@ fn serve_one_node_generation(
         .and_then(|links| links.mail.as_ref().map(Arc::downgrade));
 
     let watch_handle = {
-        let running = Arc::clone(&running);
+        let listener_stop = Arc::clone(&listener_stop);
         let open_watch = Arc::clone(&open_table);
         let stop = Arc::clone(&cfg.stop);
         let state_dir = cfg.state_dir.clone();
@@ -3781,10 +3781,10 @@ fn serve_one_node_generation(
                     HeartbeatClock::new(None, heartbeat_every(), crate::network_moved::watch());
                 let mut admission_network = crate::network_moved::watch_at_once();
 
-                while running.load(Ordering::Acquire) {
+                while !listener_stop.is_set() {
                     stop.sleep(tick_every);
                     if stop.is_set() {
-                        running.store(false, Ordering::Release);
+                        listener_stop.set();
                         return;
                     }
                     if let Some(maintain) = &maintenance {
@@ -3796,11 +3796,11 @@ fn serve_one_node_generation(
                         automatic.refresh();
                     }
                     if aterm_agent::node_service::left_the_fleet(&state_dir) {
-                        running.store(false, Ordering::Release);
+                        listener_stop.set();
                         return;
                     }
                     if swarm_holds(config_path.as_deref()) {
-                        running.store(false, Ordering::Release);
+                        listener_stop.set();
                         return;
                     }
                     if let Some(text) = read_config_text(config_path.as_deref())
@@ -3808,7 +3808,7 @@ fn serve_one_node_generation(
                         && now_wanted.as_ref().map(|w| w.listen.as_str())
                             != Some(initial_listen.as_str())
                     {
-                        running.store(false, Ordering::Release);
+                        listener_stop.set();
                         return;
                     }
                     let now_key = aterm_net::fleet::read_key_file(&state_dir);
@@ -3817,7 +3817,7 @@ fn serve_one_node_generation(
                         .flatten();
                     let now_node = identity.as_ref().map(|n| (n.node().to_owned(), n.key()));
                     if now_key.as_ref().ok() != Some(&secret_watch) || now_node != proved {
-                        running.store(false, Ordering::Release);
+                        listener_stop.set();
                         return;
                     }
 
@@ -3828,7 +3828,7 @@ fn serve_one_node_generation(
                             &stop,
                         )
                     {
-                        running.store(false, Ordering::Release);
+                        listener_stop.set();
                         return;
                     }
 
@@ -3942,7 +3942,7 @@ fn serve_one_node_generation(
                                 &state_dir,
                                 addr,
                                 secret_watch.clone(),
-                                (&running, &hb_in_flight),
+                                (&listener_stop, &hb_in_flight),
                                 (denied, log, browse_watch.clone()),
                             ),
                             None => {
@@ -3969,7 +3969,7 @@ fn serve_one_node_generation(
 
     let initial_serving = serving_fn();
     let sharing = (!is_prebound)
-        .then(|| share_units(addr, &running))
+        .then(|| share_units(addr, &listener_stop))
         .flatten();
     let listening = aterm_net::fleet::Listening {
         secret: secret.clone(),
@@ -3991,7 +3991,7 @@ fn serve_one_node_generation(
     let denied_for_serve = Arc::clone(denied_cache);
     let serving_for_offer = serving_fn.clone();
     let open_for_serve = Arc::clone(&open_table);
-    let serving_generation = Arc::clone(&running);
+    let serving_generation = Arc::clone(&listener_stop);
     let ask = relay_ask(windows.clone(), automatic_handle.map(automatic_ask));
     let mesh = cfg.mesh.on;
     let table_for_serve = neighbours.as_ref().map(|links| Arc::clone(&links.table));
@@ -4013,7 +4013,7 @@ fn serve_one_node_generation(
             deny_now,
         ),
         Some(ask),
-        &running,
+        &listener_stop,
         HANDSHAKE,
         move |served, op| {
             let peer = served.peer_addr();
@@ -4242,7 +4242,7 @@ fn serve_one_node_generation(
         fleet_event,
     );
 
-    running.store(false, Ordering::Release);
+    listener_stop.set();
     announcing.stop();
     drop(neighbours);
     if let Some(sharing) = sharing {

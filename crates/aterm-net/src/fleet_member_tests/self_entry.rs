@@ -46,7 +46,7 @@ fn an_ended_heartbeat_cannot_replace_the_new_generations_descriptor() {
         port: 7200,
         ..old.clone()
     };
-    let current = AtomicBool::new(true);
+    let ended = Stop::new();
     let (waiting, waited) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
@@ -65,13 +65,13 @@ fn an_ended_heartbeat_cannot_replace_the_new_generations_descriptor() {
                     &old,
                     HANG,
                     (Some(&log), &[], &Vec::new),
-                    &current,
+                    &ended,
                 )
                 .unwrap()
             })
         });
         waited.recv_timeout(HANG).unwrap();
-        current.store(false, Ordering::Release);
+        ended.set();
         drop(held);
         let answered = heartbeat_members_while(
             state.dir(),
@@ -79,7 +79,7 @@ fn an_ended_heartbeat_cannot_replace_the_new_generations_descriptor() {
             &new,
             HANG,
             (Some(&log), &[], &Vec::new),
-            &AtomicBool::new(true),
+            &Stop::new(),
         )
         .unwrap();
         assert_eq!(answered.len(), 1);
@@ -119,7 +119,7 @@ fn a_heartbeat_ended_during_its_book_read_keeps_no_observations() {
     }
     let me = node_identity(state.dir()).unwrap();
     let other = identity(&node_of(0x66), 0x66);
-    let current = Arc::new(AtomicBool::new(true));
+    let ended = Arc::new(Stop::new());
     let books = Arc::new(AtomicUsize::new(0));
     let log: MemberKeys = [&me, &other]
         .into_iter()
@@ -137,12 +137,12 @@ fn a_heartbeat_ended_during_its_book_read_keeps_no_observations() {
         ),
         EVERY_OP,
         Arc::new({
-            let current = Arc::clone(&current);
+            let ended = Arc::clone(&ended);
             let books = Arc::clone(&books);
             move |op| {
                 if op == FleetOp::Book {
                     books.fetch_add(1, Ordering::AcqRel);
-                    current.store(false, Ordering::Release);
+                    ended.set();
                 }
                 None
             }
@@ -174,7 +174,7 @@ fn a_heartbeat_ended_during_its_book_read_keeps_no_observations() {
         &reg,
         HANG,
         (None, &[], &hints),
-        &current,
+        &ended,
     )
     .unwrap();
     assert_eq!(books.load(Ordering::Acquire), 1);

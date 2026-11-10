@@ -46,7 +46,7 @@ two samples, or ran on after its last, books its time there).
   <out_dir>     where the takes go, OUTSIDE the repository; made if missing. Per take <take>-<k>/: the recording's
                 frames and index.json, frames.tsv (per frame: ms, gap, what changed, the needle's angle) and
                 summary.txt; deck-motion.txt holds every summary
-  --aterm PATH  the aterm to run (default: the lab's pick); takes are quoted from a release dev-seams build
+  --aterm PATH  the aterm to run (default: the lab's pick); quote the build/profile used with each take
                 (`targo --unverified build -p aterm --release --features dev-seams`)
   --secs N      the recording's length (default 10)
   --settle N    seconds from the instance's first answer to the recording (default 15: the deck has readings)

@@ -634,6 +634,7 @@ fn a_kept_image_with_no_live_terminal_is_handed_over_not_refused() {
                     grant_chunks: false,
                     grant_empty,
                     grant_desk: false,
+                    recipient_recovery: false,
                 },
                 crate::running_build_number(),
                 "the test candidate",
@@ -702,6 +703,7 @@ fn a_kept_image_holding_only_its_workers_list_is_handed_over() {
                     grant_chunks: false,
                     grant_empty: true,
                     grant_desk,
+                    recipient_recovery: false,
                 },
                 crate::running_build_number(),
                 "the test candidate",
@@ -764,6 +766,7 @@ fn a_targets_read_reaches_the_admission_through_the_lanes_facts() {
                     grant_chunks: false,
                     grant_empty: true,
                     grant_desk,
+                    recipient_recovery: false,
                 },
                 crate::running_build_number(),
                 "the test candidate",
@@ -823,6 +826,7 @@ fn the_lanes_chunk_grant_is_a_reads_or_a_renewals() {
                 grant_chunks: true,
                 grant_empty: false,
                 grant_desk: false,
+                recipient_recovery: false,
             },
             crate::running_build_number(),
             "the test candidate",
@@ -842,6 +846,7 @@ fn only_a_passed_read_of_this_artifact_says_the_target_declares_the_desk() {
         grant_chunks: false,
         grant_empty: false,
         grant_desk: true,
+        recipient_recovery: false,
     };
     let publisher = super::PreverifyPublisher::for_attempt(&app.handoff_preverified, Some(&ticket))
         .expect("an attempt names its artifact");

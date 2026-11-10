@@ -82,6 +82,22 @@ const KEYS: &[&str] = &[
     "total",
 ];
 
+/// The longest completed cases libtest timed, bounded diagnostic data rather than a verdict.
+pub(crate) fn slow_cases(timings: &[crate::exec::CaseTiming]) -> Vec<aterm_json::Value> {
+    let mut cases: Vec<_> = timings.iter().collect();
+    cases.sort_by(|a, b| b.execution.cmp(&a.execution).then(a.case.cmp(&b.case)));
+    cases
+        .into_iter()
+        .take(10)
+        .map(|timing| {
+            aterm_json::json!({
+                "case": crate::report::clip_json(&timing.case, crate::report::EVENT_ROW_BYTES),
+                "execution_s": timing.execution.as_secs_f64(),
+            })
+        })
+        .collect()
+}
+
 /// The event `line` is, if it is one whole: an object whose `type` is `suite`, `test` or `bench`,
 /// with a string `event` and no key libtest does not write. A test's own output that only looks
 /// like JSON, or a line cut short, is none.

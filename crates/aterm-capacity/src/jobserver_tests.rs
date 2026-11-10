@@ -757,3 +757,27 @@ fn a_stopped_partial_charge_returns_what_it_took() {
     assert_eq!(every_free_token(&pool).len(), 2, "nothing kept on a stop");
     drop(mine);
 }
+#[test]
+fn an_empty_wait_states_itself_without_minting_or_retrying() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let pool = Jobserver::new(&dir.path().join("wait.jobs"), 1).unwrap();
+    let reports = std::cell::Cell::new(0);
+    let report = |_| reports.set(reports.get() + 1);
+    let held = pool
+        .acquire_notifying(&|| false, Duration::ZERO, &report)
+        .unwrap();
+    assert_eq!(reports.get(), 0, "an available token causes no wait report");
+    let started = Instant::now();
+    let result = pool.acquire_notifying(
+        &|| reports.get() > 0 || started.elapsed() >= MUST_HAPPEN,
+        Duration::ZERO,
+        &report,
+    );
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+    assert_eq!(reports.get(), 1);
+    assert!(
+        pool.try_acquire().unwrap().is_none(),
+        "the report minted nothing"
+    );
+    drop(held);
+}

@@ -419,3 +419,39 @@ fn the_memory_claim_is_the_schedules_own_concurrent_peak() {
     assert_eq!(schedule(&plan(&[None, None], 8, None, GIB)).peak, 2 * GIB);
     assert_eq!(schedule(&plan(&[None, None], 8, None, 0)).peak, 0);
 }
+/// Recorded durations reach the actual dispatcher's first admission. With no records it
+/// retains the declared order. The control changes only the planted binary's duration.
+#[test]
+fn a_planted_long_binary_starts_first_from_recorded_history() {
+    use crate::test_history::{History, Sample};
+    let history = |long_ms| {
+        let mut history = History::default();
+        for (name, wall_ms) in [("short", 10), ("planted", long_ms), ("other", 20)] {
+            history.push(
+                name,
+                Sample {
+                    partition: None,
+                    at_ms: 1,
+                    outcome: "ok".into(),
+                    wall_ms,
+                    cpu_ms: Some(wall_ms),
+                    starved_ms: Some(0),
+                    peak_bytes: Some(1),
+                    width: 1,
+                    tests: Some(1),
+                },
+            );
+        }
+        History::decode(&history.encode())
+    };
+    let first = |history: &History| {
+        let seen = ["short", "planted", "other"].map(|name| history.seen(name));
+        Dispatcher::new(&plan(&seen, 1, None, 1), None)
+            .next(0.0)
+            .unwrap()
+            .index
+    };
+    assert_eq!(first(&history(1000)), 1);
+    assert_eq!(first(&history(1)), 2);
+    assert_eq!(first(&History::default()), 0);
+}

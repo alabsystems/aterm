@@ -2648,6 +2648,38 @@ fn a_peers_typist_reads_in_its_own_words() {
 }
 
 #[test]
+fn another_macs_drive_names_the_tab_until_a_person_types_there() {
+    let fleet = "m114 (node 87be5228) over the fleet";
+    let line = |by: &str, human_ms: Option<&str>| {
+        let mut row = vec![
+            ("local", "1"),
+            ("sid", "s-00000000000000000001"),
+            ("program", "zsh"),
+            ("program_kind", "shell"),
+            ("agent", "-"),
+            ("typed_by", by),
+            ("typed_ms", "2400000"),
+        ];
+        row.extend(human_ms.map(|ms| ("human_ms", ms)));
+        let text = render_text(&[reply(1, vec![wire_row(&row)])], DEFAULT_BUDGET, None);
+        assert_line_caps(&text);
+        text
+    };
+    let credit = format!(" typed by {fleet} 40m ago");
+    // Long past the news window, the drive still says whose the tab is.
+    assert!(line(fleet, None).contains(&credit), "{}", line(fleet, None));
+    // A person who typed before the drive leaves it the drive's.
+    let before = line(fleet, Some("3000000"));
+    assert!(before.contains(&credit), "{before}");
+    // A person who typed after it has taken the tab back.
+    let after = line(fleet, Some("60000"));
+    assert!(!after.contains(" typed by "), "{after}");
+    // A local typist that old is no longer news.
+    let local = line("lab-sweep", None);
+    assert!(!local.contains(" typed by "), "{local}");
+}
+
+#[test]
 fn an_agents_active_goal_is_quoted_under_its_line_before_what_it_was_asked() {
     let working = wire_row(&[
         ("sid", "s-0000000000000000000a"),

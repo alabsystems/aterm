@@ -10,7 +10,6 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -20,11 +19,9 @@ use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection, StreamOwned};
 
-use crate::slots::{
-    ACCEPT_POLL, Claim, DISPLACED, HandshakeWatchdog, Slots, arm_unauthenticated, source_of,
-    wait_listener_readable,
-};
+use crate::slots::{Claim, DISPLACED, HandshakeWatchdog, Slots, arm_unauthenticated, source_of};
 use crate::tls::{self, EXPORTER_LEN, PinnedServerVerifier, TlsTransport};
+use aterm_uds::stop::Stop;
 
 /// Base ALPN protocol (`atf/1`) for fleet connections without node proofs.
 pub const ALPN: &[u8] = b"atf/1";
@@ -2066,7 +2063,8 @@ pub enum FleetEvent {
         /// Refusal reason ([`NOT_A_FLEET_SOURCE`], [`AT_CAPACITY`], or [`FleetError`]).
         reason: String,
     },
-    /// Listener stopped due to a fatal setup error before `running` was cleared.
+    /// Listener stopped by itself (a fatal setup error, its attachment withdrawn) before its
+    /// stop was set.
     Stopped(String),
 }
 
@@ -2251,6 +2249,15 @@ impl ListenerSocket<'_> {
             Self::Link(listener) => listener.recheck(),
         }
     }
+    /// Whether [`ListenerSocket::recheck`] must run within [`RELOOK`] while no connection comes:
+    /// a link-local listener's attachment can change with nothing the loop waits on telling it.
+    fn relooks(&self) -> bool {
+        match self {
+            Self::Fleet(_) => false,
+            #[cfg(unix)]
+            Self::Link(_) => true,
+        }
+    }
     #[cfg(unix)]
     fn witness(&self) -> Option<crate::lan::ListenerWitness> {
         match self {
@@ -2260,12 +2267,12 @@ impl ListenerSocket<'_> {
     }
 }
 
-/// Accept and authenticate fleet connections on `listener` until `running` is false, enforcing
+/// Accept and authenticate fleet connections on `listener` until `stop` is set, enforcing
 /// NET-1 pre-auth slot displacement, per-source shares, and connection lifetimes.
 pub fn serve<H, E>(
     listener: &TcpListener,
     listening: &Listening,
-    running: &AtomicBool,
+    stop: &Stop,
     hand_over: H,
     on_event: E,
 ) where
@@ -2282,7 +2289,7 @@ pub fn serve<H, E>(
             Arc::new(move || Arc::clone(&empty)),
         ),
         None,
-        running,
+        stop,
         Locality::Fleet,
         HANDSHAKE_WITHIN,
         hand_over,
@@ -2298,7 +2305,7 @@ pub fn serve_offering<H, E>(
     listener: &TcpListener,
     listening: &Listening,
     offer: OfferFn,
-    running: &AtomicBool,
+    stop: &Stop,
     hand_over: H,
     on_event: E,
 ) where
@@ -2310,7 +2317,7 @@ pub fn serve_offering<H, E>(
         ListenerSocket::Fleet(listener),
         (listening, offer, Arc::new(move || Arc::clone(&empty))),
         None,
-        running,
+        stop,
         Locality::Fleet,
         HANDSHAKE_WITHIN,
         hand_over,
@@ -2329,7 +2336,7 @@ pub fn serve_offering_with_denied<H, E>(
     listening: &Listening,
     offer: OfferFn,
     deny: DenyFn,
-    running: &AtomicBool,
+    stop: &Stop,
     hand_over: H,
     on_event: E,
 ) where
@@ -2340,7 +2347,7 @@ pub fn serve_offering_with_denied<H, E>(
         ListenerSocket::Fleet(listener),
         (listening, offer, deny),
         None,
-        running,
+        stop,
         Locality::Fleet,
         HANDSHAKE_WITHIN,
         hand_over,
@@ -2358,7 +2365,7 @@ pub fn serve_offering_with_ask<H, E>(
     offer: OfferFn,
     deny: DenyFn,
     ask: Option<AskHandler>,
-    running: &AtomicBool,
+    stop: &Stop,
     hand_over: H,
     on_event: E,
 ) where
@@ -2369,7 +2376,7 @@ pub fn serve_offering_with_ask<H, E>(
         listener,
         (listening, offer, deny),
         ask,
-        running,
+        stop,
         HANDSHAKE_WITHIN,
         hand_over,
         on_event,
@@ -2383,7 +2390,7 @@ pub fn serve_offering_with_ask_within<H, E>(
     listener: &TcpListener,
     (listening, offer, deny): (&Listening, OfferFn, DenyFn),
     ask: Option<AskHandler>,
-    running: &AtomicBool,
+    stop: &Stop,
     handshake_within: Duration,
     hand_over: H,
     on_event: E,
@@ -2395,7 +2402,7 @@ pub fn serve_offering_with_ask_within<H, E>(
         ListenerSocket::Fleet(listener),
         (listening, offer, deny),
         ask,
-        running,
+        stop,
         Locality::Fleet,
         handshake_within,
         hand_over,
@@ -2410,7 +2417,7 @@ pub fn serve_offering_with_ask_within<H, E>(
 pub fn serve_with_handshake<H, E>(
     listener: &TcpListener,
     listening: &Listening,
-    running: &AtomicBool,
+    stop: &Stop,
     handshake_within: Duration,
     hand_over: H,
     on_event: E,
@@ -2421,7 +2428,7 @@ pub fn serve_with_handshake<H, E>(
     serve_with_handshake_on(
         listener,
         listening,
-        running,
+        stop,
         handshake_within,
         (hand_over, on_event),
         (
@@ -2437,7 +2444,7 @@ pub fn serve_with_handshake<H, E>(
 pub(crate) fn serve_with_handshake_on<H, E>(
     listener: &TcpListener,
     listening: &Listening,
-    running: &AtomicBool,
+    stop: &Stop,
     handshake_within: Duration,
     (hand_over, on_event): (H, E),
     (slots, live): (Arc<Slots>, Arc<LiveConnections>),
@@ -2455,7 +2462,7 @@ pub(crate) fn serve_with_handshake_on<H, E>(
             Arc::new(move || Arc::clone(&empty)),
         ),
         None,
-        running,
+        stop,
         Locality::Fleet,
         handshake_within,
         (hand_over, on_event),
@@ -2471,7 +2478,7 @@ pub(crate) fn serve_with_handshake_on<H, E>(
 pub fn serve_lan<H, E>(
     listener: crate::lan::Listener,
     listening: &Listening,
-    running: &AtomicBool,
+    stop: &Stop,
     hand_over: H,
     on_event: E,
 ) where
@@ -2481,7 +2488,7 @@ pub fn serve_lan<H, E>(
     serve_lan_within(
         listener,
         listening,
-        running,
+        stop,
         HANDSHAKE_WITHIN,
         hand_over,
         on_event,
@@ -2495,7 +2502,7 @@ pub fn serve_lan<H, E>(
 pub fn serve_lan_within<H, E>(
     listener: crate::lan::Listener,
     listening: &Listening,
-    running: &AtomicBool,
+    stop: &Stop,
     handshake_within: Duration,
     hand_over: H,
     on_event: E,
@@ -2514,7 +2521,7 @@ pub fn serve_lan_within<H, E>(
             Arc::new(move || Arc::clone(&empty)),
         ),
         None,
-        running,
+        stop,
         locality,
         handshake_within,
         hand_over,
@@ -2568,12 +2575,64 @@ impl Drop for ArmedHandshake {
     }
 }
 
+/// How long the accept loop waits after a failed accept or readiness poll before it tries again,
+/// so neither busy-loops. Its stop ends the wait at once.
+const ACCEPT_RETRY: Duration = Duration::from_millis(200);
+
+/// How often the accept loop looks again where nothing it waits on would tell it to: a
+/// link-local listener's attachment ([`crate::lan::Listener::recheck`]), connection lifetimes on a
+/// clock a test or a dev seam drives, and, off unix, its stop.
+const RELOOK: Duration = Duration::from_millis(200);
+
+/// When the accept loop looks again with no connection come: at its next lifetime cut (`due`, on
+/// the native clock), and within [`RELOOK`] where it must look again on its own (`relooks`, and
+/// always off unix, where its stop wakes no wait). `None` waits for a connection or the stop alone.
+fn next_look(due: Option<Instant>, relooks: bool) -> Option<Instant> {
+    #[cfg(any(test, debug_assertions))]
+    let relooks = relooks || aterm_types::negative_control::on("fleet-accept-poll");
+    let relook = (relooks || cfg!(not(unix))).then(|| Instant::now() + RELOOK);
+    match (due, relook) {
+        (Some(due), Some(relook)) => Some(due.min(relook)),
+        (due, relook) => due.or(relook),
+    }
+}
+
+/// Wait until `listener` may accept, `stop` is set (its bell rings), or `look` comes. Unix only:
+/// a stop has no descriptor elsewhere, so there `look` is always due within [`RELOOK`].
+///
+/// # Errors
+/// The stop's bell could not be made, or `poll(2)` failed.
+#[cfg(unix)]
+fn wait_for_a_connection(
+    listener: &TcpListener,
+    stop: &Stop,
+    look: Option<Instant>,
+) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let bell = stop.bell()?;
+    match look {
+        Some(at) => aterm_uds::ready::either_until(listener.as_fd(), bell, at).map(drop),
+        None => aterm_uds::ready::either(listener.as_fd(), bell).map(drop),
+    }
+}
+
+/// [`wait_for_a_connection`] where a stop rings no descriptor: the listener alone, until `look`.
+#[cfg(not(unix))]
+fn wait_for_a_connection(
+    listener: &TcpListener,
+    _stop: &Stop,
+    look: Option<Instant>,
+) -> io::Result<()> {
+    let left = look.map_or(RELOOK, |at| at.saturating_duration_since(Instant::now()));
+    crate::slots::wait_listener_readable(listener, left).map(drop)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_inner<H, E>(
     listener: ListenerSocket<'_>,
     (listening, offer, deny): (&Listening, OfferFn, DenyFn),
     ask: Option<AskHandler>,
-    running: &AtomicBool,
+    stop: &Stop,
     locality: Locality,
     handshake_within: Duration,
     hand_over: H,
@@ -2586,7 +2645,7 @@ fn serve_inner<H, E>(
         listener,
         (listening, offer, deny),
         ask,
-        running,
+        stop,
         locality,
         handshake_within,
         (hand_over, on_event),
@@ -2604,7 +2663,7 @@ fn serve_seated<H, E>(
     listener: ListenerSocket<'_>,
     (listening, offer, deny): (&Listening, OfferFn, DenyFn),
     ask: Option<AskHandler>,
-    running: &AtomicBool,
+    stop: &Stop,
     locality: Locality,
     handshake_within: Duration,
     (hand_over, on_event): (H, E),
@@ -2623,12 +2682,12 @@ fn serve_seated<H, E>(
     }
     let mut next_id: u64 = 0;
     let mut stopped = None;
-    while running.load(Ordering::Acquire) {
+    while !stop.is_set() {
         if let Err(error) = listener.recheck() {
             stopped = Some(format!("listener withdrawn: {error}"));
             break;
         }
-        live.cut_overdue(listening.lifetime);
+        let due = live.cut_overdue(listening.lifetime);
         let (tcp, peer) = match aterm_uds::accept(
             listener.tcp(),
             aterm_uds::AcceptWait::Ready,
@@ -2636,16 +2695,17 @@ fn serve_seated<H, E>(
         ) {
             Ok(accepted) => accepted,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // `due` is on the connections' clock: only the native one is the poll's.
+                let native = live.on_native_clock();
+                let look = next_look(due.filter(|_| native), listener.relooks() || !native);
                 // A readiness error backs off like an accept error below, so neither busy-loops.
-                if wait_listener_readable(listener.tcp(), ACCEPT_POLL).is_err()
-                    && running.load(Ordering::Acquire)
-                {
-                    std::thread::sleep(ACCEPT_POLL);
+                if wait_for_a_connection(listener.tcp(), stop, look).is_err() {
+                    stop.sleep(ACCEPT_RETRY);
                 }
                 continue;
             }
             Err(_) => {
-                std::thread::sleep(ACCEPT_POLL);
+                stop.sleep(ACCEPT_RETRY);
                 continue;
             }
         };
@@ -2821,12 +2881,21 @@ pub(crate) struct LiveConnections {
     /// ([`LiveConnections::cut_overdue`]) both read.
     now: Box<dyn Fn() -> Instant + Send + Sync>,
     advance: Option<aterm_types::advance_clock::Clock>,
+    /// Whether that clock is [`Instant::now`], so a lifetime's cut falls due at a moment the accept
+    /// loop can sleep until; a test's or a dev seam's clock is looked at every [`RELOOK`] instead.
+    native: bool,
+    /// How many times the accept loop has looked ([`LiveConnections::cut_overdue`] runs once a
+    /// round), for a test to tell a loop that sleeps from one that polls.
+    #[cfg(test)]
+    looks: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for LiveConnections {
     fn default() -> Self {
         let mut live = Self::on_clock(Instant::now);
+        live.native = true;
         if let Some(path) = aterm_types::dev_seam!("ATERM_DEBUG_FLEET_CLOCK") {
+            live.native = false;
             live.advance = Some(aterm_types::advance_clock::Clock::new(
                 Some(path),
                 "lifetime",
@@ -2844,6 +2913,8 @@ struct Live {
     local: Option<aterm_uds::CtlStream>,
     proved: Option<Instant>,
     drive: bool,
+    /// A proved [`FleetOp::Neighbour`] link ([`LiveTenure::linked`]), which no lifetime cuts.
+    linked: bool,
 }
 
 impl Live {
@@ -2864,6 +2935,9 @@ impl LiveConnections {
             fleet_live: Mutex::default(),
             now: Box::new(now),
             advance: None,
+            native: false,
+            #[cfg(test)]
+            looks: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -2881,6 +2955,7 @@ impl LiveConnections {
             local: None,
             proved: None,
             drive: false,
+            linked: false,
         });
         LiveTenure {
             live: Arc::clone(self),
@@ -2888,7 +2963,15 @@ impl LiveConnections {
         }
     }
 
-    fn cut_overdue(&self, lifetime: Duration) {
+    /// Cut every connection a proof stamped a lifetime or more ago, and answer when the next cut
+    /// falls due on this clock: a proved connection's at its stamp plus the lifetime, and while a
+    /// connection is neither proved nor a link, no later than a lifetime (at least [`RELOOK`])
+    /// from now, since a proof stamped while the accept loop waits starts a lifetime from then.
+    /// `None`: no cut can fall due before a new connection comes.
+    fn cut_overdue(&self, lifetime: Duration) -> Option<Instant> {
+        #[cfg(test)]
+        self.looks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(any(test, debug_assertions))]
         let lifetime = if aterm_types::negative_control::on("fleet-fixed-lifetime") {
             SERVED_WITHIN
@@ -2899,18 +2982,42 @@ impl LiveConnections {
         let now = reading
             .as_ref()
             .map_or_else(|| (self.now)(), |reading| reading.now);
+        let mut next: Option<Instant> = None;
+        let mut due_at = |at: Option<Instant>| {
+            if let Some(at) = at {
+                next = Some(next.map_or(at, |next| next.min(at)));
+            }
+        };
         self.lock().retain(|live| {
             let overdue = live
                 .proved
                 .is_some_and(|at| now.saturating_duration_since(at) >= lifetime);
             if overdue {
                 live.cut();
+                return false;
             }
-            !overdue
+            match live.proved {
+                Some(at) => due_at(at.checked_add(lifetime)),
+                None if !live.linked => {
+                    #[cfg(any(test, debug_assertions))]
+                    if aterm_types::negative_control::on("fleet-unproved-uncapped") {
+                        return true;
+                    }
+                    due_at(now.checked_add(lifetime.max(RELOOK)));
+                }
+                None => {}
+            }
+            true
         });
         if let Some(reading) = reading {
             reading.observed();
         }
+        next
+    }
+
+    /// Whether this listener's lifetimes run on [`Instant::now`] (`LiveConnections::native`).
+    fn on_native_clock(&self) -> bool {
+        self.native
     }
 
     fn cut_all(&self) {
@@ -2941,7 +3048,12 @@ impl LiveTenure {
     /// [`link::Neighbours`] table bounds links. The listener's stop still cuts it. `false` where
     /// a cut already removed it.
     fn linked(&self) -> bool {
-        self.live.lock().iter().any(|live| live.id == self.id)
+        self.live
+            .lock()
+            .iter_mut()
+            .find(|live| live.id == self.id)
+            .map(|live| live.linked = true)
+            .is_some()
     }
 
     fn proved(&self, drive: bool, most: usize) -> bool {
@@ -3553,6 +3665,7 @@ mod tests {
     use super::*;
     use aterm_uds::CtlStream;
     use std::net::TcpListener;
+    use std::sync::atomic::Ordering;
 
     const HANG: Duration = Duration::from_secs(60);
 
@@ -4704,7 +4817,7 @@ mod tests {
         use std::sync::mpsc;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let (events, heard) = mpsc::channel::<FleetEvent>();
         let events = Arc::new(Mutex::new(events));
         let listening = Listening {
@@ -4717,12 +4830,12 @@ mod tests {
             lifetime: HANG,
         };
         let serving = {
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 serve_with_handshake(
                     &listener,
                     &listening,
-                    &running,
+                    &stop,
                     HANG,
                     |served, _op| served.answer(echo_all),
                     move |event| {
@@ -4768,7 +4881,7 @@ mod tests {
             matches!(next("Refused"), FleetEvent::Refused { reason, .. } if reason == AT_CAPACITY)
         );
 
-        running.store(false, Ordering::Release);
+        stop.set();
         serving.join().unwrap();
         let mut rest = Vec::new();
         let ended = held.stream().read_to_end(&mut rest);
@@ -4818,7 +4931,7 @@ mod tests {
         use std::sync::mpsc;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let (go, gate) = mpsc::channel::<()>();
         let gate = Arc::new(Mutex::new(gate));
         let listening = Listening {
@@ -4831,12 +4944,12 @@ mod tests {
             lifetime: HANG,
         };
         let serving = {
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 serve_with_handshake(
                     &listener,
                     &listening,
-                    &running,
+                    &stop,
                     HANG,
                     move |served: Served, _op| {
                         let (answered, kept) = match end {
@@ -4909,7 +5022,7 @@ mod tests {
         );
         let second = dial().and_then(|mut proved| ask(&mut proved).map_err(FleetError::Io));
         drop(go);
-        running.store(false, Ordering::Release);
+        stop.set();
         serving.join().unwrap();
         second
     }
@@ -4955,6 +5068,11 @@ mod tests {
             *self.past.lock().unwrap() += by;
         }
 
+        /// What the clock reads.
+        fn now(&self) -> Instant {
+            self.base + *self.past.lock().unwrap()
+        }
+
         fn live(&self) -> Arc<LiveConnections> {
             let Self { base, past } = self.clone();
             Arc::new(LiveConnections::on_clock(move || {
@@ -4979,23 +5097,34 @@ mod tests {
                 let line = aterm_uds::kept_out(|| tcp.try_clone()).unwrap();
                 let tenure = live.hold(1, tcp.peer_addr().unwrap().ip(), line);
                 clock.pass(Duration::from_secs(3600));
+                assert_eq!(
+                    live.cut_overdue(lifetime),
+                    Some(clock.now() + lifetime.max(RELOOK)),
+                    "a connection not yet proved is looked at again a lifetime on, at the latest"
+                );
                 assert!(
                     tenure.proved(false, 1),
                     "the only connection proves within its share"
                 );
-                live.cut_overdue(lifetime);
+                let proved_at = clock.now();
+                assert_eq!(live.cut_overdue(lifetime), Some(proved_at + lifetime));
                 assert_eq!(
                     held(),
                     1,
                     "its lifetime starts at the proof, not the accept"
                 );
                 clock.pass(lifetime - Duration::from_millis(1));
-                live.cut_overdue(lifetime);
+                assert_eq!(live.cut_overdue(lifetime), Some(proved_at + lifetime));
                 assert_eq!(held(), 1, "a millisecond short of its lifetime it is held");
                 clock.pass(Duration::from_millis(1));
-                live.cut_overdue(lifetime);
+                assert_eq!(live.cut_overdue(lifetime), None, "nothing else is due");
                 assert_eq!(held(), 0, "at its lifetime it is cut");
                 drop(tenure);
+                let line = aterm_uds::kept_out(|| tcp.try_clone()).unwrap();
+                let link = live.hold(2, std::net::Ipv4Addr::LOCALHOST.into(), line);
+                assert!(link.linked());
+                assert_eq!(live.cut_overdue(lifetime), None, "no lifetime cuts a link");
+                drop(link);
                 tcp
             },
             |tcp| tcp,
@@ -5046,7 +5175,7 @@ mod tests {
         use std::sync::mpsc;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let (events, heard) = mpsc::channel::<FleetEvent>();
         let events = Arc::new(Mutex::new(events));
         let listening = Listening {
@@ -5060,13 +5189,13 @@ mod tests {
         };
         let clock = Still::new();
         let serving = {
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             let live = clock.live();
             std::thread::spawn(move || {
                 serve_with_handshake_on(
                     &listener,
                     &listening,
-                    &running,
+                    &stop,
                     HANG,
                     (
                         move |served: Served, _op| {
@@ -5107,7 +5236,7 @@ mod tests {
             again.err()
         );
         drop(again);
-        running.store(false, Ordering::Release);
+        stop.set();
         serving.join().unwrap();
         drop(silent);
     }
@@ -5127,7 +5256,7 @@ mod tests {
         /// The listener's slots where [`Serving::start_on`] made them, read to see
         /// who holds them ([`Serving::seats`]).
         slots: Option<Arc<Slots>>,
-        running: Arc<AtomicBool>,
+        stop: Arc<Stop>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -5144,9 +5273,9 @@ mod tests {
         ) -> Self {
             let heard = Arc::new(Heard::default());
             let slots = Arc::new(Slots::new(listening.slots, PREAUTH_GRACE));
-            let running = Arc::new(AtomicBool::new(true));
+            let stop = Arc::new(Stop::new());
             let thread = std::thread::spawn({
-                let (heard, running) = (Arc::clone(&heard), Arc::clone(&running));
+                let (heard, stop) = (Arc::clone(&heard), Arc::clone(&stop));
                 let slots = Arc::clone(&slots);
                 move || {
                     let on_event = move |event| match event {
@@ -5173,7 +5302,7 @@ mod tests {
                     serve_with_handshake_on(
                         &listener,
                         &listening,
-                        &running,
+                        &stop,
                         HANG,
                         (echo, on_event),
                         (slots, live),
@@ -5183,7 +5312,7 @@ mod tests {
             Self {
                 heard,
                 slots: Some(slots),
-                running,
+                stop,
                 thread: Some(thread),
             }
         }
@@ -5200,7 +5329,7 @@ mod tests {
 
     impl Drop for Serving {
         fn drop(&mut self) {
-            self.running.store(false, Ordering::Release);
+            self.stop.set();
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
@@ -5278,10 +5407,10 @@ mod tests {
                 }
             }
         });
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let heard = Arc::new(Heard::default());
         let thread = std::thread::spawn({
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             let heard = Arc::clone(&heard);
             move || {
                 let for_offer = Arc::clone(&lookup);
@@ -5302,7 +5431,7 @@ mod tests {
                     &listener,
                     (&listening(slots, HANG), Arc::new(offer), Arc::new(deny)),
                     None,
-                    &running,
+                    &stop,
                     HANG,
                     echo,
                     move |event| {
@@ -5321,7 +5450,7 @@ mod tests {
         let serving = Serving {
             heard,
             slots: None,
-            running,
+            stop,
             thread: Some(thread),
         };
         enum First {
@@ -5436,13 +5565,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refused = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let thread = std::thread::spawn({
-            let (calls, refused, running) = (
-                Arc::clone(&calls),
-                Arc::clone(&refused),
-                Arc::clone(&running),
-            );
+            let (calls, refused, stop) =
+                (Arc::clone(&calls), Arc::clone(&refused), Arc::clone(&stop));
             move || {
                 let deny = move || {
                     calls.fetch_add(1, Ordering::AcqRel);
@@ -5456,7 +5582,7 @@ mod tests {
                         Arc::new(deny),
                     ),
                     None,
-                    &running,
+                    &stop,
                     HANG,
                     echo,
                     move |event| {
@@ -5472,7 +5598,7 @@ mod tests {
         let serving = Serving {
             heard: Arc::new(Heard::default()),
             slots: None,
-            running,
+            stop,
             thread: Some(thread),
         };
         for _ in 0..DEAD {
@@ -5781,6 +5907,107 @@ mod tests {
         dial().expect("the next dial is served once the cut gave its slot back");
     }
 
+    /// An idle listener on the native clock sleeps until a connection comes or its stop is set: it
+    /// looks once, then not again while a second passes (nothing it polls is ready, and a `poll(2)`
+    /// a signal interrupts is asked again), and a stop set from another thread ends it at once (a
+    /// stop it never heard leaves it serving past the hang detector's minute).
+    /// NEGATIVE CONTROL: `fleet-accept-poll` looks again every [`RELOOK`], as the loop once did.
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_listener_waits_only_for_a_connection_or_its_stop() {
+        let live = Arc::new(LiveConnections::default());
+        let looks = || live.looks.load(Ordering::Relaxed);
+        let mut served = Serving::start_on(
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            listening(1, HANG),
+            Arc::clone(&live),
+        );
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the listener looks", || {
+            (looks() >= 1).then_some(())
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(
+            looks(),
+            1,
+            "an idle listener looked again with nothing come"
+        );
+        served.stop.set();
+        let serving = served.thread.take().expect("the listener's thread");
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the listener ends at its stop",
+            || serving.is_finished().then_some(()),
+        );
+        serving.join().unwrap();
+    }
+
+    /// On a clock its test drives, the accept loop looks again every [`RELOOK`] and never sooner:
+    /// a proved connection's cut, which that clock names, is no deadline on the native clock the
+    /// loop waits on, so real time passing the lifetime the test's clock has not spent sets no
+    /// pace (a loop that waited until it would look again at once, thousands of times a second).
+    #[test]
+    fn a_test_clocks_deadline_never_paces_the_accept_loop() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let clock = Still::new();
+        let live = clock.live();
+        let looks = || live.looks.load(Ordering::Relaxed);
+        let served = Serving::start_on(
+            listener,
+            listening(1, Duration::from_millis(50)),
+            Arc::clone(&live),
+        );
+        let tcp = TcpStream::connect(addr).unwrap();
+        let (_silent, _) = client_handshake(tcp, &secret(7), FleetOp::Survey, HANG).unwrap();
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the listener admits the dial",
+            || (served.heard.admitted.load(Ordering::SeqCst) == 1).then_some(()),
+        );
+        let from = looks();
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_secs(1));
+        let looked = looks() - from;
+        let elapsed = started.elapsed();
+        let most = elapsed.as_millis() / RELOOK.as_millis() + 2;
+        assert!(
+            u128::try_from(looked).unwrap() <= most,
+            "the accept loop looked {looked} times in {elapsed:?}, more than once a {RELOOK:?}"
+        );
+    }
+
+    /// On the native clock a proved connection is cut at its lifetime though no connection comes
+    /// to wake the accept loop: the loop sleeps no longer than a lifetime (at least [`RELOOK`])
+    /// past a connection not yet proved, so a proof stamped during its wait falls due on time,
+    /// and the silent dialer reads its end (a loop that slept on reads nothing until the hang
+    /// detector's minute). The lifetime is one no stall between the proof's stamp and its answer
+    /// spends, which would cut the handshake instead.
+    /// NEGATIVE CONTROL: `fleet-unproved-uncapped`, under which a connection mid-handshake is due
+    /// no look, so the loop sleeps through the lifetime its proof starts.
+    #[test]
+    fn a_silent_proved_connection_is_cut_on_the_native_clock() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _served = Serving::start(listener, listening(1, Duration::from_secs(2)));
+        let tcp = TcpStream::connect(addr).unwrap();
+        let (mut silent, _) = client_handshake(tcp, &secret(7), FleetOp::Survey, HANG).unwrap();
+        silent
+            .stream()
+            .get_ref()
+            .set_read_timeout(Some(HANG))
+            .unwrap();
+        let mut rest = Vec::new();
+        let ended = silent.stream().read_to_end(&mut rest);
+        assert!(
+            rest.is_empty()
+                && !ended.as_ref().is_err_and(|e| matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                )),
+            "the silent connection is cut at its lifetime: {rest:?} {ended:?}"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_concurrent_socket_descriptor_scan_during_handshake_never_drains_the_proved_stream() {
@@ -5802,7 +6029,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let _served = Serving::start(listener, listening(8, HANG));
 
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pid = std::process::id().cast_signed();
         let scanners: Vec<_> = (0..2)
             .map(|_| {
@@ -6067,7 +6294,7 @@ mod tests {
         addr: SocketAddr,
         ops: Arc<Mutex<Vec<FleetOp>>>,
         lines: Arc<Mutex<Vec<String>>>,
-        running: Arc<AtomicBool>,
+        stop: Arc<Stop>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -6077,7 +6304,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let ops = Arc::new(Mutex::new(Vec::new()));
             let lines = Arc::new(Mutex::new(Vec::new()));
-            let running = Arc::new(AtomicBool::new(true));
+            let stop = Arc::new(Stop::new());
             let ask: AskHandler = Arc::new({
                 let lines = Arc::clone(&lines);
                 move |mut stream: &mut dyn Duplex, _peer| {
@@ -6089,7 +6316,7 @@ mod tests {
                 }
             });
             let thread = std::thread::spawn({
-                let (ops, running) = (Arc::clone(&ops), Arc::clone(&running));
+                let (ops, stop) = (Arc::clone(&ops), Arc::clone(&stop));
                 move || {
                     let listening = Listening {
                         secret: secret(7),
@@ -6117,7 +6344,7 @@ mod tests {
                             Arc::new(move || Arc::clone(&empty)),
                         ),
                         serves_ask.then_some(ask),
-                        &running,
+                        &stop,
                         Locality::Fleet,
                         HANG,
                         move |served: Served, op| {
@@ -6132,7 +6359,7 @@ mod tests {
                 addr,
                 ops,
                 lines,
-                running,
+                stop,
                 thread: Some(thread),
             }
         }
@@ -6146,7 +6373,7 @@ mod tests {
 
     impl Drop for Asked {
         fn drop(&mut self) {
-            self.running.store(false, Ordering::Release);
+            self.stop.set();
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }

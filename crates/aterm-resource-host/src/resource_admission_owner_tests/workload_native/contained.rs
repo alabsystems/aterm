@@ -220,6 +220,8 @@ pub(super) fn run(
     )
     .unwrap();
     for index in 1..=action_count {
+        // Each action has a hang detector. Earlier successful actions spend none of it.
+        let deadline = Instant::now() + HANG;
         let requested = request(index);
         let registered = &registrations[selected(index)];
         let marker = source.join("contained-target-ran");
@@ -339,10 +341,10 @@ pub(super) fn run(
     assert_eq!(completed_owners.len(), usize::from(action_count - 1));
     aterm_durable::durable(&counts).unwrap();
     for operation in &completed_owners {
-        operation.validate(deadline).unwrap();
+        operation.validate(Instant::now() + HANG).unwrap();
     }
     for held in &programs {
-        held.validate(deadline).unwrap();
+        held.validate(Instant::now() + HANG).unwrap();
     }
     Retained {
         _operations: completed_owners,

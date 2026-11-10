@@ -331,13 +331,13 @@ fn rows_of(text: &str, label: &str, path: &str, out: &mut Vec<Finding>) -> Vec<R
 }
 
 fn capture_privacy(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    held_to(tree, tree.engine, out);
+    held_to(tree, tree.engine(), out);
 }
 
 fn held_to(tree: &Tree<'_>, baseline: &crate::EngineBaseline, out: &mut Vec<Finding>) {
     let captures: Vec<&String> = tree
         .corpus
-        .paths
+        .paths()
         .iter()
         .filter(|rel| format_of(rel).is_some())
         .collect();

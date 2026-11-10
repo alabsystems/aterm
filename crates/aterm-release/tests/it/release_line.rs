@@ -17,6 +17,63 @@ use ledger::testing::Git;
 
 const VERSION: &str = "0.26.0";
 
+/// Real git merge-tree/commit-tree and the actual changelog gate. The old head is red;
+/// the carried tree is green and excludes main's unrelated change. NEGATIVE CONTROL:
+/// judging before carrying (the former dry flow) returns the old head's red.
+#[test]
+fn dry_fix_step_one_judges_the_carried_tree() {
+    let f = Fixture::merging("dry-tree");
+    run(&f.rival, &["checkout", "-q", "--detach", &f.shas.g]);
+    let bad = commit(
+        &f.rival,
+        "orphan changelog",
+        &[(
+            "CHANGELOG.md",
+            "# Changelog\n\n- Orphan entry.\n\n## [Unreleased]\n\n- Change.\n",
+        )],
+    );
+    let line = Line::start(VERSION, &bad, 1);
+    commit(
+        &f.rival,
+        "unrelated main change",
+        &[("unrelated.txt", "main only\n")],
+    );
+    let repair = commit(
+        &f.rival,
+        "repair orphan",
+        &[(
+            "CHANGELOG.md",
+            "# Changelog\n\n## [Unreleased]\n\n- Orphan entry.\n- Change.\n",
+        )],
+    );
+    let fix = Fix {
+        commit: repair,
+        subject: "repair orphan".into(),
+        paths: vec!["CHANGELOG.md".into()],
+    };
+    let git = Git::new(&f.rival);
+    assert!(crate::gates::changelog_gate_at(&git, &bad, VERSION).is_err());
+    let hops = line::carry(&git, &line, std::slice::from_ref(&fix)).unwrap();
+    let planned = &hops[0].commit;
+    crate::gates::changelog_gate_at(&git, planned, VERSION).unwrap();
+    assert!(
+        !git.git(&["cat-file", "-e", &format!("{planned}:unrelated.txt")])
+            .unwrap()
+            .success()
+    );
+    let before = run(&f.rival, &["show-ref"]);
+    let head = rev(&f.rival, "HEAD");
+    let (code, last, rows) =
+        super::release_flow::real_carry_fixture(&f.rival, &line, &[fix], true, true);
+    assert_eq!(code, 0, "{last}\n{rows:#?}");
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("preflight passes") && row.contains(&planned[..9]))
+    );
+    assert_eq!(run(&f.rival, &["show-ref"]), before);
+    assert_eq!(rev(&f.rival, "HEAD"), head);
+}
+
 #[test]
 fn dry_carry_judges_real_doc_conflicts_and_clean_hops() {
     let f = Fixture::merging("dry-carry");
@@ -38,7 +95,9 @@ fn dry_carry_judges_real_doc_conflicts_and_clean_hops() {
     let line = Line::start(VERSION, &head, 1);
     let fix = |commit: &str| Fix {
         commit: commit.into(),
-        subject: format!("fix {}", &commit[..4]),
+        subject: run(&f.rival, &["show", "-s", "--format=%s", commit])
+            .trim()
+            .into(),
         paths: vec!["src/fix.rs".into()],
     };
     let before = run(&f.rival, &["show-ref"]);
@@ -51,6 +110,7 @@ fn dry_carry_judges_real_doc_conflicts_and_clean_hops() {
         &line,
         std::slice::from_ref(&conflict),
         true,
+        false,
     );
     println!("docs-conflict dry: {dry_code} {dry_last}");
     assert_eq!(dry_code, 1, "{dry_last}\n{dry:#?}");
@@ -64,6 +124,7 @@ fn dry_carry_judges_real_doc_conflicts_and_clean_hops() {
         &line,
         std::slice::from_ref(&conflict),
         false,
+        false,
     );
     println!("docs-conflict real: {real_code} {real_last}");
     assert_eq!(real_code, 1, "{real_last}\n{real:#?}");
@@ -74,6 +135,7 @@ fn dry_carry_judges_real_doc_conflicts_and_clean_hops() {
         &line,
         std::slice::from_ref(&clean),
         true,
+        false,
     );
     println!("clean dry: {code} {last}");
     assert_eq!(code, 0, "{last}\n{rows:#?}");

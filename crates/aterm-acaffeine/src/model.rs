@@ -298,6 +298,30 @@ pub const fn hold(on: bool, lid_awake: bool, machine: Machine) -> Hold {
     }
 }
 
+/// How long after a wake a paused hold is looked at again every second ([`settling`]).
+///
+/// A wake is announced before it has settled: an Apple-silicon Mac whose lid opens wakes dark
+/// (the CPU without graphics) and gains graphics a fraction of a second later, and every signal
+/// the mug hears (the system's power-on, `NSWorkspaceDidWakeNotification`, the displays'
+/// reconfiguration) comes in that dark part, so the look each takes reads a dark wake and pauses.
+/// Nothing announces the graphics' arrival to a process outside the kernel, so the mug looks
+/// again until the pause ends or this long has passed; a wake that stays dark this long is a
+/// dark wake, which the next tick reads again.
+pub const SETTLE_SECS: u64 = 30;
+
+/// Whether `hold`, decided at `now` on the boot clock, is a pause that may be a wake not yet
+/// settled ([`SETTLE_SECS`]) after the wake at `woke_at`, so the mug looks again in a second
+/// rather than at its next tick. A hold that is not paused has nothing to settle, and no wake
+/// (none heard, or a will-sleep since) leaves none.
+#[inline]
+#[must_use]
+pub const fn settling(hold: Hold, woke_at: Option<u64>, now: u64) -> bool {
+    match (hold, woke_at) {
+        (Hold::Paused(_), Some(at)) => now >= at && now - at < SETTLE_SECS,
+        _ => false,
+    }
+}
+
 /// Parse a span word: `forever` (`Ok(None)`), or `<n>h` / `<n>m` up to [`MAX_SPAN`].
 ///
 /// # Errors
@@ -626,6 +650,26 @@ mod tests {
         let after = NOW + 9 * HOUR;
         assert_eq!(hold(mode.is_on(after), false, open), Hold::Off);
         assert_eq!(hold(Mode::Forever.is_on(after), false, open), Hold::Idle);
+    }
+
+    /// A pause within [`SETTLE_SECS`] of a wake is settling, whichever pause it is; a hold, no
+    /// wake, a wake that long ago, and a wake read after a clock that reads before it are not.
+    /// NEGATIVE CONTROL: `settling` answering `false` for every pause leaves the lid's open
+    /// unheld until the next tick, which the first assertion refuses.
+    #[test]
+    fn a_pause_just_after_a_wake_is_settling() {
+        let woke = NOW.since_boot;
+        for pause in [Pause::Asleep, Pause::LidClosed] {
+            let paused = Hold::Paused(pause);
+            assert!(settling(paused, Some(woke), woke), "{pause:?}");
+            assert!(settling(paused, Some(woke), woke + SETTLE_SECS - 1));
+            assert!(!settling(paused, Some(woke), woke + SETTLE_SECS));
+            assert!(!settling(paused, None, woke));
+            assert!(!settling(paused, Some(woke), woke - 1));
+        }
+        for held in [Hold::Off, Hold::Idle, Hold::LidClosedToo] {
+            assert!(!settling(held, Some(woke), woke), "{held:?}");
+        }
     }
 
     #[test]

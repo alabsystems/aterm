@@ -43,6 +43,14 @@ pub(crate) fn stage_jobs(
         .map(|slots| ceiling.map_or(slots, |ceiling| ceiling.min(slots)).max(1))
 }
 
+pub(crate) fn jobs_for(ctx: &crate::Ctx, stage: crate::plan::StageId) -> Option<u32> {
+    stage_jobs(
+        stage,
+        ctx.pool.as_ref().map(aterm_capacity::Jobserver::slots),
+        ctx.build_jobs_ceiling(),
+    )
+}
+
 /// Pooled observations must not lower an unpooled compile's cold estimate.
 pub(crate) fn record_key(mut key: crate::memory::Key, jobs: Option<u32>) -> crate::memory::Key {
     if let Some(jobs) = jobs {

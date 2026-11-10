@@ -25,6 +25,7 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
     }
 
     let mut app = App::headless_for_test();
+    app.boot_health_confirmation_dispatched = false;
     assert!(
         app.headless,
         "negative control: this fixture IS the headless lane"
@@ -69,6 +70,7 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
 fn boot_health_never_folds_a_past_deadline() {
     use std::time::{Duration, Instant};
     let mut app = App::headless_for_test();
+    app.boot_health_confirmation_dispatched = false;
     let now = Instant::now();
     let past = now.checked_sub(Duration::from_secs(5)).unwrap_or(now);
     app.boot_health_confirmation_retry_at = Some(past);
@@ -1306,7 +1308,7 @@ fn native_preview_deadlines_preserve_idle_and_blink_edges() {
 
 fn url_at(line: &str, col: usize) -> Option<String> {
     let chars: Vec<char> = line.chars().collect();
-    find_url_span(&chars, col).map(|(u, _, _)| u)
+    find_url_span(chars.len(), col, |i| chars[i]).map(|span| chars[span].iter().collect())
 }
 
 #[test]
@@ -1877,7 +1879,7 @@ fn a_plain_url_is_as_long_as_its_ink_and_says_when_the_ink_is_faint() {
         t.render_row(0)
     };
     let at = |row: &[crate::RenderCell], col, floor| {
-        crate::plain_url_at(row, col, floor).map(|plain| (plain.url, plain.faint))
+        crate::plain_url_at(row, col, floor).map(|plain| (plain.to_url_string(), plain.faint))
     };
     let tail_in = |ink: &str| {
         row_of(&format!(
@@ -1912,15 +1914,37 @@ fn a_plain_url_is_as_long_as_its_ink_and_says_when_the_ink_is_faint() {
 }
 
 #[test]
+fn plain_url_discovery_is_allocation_free() {
+    for (text, expected) in [
+        ("https://example.com/path", true),
+        ("\x1b[38;2;20;20;20mhttps://example.com/path", true),
+        ("\x1b[8mhttps://example.com/path", false),
+        ("ordinary text", false),
+    ] {
+        let mut term = aterm_core::terminal::Terminal::new(4, 80);
+        term.process(format!("Docs: {text}\x1b[m").as_bytes());
+        let cells = term.render_row(0);
+        let (result, calls) =
+            aterm_heap_count::allocations_in(|| crate::plain_url_at(&cells, 10, 1.0));
+        assert_eq!(result.is_some(), expected, "{text:?}");
+        assert_eq!(calls, 0, "{text:?}");
+    }
+}
+
+#[test]
 fn safe_url_allowlist() {
     for ok in [
         "http://example.com",
         "https://example.com/path?q=1#frag",
         "HTTPS://EXAMPLE.COM",
+        "hTtP://example.com/例え",
         "mailto:user@example.com",
+        "MAILTO:user@example.com",
         "  https://example.com  ", // surrounding whitespace is trimmed
     ] {
-        assert!(is_safe_url(ok), "should allow: {ok:?}");
+        let (allowed, calls) = aterm_heap_count::allocations_in(|| is_safe_url(ok));
+        assert!(allowed, "should allow: {ok:?}");
+        assert_eq!(calls, 0, "validating {ok:?}");
     }
     for bad in [
         "file:///etc/passwd",
@@ -1928,13 +1952,17 @@ fn safe_url_allowlist() {
         "javascript:alert(1)",
         "tel:+15551234",
         "ftp://example.com",
+        "httpſ://example.com",
+        "hṫtp://example.com",
         "http://exa mple.com", // internal whitespace
         "https://e\nvil.com",  // control byte
         "://noscheme",
         "",
         "   ",
     ] {
-        assert!(!is_safe_url(bad), "should reject: {bad:?}");
+        let (allowed, calls) = aterm_heap_count::allocations_in(|| is_safe_url(bad));
+        assert!(!allowed, "should reject: {bad:?}");
+        assert_eq!(calls, 0, "validating {bad:?}");
     }
 }
 

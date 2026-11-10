@@ -66,6 +66,7 @@ fn laid_out(phase: ImagePhase) -> (St, Prepare) {
     back.env[0].1 = "/model/back".into();
     back.account_intent = Some(Box::new(intent("/model/back", "78")));
     let old = Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),

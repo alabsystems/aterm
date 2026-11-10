@@ -148,7 +148,13 @@ impl Facts {
             Kind::SignedIn | Kind::Renewed => signin("in", &mut self.signin),
             Kind::SignedOut | Kind::Displaced => signin("out", &mut self.signin),
             Kind::LoginEnded => signin("ended", &mut self.signin),
-            Kind::WrongAccount => signin("wrong", &mut self.signin),
+            // A tab's observation that contradicts its belief (`x` names the tab) says nothing of
+            // the observed account's sign-in; a capture's wrong account does.
+            Kind::WrongAccount if e.tab.is_none() => signin("wrong", &mut self.signin),
+            // A sighting is no sign-in word: a profile keeps naming its account after the
+            // credential is revoked or expires, so a file read after a login ended would say
+            // `in` over the newer truth. Where a tab runs an account now is the `seen` events'
+            // own view (`command::views`, `seen_on`).
             Kind::SignInFailed => signin("failed", &mut self.signin),
             Kind::Quota => {
                 if let (Some(w), Some(_)) = (e.window, e.pct_x10)
@@ -592,7 +598,7 @@ impl Book {
         if off {
             return false;
         }
-        outbox.iter().any(|e| e.kind.sharp())
+        outbox.iter().any(Event::sharp)
             || outbox.len() >= BATCH_EVENTS
             || ((owed || !outbox.is_empty()) && now >= self.flushed_at.saturating_add(ROUTINE_S))
     }

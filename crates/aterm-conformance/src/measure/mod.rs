@@ -4,6 +4,7 @@
 //! The `measure` check's instruments.
 
 pub mod aos;
+pub mod decision;
 pub mod frame;
 pub mod instance;
 pub mod paint;

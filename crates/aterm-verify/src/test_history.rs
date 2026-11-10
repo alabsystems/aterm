@@ -22,9 +22,17 @@
 //! be read at all (a symlink, a directory, past its bound) is left as it is.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aterm_json::{Map, Value};
+
+/// Select only the planning record location; CPU and memory admission keep their account book.
+pub(crate) fn planning_path(
+    explicit: Option<PathBuf>,
+    account: Option<PathBuf>,
+) -> Option<PathBuf> {
+    explicit.or_else(|| account.map(|root| root.join(aterm_capacity::book::TEST_HISTORY)))
+}
 
 /// The history's schema.
 pub const SCHEMA: u64 = 1;
@@ -57,6 +65,8 @@ pub struct Sample {
     pub width: u32,
     /// The tests libtest said it runs ([`crate::libtest::tests_run`]); `None` where it said none.
     pub tests: Option<u64>,
+    /// A case or module filter balancing observed time, where a successful long run measured one.
+    pub partition: Option<String>,
 }
 
 /// One binary's samples, newest last.
@@ -229,6 +239,10 @@ impl History {
                         o.insert("peak_bytes".to_owned(), opt(s.peak_bytes));
                         o.insert("width".to_owned(), Value::from(s.width));
                         o.insert("tests".to_owned(), opt(s.tests));
+                        o.insert(
+                            "partition".to_owned(),
+                            s.partition.as_deref().map_or(Value::Null, Value::from),
+                        );
                         Value::Object(o)
                     })
                     .collect();
@@ -278,6 +292,10 @@ impl History {
                                 peak_bytes: opt(s, "peak_bytes")?,
                                 width: u32::try_from(s.get("width")?.as_u64()?).ok()?,
                                 tests: opt(s, "tests")?,
+                                partition: match s.get("partition") {
+                                    None | Some(Value::Null) => None,
+                                    Some(value) => Some(value.as_str()?.to_owned()),
+                                },
                             })
                         })
                         .collect::<Option<Vec<_>>>()?;

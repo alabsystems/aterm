@@ -398,6 +398,7 @@ fn malformed_policy_cannot_be_overwritten_or_clear_retirement() {
         wake: None,
         fleet: None,
         source_policy: Some(image),
+        outbox: None,
     };
     assert!(plan.validate(&bed.store, Scope::default()).is_err());
     plan.source_policy.as_mut().unwrap().after =

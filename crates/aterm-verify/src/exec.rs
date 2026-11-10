@@ -891,6 +891,8 @@ pub use start::{Backlog, DaemonNow, Unstarted};
 mod compiler_progress;
 #[path = "exec_test_progress.rs"]
 mod test_progress;
+/// A completed libtest case's measured time, retained before its log is rendered.
+pub use test_progress::Timing as CaseTiming;
 
 const MAX_CEILING_SECS: f64 = 3_153_600_000.0;
 
@@ -1051,6 +1053,7 @@ pub(crate) fn case_observations(path: &Path, json: bool) -> test_progress::Obser
         json,
         read_end: test_progress::ReadEnd::Unread,
         failures: Vec::new(),
+        ..Default::default()
     };
     if let Ok(mut cases) = test_progress::LiveCases::open(path, json) {
         let _ = cases.poll();

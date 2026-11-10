@@ -59,7 +59,7 @@ default-members = [
 # 0.61.2 and crates/aterm-windows-sys-052 is `windows-sys` 0.52.0: cargo refuses
 # two members of one name. It is its own root (a `[workspace]` stub, as a
 # vendored fork has), and the `windows-sys` patch row reaches it by path.
-exclude = ["vendor/astream", "vendor/trust-build-cpu", "vendor/trust-sha2", "vendor/trust-jobserver-utils", "vendor/trust-resource-provenance", "vendor/trust-resource-controller", "crates/aterm-windows-sys"]
+exclude = ["vendor/astream", "vendor/trust-build-cpu", "vendor/trust-sha2", "vendor/trust-jobserver-utils", "vendor/trust-resource-provenance", "vendor/trust-resource-controller", "vendor/trust-exec-policy", "crates/aterm-windows-sys"]
 resolver = "2"
 
 # The executable surface read by `atpkg-publish pack`: `expose` names commands
@@ -84,7 +84,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
 [workspace.package]
-version = "0.192.0"
+version = "0.193.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -143,6 +143,7 @@ aterm-resource-host = { path = "crates/aterm-resource-host" }
 # Core Trust owns CPU lease identity and lifetime; aterm observes the same pool.
 trust-resource-controller = { path = "vendor/trust-resource-controller", default-features = false }
 trust-resource-provenance = { path = "vendor/trust-resource-provenance" }
+trust-exec-policy = { path = "vendor/trust-exec-policy" }
 trust-build-cpu = { version = "0.13.0", path = "vendor/trust-build-cpu" }
 jobserver_utils = { path = "vendor/trust-jobserver-utils", default-features = false }
 aterm-census = { path = "crates/aterm-census" }

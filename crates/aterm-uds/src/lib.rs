@@ -325,6 +325,7 @@ pub mod backup;
 /// takes: durable for `write`, the one named or none for `write_flushed`; Unix modes apply on
 /// Unix), and aterm.toml's Unix editor under the config service's write lock.
 pub mod atomic_file;
+pub mod quiet_state;
 
 /// This account's own home as the account database has it ([`account::home`]), whatever `$HOME` says: what a launchd job of this login runs with.
 #[cfg(unix)]

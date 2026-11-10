@@ -257,6 +257,21 @@ impl<'a> VisibleRowView<'a> {
 }
 
 impl Grid {
+    /// Rule out hyperlinks without materializing a row. Live extras are
+    /// conservative across rows; uncached history remains unknown and returns true.
+    #[must_use]
+    #[inline]
+    pub fn visible_row_may_have_hyperlinks(&self, visible_row: u16) -> bool {
+        let d = self.display_offset();
+        if usize::from(visible_row) >= d {
+            return self.extras().hyperlink_upper_bound() != 0 && self.row(visible_row).is_some();
+        }
+        let rev_idx = d - 1 - usize::from(visible_row);
+        self.history_row_key(rev_idx, self.cols())
+            .and_then(|(epoch, abs_row)| self.viewport_cache.hyperlink_presence(epoch, abs_row))
+            .unwrap_or(true)
+    }
+
     /// Resolve a viewport row against `display_offset`: [`VisibleRowView::Live`] when the viewport is not
     /// scrolled past it, else [`VisibleRowView::History`], materialized through the 3-tier reader.
     #[must_use]
@@ -305,21 +320,27 @@ impl Grid {
         top_live.checked_sub(u64::try_from(rev_idx).ok()?.checked_add(1)?)
     }
 
+    fn history_row_key(&self, rev_idx: usize, cols: u16) -> Option<(HistoryEpoch, u64)> {
+        Some((
+            HistoryEpoch {
+                content_gen: self.storage.content_gen,
+                renumber: self.storage.history_renumber_epoch,
+                cols,
+                visible_rows: self.storage.visible_rows,
+            },
+            self.history_absolute_row(rev_idx)?,
+        ))
+    }
+
     /// The materialized history row at `rev_idx`, from the memo when it provably describes
     /// this history, else materialized and memoized; `None` only when the row does not exist.
     fn materialized_history_row(&self, rev_idx: usize, cols: u16) -> Option<Arc<MaterializedRow>> {
-        let Some(abs_row) = self.history_absolute_row(rev_idx) else {
+        let Some((epoch, abs_row)) = self.history_row_key(rev_idx, cols) else {
             #[cfg(any(test, debug_assertions))]
             super::count_viewport_row_materialize();
             return self
                 .materialize_scrollback_row_full(rev_idx, cols)
                 .map(Arc::new);
-        };
-        let epoch = HistoryEpoch {
-            content_gen: self.storage.content_gen,
-            renumber: self.storage.history_renumber_epoch,
-            cols,
-            visible_rows: self.storage.visible_rows,
         };
         if let Some(hit) = self.viewport_cache.lookup(epoch, abs_row) {
             #[cfg(debug_assertions)]

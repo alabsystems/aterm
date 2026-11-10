@@ -41,6 +41,17 @@ fn descriptor_population() -> (libc::rlim_t, usize) {
 fn attempt_budget(full: bool) -> Duration {
     if full { Duration::from_secs(600) } else { HANG }
 }
+fn population_budget() -> Duration {
+    wire::budget::Budget::new(32, HANG.as_nanos().try_into().unwrap())
+        .unwrap()
+        .root_duration()
+}
+#[test]
+fn population_containment_preserves_each_actions_hang_detector() {
+    // The old ten-minute cap could expire during a healthy complete population.
+    // This is a containment inequality, not a wall-clock performance assertion.
+    assert!(population_budget() >= HANG * 68);
+}
 #[cfg(target_arch = "aarch64")]
 #[path = "workload_native/contained.rs"]
 mod contained;
@@ -139,10 +150,14 @@ fn run_case(case: &str) {
         .env(ROLE, "host")
         .env(STORE, &path)
         .env(CASE, case);
-    let output = match deadline::output_within(
-        &mut command,
-        attempt_budget(case == "contained-full-population" || linker::selected(case)),
-    ) {
+    let result = if case == "contained-full-population" {
+        deadline::output_while_progressing(&mut command, HANG, &mut || {
+            fs::metadata(path.join("progress")).map_or(0, |file| file.len())
+        })
+    } else {
+        deadline::output_within(&mut command, attempt_budget(linker::selected(case)))
+    };
+    let output = match result {
         Ok(output) => output,
         Err(error) => panic!(
             "workload host {case} failed; preserved {}: {error:?}",
@@ -176,6 +191,17 @@ fn input(path: &std::path::Path) -> wire::InputFile {
 fn host_process() {
     let path = PathBuf::from(std::env::var_os(STORE).unwrap());
     let case = std::env::var(CASE).unwrap();
+    let progress = || {
+        if case == "contained-full-population" {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path.join("progress"))
+                .unwrap();
+            file.write_all(b"+").unwrap();
+        }
+    };
+    progress();
     if case == "contained-full-population" {
         // This fresh private fixture gets a stricter real kernel limit BEFORE
         // any owners. Capping hard and soft prevents ordinary spawn's existing
@@ -186,7 +212,11 @@ fn host_process() {
         };
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
     }
-    let budget = attempt_budget(case == "contained-full-population" || linker::selected(&case));
+    let budget = if case == "contained-full-population" {
+        population_budget()
+    } else {
+        attempt_budget(linker::selected(&case))
+    };
     let store = ImageStore::open_at(&path).unwrap();
     let program = store.cache_current().unwrap();
     let socket = path.join("workload.sock");
@@ -206,6 +236,7 @@ fn host_process() {
     // successful LLD. Never unlink its copied Mach-O during OS assessment.
     scratch.preserve = linker::selected(&case);
     let (mut owner, namespace, retirement) = World::prepare(&scratch);
+    progress();
     let artifacts = scratch.path.join("managed-sdk");
     let layout = atpkg::store::Layout {
         prefix: artifacts.join("manager"),
@@ -217,7 +248,9 @@ fn host_process() {
     let service = build.join("bin/targo");
     let compiler = build.join("bin/trustc");
     fs::copy(program.path(), &service).unwrap();
+    progress();
     fs::copy(program.path(), &compiler).unwrap();
+    progress();
     if linker::selected(&case) {
         linker::install(&build);
     } else {
@@ -225,6 +258,7 @@ fn host_process() {
     }
     atpkg::platform::install_shim_to(&layout.bin_dir().join("targo"), &service).unwrap();
     atpkg::store::mark_build_ready(&build).unwrap();
+    progress();
     let source = scratch.path.join("source");
     let cargo_home = scratch.path.join("cargo-home");
     let output = scratch.path.join("output");
@@ -254,9 +288,9 @@ fn host_process() {
         } else {
             1
         },
-        // Full-population and real-linker actions use the one-minute native
-        // hang detector within a ten-minute preparation attempt. Ordinary
-        // phases retain room inside their original whole-attempt minute.
+        // Each full-population action keeps its one-minute hang detector within the
+        // protocol's checked complete containment plan. Real-linker preparation retains
+        // its separate attempt budget; ordinary phases fit their whole-attempt minute.
         timeout_ns: if case == "contained-full-population" || linker::selected(&case) {
             HANG
         } else {
@@ -316,6 +350,7 @@ fn host_process() {
         if actual_bytes != progress_bytes {
             progress_bytes = actual_bytes;
             last_progress = Instant::now();
+            progress();
             writeln!(
                 fd_trace,
                 "root_progress_bytes={actual_bytes} descriptors={} peak={peak_descriptors}",
@@ -570,7 +605,12 @@ fn root() -> i32 {
     let mut raw = vec![0; n];
     std::io::stdin().read_exact(&mut raw).unwrap();
     let invocation = wire::WorkloadInvocation::decode(&raw).unwrap();
-    let deadline = Instant::now() + attempt_budget(invocation.repetitions == 32);
+    let deadline = Instant::now()
+        + if invocation.repetitions == 32 {
+            population_budget()
+        } else {
+            HANG
+        };
     let client = store.discover(deadline).unwrap();
     assert_eq!(
         Some(client.original_store_path().as_os_str().as_bytes()),
@@ -802,6 +842,11 @@ fn root() -> i32 {
             action_count,
         )
     });
+    let deadline = if case == "contained-full-population" {
+        Instant::now() + HANG
+    } else {
+        deadline
+    };
     let mut sequence = 2;
     loop {
         let left = control

@@ -70,6 +70,10 @@ words!(
         TokenFallback = "token-fallback",
         TokenOffered = "token-offered",
         TokenRemoved = "token-removed",
+        // What a tab's CLI really runs on, read from its login file
+        // (`docs/DESIGN-account-discovery-2026-11-09.md`): the observed account, the tab and the
+        // harness that runs it.
+        Seen = "seen",
     }
 );
 
@@ -82,7 +86,21 @@ impl Kind {
             Self::SignedIn | Self::SignedOut | Self::WrongAccount | Self::LoginEnded | Self::Wall
         )
     }
+
+    /// Whether an event of this kind may name a tab (`x`) and its harness (`h`): a sighting, a
+    /// wrong account and a session's start and end are about one tab's run.
+    pub const fn names_tab(self) -> bool {
+        matches!(
+            self,
+            Self::Seen | Self::WrongAccount | Self::SessionStart | Self::SessionEnd
+        )
+    }
 }
+
+/// The reason word a `seen` event carries on a first sighting of its (tab, account) pair.
+pub const SEEN_FIRST: &str = "first";
+/// The reason word a `seen` event carries when a tab's account changed.
+pub const SEEN_CHANGED: &str = "changed";
 
 words!(
     /// Where a figure or fact came from.
@@ -95,6 +113,12 @@ words!(
         Error = "error",
         Relay = "relay",
         Probe = "probe",
+        // Where an observed login was read (`seen`): Claude Code's profile, a CLI's auth file,
+        // a CLI's own log, or the vault token entry a token route runs on.
+        Profile = "profile",
+        AuthFile = "auth-file",
+        CliLog = "cli-log",
+        VaultToken = "vault-token",
     }
 );
 
@@ -192,8 +216,9 @@ impl std::fmt::Debug for Pk {
 /// A sub-account's observed `AccountKey`: 12 lower-case hex digits.
 pub type SubKey = Word<12>;
 
-/// One event (design §4.17 `ev`): `{t, k, a, c, s?, w?, p?, r?, rr?, u?, plan?, src, why?, to?}`,
-/// `a` absent only on a `probe` of an unpooled CLI's unseen login.
+/// One event (design §4.17 `ev`): `{t, k, a, c, s?, w?, p?, r?, rr?, u?, plan?, src, why?, to?,
+/// x?, h?}`, `a` absent only on a `probe` of an unpooled CLI's unseen login, `x` and `h` only on
+/// a kind that [names a tab](Kind::names_tab).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Event {
     /// When, Unix seconds.
@@ -220,8 +245,26 @@ pub struct Event {
     pub src: Source,
     /// A short reason word.
     pub why: Option<Word<16>>,
-    /// The other account of a switch or a displacement.
+    /// The other account of a switch or a displacement; the believed account of a
+    /// `wrong-account` a tab's observation contradicted.
     pub to: Option<Pk>,
+    /// The tab: 8 hex of its id (`docs/DESIGN-account-discovery-2026-11-09.md`).
+    pub tab: Option<Word<8>>,
+    /// The harness word of the tab's session.
+    pub harness: Option<Word<16>>,
+}
+
+impl Event {
+    /// Whether the flusher sends this event out on its next pass (design §3.9): a sharp kind,
+    /// or a `seen` of a tab's first sighting or changed account. An hourly refresh of a
+    /// sighting waits for the routine flush.
+    pub fn sharp(&self) -> bool {
+        self.kind.sharp()
+            || (self.kind == Kind::Seen
+                && self
+                    .why
+                    .is_some_and(|why| matches!(why.as_str(), SEEN_FIRST | SEEN_CHANGED)))
+    }
 }
 
 /// A fixed buffer that refuses to overflow, so encoding never allocates.
@@ -288,6 +331,9 @@ impl Event {
             line.text(f, "a", account.as_str())?;
         }
         line.text(f, "c", self.cli.as_str())?;
+        if let Some(h) = &self.harness {
+            line.text(f, "h", h.as_str())?;
+        }
         line.text(f, "k", self.kind.word())?;
         if let Some(p) = self.pct_x10 {
             line.uint(f, "p", u64::from(p))?;
@@ -317,6 +363,9 @@ impl Event {
         }
         if let Some(why) = &self.why {
             line.text(f, "why", why.as_str())?;
+        }
+        if let Some(x) = &self.tab {
+            line.text(f, "x", x.as_str())?;
         }
         line.put(b"}")?;
         (line.at <= MAX_EVENT).then_some(line.at)
@@ -352,6 +401,12 @@ impl Event {
         if let Some(why) = &self.why {
             text("why", why.as_str());
         }
+        if let Some(x) = &self.tab {
+            text("x", x.as_str());
+        }
+        if let Some(h) = &self.harness {
+            text("h", h.as_str());
+        }
         o.insert("t".to_owned(), Value::from(self.t));
         for (k, v) in [
             ("p", self.pct_x10.map(u64::from)),
@@ -369,8 +424,8 @@ impl Event {
     /// peer's modified build cannot slip text past the vocabulary.
     pub fn from_value(value: &Value) -> Option<Self> {
         let o = value.as_object()?;
-        const KEYS: [&str; 14] = [
-            "a", "c", "k", "p", "plan", "r", "rr", "s", "src", "t", "to", "u", "w", "why",
+        const KEYS: [&str; 16] = [
+            "a", "c", "h", "k", "p", "plan", "r", "rr", "s", "src", "t", "to", "u", "w", "why", "x",
         ];
         if o.keys().any(|k| !KEYS.contains(&k.as_str())) {
             return None;
@@ -426,7 +481,21 @@ impl Event {
                 None => None,
                 Some(w) => Some(Pk::new(w)?),
             },
+            tab: match word("x")? {
+                None => None,
+                Some(w) => Some(Word::new(w).filter(|x: &Word<8>| {
+                    x.as_str().len() == 8 && x.as_str().bytes().all(|b| b.is_ascii_hexdigit())
+                })?),
+            },
+            harness: match word("h")? {
+                None => None,
+                Some(w) => Some(Word::new(w)?),
+            },
         };
+        // Only a kind about one tab's run names the tab and its harness.
+        if (event.tab.is_some() || event.harness.is_some()) && !event.kind.names_tab() {
+            return None;
+        }
         // An event names its account; a probe may name only its realm, and then no workspace.
         if event.account.is_none() && (event.kind != Kind::Probe || event.sub.is_some()) {
             return None;

@@ -1772,12 +1772,7 @@ impl Tab {
     /// Structural invariant consumed by window-level debug assertions and tests.
     #[must_use]
     pub fn invariant_holds(&self, views: &ViewStore) -> bool {
-        self.root.contains(self.focus)
-            && self
-                .root
-                .leaves()
-                .into_iter()
-                .all(|view| views.contains(view))
+        self.root.contains(self.focus) && !self.root.any_leaf(&mut |&view| !views.contains(view))
     }
 }
 

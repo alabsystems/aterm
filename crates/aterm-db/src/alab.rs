@@ -42,6 +42,7 @@ pub mod import;
 pub mod journal;
 pub mod mail;
 pub mod merge;
+pub mod observe;
 pub mod register;
 pub mod registry;
 #[cfg(unix)]
@@ -56,7 +57,9 @@ pub use crate::att::View;
 #[cfg(unix)]
 pub use roll::Rolled;
 #[cfg(unix)]
-pub use store::{Discovered, Inventory, LabRead, Registry, Seeded};
+pub use store::{
+    Discovered, Inventory, LabRead, Observed, Registry, Seeded, SourceRead, SourceRevision,
+};
 #[cfg(unix)]
 pub(crate) mod upkeep;
 

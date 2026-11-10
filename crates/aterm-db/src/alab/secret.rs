@@ -20,6 +20,7 @@ pub enum Surface {
 }
 
 impl Surface {
+    #[cfg(unix)]
     const fn as_str(self) -> &'static str {
         match self {
             Self::Terminal => "Terminal",

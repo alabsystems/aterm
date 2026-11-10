@@ -1482,14 +1482,8 @@ fn orphaned_in_a_group(leftover: &str) -> (u32, i32) {
         .split_whitespace()
         .map(|n| n.parse::<i32>().expect("a pid"));
     let (leader, left) = (pids.next().expect("leader"), pids.next().expect("leftover"));
-    // `$!` names the forked shell, which runs the leftover's own image only once its exec lands.
     let program = leftover.split_whitespace().next().expect("a program");
-    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the leftover's exec", || {
-        (aterm_uds::process::read_process_execd(left) == Some(true)
-            && aterm_uds::process::read_process_path(left).as_deref()
-                == Some(std::path::Path::new(program)))
-        .then_some(())
-    });
+    aterm_uds::deadline::execd(left, std::path::Path::new(program));
     assert_eq!(
         aterm_uds::process::read_short_info(left).map(|info| (info.pbsi_pgid, info.pbsi_ppid)),
         Some((leader.unsigned_abs(), 1)),

@@ -9,9 +9,11 @@ use aterm_agent::harness::footer::{FactKind, FactMask, FooterFacts};
 use aterm_agent::harness::session_usage::{ModelTokens, UsageFacts};
 
 use super::{
-    default_mask_for, fact_spoken_of, fact_title, mask_after, runtime_spoken, tokens_spoken,
+    ModelSwitch, Pick, default_mask_for, fact_spoken_of, fact_spoken_with, fact_title,
+    fact_title_with, mask_after, runtime_spoken, switch_plan, tokens_spoken,
 };
 use crate::claude_lights::Fact;
+use crate::claude_slash::{ModelArg, Slash};
 
 fn facts() -> FooterFacts {
     FooterFacts {
@@ -72,10 +74,6 @@ fn a_click_hides_its_fact_and_a_stub_click_shows_its_own_again() {
         mask_after(none, Fact::Branch, none),
         mask(&[FactKind::Branch])
     );
-    assert_eq!(
-        mask_after(mask(&[FactKind::Path]), Fact::Model, none),
-        mask(&[FactKind::Path, FactKind::Model])
-    );
     let both = mask(&[FactKind::Model, FactKind::Effort, FactKind::Branch]);
     assert_eq!(
         mask_after(
@@ -105,13 +103,36 @@ fn a_title_names_the_value_and_the_click() {
     assert_eq!(
         title(&shown, Fact::Model),
         (
-            "Opus 5.5 \u{b7} click: hide \u{b7} right-click: model menu".into(),
-            "click: hide".into()
+            "Opus 5.5 \u{b7} click: back to the default model at auto effort \u{b7} \
+             right-click: model menu"
+                .into(),
+            "click: back to the default model at auto effort".into()
         )
     );
     assert_eq!(
         title(&shown, Fact::Effort).0,
-        "effort xhigh \u{b7} click: hide \u{b7} right-click: effort menu"
+        "effort xhigh \u{b7} click: back to the default model at auto effort \u{b7} \
+         right-click: effort menu"
+    );
+    let sonnet = FooterFacts {
+        model: Some("Sonnet 4.5".into()),
+        effort: Some("high".into()),
+        ..facts()
+    };
+    assert_eq!(
+        title(&sonnet, Fact::Model).1,
+        "click: switch to Opus 5.5 xhigh"
+    );
+    let remembered = ModelSwitch {
+        back: Some(Pick {
+            model: ModelArg::new("claude-sonnet-4-5"),
+            effort: Some("high"),
+        }),
+        ..ModelSwitch::default()
+    };
+    assert_eq!(
+        fact_title_with(&shown, Some(cwd), Fact::Model, Some(&remembered)).1,
+        "click: back to Sonnet 4.5 high"
     );
     assert_eq!(
         title(&shown, Fact::Path).0,
@@ -176,7 +197,35 @@ fn a_reader_hears_each_fact_in_words() {
     let spoken = |fact, restores| fact_spoken_of(&shown, Some(cwd), fact, restores);
     assert_eq!(
         spoken(Fact::Model, none),
-        ("Model: Opus 5.5".into(), "Activate to hide it.".into())
+        (
+            "Model: Opus 5.5".into(),
+            "Activate to switch back to the default model at auto effort.".into()
+        )
+    );
+    let sonnet = FooterFacts {
+        model: Some("Sonnet 4.5".into()),
+        effort: Some("high".into()),
+        ..facts()
+    };
+    assert_eq!(
+        fact_spoken_with(
+            &sonnet,
+            None,
+            Fact::Effort,
+            none,
+            Some(&ModelSwitch::default())
+        )
+        .1,
+        "Activate to switch to Opus 5.5 xhigh."
+    );
+    assert_eq!(
+        fact_spoken_with(&sonnet, None, Fact::Effort, none, None).1,
+        "Activate to hide it.",
+        "no Claude Code: nothing types `/model`, and a press hides the effort"
+    );
+    assert_eq!(
+        fact_title_with(&sonnet, None, Fact::Model, None).0,
+        "Sonnet 4.5 \u{b7} click: hide \u{b7} right-click: model menu"
     );
     assert_eq!(spoken(Fact::Effort, none).0, "Effort: xhigh");
     assert_eq!(
@@ -231,11 +280,11 @@ fn a_reader_hears_each_fact_in_words() {
 /// AN ACCOUNT WITH NO WEEKLY FIGURE says why in its title, in the footer's own words
 /// (`profile::WeeklyGap::words`), and to a reader in full (`WeeklyGap::spoken`, no glyph); a
 /// figure, where there is one, says the week instead, a lower bound read `at least`. A pane with
-/// no quota view (agy, Muse Code, a roster not read) names the account as line D's unit does,
-/// `this login` for a login the roster cannot name, its roster label where it has one, and never
-/// its email (design §2.5: the title is painted in line D's lights block, on the glass).
-/// NEGATIVE CONTROL: the profile does name the email, which the title said before (`⎆
-/// owner@example.com · Max 20x · …`).
+/// no quota view (agy, Muse Code, a roster not read) names the account as line D's unit does:
+/// by the email its profile names, whether or not the roster names the login (design §2.5, owner
+/// ruling 2026-11-09), else by its roster label.
+/// NEGATIVE CONTROL: the roster label, which the title said before the ruling, is on no title or
+/// speech whose profile names an email.
 #[test]
 fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
     use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyGap};
@@ -262,25 +311,28 @@ fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
     );
     let (title, spoken) = said(&with(None));
     assert!(
-        title.starts_with("\u{2386} this login \u{b7} Max 20x \u{b7} ")
+        title.starts_with("\u{2386} owner@example.com \u{b7} Max 20x \u{b7} ")
             && title.contains("weekly \u{2013} \u{b7} until relaunch"),
         "{title}"
     );
     assert_eq!(
         spoken,
-        "Account: this login, Max 20x, weekly figure unknown until aterm next relaunches this Claude Code"
+        "Account: owner@example.com, Max 20x, weekly figure unknown until aterm next relaunches this Claude Code"
     );
     let (title, spoken) = said(&with(Some("weekly 38% used")));
     assert!(
         title.contains("weekly 38% used") && !title.contains("until relaunch"),
         "{title}"
     );
-    assert_eq!(spoken, "Account: this login, Max 20x, weekly 38% used");
+    assert_eq!(
+        spoken,
+        "Account: owner@example.com, Max 20x, weekly 38% used"
+    );
     let (title, spoken) = said(&with(Some("weekly \u{2265}38% used")));
     assert!(title.contains("weekly \u{2265}38% used"), "{title}");
     assert_eq!(
         spoken,
-        "Account: this login, Max 20x, weekly at least 38% used"
+        "Account: owner@example.com, Max 20x, weekly at least 38% used"
     );
     let labelled = FooterFacts {
         account: Some("main".into()),
@@ -288,17 +340,30 @@ fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
     };
     let (title, spoken) = said(&labelled);
     assert!(
+        title.starts_with("\u{2386} owner@example.com \u{b7} Max 20x \u{b7} weekly 38% used"),
+        "{title}"
+    );
+    assert_eq!(
+        spoken,
+        "Account: owner@example.com, Max 20x, weekly 38% used"
+    );
+    for words in [&title, &spoken] {
+        assert!(!words.contains("main"), "NEGATIVE CONTROL: {words}");
+    }
+    // A profile that names no email is named by its roster label.
+    let unmailed = FooterFacts {
+        subscription: labelled
+            .subscription
+            .clone()
+            .map(|sub| SubscriptionDisplay { email: None, ..sub }),
+        ..labelled
+    };
+    let (title, spoken) = said(&unmailed);
+    assert!(
         title.starts_with("\u{2386} main \u{b7} Max 20x \u{b7} weekly 38% used"),
         "{title}"
     );
     assert_eq!(spoken, "Account: main, Max 20x, weekly 38% used");
-    for facts in [with(None), with(Some("weekly 38% used")), labelled] {
-        let (title, spoken) = said(&facts);
-        for words in [&title, &spoken] {
-            assert!(!words.contains("owner@example.com"), "{words}");
-            assert!(!words.contains("owner"), "no local part: {words}");
-        }
-    }
 }
 
 /// A WATCHING ROTATION IS SAID LAST, where accounts are (design §5.1): the account's title and
@@ -354,8 +419,8 @@ fn a_watching_rotation_follows_the_observed_week_or_its_missing_reading_reason()
                     .expect("observed quota or reason retained");
                 assert!(quota_at < rotation_at, "the rotation is said last: {said}");
                 assert!(
-                    !said.contains("owner@example.test") && said.contains("this login"),
-                    "line D's unit's name, never the email: {said}"
+                    said.contains("owner@example.test") && !said.contains("this login"),
+                    "line D's unit's name is the email the profile names: {said}"
                 );
             }
             assert!(
@@ -553,4 +618,135 @@ fn watching_disclosures_use_the_panes_quota_view_without_inventing_a_profile() {
             );
         }
     }
+}
+
+#[test]
+fn a_switch_goes_to_opus_xhigh_remembering_the_session_s_own_and_back() {
+    let on = |model: &str, effort: &str| FooterFacts {
+        model: Some(model.into()),
+        effort: Some(effort.into()),
+        ..FooterFacts::default()
+    };
+    let opus = ModelArg::new("claude-opus-5-5");
+    let sonnet = Pick {
+        model: ModelArg::new("claude-sonnet-4-5"),
+        effort: Some("high"),
+    };
+    let toward = switch_plan(&on("Sonnet 4.5", "high"), &ModelSwitch::default());
+    assert_eq!(
+        (toward.model, toward.effort, toward.remember, toward.back),
+        (
+            Slash::Model(opus),
+            Slash::Effort("xhigh"),
+            Some(sonnet),
+            false
+        )
+    );
+    assert_eq!(toward.model.text(), "/model claude-opus-5-5");
+    assert_eq!(toward.effort.text(), "/effort xhigh");
+    let same_model = switch_plan(&on("Opus 5.5", "high"), &ModelSwitch::default());
+    assert_eq!(
+        (same_model.back, same_model.remember.and_then(|p| p.effort)),
+        (false, Some("high")),
+        "Opus 5.5 at another effort is the session's own"
+    );
+    let back = switch_plan(
+        &on("Opus 5.5", "xhigh"),
+        &ModelSwitch {
+            back: Some(sonnet),
+            ..ModelSwitch::default()
+        },
+    );
+    assert_eq!(
+        (
+            back.model.text(),
+            back.effort.text(),
+            back.remember,
+            back.back
+        ),
+        (
+            "/model claude-sonnet-4-5".to_owned(),
+            "/effort high".to_owned(),
+            None,
+            true
+        )
+    );
+    let unknown = switch_plan(&on("Opus 5.5", "xhigh"), &ModelSwitch::default());
+    assert_eq!(
+        (unknown.model.text(), unknown.effort.text()),
+        ("/model default".to_owned(), "/effort auto".to_owned()),
+        "nothing remembered: Claude's own defaults"
+    );
+    let half = switch_plan(
+        &on("Opus 5.5", "high"),
+        &ModelSwitch {
+            back: Some(sonnet),
+            half: true,
+            ..ModelSwitch::default()
+        },
+    );
+    assert_eq!(
+        (half.back, half.remember),
+        (false, None),
+        "a switch stopped half-way keeps the session's own pick"
+    );
+    let gpt = switch_plan(&on("gpt-5-codex", "high"), &ModelSwitch::default());
+    assert_eq!(
+        gpt.remember,
+        Some(Pick {
+            model: None,
+            effort: Some("high")
+        }),
+        "a name no Claude id spells is remembered as the default model"
+    );
+}
+
+/// A session on a 1M-context model keeps its context both ways: the tap's `model.id` names the
+/// variant the display name drops, so the switch types `claude-opus-5-5[1m]` and remembers
+/// `claude-opus-4-6[1m]`. A tap naming another model than the one shown is not read for it.
+#[test]
+fn a_switch_keeps_the_session_s_context_variant() {
+    use aterm_agent::harness::profile::SubscriptionDisplay;
+    let tapped = |shown: &str, id: &str| FooterFacts {
+        model: Some(shown.into()),
+        effort: Some("high".into()),
+        subscription: Some(SubscriptionDisplay {
+            model_id: Some(id.into()),
+            ..SubscriptionDisplay::default()
+        }),
+        ..FooterFacts::default()
+    };
+    let long = switch_plan(
+        &tapped("Opus 4.6", "claude-opus-4-6[1m]"),
+        &ModelSwitch::default(),
+    );
+    assert_eq!(long.model.text(), "/model claude-opus-5-5[1m]");
+    assert_eq!(
+        long.remember
+            .and_then(|p| p.model)
+            .map(|m| m.as_str().to_owned()),
+        Some("claude-opus-4-6[1m]".to_owned())
+    );
+    let at = FooterFacts {
+        effort: Some("xhigh".into()),
+        ..tapped("Opus 5.5", "claude-opus-5-5[1m]")
+    };
+    let back = switch_plan(
+        &at,
+        &ModelSwitch {
+            back: long.remember,
+            ..ModelSwitch::default()
+        },
+    );
+    assert!(back.back);
+    assert_eq!(back.model.text(), "/model claude-opus-4-6[1m]");
+    let stale = switch_plan(
+        &tapped("Sonnet 4.5", "claude-opus-4-6[1m]"),
+        &ModelSwitch::default(),
+    );
+    assert_eq!(
+        stale.model.text(),
+        "/model claude-opus-5-5",
+        "a tap of another model says nothing of this one's context"
+    );
 }

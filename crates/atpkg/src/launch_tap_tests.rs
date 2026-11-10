@@ -235,6 +235,105 @@ fn the_twin_taps_a_launch_in_an_aterm_tab_and_otherwise_runs_it_as_typed() {
     );
 }
 
+/// THE RENDERER BLOCK, EXECUTED: a launch in an aterm tab that names no renderer runs with
+/// `CLAUDE_CODE_NO_FLICKER=1` (Claude Code's fullscreen renderer from its first start); one that
+/// names a renderer in its environment (any value, empty included) or by a `"tui":` key in the
+/// person's own `settings.json` (`$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`), one outside a tab,
+/// and one under `--no-harness` keep what they had. NEGATIVE CONTROL: the plain twin without the
+/// block (`sh_prelude` left out) leaves the variable unset in the same tab.
+#[cfg(unix)]
+#[test]
+fn a_tab_launch_that_names_no_renderer_runs_fullscreen() {
+    let laid = Laid::new();
+    laid.aterm(":");
+    let home = laid.root.join("home");
+    let config = laid.root.join("config");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    exe(
+        &laid.root.join("env-build"),
+        "#!/bin/sh\nprintf '%s|%s\\n' \"${CLAUDE_CODE_NO_FLICKER-unset}\" \
+         \"${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN-unset}\"\n",
+    );
+    let twin = |with_block: bool| {
+        let prelude = if with_block {
+            sh_prelude("claude", Some(&laid.atpkg))
+        } else {
+            String::new()
+        };
+        let path = laid.root.join(if with_block { "claude" } else { "plain" });
+        std::fs::write(
+            &path,
+            crate::platform::sh_shim_content_twin(
+                &laid.root.join("env-build"),
+                &crate::shim_env::ShimEnv::NONE,
+                None,
+                &prelude,
+            ),
+        )
+        .unwrap();
+        set_exec(&path);
+        path
+    };
+    let run = |path: &Path, env: &[(&str, &str)]| {
+        let out = aterm_spec::wait::past_text_busy(|| {
+            let mut command = std::process::Command::new(path);
+            command
+                .env("HOME", &home)
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("CLAUDE_CODE_NO_FLICKER")
+                .env_remove("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN")
+                .env_remove("ATERM_PARENT_SESSION_ID")
+                .env_remove("ATERM_NO_HARNESS");
+            for (key, value) in env {
+                command.env(key, value);
+            }
+            command.output()
+        })
+        .unwrap();
+        assert!(out.status.success(), "{env:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let with = twin(true);
+    let tab = ("ATERM_PARENT_SESSION_ID", "s-60776b6e2ed1b73bd013");
+    assert_eq!(run(&with, &[tab]), "1|unset\n", "a tab launch naming none");
+    assert_eq!(
+        run(&twin(false), &[tab]),
+        "unset|unset\n",
+        "negative control: no block, no variable"
+    );
+    assert_eq!(run(&with, &[]), "unset|unset\n", "outside a tab");
+    assert_eq!(
+        run(&with, &[tab, ("ATERM_NO_HARNESS", "1")]),
+        "unset|unset\n",
+        "under --no-harness"
+    );
+    for (env, want) in [
+        (("CLAUDE_CODE_NO_FLICKER", "0"), "0|unset\n"),
+        (("CLAUDE_CODE_NO_FLICKER", ""), "|unset\n"),
+        (("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1"), "unset|1\n"),
+    ] {
+        assert_eq!(run(&with, &[tab, env]), want, "{env:?}");
+    }
+    let settings = home.join(".claude/settings.json");
+    std::fs::write(&settings, "{\n  \"theme\": \"auto\"\n}\n").unwrap();
+    assert_eq!(run(&with, &[tab]), "1|unset\n", "settings naming no tui");
+    std::fs::write(&settings, "{\"theme\":\"auto\",\"tui\" : \"default\"}").unwrap();
+    assert_eq!(run(&with, &[tab]), "unset|unset\n", "the person's /tui");
+    let config_str = config.to_string_lossy().into_owned();
+    assert_eq!(
+        run(&with, &[tab, ("CLAUDE_CONFIG_DIR", &config_str)]),
+        "1|unset\n",
+        "CLAUDE_CONFIG_DIR's settings, not HOME's, are the person's"
+    );
+    std::fs::write(config.join("settings.json"), "{\"tui\":\"fullscreen\"}").unwrap();
+    assert_eq!(
+        run(&with, &[tab, ("CLAUDE_CONFIG_DIR", &config_str)]),
+        "unset|unset\n",
+        "a tui under CLAUDE_CONFIG_DIR"
+    );
+}
+
 /// THE TOKEN BLOCK (DESIGN-claude-setup-token S8, §5.4): right before the twin's last line, the
 /// plain exec, which still names the build; absent for another program
 /// and where atpkg names no file.

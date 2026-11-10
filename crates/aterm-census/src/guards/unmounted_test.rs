@@ -48,11 +48,16 @@ fn unmounted_test(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for (dir, targets) in &pkgs {
         let files = owned.get(dir.as_str()).map_or(&[][..], Vec::as_slice);
         let roots = pkg_roots(dir, targets, files);
-        let libtest = reachable(tree.corpus, dir, &roots.libtest);
+        // Every libtest root is a root of some target, so what the libtest roots reach is
+        // reached again from every root; the walk goes on from there, once.
+        let mut reach = Reach::new(tree.corpus, dir);
+        reach.from(&roots.libtest);
+        let libtest = reach.files();
         if roots.all.len() == roots.libtest.len() {
             all_reach.extend(libtest.iter().cloned());
         } else {
-            all_reach.extend(reachable(tree.corpus, dir, &roots.all));
+            reach.from(&roots.all);
+            all_reach.extend(reach.files());
         }
         libtest_reach.extend(libtest);
     }
@@ -88,7 +93,7 @@ fn unmounted_test(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 /// Every `[package]` manifest under [`PRODUCT`], keyed by its package directory.
 fn load_packages(tree: &Tree<'_>, out: &mut Vec<Finding>) -> BTreeMap<String, ManifestTargets> {
     let mut pkgs = BTreeMap::new();
-    for (rel, text) in &tree.corpus.manifests {
+    for (rel, text) in tree.corpus.manifests() {
         if !PRODUCT.iter().any(|p| rel.starts_with(p)) {
             continue;
         }
@@ -174,41 +179,66 @@ fn pkg_roots(dir: &str, targets: &ManifestTargets, files: &[&SourceFile]) -> Pkg
     PkgRoots { all, libtest }
 }
 
-/// Transitive closure of files in `corpus` loaded from `roots` (`mod`, `#[path]`, `include!`).
-fn reachable(corpus: &Corpus, manifest_dir: &str, roots: &BTreeSet<String>) -> BTreeSet<String> {
-    let mut seen: BTreeSet<(String, bool)> = BTreeSet::new();
-    let mut queue: VecDeque<(String, bool)> = VecDeque::new();
-    for root in roots {
-        if corpus.get(root).is_some() && seen.insert((root.clone(), true)) {
-            queue.push_back((root.clone(), true));
+/// The transitive closure of files in a corpus that roots load (`mod`, `#[path]`, `include!`),
+/// in one package, walked on as roots are added: what a file loads depends on the file, on
+/// whether it owns its directory and on the package alone, so reaching from more roots only
+/// adds to what was reached.
+struct Reach<'a> {
+    corpus: &'a Corpus,
+    manifest_dir: &'a str,
+    /// Each file reached, and whether it was reached owning its directory.
+    seen: BTreeSet<(String, bool)>,
+}
+
+impl<'a> Reach<'a> {
+    const fn new(corpus: &'a Corpus, manifest_dir: &'a str) -> Self {
+        Self {
+            corpus,
+            manifest_dir,
+            seen: BTreeSet::new(),
         }
     }
-    while let Some((rel, dir_owner)) = queue.pop_front() {
-        let Some(file) = corpus.get(&rel) else {
-            continue;
-        };
-        for load in file.loads_in(dir_owner, Some(manifest_dir)) {
-            for child in load.files {
-                let Some(target) = corpus.get(&child) else {
-                    continue;
-                };
-                let child_owner = match load.kind {
-                    LoadKind::Mod => target.name() == "mod.rs",
-                    LoadKind::PathMod => true,
-                    LoadKind::Include => dir_owner,
-                };
-                if seen.insert((child.clone(), child_owner)) {
-                    queue.push_back((child, child_owner));
+
+    /// Reach on from `roots`, each owning its directory.
+    fn from(&mut self, roots: &BTreeSet<String>) {
+        let corpus = self.corpus;
+        let mut queue: VecDeque<(String, bool)> = VecDeque::new();
+        for root in roots {
+            if corpus.get(root).is_some() && self.seen.insert((root.clone(), true)) {
+                queue.push_back((root.clone(), true));
+            }
+        }
+        while let Some((rel, dir_owner)) = queue.pop_front() {
+            let Some(file) = corpus.get(&rel) else {
+                continue;
+            };
+            for load in file.loads_in(dir_owner, Some(self.manifest_dir)) {
+                for child in load.files {
+                    let Some(target) = corpus.get(&child) else {
+                        continue;
+                    };
+                    let child_owner = match load.kind {
+                        LoadKind::Mod => target.name() == "mod.rs",
+                        LoadKind::PathMod => true,
+                        LoadKind::Include => dir_owner,
+                    };
+                    if self.seen.insert((child.clone(), child_owner)) {
+                        queue.push_back((child, child_owner));
+                    }
                 }
             }
         }
     }
-    seen.into_iter().map(|(rel, _)| rel).collect()
+
+    /// Every file reached so far.
+    fn files(&self) -> BTreeSet<String> {
+        self.seen.iter().map(|(rel, _)| rel.clone()).collect()
+    }
 }
 
 /// First 1-based line carrying a `#[test]` attribute in the CODE view (outside strings/comments).
 fn first_test_attr_line(file: &SourceFile) -> Option<usize> {
-    if !file.raw.contains("test") {
+    if !file.raw().contains("test") {
         return None;
     }
     file.lines()

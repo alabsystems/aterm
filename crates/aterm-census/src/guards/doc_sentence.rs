@@ -59,7 +59,7 @@ fn doc_sentence(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         if !file.mentions(&["//"]) {
             continue;
         }
-        let raw: Vec<&str> = file.raw.lines().collect();
+        let raw: Vec<&str> = file.raw().lines().collect();
         let marker = |no: usize| {
             let line = raw.get(no.wrapping_sub(1))?.trim_start();
             ["///", "//!", "//"]
@@ -70,9 +70,20 @@ fn doc_sentence(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         let (mut fenced, mut safety, mut just_opened) = (false, false, false);
         let mut first_in_fence: Vec<&str> = Vec::new();
         let mut paragraph = String::new();
-        for line in file.lines() {
-            let code_free = line.text.trim().is_empty();
-            let Some(own) = code_free.then(|| marker(line.no)).flatten() else {
+        let text = &file.lexed().text;
+        for (at, line) in raw.iter().enumerate() {
+            let line = Line {
+                no: at + 1,
+                raw: line,
+            };
+            // A comment's own line opens on its marker, and the TEXT view, which blanks the
+            // comment, holds nothing else there: it is read only on a line that opens so, from
+            // the line break both views share.
+            let own = marker(line.no).filter(|_| {
+                let start = line.raw.as_ptr().addr() - file.raw().as_ptr().addr();
+                blank(text[start..].lines().next().unwrap_or_default())
+            });
+            let Some(own) = own else {
                 (fenced, safety, just_opened) = (false, false, false);
                 first_in_fence.clear();
                 paragraph.clear();
@@ -146,6 +157,24 @@ fn doc_sentence(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                 ));
             }
         }
+    }
+}
+
+/// One line of a file as it was written, 1-based.
+struct Line<'a> {
+    no: usize,
+    raw: &'a str,
+}
+
+/// Whether `s` is white space throughout (`str::trim_start` leaves nothing of it), read a byte
+/// at a time while it is ASCII.
+fn blank(s: &str) -> bool {
+    match s
+        .bytes()
+        .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\x0B' | b'\x0C' | b'\r'))
+    {
+        None => true,
+        Some(at) => s.as_bytes()[at] >= 0x80 && s[at..].trim_start().is_empty(),
     }
 }
 
@@ -459,5 +488,21 @@ mod tests {
             found[9].detail,
             "a comment ends mid-sentence: `…127.0.0.1:9\".into()`"
         );
+    }
+
+    /// A comment's own line may open on any white space, ASCII or not, and is read; a line of
+    /// a literal that only looks like one is not.
+    #[test]
+    fn a_comment_indented_by_unicode_space_is_read() {
+        let at = "crates/x/src/lib.rs";
+        let cut = "fn a() {}\n\u{3000}// The vault and\nfn b() {}\n";
+        assert_eq!(
+            spots(&run(&DOC_SENTENCE, &[(at, cut)])),
+            [format!("{at}:2")]
+        );
+        let whole = "fn a() {}\n\u{3000}// The vault.\nfn b() {}\n";
+        assert!(run(&DOC_SENTENCE, &[(at, whole)]).is_empty());
+        let literal = "const S: &str = \"\n\u{3000}// The vault and\n\";\n";
+        assert!(run(&DOC_SENTENCE, &[(at, literal)]).is_empty());
     }
 }

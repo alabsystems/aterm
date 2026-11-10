@@ -5,6 +5,7 @@
 //! grant budget, machine-name, credential or provider-login authority. Network
 //! exclusions pause replication; local reads and offline edits remain available.
 
+use super::publication::{Completion, Condition, Destination, Pending};
 use crate::{
     Error, Result,
     catalog::Descriptor,
@@ -23,6 +24,11 @@ use crate::documents::{application, log::Log};
 pub(crate) mod command;
 
 const MAX_PAYLOAD: usize = 64 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static CHAIN_MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
 
 fn descriptor(bootstrap: &Bootstrap) -> Result<Descriptor> {
     Descriptor::application(bootstrap.trust(), "accounts", "proposals", 1)
@@ -67,6 +73,64 @@ impl Proposals {
             ),
             None => crate::documents::application::observe_store(&self.paths, descriptor, read),
         }
+    }
+
+    /// Capture the identity of an already declared proposal table and this
+    /// writer incarnation. This observation creates no publication authority.
+    pub fn publication_destination(&self) -> Result<Destination> {
+        let read =
+            |session: &Session<'_>, _: &Store, scope| Destination::observed(scope, session.actor());
+        match self.deadline {
+            Some(deadline) => {
+                application::observe_store_until(&self.paths, descriptor, deadline, read)
+            }
+            None => application::observe_store(&self.paths, descriptor, read),
+        }
+    }
+
+    /// Deliver the exact retained description command. A changed destination
+    /// or writer refuses before opening the table for mutation. Exact retries
+    /// use the original application receipt, including after a lost reply.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbPublicationChain",
+            action = "Scenario",
+            reason = "The environment selects retained, missing, conflicting or superseded history."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbPublicationChain",
+            action = "Check",
+            project = "aterm_db::accounts::proposals::chain_tests::transition"
+        )
+    )]
+    pub fn deliver_publication(&self, pending: &Pending) -> Result<Completion> {
+        let command = pending.validate()?;
+        let deadline = self.deadline.unwrap_or_else(crate::admission::deadline);
+        let receipt = application::with_store_guarded_until(
+            &self.paths,
+            false,
+            descriptor,
+            deadline,
+            |session, _, descriptor| {
+                if !pending
+                    .destination()
+                    .matches(descriptor.scope, session.actor())?
+                {
+                    return Err(Error::new("publication destination or writer changed"));
+                }
+                Ok(())
+            },
+            |session, store, scope| {
+                conditional_write(session, store, scope, &command, |log, change| {
+                    publication_expected(log, session.actor(), pending.condition(), change)
+                })
+            },
+        )?;
+        Ok(Completion::admitted(pending, receipt.id))
     }
     /// [`Self::snapshot`] where the proposal table is declared here: `None` where nothing declared
     /// it, this Mac having set up no account catalog, and every other failure remains an error.
@@ -239,33 +303,8 @@ impl Proposals {
                 value: Some(value),
             }],
         };
-        let payload = encode(&command)?;
         self.with_store(false, |session, store, scope| {
-            session.writer()?;
-            let log = Log::read_with(session, store, scope, decode)?;
-            log.writable(session.actor())?;
-            if let Some(id) = log.retry(session.actor(), &command)? {
-                return receipt(session, store, &id);
-            }
-            if !log.history_complete() {
-                return Err(Error::new(
-                    "conditional proposal write needs complete retained history",
-                ));
-            }
-            let cell = log.project_cell(collection, key);
-            let matches = match (cell.as_ref(), expected) {
-                (None, None) => true,
-                (Some(cell), Some(expected)) => {
-                    !cell.stopped
-                        && cell.candidates.len() == 1
-                        && cell.candidates[0].operation == expected
-                }
-                _ => false,
-            };
-            if !matches {
-                return Err(Error::new("metadata candidate changed before replacement"));
-            }
-            application::append(session, store, &payload)
+            conditional_write(session, store, scope, &command, |_, _| Ok(expected))
         })
     }
     /// Append an exact compensating edit while every affected key still has the
@@ -299,6 +338,100 @@ impl Proposals {
             None => {
                 crate::documents::application::with_store(&self.paths, create, descriptor, action)
             }
+        }
+    }
+}
+
+fn conditional_write(
+    session: &Session<'_>,
+    store: &mut Store,
+    scope: Scope,
+    command: &Command,
+    expected: impl FnOnce(&Log, &Change) -> Result<Option<Digest>>,
+) -> Result<Receipt> {
+    let Command::Write { changes, .. } = command else {
+        return Err(Error::new("conditional proposal needs a write"));
+    };
+    let [change] = changes.as_slice() else {
+        return Err(Error::new("conditional proposal needs one description"));
+    };
+    let payload = encode(command)?;
+    session.writer()?;
+    let log = Log::read_with(session, store, scope, decode)?;
+    #[cfg(test)]
+    let retry_first = CHAIN_MUTANT.get() != 3;
+    #[cfg(not(test))]
+    let retry_first = true;
+    if retry_first && let Some(id) = log.retry(session.actor(), command)? {
+        return receipt(session, store, &id);
+    }
+    log.writable(session.actor())?;
+    if !log.history_complete() {
+        return Err(Error::new(
+            "conditional proposal write needs complete retained history",
+        ));
+    }
+    let expected = expected(&log, change)?;
+    let cell = log.project_cell(&change.collection, &change.key);
+    let matches = match (cell.as_ref(), expected) {
+        (None, None) => true,
+        (Some(cell), Some(expected)) => {
+            !cell.stopped && cell.candidates.len() == 1 && cell.candidates[0].operation == expected
+        }
+        _ => false,
+    };
+    #[cfg(test)]
+    let matches = matches || CHAIN_MUTANT.get() == 1;
+    if !matches {
+        return Err(Error::new("metadata candidate changed before replacement"));
+    }
+    #[cfg(test)]
+    if !retry_first && let Some(id) = log.retry(session.actor(), command)? {
+        return receipt(session, store, &id);
+    }
+    application::append(session, store, &payload)
+}
+
+fn publication_expected(
+    log: &Log,
+    actor: astream_wire::sync::Actor,
+    condition: &Condition,
+    change: &Change,
+) -> Result<Option<Digest>> {
+    use crate::database::decode_hex;
+    match condition {
+        Condition::NeverUsed => Ok(None),
+        Condition::Existing { operation } => Ok(Some(decode_hex(operation)?)),
+        Condition::After {
+            request,
+            command_sha256,
+        } => {
+            let expected: Digest = decode_hex(command_sha256)?;
+            let Some((id, predecessor)) =
+                log.resolve_request(actor, decode_hex(request)?, |old| {
+                    let matches = aterm_digest::Sha256::digest(&old.encode()?) == expected;
+                    #[cfg(test)]
+                    let matches = matches || CHAIN_MUTANT.get() == 2;
+                    Ok(matches)
+                })?
+            else {
+                return Err(Error::new("publication predecessor is not retained"));
+            };
+            let Command::Write { changes, .. } = predecessor else {
+                return Err(Error::new("publication predecessor is not a put"));
+            };
+            let [previous] = changes.as_slice() else {
+                return Err(Error::new("publication predecessor needs one description"));
+            };
+            if previous.value.is_none()
+                || previous.collection != change.collection
+                || previous.key != change.key
+            {
+                return Err(Error::new(
+                    "publication predecessor names another description",
+                ));
+            }
+            Ok(Some(id))
         }
     }
 }
@@ -358,3 +491,7 @@ mod frontier_tests;
 #[cfg(test)]
 #[path = "proposals/conditional_tests.rs"]
 mod conditional_tests;
+
+#[cfg(test)]
+#[path = "proposals/chain_tests.rs"]
+mod chain_tests;

@@ -336,11 +336,13 @@ fn subscription_display_checks_the_canonical_identity_of_a_login_alias() {
             aterm_json::to_string(&value).unwrap(),
         )
         .unwrap();
+        // The default home's profile is what the process runs on: an address that is not the
+        // row's identity is still shown, as the account observed, never as the row's.
         let displayed = subscription_for(&env, root.path(), &records, Some(&roster), 1_792_050_000);
-        assert_eq!(displayed.is_some(), email == "canonical@example.test");
-        if let Some(displayed) = displayed {
-            assert_eq!(displayed.email.as_deref(), Some(email));
-        }
+        assert_eq!(
+            displayed.and_then(|shown| shown.email).as_deref(),
+            Some(email)
+        );
     }
 }
 
@@ -391,7 +393,11 @@ fn subscription_shared_profile_is_bound_to_the_captured_secure_storage_login() {
     assert!(read(&second_env, Some(&roster)).is_none());
 
     write("second@example.com");
-    assert!(read(&first_env, Some(&roster)).is_none());
+    assert_eq!(
+        read(&first_env, Some(&roster)).unwrap().email.as_deref(),
+        Some("second@example.com"),
+        "the default home's process runs on what its profile names, not on the believed row"
+    );
     assert_eq!(
         read(&second_env, Some(&roster)).unwrap().email.as_deref(),
         Some("second@example.com")
@@ -629,9 +635,12 @@ fn plan_usage_selection() {
     let stranger = Roster {
         rows: vec![row(Some("someone-else@example.com"))],
     };
+    // The default home's profile is the process's own account even where the believed row
+    // names another address: observation beats belief.
+    assert!(read(Some(&stranger), now, None).is_some());
+    assert!(subscription_for(&env, root.path(), &records, Some(&stranger), now).is_some());
     for (roster, why) in [
         (Some(&several), "a shared default home with several logins"),
-        (Some(&stranger), "an address the roster does not bind"),
         (None, "an unread roster"),
     ] {
         assert_eq!(read(roster, now, None), None, "{why}");

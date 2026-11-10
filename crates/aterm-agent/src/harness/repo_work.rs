@@ -1331,7 +1331,9 @@ fn branch_unborn(root: &Path, reads: &Reads<'_>) -> bool {
 /// (`git -c status.renames=false status --porcelain=v1 -z --untracked-files=normal`),
 /// with the person's excludes as their own `git status` reads them, without each
 /// submodule whose checkout only lags its record ([`without_lagging_submodules`]),
-/// and the `core.excludesFile=` setting it passed. It runs offline
+/// and the `core.excludesFile=` setting it passed. It reads the repository's index through a
+/// refreshed private copy where one can be made ([`private_index`]), and through the
+/// repository's own otherwise, or where the copy did not stand through the read. It runs offline
 /// ([`git_offline`]) and finds no rename, so it never needs an object a partial
 /// clone lacks: a move reads as its two paths, one deleted and one added. Names in
 /// bytes that are no UTF-8 are decoded lossily, as [`git_lossy`]'s are. `None`,
@@ -1351,21 +1353,248 @@ fn work_status(
         status_args.extend(["-c", flag]);
     }
     status_args.extend(["status", "--porcelain=v1", "-z", "--untracked-files=normal"]);
-    let Some(status) = run_git_bytes(
-        root,
-        &status_args,
-        reads,
-        false,
-        true,
-        None,
-        Diagnostics::Permit,
-    ) else {
+    let read = |index: Option<&Path>| {
+        run_git_bytes(
+            root,
+            &status_args,
+            reads,
+            false,
+            true,
+            None,
+            Diagnostics::Permit,
+            index,
+        )
+    };
+    #[cfg(unix)]
+    let private = private_index(root, reads).and_then(|copy| {
+        #[cfg(test)]
+        index_seam::before_status(&copy.path);
+        read(Some(&copy.path)).filter(|_| copy.stands())
+    });
+    #[cfg(not(unix))]
+    let private = None;
+    #[cfg(all(test, unix))]
+    index_seam::answered(private.is_some());
+    let Some(status) = private.or_else(|| read(None)) else {
         reads.cut.set(true);
         return None;
     };
     let status = String::from_utf8_lossy(&status);
     let status = without_lagging_submodules(root, &status, excludes.as_deref(), reads);
     Some((status, excludes))
+}
+
+/// The most copies [`private_index`] keeps: past it the copy refreshed longest ago goes first.
+#[cfg(unix)]
+const PRIVATE_INDEXES: usize = 256;
+
+/// What [`private_index`] hands [`work_status`]: the copy, and which file it was then.
+#[cfg(unix)]
+struct PrivateIndex {
+    path: PathBuf,
+    file: (u64, u64),
+}
+
+#[cfg(unix)]
+impl PrivateIndex {
+    /// Whether [`Self::path`] is still the file it was when handed out: a sweep
+    /// ([`sweep_private_indexes`]) that let it go before git opened it leaves git no index, which
+    /// it reads as an empty one, every tracked file then new.
+    fn stands(&self) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|meta| (meta.dev(), meta.ino()) == self.file)
+    }
+}
+
+/// Where [`private_index`] keeps its copies: aterm's `git-index` cache, under a test binary's
+/// own root in a test ([`aterm_uds::test_binary::scratch_root`]).
+#[cfg(unix)]
+fn private_index_folder() -> Option<PathBuf> {
+    aterm_uds::test_binary::scratch_root()
+        .map(|root| root.join("git-index"))
+        .or_else(|| aterm_uds::host::host_user_cache("git-index"))
+}
+
+/// A copy of the index of the repository at `root` whose stat data git has refreshed, for
+/// [`work_status`] to read in place of the repository's own. An index written in the same second
+/// as files it lists (a clone's, a checkout's) leaves each of them racily clean: git compares
+/// those times to the second, so it reads and hashes each such file at every status, and no read
+/// here writes the refreshed index back (`GIT_OPTIONAL_LOCKS=0`, so a person's own git never meets
+/// a lock of ours). One checkout of 9,829 such files read 100 MB at every status, and a home of 60
+/// checkouts 574 MB and 10 s of CPU at each of its reads, every 12 minutes (Linux arm64,
+/// 2026-11-09); a status of the copy read 34 KB. The copy keeps the source's modification time,
+/// so the one refresh (`update-index --refresh --force-write-index`, the split index written
+/// whole) checks those files' contents as a status would, then writes the copy later than every
+/// file it lists. The refresh writes no untracked cache, whose folder records the later time
+/// would trust as a status of the source would not, and keeps every skip-worktree bit, which a
+/// status of the source clears for a present file only as it reads. It is named by the source's path and its identity, length and times, so a
+/// moved index is copied again, and kept only where those tell apart every later state of the
+/// index ([`aterm_uds::private_file::stamp_settled`]: its last change a second before the read,
+/// on a volume whose times this kernel sets); it is renamed into place only once refreshed.
+/// `None`, the repository's own index read as before, where the index cannot be found, read,
+/// copied or refreshed, changed within that second or lies on another kind of volume, or the
+/// cache folder cannot be made private.
+#[cfg(unix)]
+fn private_index(root: &Path, reads: &Reads<'_>) -> Option<PrivateIndex> {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    static TEMPORARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stamp = |meta: &std::fs::Metadata| {
+        format!(
+            "{} {} {} {}.{} {}.{}",
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec()
+        )
+    };
+    let digest = |bytes: &[u8]| {
+        aterm_digest::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    #[cfg(test)]
+    let settle = index_seam::settle();
+    #[cfg(not(test))]
+    let settle = aterm_uds::private_file::SETTLE;
+    let named = git(root, &["rev-parse", "--git-path", "index"], reads)?;
+    let source = root.join(named.trim_end_matches(['\n', '\r']));
+    let began = std::time::SystemTime::now();
+    let mut file = std::fs::File::open(&source).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let id = digest(source.as_os_str().as_bytes()).get(..32)?.to_owned();
+    let state = digest(stamp(&meta).as_bytes()).get(..16)?.to_owned();
+    let folder = private_index_folder()?;
+    let name = format!("{id}-{state}.index");
+    let path = folder.join(&name);
+    let handed = |path: PathBuf| {
+        let held = std::fs::symlink_metadata(&path).ok()?;
+        held.is_file().then(|| PrivateIndex {
+            file: (held.dev(), held.ino()),
+            path,
+        })
+    };
+    if let Some(copy) = handed(path.clone()) {
+        return Some(copy);
+    }
+    if !aterm_uds::private_file::stamp_settled(&file, &meta, began, settle) {
+        return None;
+    }
+    std::fs::create_dir_all(folder.parent()?).ok()?;
+    aterm_uds::private_file::ensure_private_dir(&folder).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    // The bytes are the file the name says only where nothing wrote it during the read.
+    if file.metadata().ok().map(|now| stamp(&now)) != Some(stamp(&meta)) {
+        return None;
+    }
+    let temporary = format!(
+        "{id}-{state}.{}.{}.tmp",
+        std::process::id(),
+        TEMPORARY.fetch_add(1, Ordering::Relaxed)
+    );
+    let at = folder.join(&temporary);
+    // Written under its own name, which no other read takes, and left for git to rewrite: no
+    // writer's temporary of its own that a kill would leave past the sweep's names.
+    let refreshed = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&at)
+        .and_then(|mut copy| {
+            copy.write_all(&bytes)?;
+            copy.set_modified(meta.modified()?)
+        })
+        .is_ok()
+        && run_git_bytes(
+            root,
+            &[
+                "-c",
+                "core.splitIndex=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "sparse.expectFilesOutsideOfPatterns=true",
+                "update-index",
+                "-q",
+                "--unmerged",
+                "--ignore-missing",
+                "--refresh",
+                "--force-write-index",
+            ],
+            reads,
+            false,
+            true,
+            None,
+            Diagnostics::Permit,
+            Some(&at),
+        )
+        .is_some()
+        && std::fs::rename(&at, &path).is_ok();
+    if !refreshed {
+        let _ = std::fs::remove_file(&at);
+        let _ = std::fs::remove_file(folder.join(format!("{temporary}.lock")));
+        return None;
+    }
+    sweep_private_indexes(&folder, &id, &name);
+    handed(path)
+}
+
+/// Let go of what [`private_index`] keeps in `folder` that the copy `kept`, of the index `id`
+/// names, leaves behind: that index's copies of earlier states, temporaries unchanged for an hour
+/// (a read that ended before it renamed its copy into place), and past [`PRIVATE_INDEXES`] the
+/// copies refreshed longest ago. Each is aged by its change time, which no writer sets: a
+/// temporary carries its source's modification time, often hours old, so a sweep that went by it
+/// would let go of another read's temporary mid-refresh, and git refresh the missing file into an
+/// empty index, every tracked file deleted.
+#[cfg(unix)]
+fn sweep_private_indexes(folder: &Path, id: &str, kept: &str) {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        });
+    let earlier = format!("{id}-");
+    let mut copies = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|name| *name != kept) else {
+            continue;
+        };
+        let Ok(changed) = entry
+            .metadata()
+            .map(|meta| (meta.ctime(), meta.ctime_nsec()))
+        else {
+            continue;
+        };
+        if name.ends_with(".index") && name.starts_with(&earlier) {
+            let _ = std::fs::remove_file(entry.path());
+        } else if name.ends_with(".index") {
+            copies.push((changed, entry.path()));
+        } else if (name.ends_with(".tmp") || name.ends_with(".tmp.lock"))
+            && now.saturating_sub(changed.0) >= 60 * 60
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    copies.sort();
+    let over = (copies.len() + 1).saturating_sub(PRIVATE_INDEXES);
+    for (_, path) in copies.into_iter().take(over) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Whether a `git status --porcelain=v1 -z` entry's two-letter `code` renames or copies, in the
@@ -2599,7 +2828,7 @@ fn git_lossy(
     reads: &Reads<'_>,
     diagnostics: Diagnostics,
 ) -> Option<String> {
-    run_git_bytes(dir, args, reads, false, false, None, diagnostics)
+    run_git_bytes(dir, args, reads, false, false, None, diagnostics, None)
         .map(|out| String::from_utf8_lossy(&out).into_owned())
 }
 
@@ -2703,7 +2932,7 @@ fn run_git(
     feed: Option<std::fs::File>,
     diagnostics: Diagnostics,
 ) -> Option<String> {
-    run_git_bytes(dir, args, reads, global, offline, feed, diagnostics)
+    run_git_bytes(dir, args, reads, global, offline, feed, diagnostics, None)
         .and_then(|out| String::from_utf8(out).ok())
 }
 
@@ -2712,7 +2941,9 @@ fn run_git(
 /// set where the read did not start before its deadline or while new starts
 /// are held back ([`Reads::held`]), could not be made or was cut off, a signal
 /// ended it, git could not open a directory, or git refused a read that must
-/// answer ([`Diagnostics::Answer`]).
+/// answer ([`Diagnostics::Answer`]). With `index`, git reads and writes that file in place of the
+/// repository's index (`GIT_INDEX_FILE`, [`private_index`]).
+#[allow(clippy::too_many_arguments)]
 fn run_git_bytes(
     dir: &Path,
     args: &[&str],
@@ -2721,6 +2952,7 @@ fn run_git_bytes(
     offline: bool,
     feed: Option<std::fs::File>,
     diagnostics: Diagnostics,
+    index: Option<&Path>,
 ) -> Option<Vec<u8>> {
     let deadline = reads.deadline.get();
     #[cfg(test)]
@@ -2769,9 +3001,12 @@ fn run_git_bytes(
     if offline {
         cmd.env("GIT_NO_LAZY_FETCH", "1");
     }
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
     // A test's memoized read ([`read_memo`]).
     #[cfg(test)]
-    let memo = read_memo::read(dir, args, reads, global, offline, feed.as_ref());
+    let memo = read_memo::read(dir, args, reads, global, offline, feed.as_ref(), index);
     let stdin = feed.map_or_else(
         aterm_uds::spawnfd::Stdio::null,
         aterm_uds::spawnfd::Stdio::from,
@@ -2901,6 +3136,77 @@ fn git_to_run(
     Some(std::path::PathBuf::from(aterm_uds::os_path!("git")))
 }
 
+/// [`private_index`]'s seams for this thread's reads (tests): how old an index's last change must
+/// be for a copy of it to be kept (none unless a test sets one, so a test's reads take a copy from
+/// the first, however soon after the index changed, and each makes the same gits whenever it
+/// runs), what runs between a copy's handing out and its status, and whether the last
+/// [`work_status`] was answered by a copy.
+#[cfg(all(test, unix))]
+pub(crate) mod index_seam {
+    use std::cell::{Cell, RefCell};
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// What runs with a copy's path before its status.
+    type Hook = Box<dyn FnMut(&Path)>;
+
+    std::thread_local! {
+        static SETTLE: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static BEFORE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static ANSWERED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// Until the guard it returns drops, this thread's reads keep a copy only of an index whose
+    /// last change is `settle` old.
+    pub(crate) fn set_settle(settle: Duration) -> Reset {
+        SETTLE.with(|s| s.set(settle));
+        Reset(())
+    }
+
+    /// Until the guard it returns drops, `hook` runs with each copy's path before its status.
+    pub(crate) fn set_before_status(hook: impl FnMut(&Path) + 'static) -> Reset {
+        BEFORE.with(|b| *b.borrow_mut() = Some(Box::new(hook)));
+        Reset(())
+    }
+
+    /// Whether the last [`super::work_status`] on this thread was answered by a copy (`None`:
+    /// none has asked since the thread began).
+    pub(crate) fn copy_answered() -> Option<bool> {
+        ANSWERED.with(Cell::get)
+    }
+
+    /// No settle and no hook again once dropped.
+    pub(crate) struct Reset(());
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SETTLE.with(|s| s.set(Duration::ZERO));
+            BEFORE.with(|b| *b.borrow_mut() = None);
+        }
+    }
+
+    /// This thread's settle.
+    pub(super) fn settle() -> Duration {
+        SETTLE.with(Cell::get)
+    }
+
+    /// Run this thread's hook, if one is set, with the copy at `path`.
+    pub(super) fn before_status(path: &Path) {
+        let hook = BEFORE.with(|b| b.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(path);
+            BEFORE.with(|b| {
+                b.borrow_mut().get_or_insert(hook);
+            });
+        }
+    }
+
+    /// Note whether a copy answered this [`super::work_status`].
+    pub(super) fn answered(by_copy: bool) {
+        ANSWERED.with(|a| a.set(Some(by_copy)));
+    }
+}
+
 /// A starved `git` for this thread's probes (tests).
 #[cfg(test)]
 pub(crate) mod read_stall {
@@ -2986,7 +3292,8 @@ pub(crate) mod read_memo {
     use std::process::Output;
 
     /// What a read's `git` is: its folder, arguments, global and offline settings, home,
-    /// `XDG_CONFIG_HOME` and the bytes fed to its standard input.
+    /// `XDG_CONFIG_HOME`, the bytes fed to its standard input and the index it reads in place of
+    /// the repository's.
     pub(super) type Key = (
         PathBuf,
         Vec<String>,
@@ -2995,6 +3302,7 @@ pub(crate) mod read_memo {
         PathBuf,
         Option<PathBuf>,
         Option<Vec<u8>>,
+        Option<PathBuf>,
     );
 
     /// How a read meets this thread's memo.
@@ -3072,6 +3380,7 @@ pub(crate) mod read_memo {
         global: bool,
         offline: bool,
         feed: Option<&std::fs::File>,
+        index: Option<&Path>,
     ) -> Read {
         if MEMORY.with(|m| m.borrow().is_none()) {
             return Read::Off;
@@ -3089,6 +3398,7 @@ pub(crate) mod read_memo {
             reads.home.to_path_buf(),
             reads.xdg.map(Path::to_path_buf),
             fed,
+            index.map(Path::to_path_buf),
         ))
     }
 

@@ -219,7 +219,9 @@ fn an_untold_move_remains_with_its_origin() {
         account_land(&idle.sid, &idle.kept, &idle.hooks, Landing::Asked),
         Applied::Yes
     );
-    let look = idle.account_look(&a.roster()).unwrap();
+    let look = idle
+        .account_look(&(idle.hooks.acts.account_seat)().unwrap(), &a.roster())
+        .unwrap();
     let mut foreign = a.seat();
     foreign.state = a.tmp.path().join("foreign");
     assert_eq!(

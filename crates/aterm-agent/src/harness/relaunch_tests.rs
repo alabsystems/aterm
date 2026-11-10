@@ -430,6 +430,10 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
         "failed:no-resume",
         "failed:relaunch:ERR-busy",
         "wait:tab-ownership-changed",
+        "wait:native-crash-observation",
+        "wait:native-unknown",
+        "wait:native-unsaved",
+        "wait:native-unresolved-operation",
     ] {
         assert_eq!(outcome(step), Outcome::NotYet(step.to_string()), "{step}");
     }
@@ -446,23 +450,37 @@ fn account_admission_waits_preserve_the_pending_relaunch_and_its_failure_history
                 retry.attempted(&Outcome::NotYet("wait:shell-prompt".into()), now);
             }
             let before = retry.clone();
-            for n in 0..12 {
-                let result = outcome(match n % 3 {
+            for n in 0..24 {
+                let result = outcome(match n % 8 {
                     0 => WAIT_ACCOUNT,
                     1 => WAIT_NATIVE_UNISSUED,
-                    _ => super::super::native_restart::WAIT_RETIRED_UNISSUED,
+                    2 => super::super::native_restart::WAIT_RETIRED_UNISSUED,
+                    3 => super::super::native_restart::WAIT_LAPSED,
+                    4 => super::super::native_restart::WAIT_UNADMITTED,
+                    5 => "wait:native-cancelled",
+                    6 => "wait:native-cancelled-before-mutation",
+                    _ => "wait:native-aborted-before-signal",
                 });
                 assert_eq!(result, Outcome::Busy);
                 assert_eq!(retry.attempted(&result, now), Say::Nothing);
                 assert_eq!(retry.attempted_at_keys(&result, now), Say::Nothing);
                 assert_eq!(retry, before, "{decision:?}: preserve every field");
             }
-            let mut old = before.clone();
-            old.attempted(&Outcome::NotYet("wait:account".into()), now);
-            assert_ne!(
-                old, before,
-                "negative control: the old classification counts a failure"
-            );
+            for word in [
+                WAIT_ACCOUNT,
+                super::super::native_restart::WAIT_LAPSED,
+                super::super::native_restart::WAIT_UNADMITTED,
+                "wait:native-cancelled",
+                "wait:native-cancelled-before-mutation",
+                "wait:native-aborted-before-signal",
+            ] {
+                let mut old = before.clone();
+                old.attempted(&Outcome::NotYet(word.into()), now);
+                assert_ne!(
+                    old, before,
+                    "negative control: the old classification counts {word} as a failure"
+                );
+            }
             retry.attempted(&Outcome::Relaunched, now);
             assert!(
                 !retry.pending(),

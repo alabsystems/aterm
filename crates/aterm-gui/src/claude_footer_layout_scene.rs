@@ -320,8 +320,6 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
             face: KeyFace::default(),
             cell: (cw, ch),
             clip: aterm_core::render::PxRect::EVERYWHERE,
-            mark_hover: false,
-            title_gen: 0,
         };
         layouts.footers[i].session = i as u64 + 1;
         let top = layouts.footers[i].compose_top(key, &[], &mut layouts.marks, &mut layouts.rings);

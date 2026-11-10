@@ -24,6 +24,8 @@
 //! every key: the mark guards against mistakes, and the three built-in addresses are refused at
 //! decode on every replica.
 
+pub use crate::database::legacy::{is_always_protected_email, storage_key, validate_email_record};
+use crate::database::legacy::{sensitive_field, with_normalized_phone_key};
 use crate::{
     Error, Result, crypto,
     database::{
@@ -34,6 +36,7 @@ use crate::{
     network::{self, while_busy},
 };
 use aterm_codec::hex;
+#[cfg(test)]
 use aterm_digest::Sha256;
 use aterm_json::{Map, Value, json};
 use std::{
@@ -55,26 +58,6 @@ const HAS_PASSWORD: &str = "1";
 
 /// Maximum encoded JSON command payload size per `commit_batch` operation (well below `MAX_COMMAND_BYTES`).
 const MAX_BATCH_BYTES: usize = 48 * 1024;
-
-/// SHA-256 digests of the 3 personal email addresses that must always remain `protected: true`
-/// and never store a password in any operation.
-const PROTECTED_EMAIL_DIGESTS: [[u8; 32]; 3] = [
-    [
-        0x45, 0x1d, 0xba, 0x8f, 0x26, 0x17, 0x58, 0xf5, 0x48, 0x6f, 0x3e, 0x97, 0x35, 0xec, 0xe9,
-        0x08, 0xe6, 0xe7, 0xcb, 0xcf, 0xd6, 0x7d, 0x79, 0x55, 0xbd, 0x31, 0x99, 0x04, 0xa4, 0xb9,
-        0x18, 0x3e,
-    ],
-    [
-        0x69, 0x77, 0x11, 0xa4, 0x89, 0x55, 0xca, 0xfd, 0x0a, 0xad, 0x70, 0xe2, 0xb4, 0x04, 0xd6,
-        0x0c, 0xf3, 0xb9, 0x94, 0xe2, 0xe3, 0x8b, 0xd2, 0x22, 0x1b, 0xbd, 0xeb, 0x78, 0xbf, 0xd5,
-        0xc2, 0x0b,
-    ],
-    [
-        0x6a, 0xe3, 0x1e, 0xb5, 0x38, 0xf4, 0x7c, 0x79, 0xac, 0xcd, 0x2a, 0x37, 0x58, 0x3c, 0x7c,
-        0xb1, 0xc7, 0xa5, 0x49, 0x29, 0x57, 0x5a, 0x5e, 0x3f, 0x9b, 0x49, 0x71, 0xac, 0x1d, 0xbd,
-        0xb4, 0x8f,
-    ],
-];
 
 /// Logical table names exposed to users and callers.
 pub const TABLES: &[&str] = &["computers", "emails", "phones", "ai_accounts"];
@@ -163,35 +146,6 @@ fn digits_only(raw: &str) -> String {
     d
 }
 
-fn with_normalized_phone_key<R>(raw: &str, f: impl FnOnce(&str) -> R) -> R {
-    let trimmed = raw.trim();
-    let mut digits = [0u8; 12];
-    let mut len = 0;
-    for b in trimmed.bytes().filter(u8::is_ascii_digit) {
-        if len == digits.len() {
-            return f(trimmed);
-        }
-        digits[len] = b;
-        len += 1;
-    }
-    let ten = if len == 10 {
-        Some(&digits[..10])
-    } else if len == 11 && digits[0] == b'1' {
-        Some(&digits[1..11])
-    } else {
-        None
-    };
-    if let Some(d) = ten {
-        let buf = [
-            d[0], d[1], d[2], b'-', d[3], d[4], d[5], b'-', d[6], d[7], d[8], d[9],
-        ];
-        let s = std::str::from_utf8(&buf).expect("ASCII digits and hyphens");
-        f(s)
-    } else {
-        f(trimmed)
-    }
-}
-
 /// Normalize a US 10-digit phone number to `XXX-XXX-XXXX`, leaving non-10-digit strings trimmed.
 pub fn normalize_phone_key(raw: &str) -> String {
     with_normalized_phone_key(raw, str::to_owned)
@@ -211,47 +165,6 @@ pub fn normalize_natural_key(logical_table: &str, raw: &str) -> Result<String> {
     }
 }
 
-fn sha256_ascii_lowercase(bytes: &[u8]) -> [u8; 32] {
-    if !bytes.iter().any(u8::is_ascii_uppercase) {
-        return Sha256::digest(bytes);
-    }
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 256];
-    for chunk in bytes.chunks(buf.len()) {
-        for (dst, &src) in buf[..chunk.len()].iter_mut().zip(chunk) {
-            *dst = src.to_ascii_lowercase();
-        }
-        hasher.update(&buf[..chunk.len()]);
-    }
-    hasher.finalize()
-}
-
-/// Convert a natural primary key (`m104`, `root@example.com`, `+1-555-234-5678`,
-/// `acc-001`) into a uniform `crypto::name`-safe storage key (`<prefix>-<24 hex chars>`).
-pub fn storage_key(logical_table: &str, natural_key: &str) -> Result<String> {
-    let trimmed = natural_key.trim();
-    if trimmed.is_empty() {
-        return Err(Error::new("table primary key must not be empty"));
-    }
-    let prefix = match logical_table {
-        "computers" => "mc",
-        "emails" => "em",
-        "phones" => "ph",
-        "ai_accounts" => "ac",
-        _ => "rk",
-    };
-    let digest = if logical_table == "phones" {
-        with_normalized_phone_key(trimmed, |s| sha256_ascii_lowercase(s.as_bytes()))
-    } else {
-        sha256_ascii_lowercase(trimmed.as_bytes())
-    };
-    let mut out = String::with_capacity(prefix.len() + 1 + 24);
-    out.push_str(prefix);
-    out.push('-');
-    hex::push_lower(&mut out, &digest[..12]);
-    Ok(out)
-}
-
 /// Extract the natural primary key from a stored row object, falling back to the storage key.
 pub fn natural_key_of(logical_table: &str, stored_key: &str, row: &Value) -> String {
     let field = match logical_table {
@@ -267,71 +180,6 @@ pub fn natural_key_of(logical_table: &str, stored_key: &str, row: &Value) -> Str
         .filter(|s| !s.is_empty())
         .unwrap_or(stored_key)
         .to_owned()
-}
-
-/// Return true if `email` is one of the 3 personal email addresses that must always be `protected: true`.
-pub fn is_always_protected_email(email: &str) -> bool {
-    let digest = sha256_ascii_lowercase(email.trim().as_bytes());
-    PROTECTED_EMAIL_DIGESTS.contains(&digest)
-}
-
-/// Validate a decoded `"emails"` record inside `Command::decode` so neither local writes nor
-/// remote peers can ever bypass the `protected: true` no-password invariant.
-pub fn validate_email_record(stored_key: &str, value: &Value) -> Result<()> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| Error::new("emails record must be a JSON object"))?;
-    if let Some(del) = obj.get("_deleted") {
-        if del.as_bool() == Some(true) && obj.len() == 1 {
-            return Ok(());
-        }
-        return Err(Error::new(
-            "emails tombstone must contain only \"_deleted\": true",
-        ));
-    }
-    let email = obj
-        .get("email")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::new("emails record requires string \"email\" field"))?;
-    let trimmed = email.trim();
-    if trimmed.is_empty()
-        || !trimmed.contains('@')
-        || trimmed.len() != email.len()
-        || trimmed.bytes().any(|b| b.is_ascii_uppercase())
-    {
-        return Err(Error::new(
-            "emails record requires lowercase email address containing '@'",
-        ));
-    }
-    let expected_skey = storage_key("emails", trimmed)?;
-    if stored_key != expected_skey {
-        return Err(Error::new(
-            "emails storage key does not match canonical email address",
-        ));
-    }
-    let protected = obj
-        .get("protected")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| Error::new("emails record requires boolean \"protected\" field"))?;
-    if is_always_protected_email(trimmed) && !protected {
-        return Err(Error::new(
-            "protected personal email address cannot have protected set to false",
-        ));
-    }
-    if let Some(pw) = obj.get("password")
-        && !pw.is_null()
-        && pw.as_str().is_none()
-    {
-        return Err(Error::new(
-            "emails \"password\" field must be a string or null",
-        ));
-    }
-    if protected && credential_fields(obj) {
-        return Err(Error::new(
-            "protected real email rows must not store credential fields",
-        ));
-    }
-    Ok(())
 }
 
 /// Default database directory (`~/.aterm/lab-db`), or `ATERM_LAB_DB_DIR` when set.
@@ -659,74 +507,6 @@ fn cell_is_protected_email(view: &View, skey: &str) -> bool {
                         .is_some_and(is_always_protected_email)
             })
         })
-}
-
-/// Whether a field carries credentials rather than an account identifier or secret reference.
-fn credential_field(key: &str) -> bool {
-    const SUFFIXES: &[&str] = &[
-        "password",
-        "passwords",
-        "passwd",
-        "passwds",
-        "passphrase",
-        "passphrases",
-        "secret",
-        "secrets",
-        "token",
-        "tokens",
-        "apikey",
-        "apikeys",
-        "privatekey",
-        "privatekeys",
-        "credential",
-        "credentials",
-        "authorization",
-        "authorizations",
-        "authheader",
-        "authheaders",
-        "cookie",
-        "cookies",
-        "totp",
-        "otp",
-        "seed",
-        "seeds",
-        "authenticator",
-        "recoverycode",
-        "recoverycodes",
-        "backupcode",
-        "backupcodes",
-    ];
-    let mut buf = [0u8; 16];
-    let mut start = buf.len();
-    for b in key.bytes().rev().filter(u8::is_ascii_alphanumeric).take(16) {
-        start -= 1;
-        buf[start] = b.to_ascii_lowercase();
-    }
-    let tail = &buf[start..];
-    SUFFIXES
-        .iter()
-        .any(|suffix| tail.ends_with(suffix.as_bytes()))
-}
-
-fn sensitive_field(key: &str, value: &Value) -> bool {
-    if value.is_null() || (key == "has_password" && value.as_bool().is_some()) {
-        return false;
-    }
-    credential_field(key)
-}
-
-fn credential_fields(object: &Map) -> bool {
-    object
-        .iter()
-        .any(|(key, value)| sensitive_field(key, value) || contains_credentials(value))
-}
-
-fn contains_credentials(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => credential_fields(object),
-        Value::Array(values) => values.iter().any(contains_credentials),
-        _ => false,
-    }
 }
 
 fn redacted_fields(object: &Map) -> bool {
@@ -2288,7 +2068,7 @@ pub fn serve_fleet(
     network::serve_fleet_until(
         dir,
         listener,
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        std::sync::Arc::new(aterm_uds::stop::Stop::new()),
         std::sync::Arc::new(std::sync::Mutex::new(peers)),
     )
 }
@@ -3646,14 +3426,14 @@ mod tests {
         let listener =
             aterm_uds::kept_out(|| std::net::TcpListener::bind("127.0.0.1:0")).expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stop = std::sync::Arc::new(aterm_uds::stop::Stop::new());
         let server = {
-            let (b, running) = (b.clone(), running.clone());
+            let (b, stop) = (b.clone(), stop.clone());
             std::thread::spawn(move || {
                 network::serve_fleet_until(
                     &b,
                     listener,
-                    running,
+                    stop,
                     std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 )
             })
@@ -3676,7 +3456,7 @@ mod tests {
         drop(db);
         // Once it has finished, a round carries rows as before and both values show.
         network::sync_fleet_round_with(&a, addr, &mut repair).unwrap();
-        running.store(false, std::sync::atomic::Ordering::Release);
+        stop.set();
         let _ = server.join();
         let db = Database::open(&a).unwrap();
         let rows = scan_table(&db.view(), "computers").unwrap();
@@ -3911,22 +3691,22 @@ mod tests {
         let listener =
             aterm_uds::kept_out(|| std::net::TcpListener::bind("127.0.0.1:0")).expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stop = std::sync::Arc::new(aterm_uds::stop::Stop::new());
         let server = {
-            let (a, running) = (a.clone(), running.clone());
+            let (a, stop) = (a.clone(), stop.clone());
             std::thread::spawn(move || {
                 network::serve_fleet_until(
                     &a,
                     listener,
-                    running,
+                    stop,
                     std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 )
             })
         };
         let neighbour = {
-            let (a, running) = (a.clone(), running.clone());
+            let (a, stop) = (a.clone(), stop.clone());
             std::thread::spawn(move || {
-                while running.load(std::sync::atomic::Ordering::Acquire) {
+                while !stop.is_set() {
                     let held = Database::open(&a);
                     std::thread::sleep(std::time::Duration::from_millis(2));
                     drop(held);
@@ -3935,7 +3715,7 @@ mod tests {
             })
         };
         let report = sync_peers(&b, &[addr]).unwrap();
-        running.store(false, std::sync::atomic::Ordering::Release);
+        stop.set();
         neighbour.join().unwrap();
         let _ = server.join();
 
@@ -4530,22 +4310,22 @@ mod tests {
         let listener =
             aterm_uds::kept_out(|| std::net::TcpListener::bind("127.0.0.1:0")).expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stop = std::sync::Arc::new(aterm_uds::stop::Stop::new());
         let server = {
-            let (a, running) = (a.clone(), running.clone());
+            let (a, stop) = (a.clone(), stop.clone());
             std::thread::spawn(move || {
                 network::serve_fleet_until(
                     &a,
                     listener,
-                    running,
+                    stop,
                     std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 )
             })
         };
         let neighbour = {
-            let (b, running) = (b.clone(), running.clone());
+            let (b, stop) = (b.clone(), stop.clone());
             std::thread::spawn(move || {
-                while running.load(std::sync::atomic::Ordering::Acquire) {
+                while !stop.is_set() {
                     let held = Database::open(&b);
                     std::thread::sleep(std::time::Duration::from_millis(2));
                     drop(held);
@@ -4554,7 +4334,7 @@ mod tests {
             })
         };
         let report = sync_peers(&b, &[addr]).unwrap();
-        running.store(false, std::sync::atomic::Ordering::Release);
+        stop.set();
         neighbour.join().unwrap();
         let _ = server.join();
 
@@ -4919,14 +4699,14 @@ mod tests {
         let listener =
             aterm_uds::kept_out(|| std::net::TcpListener::bind("127.0.0.1:0")).expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let running_srv = running.clone();
+        let stop = std::sync::Arc::new(aterm_uds::stop::Stop::new());
+        let stop_srv = stop.clone();
         let node_b_srv = node_b.clone();
         let srv = std::thread::spawn(move || {
             network::serve_fleet_until(
                 &node_b_srv,
                 listener,
-                running_srv,
+                stop_srv,
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             )
         });
@@ -4943,7 +4723,7 @@ mod tests {
         .expect("explicit-directory sync over TLS");
         assert_eq!(delegated["ok"], json!(true));
         assert_eq!(delegated["caught_up"], json!(true));
-        running.store(false, std::sync::atomic::Ordering::Release);
+        stop.set();
         let _ = srv.join();
         assert_eq!(sync_res["ok"], json!(true));
         let db_c = open_at(&node_c).expect("open node_c");

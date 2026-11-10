@@ -11,6 +11,8 @@
 //! composes it with its own operation table and an expired same-epoch deadline
 //! ([`contains_operation`]), and its `lapsed` answer with a prepare's custody stamp, a clock
 //! read before the journal and an expired deadline or another boot ([`observe_closure`]).
+//! Complete recipient histories additionally support same-boot closure when the host proves
+//! each recorded process and group retired after reading the expired deadline.
 //! Across epochs, [`reject_unadmitted`] instead commits permanent denial before absence can
 //! release an unbound recipe.
 //! The separate enrollment file detects a missing established journal; neither
@@ -28,10 +30,16 @@ use std::time::{Duration, Instant};
 
 #[path = "native_receipts_account.rs"]
 mod account;
+#[path = "native_receipts_recipients.rs"]
+mod recipients;
+#[cfg(any(test, debug_assertions))]
+#[path = "native_receipts_replay_bench.rs"]
+mod replay_bench;
 pub use account::{
     AccountObservation, AccountOutcome, AccountRelation, ClaimedState, claim_account_successor,
     fence_account_successor, observe_account_successor, recover_account_successor,
 };
+pub use recipients::{Recipient, RecipientHistory, observe_recipients};
 
 const NAME: &str = "noexec";
 const ENROLLMENT: &str = "native-noexec.enrolled";
@@ -53,7 +61,7 @@ const SUCCESSOR_FRAME: usize =
 const LIMITS: Limits = Limits {
     records: 32_768,
     bytes: 16 * 1024 * 1024,
-    record_bytes: ACCOUNT_BYTES,
+    record_bytes: recipients::BODY_BYTES,
 };
 
 type Digest = [u8; 32];
@@ -193,6 +201,17 @@ struct Entry {
     successor: Option<Digest>,
     closed_phase: Option<ImagePhase>,
     account: Option<account::Link>,
+    recipients: Option<recipients::History>,
+}
+
+impl Entry {
+    fn reservation(&self) -> (usize, usize) {
+        let (records, frame) = self.recipients.as_ref().map_or_else(
+            || (self.state.reserved(), ISSUER_FRAME),
+            |history| (history.reserved(self.state), recipients::FRAME_BYTES),
+        );
+        (records, records * frame)
+    }
 }
 
 /// A verified observation, deliberately without any reusable native capability.
@@ -227,9 +246,36 @@ struct View {
     genesis: Option<Digest>,
     sequence: u64,
     committed_bytes: usize,
+    reserved_records: usize,
+    reserved_bytes: usize,
 }
 
 impl View {
+    /// Only the named operation changes its reservation. Successor backlinks change no
+    /// reservation, so every format can maintain the aggregate through this replacement.
+    fn replace_entry(&mut self, entry: Entry) -> io::Result<()> {
+        let operation = entry.receipt.operation;
+        let before = self
+            .entries
+            .get(&operation)
+            .map_or((0, 0), Entry::reservation);
+        let after = entry.reservation();
+        let records = self
+            .reserved_records
+            .checked_sub(before.0)
+            .and_then(|n| n.checked_add(after.0))
+            .ok_or_else(invalid)?;
+        let bytes = self
+            .reserved_bytes
+            .checked_sub(before.1)
+            .and_then(|n| n.checked_add(after.1))
+            .ok_or_else(invalid)?;
+        self.entries.insert(operation, entry);
+        self.reserved_records = records;
+        self.reserved_bytes = bytes;
+        Ok(())
+    }
+
     /// The `custody=` spelling of this journal instance: SHA-256 of the public anchor and the
     /// first record's authenticated head, which carries no secret. `None` while the journal
     /// holds no record, so an absence from it proves nothing.
@@ -265,14 +311,91 @@ impl View {
             reason = "Prior issuers produced legacy receipts; current writes are bound to IssuerJournal"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "RecipientJournal",
+            action = "Prepare",
+            project = "aterm_agent::harness::native_receipts::recipients::tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "RecipientJournal",
+            action = "Forward",
+            project = "aterm_agent::harness::native_receipts::recipients::tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "RecipientJournal",
+            action = "Rollback",
+            project = "aterm_agent::harness::native_receipts::recipients::tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "RecipientJournal",
+            action = "NoExec",
+            project = "aterm_agent::harness::native_receipts::recipients::tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "RecipientJournal",
+            action = "Seal",
+            project = "aterm_agent::harness::native_receipts::recipients::tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "RecipientJournal",
+            action = "Other",
+            project = "aterm_agent::harness::native_receipts::recipients::tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "RecipientJournal",
+            action = "Legacy",
+            project = "aterm_agent::harness::native_receipts::recipients::tests::transition"
+        )
+    )]
     fn ingest(&mut self, key: &Key, body: &[u8]) -> io::Result<()> {
-        if body.starts_with(b"ANS4") || body.starts_with(b"ANF4") {
+        if body.starts_with(b"ANG5") {
+            recipients::ingest(self, key, body)?;
+        } else if body.starts_with(b"ANS4") || body.starts_with(b"ANF4") {
             account::ingest(self, key, body)?;
         } else {
             self.ingest_issuer(key, body)?;
         }
         self.genesis.get_or_insert(self.head);
+        #[cfg(test)]
+        {
+            // Check the incremental totals against the original definition on every
+            // successful transition exercised by the journal conformance models.
+            let total = self.entries.values().fold((0, 0), |sum, entry| {
+                let reserve = entry.reservation();
+                (sum.0 + reserve.0, sum.1 + reserve.1)
+            });
+            assert_eq!((self.reserved_records, self.reserved_bytes), total);
+        }
         Ok(())
+    }
+
+    fn ingest_bounded(&mut self, key: &Key, body: &[u8], limits: Limits) -> io::Result<()> {
+        self.ingest(key, body)?;
+        if self.within_capacity(limits, 0) {
+            Ok(())
+        } else {
+            Err(invalid())
+        }
     }
 
     fn ingest_issuer(&mut self, key: &Key, body: &[u8]) -> io::Result<()> {
@@ -296,6 +419,9 @@ impl View {
             capability: digest(116),
         };
         let old = self.entries.get(&receipt.operation);
+        if old.is_some_and(|entry| entry.recipients.is_some()) {
+            return Err(invalid());
+        }
         let closed_phase = if phased {
             Some(match body[148] {
                 5 => ImagePhase::Forward,
@@ -311,6 +437,7 @@ impl View {
             if old.is_some()
                 || Event::parse(body[148])? != Event::Prepare
                 || parent.state != IssuerState::NoExec
+                || parent.recipients.is_some()
                 || parent.epoch != Some(digest(149))
                 || parent.successor.is_some()
             {
@@ -359,28 +486,27 @@ impl View {
                 ISSUER_FRAME
             })
             .ok_or_else(invalid)?;
+        let operation = receipt.operation;
+        self.replace_entry(Entry {
+            receipt,
+            observed: Observed {
+                sequence: number(4),
+                recorded_ms: number(12),
+            },
+            state,
+            epoch,
+            predecessor,
+            successor: retained_successor,
+            closed_phase,
+            account,
+            recipients: None,
+        })?;
         if successor {
             self.entries
                 .get_mut(&predecessor.unwrap())
                 .unwrap()
-                .successor = Some(receipt.operation);
+                .successor = Some(operation);
         }
-        self.entries.insert(
-            receipt.operation,
-            Entry {
-                receipt,
-                observed: Observed {
-                    sequence: number(4),
-                    recorded_ms: number(12),
-                },
-                state,
-                epoch,
-                predecessor,
-                successor: retained_successor,
-                closed_phase,
-                account,
-            },
-        );
         self.sequence = next_sequence;
         self.committed_bytes = next_bytes;
         self.head = key.digest(b"receipt\0", body);
@@ -477,26 +603,19 @@ impl View {
     }
 
     fn within_capacity_extra(&self, limits: Limits, added: usize, added_bytes: usize) -> bool {
-        let Some(reserved) = self
-            .entries
-            .values()
-            .try_fold(0usize, |sum, entry| sum.checked_add(entry.state.reserved()))
-        else {
-            return false;
-        };
         let Ok(retained) = usize::try_from(self.sequence) else {
             return false;
         };
         let Some(total) = retained
-            .checked_add(reserved)
+            .checked_add(self.reserved_records)
             .and_then(|n| n.checked_add(added))
         else {
             return false;
         };
         total <= limits.records
-            && reserved
-                .checked_mul(ISSUER_FRAME)
-                .and_then(|bytes| bytes.checked_add(self.committed_bytes))
+            && self
+                .reserved_bytes
+                .checked_add(self.committed_bytes)
                 .and_then(|bytes| bytes.checked_add(added_bytes))
                 .is_some_and(|bytes| bytes <= limits.bytes)
     }
@@ -540,10 +659,7 @@ fn replay(log: &Log, key: &Key, limits: Limits) -> io::Result<View> {
             if !record_subject(&record.subject, &record.body) || record.seq.0 != view.sequence {
                 return Err(invalid());
             }
-            view.ingest(key, &record.body)?;
-            if !view.within_capacity(limits, 0) {
-                return Err(invalid());
-            }
+            view.ingest_bounded(key, &record.body, limits)?;
         }
     }
     Ok(view)
@@ -556,6 +672,7 @@ fn record_subject(subject: &str, body: &[u8]) -> bool {
         || (subject == PHASE_SUBJECT && body.starts_with(b"ANI4"))
         || (subject == ACCOUNT_SUBJECT && body.starts_with(b"ANS4"))
         || (subject == FENCE_SUBJECT && body.starts_with(b"ANF4"))
+        || (subject == recipients::SUBJECT && body.starts_with(b"ANG5"))
 }
 
 fn open(paths: &Paths, key: &Key, limits: Limits) -> io::Result<(Log, View)> {
@@ -789,7 +906,9 @@ fn record_successor_at(
     // Resolve the exact old capability and recipe under the same log lock as
     // the candidate insertion. A missing, legacy or foreign epoch is never a
     // replaceable command. No lease expiry or absent process frees this slot.
-    if !valid_pair(predecessor, predecessor_binding)
+    if predecessor.receipt_mode.is_some()
+        || prepare.receipt_mode.is_some()
+        || !valid_pair(predecessor, predecessor_binding)
         || !valid_pair(prepare, binding)
         || predecessor.id == prepare.id
         || predecessor.host_epoch != prepare.host_epoch
@@ -808,6 +927,7 @@ fn record_successor_at(
         .get(&parent_receipt.operation)
         .ok_or_else(invalid)?;
     if parent.receipt != parent_receipt
+        || parent.recipients.is_some()
         || parent.state != IssuerState::NoExec
         || parent.epoch != Some(epoch)
         || predecessor.host_epoch != prepare.host_epoch
@@ -817,6 +937,7 @@ fn record_successor_at(
     }
     if let Some(old) = view.entries.get(&candidate.operation) {
         return if old.state == IssuerState::Prepared
+            && old.recipients.is_none()
             && old.account.is_none()
             && old.receipt == candidate
             && old.epoch == Some(epoch)
@@ -1047,6 +1168,14 @@ fn record_event_at_limits(
         project = "aterm_agent::harness::native_receipts::tests::accounts::model::transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "RecipientJournal",
+        action = "LegacyWrite",
+        project = "aterm_agent::harness::native_receipts::recipients::tests::transition"
+    )
+)]
 fn record_with_phase_at_limits(
     paths: &Paths,
     prepare: &Prepare,
@@ -1055,7 +1184,8 @@ fn record_with_phase_at_limits(
     phase: Option<ImagePhase>,
     limits: Limits,
 ) -> io::Result<Observed> {
-    if (phase.is_some() && event != Some(Event::NoExec))
+    if prepare.receipt_mode.is_some()
+        || (phase.is_some() && event != Some(Event::NoExec))
         || (phase == Some(ImagePhase::Rollback)
             && !matches!(
                 &prepare.plan,
@@ -1086,6 +1216,9 @@ fn record_with_phase_at_limits(
     check_rejection_domain(paths, &key, prepare)?;
     let previous = view.entries.get(&receipt.operation);
     if let Some(old) = previous {
+        if old.recipients.is_some() {
+            return Err(invalid());
+        }
         if event == Some(Event::Prepare) && old.predecessor.is_some() {
             return Err(invalid());
         }
@@ -1270,6 +1403,9 @@ fn observe_phase_at(
     if !valid_pair(prepare, binding) {
         return Err(invalid());
     }
+    if prepare.receipt_mode.is_some() {
+        return Ok(None);
+    }
     let Some((key, view)) = read(paths)? else {
         return Ok(None);
     };
@@ -1281,6 +1417,7 @@ fn observe_phase_at(
         .get(&expected.operation)
         .filter(|entry| {
             entry.receipt.operation == expected.operation
+                && entry.recipients.is_none()
                 && entry.receipt.capability == expected.capability
                 && (entry.receipt.prepare == expected.prepare
                     || Some(entry.receipt.prepare) == legacy)
@@ -1346,10 +1483,7 @@ fn read(paths: &Paths) -> io::Result<Option<(Key, View)>> {
         if !record_subject(&record.subject, &record.body) || record.seq.0 != view.sequence {
             return Err(invalid());
         }
-        view.ingest(&key, &record.body)?;
-        if !view.within_capacity(LIMITS, 0) {
-            return Err(invalid());
-        }
+        view.ingest_bounded(&key, &record.body, LIMITS)?;
     }
     Ok(Some((key, view)))
 }
@@ -1411,6 +1545,7 @@ fn observe_at(paths: &Paths, binding: &Binding) -> io::Result<Option<Observed>> 
         .get(&key.operation(&binding.id))
         .filter(|entry| {
             entry.state == IssuerState::NoExec
+                && entry.recipients.is_none()
                 && entry.receipt.capability == key.capability(binding)
         })
         .map(|entry| entry.observed))
@@ -1426,6 +1561,12 @@ pub fn observe_prepare(prepare: &Prepare) -> io::Result<Option<Observed>> {
 }
 
 fn observe_prepare_at(paths: &Paths, prepare: &Prepare) -> io::Result<Option<Observed>> {
+    if prepare.receipt_mode.is_some() {
+        Request::prepare(prepare.clone())
+            .encode()
+            .ok_or_else(invalid)?;
+        return Ok(None);
+    }
     let Some((key, view)) = read(paths)? else {
         return Ok(None);
     };
@@ -1436,6 +1577,7 @@ fn observe_prepare_at(paths: &Paths, prepare: &Prepare) -> io::Result<Option<Obs
         .get(&key.operation(&prepare.id))
         .filter(|entry| {
             entry.state == IssuerState::NoExec
+                && entry.recipients.is_none()
                 && entry.account.is_none()
                 && (entry.receipt.prepare == digest || Some(entry.receipt.prepare) == legacy)
         })
@@ -1470,7 +1612,8 @@ fn custody_at(paths: &Paths) -> io::Result<Option<String>> {
 /// lock and sees every acknowledged append; an absence carries the custody digest of the
 /// journal instance it was read from ([`custody`]), since only that instance's history proves
 /// it, and none from a journal with no record. Account claims and fences read as
-/// [`Closure::Other`]. This never returns a capability or grants anything.
+/// [`Closure::Other`]; complete histories return [`Closure::Recipients`]. This never
+/// returns a capability or grants anything.
 /// # Errors
 /// Refuses a prepare that is not a valid restart recipe, and damaged, incomplete or
 /// untrusted established custody.
@@ -1478,6 +1621,14 @@ pub fn observe_closure(prepare: &Prepare) -> io::Result<Closure> {
     observe_closure_at(&Paths::locate().map_err(|_| invalid())?, prepare)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "RecipientClosure",
+        action = "ReadJournal",
+        project = "aterm_gui::native_act::tests::recipient_recovery::World::probe"
+    )
+)]
 fn observe_closure_at(paths: &Paths, prepare: &Prepare) -> io::Result<Closure> {
     if !matches!(prepare.plan, NativePlan::Restart { .. })
         || Request::prepare(prepare.clone()).encode().is_none()
@@ -1490,9 +1641,16 @@ fn observe_closure_at(paths: &Paths, prepare: &Prepare) -> io::Result<Closure> {
     let Some(entry) = view.entries.get(&key.operation(&prepare.id)) else {
         return Ok(Closure::Absent(view.custody(&key)));
     };
+    if entry.recipients.is_some() {
+        return Ok(recipients::observe_entry(&key, entry, prepare)?
+            .map_or(Closure::Other, Closure::Recipients));
+    }
+    if prepare.receipt_mode.is_some() {
+        return Ok(Closure::Other);
+    }
     let exact = entry.receipt.prepare == key.prepare(prepare)?
         || Some(entry.receipt.prepare) == key.legacy_prepare(prepare);
-    if !exact || entry.account.is_some() {
+    if !exact || entry.account.is_some() || entry.recipients.is_some() {
         return Ok(Closure::Other);
     }
     Ok(match entry.state {
@@ -1580,7 +1738,8 @@ fn check_rejection_domain(paths: &Paths, key: &Key, prepare: &Prepare) -> io::Re
     )
 )]
 fn reject_unadmitted_at(paths: &Paths, prepare: &Prepare, limits: Limits) -> io::Result<bool> {
-    if prepare.rejection_domain.is_none()
+    if prepare.receipt_mode.is_some()
+        || prepare.rejection_domain.is_none()
         || !matches!(prepare.plan, NativePlan::Restart { .. })
         || Request::prepare(prepare.clone()).encode().is_none()
     {
@@ -1634,7 +1793,19 @@ fn contains_operation_at(paths: &Paths, id: &str) -> io::Result<bool> {
 /// Real journal storage in a caller-owned home for cross-crate conformance tests.
 #[cfg(any(test, debug_assertions))]
 pub mod testing {
+    pub use super::replay_bench::{ReplayCorpus, ReplayFormat, ReplaySummary};
     use super::*;
+
+    /// Development fixture events for the complete journal format. No production
+    /// writer emits these records until the recovery readers have deployed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RecipientAppend {
+        Prepare,
+        Forward(Recipient),
+        Rollback(Recipient),
+        NoExec,
+        Seal,
+    }
 
     /// Events supplied to the issuer; the stored state is derived by its DFA.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1668,6 +1839,18 @@ pub mod testing {
             Self {
                 paths: Paths::for_home(home),
             }
+        }
+
+        /// Commit a complete-format fixture with the production codec validation.
+        /// # Errors
+        /// Refuses invalid transitions, identities, capacity or custody.
+        pub fn record_recipient(
+            &self,
+            prepare: &Prepare,
+            binding: &Binding,
+            event: RecipientAppend,
+        ) -> io::Result<Observed> {
+            recipients::append_fixture(&self.paths, prepare, binding, event)
         }
 
         /// Append using the production authenticator, capacity and DFA checks.

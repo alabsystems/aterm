@@ -441,6 +441,74 @@ pub(crate) fn local_source_reads_until(
     }
 }
 
+/// Admit one completed application generation while holding every local vault
+/// source and control writer in its lineage. Take sources before any control
+/// writer, then controls from oldest to newest; no guard escapes this function.
+/// The callback is for bounded local persistence, never network I/O or a vault
+/// mutation. A caller's account writer, if any, must already be held.
+pub(crate) fn with_admitted_session<T>(
+    paths: &Paths,
+    deadline: Instant,
+    action: impl FnOnce(&Bootstrap, &Session<'_>) -> Result<T>,
+) -> Result<T> {
+    let selected = observed_generation_until(paths, deadline)?;
+    let sources = local_source_reads_until(&selected, deadline)?;
+    #[cfg(test)]
+    let sources = if RELEASE_SOURCE_EARLY.get() {
+        drop(sources);
+        Vec::new()
+    } else {
+        sources
+    };
+    let _sources = sources;
+    let mut lineage = vec![selected.clone()];
+    while let Some(parent) = linked(lineage.last().ok_or_else(fail)?)? {
+        if lineage.len() > MAX_GENERATIONS {
+            return Err(fail());
+        }
+        lineage.push(parent.original);
+    }
+    // Observe custody before taking any control writer. Established custody
+    // does not create, repair or enroll a generation.
+    let custody = lineage
+        .iter()
+        .rev()
+        .map(|path| {
+            Bootstrap::established_with_journal_until(path, deadline)
+                .map(|(bootstrap, _)| bootstrap)
+                .map_err(crate::table::failure)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Capture ancestor custody before taking any control writer, too: opening
+    // it later would invert a normal bootstrap's custody -> control order.
+    let observation = observe_generation(&selected, deadline, &|| deadline)?;
+    let mut controls = custody
+        .iter()
+        .map(|bootstrap| {
+            Journal::open_existing_until(bootstrap.journal_dir(), bootstrap.trust(), deadline)
+                .map_err(crate::table::failure)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bootstrap = custody.last().ok_or_else(fail)?;
+    let journal = controls.pop().ok_or_else(fail)?;
+    // Revalidate the captured lineage after all waits, without reopening its
+    // custody. Earlier control writers remain
+    // held: neither an ancestor revocation nor a new succession fence can race
+    // the local receipt written by the callback.
+    if observed_generation_until(paths, deadline)? != selected {
+        return Err(fail());
+    }
+    let session = Session::admit_selected(bootstrap, journal, observation, deadline)?;
+    session.writer()?;
+    within(deadline)?;
+    action(bootstrap, &session)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RELEASE_SOURCE_EARLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// One table session shares its authenticated ancestor observations. Every use
 /// still reobserves policy, immutable custody and the current control/log view;
 /// only unchanged authority avoids rebuilding the same bootstrap and roster.

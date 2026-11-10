@@ -232,7 +232,8 @@ pub(crate) const PAGE: Page = Page {
                      reads; then, where they apply, `attention`, `task=<state>/<rev>`, `bg=<n>` \
                      (its background processes), `bells=<n> (…)`, `ctx_left=<n>%`, `5h=<n>%` and \
                      `7d=<n>%` (the plan's windows used), `human=<age>` and `typed by <who> <age> \
-                     ago` within 15 minutes, and `| <title> | <folder> <branch> | <model>`.",
+                     ago` within 15 minutes (another Mac's drive until a person types after it), \
+                     and `| <title> | <folder> <branch> | <model>`.",
                 ),
                 para(
                     "Under it, quoted lines: `attention:`, `goal:`, `asked:` (the last prompt \

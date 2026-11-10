@@ -514,8 +514,10 @@ pub struct Source {
 /// One roster row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowOutlook {
-    /// Its label.
+    /// Its label: the row's key.
     pub label: String,
+    /// What the glass names it by ([`accounts::Row::shown_name`]): its email, else its label.
+    pub name: String,
     /// Preferred here or not ([`Class`]): an order, never a claim.
     pub class: Class,
     /// Its plan.
@@ -1602,7 +1604,13 @@ impl<'a> Sim<'a> {
             key: None,
         };
         let label = row.label.clone();
-        let _ = accounts::note_reading_held(&mut self.state, &label, &read, self.t);
+        let _ = accounts::note_reading_held(
+            &mut self.state,
+            &label,
+            &read,
+            self.t,
+            accounts::ReadingOwner::Unobserved,
+        );
     }
 
     fn advise(&self, point: &Point) -> Advice {
@@ -2783,6 +2791,7 @@ fn build(
         });
         rows.push(RowOutlook {
             label: row.label.clone(),
+            name: row.shown_name().to_owned(),
             class: row.class,
             plan: plan.clone(),
             active: state.active.as_deref() == Some(row.label.as_str()),
@@ -3484,6 +3493,13 @@ impl Outlook {
         self.rows.iter().find(|r| r.label == label)
     }
 
+    /// What the glass names the row `label` by ([`RowOutlook::name`]): its email, else the label
+    /// itself (as for a label no row holds, [`super::quota_view::THIS_LOGIN`]).
+    #[must_use]
+    pub fn name_of<'a>(&'a self, label: &'a str) -> &'a str {
+        self.row(label).map_or(label, |r| r.name.as_str())
+    }
+
     fn when(&self, t: i64) -> String {
         when(t, self.as_of, &self.offsets)
     }
@@ -3826,7 +3842,10 @@ enum GiveWay {
 /// One account's item words on the card: its columns and its forms.
 struct Item {
     label: String,
+    /// Its email as the glass lays it ([`super::quota_view::cut`]).
     name: String,
+    /// Its email's local part ([`super::quota_view::short`]), its narrowest form's name.
+    short: String,
     figure: String,
     plan: String,
     /// The words after the plan, widest first (`out ~Sat 02:00 · ↺ Wed 09:00`, `out ~Sat 02:00`).
@@ -3844,8 +3863,9 @@ impl Item {
     /// (its run-out and its reset) give way after the plan does: the lane under the item draws
     /// its run-out ([`super::quota_view::Cell::Out`]), and the item always says it in words
     /// (§1.4), so an item that runs out has no form that keeps its plan or its padded columns
-    /// without the run-out: its compact forms (`alab-pool-01 58% out ~Thu`) come first, and the
-    /// shortest of them fits wherever a lane is drawn (a name is at most 12 cells).
+    /// without the run-out: its compact forms (`alab-pool-01 58% out ~Thu`) come first. Its last
+    /// form names it by its email's local part (`owner 58%`), which fits wherever a lane is
+    /// drawn (§2.5).
     fn forms(&self, (nw, fw, pw): (usize, usize, usize)) -> Vec<String> {
         let head = format!("{:<nw$}  {:>fw$}", self.name, self.figure);
         let mut out = Vec::new();
@@ -3863,6 +3883,7 @@ impl Item {
             out.push(format!("{} {} {words}", self.name, self.figure));
         }
         out.push(format!("{} {}", self.name, self.figure));
+        out.push(format!("{} {}", self.short, self.figure));
         out.into_iter().map(|s| s.trim_end().to_owned()).collect()
     }
 
@@ -3882,6 +3903,7 @@ impl Item {
                     vec![
                         self.narrow.clone(),
                         format!("{} {}", self.name, self.figure),
+                        format!("{} {}", self.short, self.figure),
                     ],
                     room,
                 )
@@ -3929,7 +3951,7 @@ impl Outlook {
         out_at: Option<i64>,
         this_tab: bool,
     ) -> Item {
-        let name = super::quota_view::cut(&row.label);
+        let name = super::quota_view::cut(&row.name);
         let plan = row.plan.title();
         // Projected out before its reset: said here, in words, as the lane's out line draws it.
         let out_at = out_at.filter(|t| *t > self.as_of && figure != Figure::Out);
@@ -3970,7 +3992,7 @@ impl Outlook {
         } else if figure == Figure::Unread {
             narrow = format!("{name} {}", self.class_word(row));
         }
-        let mut spoken = row.label.clone();
+        let mut spoken = row.name.clone();
         if this_tab {
             spoken.push_str(", this tab");
         }
@@ -3994,6 +4016,7 @@ impl Outlook {
         spoken.push('.');
         Item {
             label: row.label.clone(),
+            short: super::quota_view::short(&row.name),
             name,
             figure: figure.words(),
             plan: plan.unwrap_or_else(|| "plan ?".into()),
@@ -4090,7 +4113,7 @@ impl Outlook {
         let pct = super::quota_view::whole_spoken;
         let mut s = format!(
             "{}'s week, to its reset {}",
-            lane.label,
+            lane.name,
             self.spoken_when(lane.renews)
         );
         match (lane.read.first(), lane.read.last()) {
@@ -4200,7 +4223,12 @@ impl Outlook {
                 ));
             }
             if !self.not_needed.is_empty() {
-                let all = self.not_needed.join(", ");
+                let all = self
+                    .not_needed
+                    .iter()
+                    .map(|l| self.name_of(l))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let mut forms = vec![format!("  not needed: {all}")];
                 if self.not_needed.len() > 1 {
                     forms.push(format!("  {} rows not needed", self.not_needed.len()));
@@ -4644,10 +4672,11 @@ impl Outlook {
                     ),
                     None => "plan not seen".into(),
                 };
-                let counted = format!("{label}: {seen}, counted as {}", like(carrier_plan));
                 if card {
-                    // Widest first; the card's narrowest names the row as its item does.
-                    let name = super::quota_view::cut(label);
+                    // Widest first; the card names the row by its email, as its item does.
+                    let full = self.name_of(label);
+                    let counted = format!("{full}: {seen}, counted as {}", like(carrier_plan));
+                    let name = super::quota_view::cut(full);
                     let like = like(carrier_plan);
                     vec![
                         counted,
@@ -4655,11 +4684,15 @@ impl Outlook {
                         format!("{name} as {like}"),
                     ]
                 } else {
+                    let counted = format!("{label}: {seen}, counted as {}", like(carrier_plan));
                     vec![format!("{counted} like {carrier}")]
                 }
             }
             Approx::PlansAlike { carrier } if card => vec![
-                format!("{carrier}: plan not seen; every row counted alike"),
+                format!(
+                    "{}: plan not seen; every row counted alike",
+                    self.name_of(carrier)
+                ),
                 "every row counted alike".into(),
             ],
             Approx::PlansAlike { carrier } => {

@@ -43,6 +43,8 @@ const MODIFIER_FLAG_CONTROL: usize = 1 << 18;
 const CONTROL_STATE_ON: isize = 1;
 /// How often the mug looks again (the time left it shows, a deadline, the update watch).
 const TICK_SECS: u64 = 60;
+/// How soon the mug looks again while a wake settles ([`crate::model::settling`]).
+const SETTLE_TICK_SECS: u64 = 1;
 /// `NSTerminateCancel`.
 const TERMINATE_CANCEL: usize = 0;
 /// `NSTerminateNow`.
@@ -169,6 +171,9 @@ struct Mug {
     machine: fn() -> Machine,
     /// The system announced it will sleep, and no wake has come since ([`Mug::power`]).
     going_to_sleep: bool,
+    /// When the last wake was heard, on the boot clock, unless a will-sleep came after it
+    /// ([`Mug::woke`]): a pause read soon after it is looked at again in a second.
+    woke_at: Option<u64>,
     /// What [`Mug::apply`] last decided to hold ([`crate::model::hold`]).
     hold: Hold,
     /// Restore saved state, including any corrective save-back.
@@ -243,9 +248,10 @@ impl Mug {
             && (matches!(hold, Hold::Paused(_)) || matches!(self.hold, Hold::Paused(_)))
         {
             aterm_log::info!(
-                "acaffeine: {:?}, which held {:?}, now holds {hold:?}",
+                "acaffeine: {:?}, which held {:?}, now holds {hold:?}{}",
                 machine,
-                self.hold
+                self.hold,
+                self.after_wake(now)
             );
         }
         self.hold = hold;
@@ -300,7 +306,7 @@ impl Mug {
         if !self.save(now) {
             return Next::Stop(Exit::Retry);
         }
-        Next::Tick(next_tick_secs(self.mode, now))
+        Next::Tick(self.next_tick(now))
     }
 
     /// A left click: on forever when off, off when on.
@@ -340,20 +346,61 @@ impl Mug {
 
     /// What the system announced ([`aterm_uds::power::listen`]): a will-sleep lets go of
     /// everything the mug holds before the system is told it may sleep (the listener acknowledges
-    /// once this returns), and a wake looks again as a tick does, holding again unless the lid is
+    /// once this returns), and a wake looks again ([`Mug::woke`]), holding again unless the lid is
     /// still closed without Keep Awake with Lid Closed, or this is a dark wake (which pauses it
-    /// with the option on too).
+    /// with the option on too). A [`aterm_uds::power::Power::Woke`] with no will-sleep before it
+    /// is an idle sleep the system pondered and dropped (`kIOMessageSystemWillNotSleep`), no wake:
+    /// it looks as a tick does, with no settling after it.
     fn power(&mut self, power: aterm_uds::power::Power, now: Clocks, menu_open: bool) -> Next {
         match power {
             aterm_uds::power::Power::WillSleep => {
                 self.going_to_sleep = true;
+                self.woke_at = None;
                 self.apply(now);
                 Next::Keep
             }
-            aterm_uds::power::Power::Woke => {
+            aterm_uds::power::Power::Woke if self.going_to_sleep => {
                 self.going_to_sleep = false;
-                self.tick(now, menu_open)
+                self.woke(now, menu_open)
             }
+            aterm_uds::power::Power::Woke => self.tick(now, menu_open),
+        }
+    }
+
+    /// A wake was heard (the system's, or `NSWorkspaceDidWakeNotification`): look again as a tick
+    /// does, and while what that holds is a pause, every second until the wake has settled
+    /// ([`crate::model::settling`]), so a lid's open holds again once its wake has graphics
+    /// rather than at the next tick.
+    /// The wake's look is logged with what it read, so a wake that only a later look ends the
+    /// pause of says so in `aterm.log` with how long that took ([`Mug::after_wake`]).
+    fn woke(&mut self, now: Clocks, menu_open: bool) -> Next {
+        self.woke_at = Some(now.since_boot);
+        let next = self.tick(now, menu_open);
+        aterm_log::info!(
+            "acaffeine: woke: {:?} holds {:?}",
+            Machine {
+                going_to_sleep: self.going_to_sleep,
+                ..(self.machine)()
+            },
+            self.hold
+        );
+        next
+    }
+
+    /// `" 3 s after the wake"` while a wake is recorded ([`Mug::woke`]), else nothing.
+    fn after_wake(&self, now: Clocks) -> String {
+        self.woke_at.map_or_else(String::new, |at| {
+            format!(" {} s after the wake", now.since_boot.saturating_sub(at))
+        })
+    }
+
+    /// The seconds to the next look at `now`: in a second while a wake settles, else
+    /// [`next_tick_secs`].
+    fn next_tick(&self, now: Clocks) -> u64 {
+        if crate::model::settling(self.hold, self.woke_at, now.since_boot) {
+            SETTLE_TICK_SECS
+        } else {
+            next_tick_secs(self.mode, now)
         }
     }
 
@@ -397,7 +444,7 @@ impl Mug {
         if !menu_open && self.watch.as_mut().is_some_and(Watch::replaced) {
             return self.restart_or_retire();
         }
-        Next::Tick(next_tick_secs(self.mode, now))
+        Next::Tick(self.next_tick(now))
     }
 
     /// The origin was replaced.
@@ -473,7 +520,7 @@ impl Mug {
         if !took {
             return Next::Stop(Exit::Retry);
         }
-        Next::Tick(next_tick_secs(self.mode, now))
+        Next::Tick(self.next_tick(now))
     }
 
     /// The app has stopped.
@@ -617,7 +664,7 @@ aterm_objc::declare_class! {
             if MainThread::new().is_some() {
                 let now = now();
                 let menu_open = self.ivars().tracking.get();
-                self.handle(|mug| mug.tick(now, menu_open));
+                self.handle(|mug| mug.woke(now, menu_open));
             }
         }
 
@@ -1125,6 +1172,7 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         lid_begin: hold_lid,
         machine: crate::held::machine_now,
         going_to_sleep: false,
+        woke_at: None,
         hold: Hold::Off,
         take_saved: state::take_saving,
         origin_serves: crate::code::serves_acaffeine,
@@ -1348,7 +1396,7 @@ fn run_app(main: MainThread, mug: Mug) -> Result<Ended, Unstarted> {
             return Err(Unstarted::MenuBarRefused);
         }
         mug.apply(now);
-        next_tick_secs(mug.mode, now)
+        mug.next_tick(now)
     };
     let woke = observe(
         workspace_center(),
@@ -1855,6 +1903,7 @@ mod tests {
             lid_begin: |_| panic!("only Keep Awake with Lid Closed asks for its assertion"),
             machine: Machine::default,
             going_to_sleep: false,
+            woke_at: None,
             hold: Hold::Off,
             take_saved: state::take_saving,
             origin_serves: |_| Some(true),
@@ -1939,6 +1988,116 @@ mod tests {
         assert_eq!(mug.tick(NOW + 120, false), Next::Tick(TICK_SECS));
         assert!(mug.awake.is_some(), "the open lid holds again");
         assert_eq!(mug.hold, Hold::Idle);
+    }
+
+    thread_local! {
+        /// Whether a test's machine door reads a dark wake ([`wake_door`]).
+        static DARK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// A machine door that reads [`LID`] and [`DARK`].
+    fn wake_door() -> Machine {
+        Machine {
+            lid_closed: LID.get(),
+            dark_wake: DARK.get(),
+            ..Machine::default()
+        }
+    }
+
+    /// The lid's open as an Apple-silicon Mac makes it (2026-11-09, macOS 27.2): every wake
+    /// signal the mug hears comes while the wake is still dark, and graphics come a fraction of
+    /// a second later with nothing to say so. The mug looks again each second while the wake
+    /// settles and holds as soon as it reads a full wake, the mode never having left forever;
+    /// a pause still there once the wake has settled, a dark wake, goes back to the minute tick,
+    /// and a will-sleep ends the settling.
+    /// NEGATIVE CONTROL: `Mug::next_tick` without its settling arm answers [`TICK_SECS`] to the
+    /// wake, which the first assertion after it refuses (the mug then stayed paused until a
+    /// click, as it did on every lid open that day).
+    #[test]
+    fn a_lid_open_that_wakes_dark_first_holds_again_once_graphics_come() {
+        let dir = crate::test_scratch_dir("app");
+        let mut mug = scratch_mug(dir.path());
+        mug.machine = wake_door;
+        LID.set(false);
+        DARK.set(false);
+        let _ = mug.set(Mode::Forever, NOW);
+        assert_eq!(mug.hold, Hold::Idle);
+        LID.set(true);
+        assert_eq!(
+            mug.power(aterm_uds::power::Power::WillSleep, NOW + 10, false),
+            Next::Keep
+        );
+        assert!(mug.awake.is_none(), "let go before the sleep");
+        LID.set(false);
+        DARK.set(true);
+        let woke = NOW + 70;
+        assert_eq!(
+            mug.power(aterm_uds::power::Power::Woke, woke, false),
+            Next::Tick(SETTLE_TICK_SECS),
+            "a dark read just after the wake is looked at again in a second"
+        );
+        assert_eq!(mug.hold, Hold::Paused(crate::model::Pause::Asleep));
+        assert_eq!(
+            mug.handled(|m| m.woke(woke, false)),
+            Some(Next::Tick(SETTLE_TICK_SECS)),
+            "NSWorkspaceDidWakeNotification, in the same dark part"
+        );
+        DARK.set(false);
+        assert_eq!(mug.tick(woke + 1, false), Next::Tick(TICK_SECS));
+        assert_eq!(mug.hold, Hold::Idle, "graphics came: it holds again");
+        assert_eq!(mug.after_wake(woke + 1), " 1 s after the wake");
+        assert!(mug.awake.is_some());
+        assert_eq!(mug.mode, Mode::Forever);
+
+        DARK.set(true);
+        let _ = mug.power(aterm_uds::power::Power::WillSleep, NOW + 200, false);
+        let dark = NOW + 300;
+        assert_eq!(
+            mug.power(aterm_uds::power::Power::Woke, dark, false),
+            Next::Tick(SETTLE_TICK_SECS)
+        );
+        let settled = dark + crate::model::SETTLE_SECS;
+        assert_eq!(
+            mug.tick(dark + (crate::model::SETTLE_SECS - 1), false),
+            Next::Tick(SETTLE_TICK_SECS)
+        );
+        assert_eq!(
+            mug.tick(settled, false),
+            Next::Tick(TICK_SECS),
+            "a wake still dark once settled is a dark wake: the minute tick reads it"
+        );
+        assert!(mug.awake.is_none());
+        let _ = mug.power(aterm_uds::power::Power::Woke, settled + 10, false);
+        assert_eq!(
+            mug.power(aterm_uds::power::Power::WillSleep, settled + 11, false),
+            Next::Keep
+        );
+        assert_eq!(mug.woke_at, None, "a will-sleep ends the settling");
+        assert_eq!(mug.after_wake(settled + 12), "");
+        assert_eq!(mug.next_tick(settled + 12), TICK_SECS);
+    }
+
+    /// A [`aterm_uds::power::Power::Woke`] with no will-sleep before it is an idle sleep the
+    /// system pondered and dropped (`kIOMessageSystemWillNotSleep`): it looks as a tick does and
+    /// starts no settling, so a lid closed on an external display, which pauses the mug, is not
+    /// looked at every second each time the idle sleep is dropped.
+    /// NEGATIVE CONTROL: `Mug::power` without its `if self.going_to_sleep` guard records a wake,
+    /// and the first assertion reads [`SETTLE_TICK_SECS`].
+    #[test]
+    fn a_dropped_idle_sleep_is_no_wake() {
+        let dir = crate::test_scratch_dir("app");
+        let mut mug = scratch_mug(dir.path());
+        mug.machine = wake_door;
+        LID.set(true);
+        DARK.set(false);
+        let _ = mug.set(Mode::Forever, NOW);
+        assert_eq!(
+            mug.power(aterm_uds::power::Power::Woke, NOW + 5, false),
+            Next::Tick(TICK_SECS)
+        );
+        assert_eq!(mug.hold, Hold::Paused(crate::model::Pause::LidClosed));
+        assert_eq!(mug.woke_at, None);
+        LID.set(false);
     }
 
     /// Keep Awake with Lid Closed, chosen in the menu, is saved and holds `PreventSystemSleep`

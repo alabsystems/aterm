@@ -75,6 +75,10 @@ libc = { workspace = true }
 # `keep_out_of_children` is its `close_on_fork` (`FD_CLOFORK`).
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Shared native final-exec attributes; no resource admission or policy receipt.
+trust-exec-policy = { workspace = true }
+
 [dev-dependencies]
 aterm-bench = { path = "../aterm-bench" }
 # Test scratch directories (mode 0700, an unpredictable name); itself dependency-free.

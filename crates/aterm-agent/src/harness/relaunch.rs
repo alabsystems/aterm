@@ -2054,7 +2054,7 @@ fn relaunch_held(
             Ok(super::native_restart::Recovery::Cancelled) => {
                 st.stop("native-cancelled-before-mutation", now_s());
                 save(opts, session, st);
-                return said(r, "wait:native-cancelled-before-mutation");
+                return said(r, super::native_restart::WAIT_CANCELLED_BEFORE_MUTATION);
             }
             Ok(super::native_restart::Recovery::Retired) => {
                 save(opts, session, st);
@@ -2119,7 +2119,7 @@ fn relaunch_held(
             Some(_) => {
                 st.stop("native-aborted-before-signal", now_s());
                 save(opts, session, st);
-                return said(r, "wait:native-aborted-before-signal");
+                return said(r, super::native_restart::WAIT_ABORTED_BEFORE_SIGNAL);
             }
             None => {}
         }
@@ -5813,7 +5813,10 @@ fn restart_locked(
             Ok(super::native_restart::Recovery::Cancelled) => {
                 let _ =
                     super::native_record::restore_inactive(opts, &session, &mut st, prior.as_ref());
-                break 'signal Some(said(r.clone(), "wait:native-cancelled-before-mutation"));
+                break 'signal Some(said(
+                    r.clone(),
+                    super::native_restart::WAIT_CANCELLED_BEFORE_MUTATION,
+                ));
             }
             Ok(super::native_restart::Recovery::Retired) => {
                 break 'signal Some(said(r.clone(), "failed:native-cohort-retired"));
@@ -6208,7 +6211,10 @@ fn retry_checked_relaunch(
         native_restart::RelaunchObservation::Terminal(Recovery::Cancelled) => {
             st.stop("native-cancelled-before-mutation", now_s());
             save(opts, session, &st);
-            return Some(said(r, "wait:native-cancelled-before-mutation"));
+            return Some(said(
+                r,
+                super::native_restart::WAIT_CANCELLED_BEFORE_MUTATION,
+            ));
         }
         native_restart::RelaunchObservation::Terminal(Recovery::Retired | Recovery::Held) => {
             save(opts, session, &st);
@@ -6263,7 +6269,10 @@ fn retry_checked_relaunch(
             Ok(Recovery::Cancelled) => {
                 st.stop("native-cancelled-before-mutation", now_s());
                 save(opts, session, &st);
-                return stopped(said(r, "wait:native-cancelled-before-mutation"));
+                return stopped(said(
+                    r,
+                    super::native_restart::WAIT_CANCELLED_BEFORE_MUTATION,
+                ));
             }
             Ok(Recovery::Retired | Recovery::Held) => {
                 save(opts, session, &st);
@@ -9354,7 +9363,8 @@ pub enum Outcome {
     Left(String),
     /// Not now, and why (a busy tab, a shell not back yet, a relaunch that did not register).
     NotYet(String),
-    /// Account admission, a hand or another aterm actor holds the attempt before launch.
+    /// Admission or ownership holds the attempt, or a no-grant closure permits a fresh attempt.
+    /// None is a failed launch, so it preserves failure history and uses the short retry cadence.
     Busy,
     /// Never, and why: an interactive conversation that cannot come back (an uncarryable launch, a gone shell).
     Cannot(String),
@@ -9391,6 +9401,11 @@ pub fn outcome(step: &str) -> Outcome {
             | WAIT_ACCOUNT
             | WAIT_NATIVE_UNISSUED
             | super::native_restart::WAIT_RETIRED_UNISSUED
+            | super::native_restart::WAIT_LAPSED
+            | super::native_restart::WAIT_UNADMITTED
+            | super::native_restart::WAIT_CANCELLED
+            | super::native_restart::WAIT_CANCELLED_BEFORE_MUTATION
+            | super::native_restart::WAIT_ABORTED_BEFORE_SIGNAL
     ) {
         Outcome::Busy
     } else if let Some(why) = step.strip_prefix("busy:") {

@@ -220,6 +220,12 @@ impl RunOut {
 pub trait GitRunner {
     fn git(&self, args: &[&str]) -> Result<RunOut>;
 
+    /// A complete local history listing, bounded in the production runner. Test runners
+    /// supply the same command seam; a failed or incomplete read supplies no semantic data.
+    fn git_read(&self, args: &[&str]) -> Result<RunOut> {
+        self.git(args)
+    }
+
     /// `git <args>` with `input` on its stdin, for the objects-only writes ([`commit_with`]: `hash-object --stdin`, `mktree -z`).
     fn git_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
         let _ = input;
@@ -410,6 +416,26 @@ impl GitRunner for GitCli {
         self.git_env(args, &[])
     }
 
+    fn git_read(&self, args: &[&str]) -> Result<RunOut> {
+        let mut cmd = git_command()?;
+        crate::credential_wait::ask_no_one(&mut cmd)
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("GIT_NO_LAZY_FETCH", "1");
+        let out = aterm_uds::deadline::output_until_complete_stdout_with_limit(
+            &mut cmd,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+        )
+        .map_err(|e| Error::new(format!("git {}: {e}", args.join(" "))))?;
+        Ok(RunOut {
+            status: out.status.code().unwrap_or(-1),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    }
+
     fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<RunOut> {
         use aterm_uds::spawnfd::Stdio;
         let mut git = git_command()?;
@@ -461,7 +487,15 @@ pub fn object_git(repo: &Path) -> Result<Command> {
 
 /// Run a git command and require success; the error carries the argv and git's trimmed stderr.
 pub fn git_ok(git: &dyn GitRunner, args: &[&str]) -> Result<RunOut> {
-    let out = git.git(args)?;
+    success(args, git.git(args)?)
+}
+
+/// Require a complete successful history read with the production capture and time bounds.
+pub fn git_read_ok(git: &dyn GitRunner, args: &[&str]) -> Result<RunOut> {
+    success(args, git.git_read(args)?)
+}
+
+fn success(args: &[&str], out: RunOut) -> Result<RunOut> {
     if !out.success() {
         return Err(Error::new(format!(
             "git {} failed (exit {}): {}",

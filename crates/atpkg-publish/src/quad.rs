@@ -318,6 +318,7 @@ mod tests {
     #[test]
     fn head_number_rejects_signed_tag_suffix() {
         let rel = |tag: &str| crate::host::Release {
+            published_at: None,
             tag: tag.to_string(),
             draft: false,
             prerelease: false,

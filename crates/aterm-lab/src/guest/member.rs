@@ -42,7 +42,6 @@
 use std::collections::BTreeSet;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -248,7 +247,7 @@ pub(crate) fn member(ask: &Ask) -> Result<(), String> {
         lifetime: aterm_net::fleet::SERVED_WITHIN,
     };
     let handler = ask_handler(Arc::clone(&desk), paths, Arc::clone(&out));
-    let running = AtomicBool::new(true);
+    let stop = aterm_uds::stop::Stop::new();
     out.line("member", &format!("listen={bound} name={name}"));
     std::thread::scope(|scope| -> Result<(), String> {
         scope.spawn(|| {
@@ -259,7 +258,7 @@ pub(crate) fn member(ask: &Ask) -> Result<(), String> {
                 Arc::new(|| -> (FleetScope, &'static [FleetOp]) { (FleetScope::Facts, &[]) }),
                 Arc::new(move || Arc::clone(&none)),
                 Some(handler),
-                &running,
+                &stop,
                 // No fleet op is offered, so none is handed over.
                 |_, _| Ok(()),
                 |_| {},

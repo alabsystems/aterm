@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! THE KEEPER and THE READER. Exactly one long-lived process per Mac keeps the record: whichever
-//! holds `<state>/netplace/keeper.lock` (the window, the node job, a vault job; [`start`]). A
+//! holds its keeper lease (the window, the node job, a vault job; [`start`]):
+//! `<state>/.ubd/netplace-keeper.lock` on macOS, `<state>/netplace/keeper.lock` elsewhere. A
 //! process that did not get it waits for it in the kernel
 //! ([`aterm_uds::private_file::PrivateLock::wait_for`]): it spends nothing while another keeps
 //! the place and takes over the moment that keeper ends (ATERM-KI-1105-20). The keeper reads the facts, steps the place ([`crate::place::step`]) and
@@ -261,10 +262,12 @@ pub fn start(state: &Path) -> Option<Candidate> {
         return None;
     }
     let candidate = match crate::facts::Live::prepare() {
-        Ok(prepared) => spawn(
-            record::dir(state),
+        Ok(prepared) => spawn_mode(
+            state.join(record::DIR),
             Box::new(move || Box::new(prepared.start()) as Box<dyn Sense>),
-        ),
+            cfg!(target_os = "macos"),
+        )
+        .map(|(candidate, _worker)| candidate),
         Err(error) => {
             aterm_log::warn!("network place: the keeper cannot receive stop: {error}");
             None
@@ -277,13 +280,23 @@ pub fn start(state: &Path) -> Option<Candidate> {
 }
 
 /// A keeper candidate over `dir` whose facts `sense` makes on its thread.
+#[cfg(test)]
 fn spawn(dir: PathBuf, sense: Box<dyn FnOnce() -> Box<dyn Sense> + Send>) -> Option<Candidate> {
     spawn_owned(dir, sense).map(|(candidate, _worker)| candidate)
 }
 
+#[cfg(test)]
 fn spawn_owned(
     dir: PathBuf,
     sense: Box<dyn FnOnce() -> Box<dyn Sense> + Send>,
+) -> Option<(Candidate, std::thread::JoinHandle<()>)> {
+    spawn_mode(dir, sense, false)
+}
+
+fn spawn_mode(
+    dir: PathBuf,
+    sense: Box<dyn FnOnce() -> Box<dyn Sense> + Send>,
+    quiet: bool,
 ) -> Option<(Candidate, std::thread::JoinHandle<()>)> {
     let stop = Arc::new(StopState::default());
     let stopped = Arc::clone(&stop);
@@ -300,7 +313,11 @@ fn spawn_owned(
                 }
             };
             stopped.install(wake);
-            candidate_loop(&dir, &*sense, &stopped.stopped);
+            if quiet {
+                quiet_candidate_loop(&dir, &*sense, &stopped.stopped);
+            } else {
+                candidate_loop(&dir, &*sense, &stopped.stopped);
+            }
         });
     match spawned {
         Ok(worker) => Some((Candidate(stop), worker)),
@@ -314,6 +331,62 @@ fn spawn_owned(
 /// How long a candidate whose lock could not be opened or waited for (its folder not private, a
 /// failed `flock`) waits before it tries again: no wait on another keeper, which blocks instead.
 const REFUSED_AGAIN: Duration = Duration::from_secs(60);
+
+fn prepare_quiet(dir: &Path) -> std::io::Result<PathBuf> {
+    use aterm_uds::private_file::PrivateLock;
+    aterm_uds::quiet_state::prepare(dir, || {
+        Ok((
+            PrivateLock::take(dir, LOCK, Duration::ZERO, "legacy keeper is running")?,
+            PrivateLock::take(
+                dir,
+                crate::heard::LOCK,
+                Duration::ZERO,
+                "evidence writer is running",
+            )?,
+            PrivateLock::take(
+                dir,
+                crate::heard::DAYS_LOCK,
+                Duration::ZERO,
+                "home-days writer is running",
+            )?,
+        ))
+    })?;
+    let selected = aterm_uds::quiet_state::selected(dir);
+    if selected != dir {
+        match aterm_uds::private_file::open_private(&selected, LOCK) {
+            Ok(_) => std::fs::remove_file(selected.join(LOCK))?,
+            Err(aterm_uds::private_file::PrivateFileError::Missing) => {}
+            Err(error) => return Err(std::io::Error::other(error)),
+        }
+    }
+    Ok(selected)
+}
+
+fn quiet_candidate_loop(legacy: &Path, sense: &dyn Sense, stop: &AtomicBool) {
+    // New keepers use a distinct lease outside the exchanged directory. An old binary
+    // already waiting on its old keeper inode can wake after migration, but the fence
+    // refuses its writes and that old inode cannot block a new keeper.
+    let quiet = aterm_uds::quiet_state::destination(legacy);
+    let Some(parent) = quiet.parent() else {
+        return;
+    };
+    while !stop.load(Ordering::SeqCst) {
+        let held = aterm_uds::private_file::create_private_dir(parent).and_then(|_| {
+            aterm_uds::private_file::PrivateLock::wait_for(parent, "netplace-keeper.lock", || {
+                sense.lock_held()
+            })
+        });
+        let result = held.and_then(|_lease| {
+            let dir = prepare_quiet(legacy)?;
+            keep(&dir, sense, stop);
+            Ok(())
+        });
+        if let Err(error) = result {
+            aterm_log::warn!("network place: quiet keeper is refused: {error}");
+            sense.wait(REFUSED_AGAIN, stop);
+        }
+    }
+}
 
 /// Waits for the lock, keeps while held, until `stop`. A candidate stopped while it waits lets the
 /// lock go as soon as it gets it.
@@ -370,6 +443,44 @@ pub fn read(state: &Path) -> Place {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quiet_handoff_preserves_records_and_excludes_every_legacy_writer() {
+        use aterm_uds::private_file::PrivateLock;
+        use std::os::unix::fs::MetadataExt as _;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let legacy = root.path().join(record::DIR);
+        let written = Written {
+            revision: 41,
+            ..Written::default()
+        };
+        record::write(&legacy, &written).unwrap();
+        let before = std::fs::metadata(&legacy).unwrap().ino();
+        for name in [LOCK, crate::heard::LOCK, crate::heard::DAYS_LOCK] {
+            let lease = PrivateLock::take(&legacy, name, Duration::ZERO, "held").unwrap();
+            assert!(
+                prepare_quiet(&legacy).is_err(),
+                "{name} must exclude migration"
+            );
+            assert_eq!(record::read(&legacy).unwrap(), written);
+            drop(lease);
+        }
+        let quiet = prepare_quiet(&legacy).unwrap();
+        assert!(aterm_tempfile::is_quiet(&quiet));
+        assert_eq!(record::dir(root.path()), quiet);
+        assert_eq!(std::fs::metadata(&quiet).unwrap().ino(), before);
+        assert_eq!(record::read(&quiet).unwrap(), written);
+        assert!(
+            !quiet.join(LOCK).exists(),
+            "the old keeper lease is obsolete"
+        );
+        assert!(
+            record::write(&legacy, &written).is_err(),
+            "an old keeper cannot fork history"
+        );
+        assert_eq!(prepare_quiet(&legacy).unwrap(), quiet);
+    }
     use crate::facts::Scripted;
     use crate::place::{ComputedBy, Lane, Link, PathFacts, RouteFacts};
     use std::net::Ipv4Addr;

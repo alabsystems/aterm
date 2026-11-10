@@ -445,6 +445,7 @@ impl PreverifyPublisher {
                 grant_chunks: false,
                 grant_empty: false,
                 grant_desk: false,
+                recipient_recovery: false,
             },
             current_build,
             candidate,

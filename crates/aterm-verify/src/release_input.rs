@@ -258,7 +258,7 @@ fn lint_has_no_inputs(root: &Path, path: &OsStr, base: &str, tree: &str) -> Resu
         ],
         true,
     )?;
-    let changed: Vec<_> = changed.iter().map(|p| root.join(p)).collect();
+    let changed: BTreeSet<_> = changed.iter().map(|p| root.join(p)).collect();
     for line in shared.lines() {
         let fields: Vec<_> = line.splitn(3, '\0').collect();
         if fields.len() != 3 {
@@ -347,30 +347,18 @@ pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Inpu
     let commits = unchecked(root, path, &nodes, &composed, &empty_lint);
     let mut paths = BTreeSet::new();
     for commit in &commits {
-        let merge_diff = if nodes[commit].parents.len() > 2 {
-            "--diff-merges=separate"
-        } else {
-            "--diff-merges=remerge"
-        };
-        let diff = git(
-            root,
-            path,
-            &[
-                "show",
-                "--format=",
-                "--name-only",
-                "-z",
-                "--no-renames",
-                merge_diff,
-                commit,
-                "--",
-            ],
+        let parents = &nodes[commit].parents;
+        let parents: Vec<_> = parents.iter().map(String::as_str).collect();
+        let changed = crate::git_paths::commit(
+            &mut |args| git(root, path, args).map(String::into_bytes),
+            commit,
+            &parents,
+            crate::git_paths::MergeDiff::Resolutions,
+            &[],
         )?;
-        paths.extend(
-            diff.split('\0')
-                .filter(|p| !p.is_empty())
-                .map(str::to_string),
-        );
+        for name in changed {
+            paths.insert(String::from_utf8(name).map_err(|e| e.to_string())?);
+        }
     }
     Ok(Input {
         commits,
@@ -388,23 +376,23 @@ pub fn judge(
     events: Option<crate::event_log::EventLog>,
     log: &mut (dyn std::io::Write + Send),
 ) -> Result<String, (bool, String)> {
-    judge_with_lint(root, base, tip, checks, events, log, LintCarry::default())
+    judge_with_inputs(root, base, tip, checks, events, log, InputCarry::default())
 }
 
 #[derive(Default)]
-struct LintCarry {
-    passed: Option<crate::lint_content::Passed>,
+struct InputCarry {
     context: Option<String>,
+    items: Vec<crate::input_content::Proof>,
 }
 
-fn judge_with_lint(
+fn judge_with_inputs(
     root: &Path,
     base: &str,
     tip: &str,
     checks: &[Check],
     events: Option<crate::event_log::EventLog>,
     log: &mut (dyn std::io::Write + Send),
-    carry: LintCarry,
+    carry: InputCarry,
 ) -> Result<String, (bool, String)> {
     let began = std::time::Instant::now();
     let env = EnvSnapshot::capture();
@@ -414,6 +402,12 @@ fn judge_with_lint(
     }
     writeln!(
         log,
+        "release input discovery: {:.3}s",
+        began.elapsed().as_secs_f64()
+    )
+    .map_err(|e| (false, e.to_string()))?;
+    writeln!(
+        log,
         "release input: {} unreceipted commits, {} paths since {base}",
         input.commits.len(),
         input.paths.len()
@@ -421,11 +415,18 @@ fn judge_with_lint(
     .map_err(|e| (false, e.to_string()))?;
     let tools = crate::preflight(&env, root).map_err(|why| (false, why))?;
     let scratch = aterm_tempfile::tempdir().map_err(|e| (false, e.to_string()))?;
+    let selecting = std::time::Instant::now();
     let selection =
         // The paths are the unreceipted commits', which no one tree precedes: a revert of a
         // receipted change compares equal to `base`.
         crate::changed::resolve_paths(root, &tools, &env.path, base, input.paths.clone(), None);
     let (scope, cone) = crate::changed::cone(base, &selection);
+    writeln!(
+        log,
+        "release input selection: {:.3}s; {cone}",
+        selecting.elapsed().as_secs_f64()
+    )
+    .map_err(|e| (false, e.to_string()))?;
     let (_leases, _) = crate::hold_toolchain(&env, &tools, root);
     let mut ctx = Ctx::new_with_tools(
         root.to_path_buf(),
@@ -439,8 +440,8 @@ fn judge_with_lint(
     .with_events(events)
     .with_memory(crate::memory::Book::live());
     ctx.input_paths = Some(input.paths.clone());
-    ctx.passed_lint_packages = carry.passed;
     ctx.carry_context = carry.context;
+    ctx.input_items = carry.items;
     ctx.head_at_start = Some(tip.into());
     let mut unavailable = Vec::new();
     for check in checks.iter().copied() {
@@ -495,26 +496,26 @@ pub fn run_cli(args: &[String], root: &Path) -> i32 {
     }
     let mut checks = CHECKS.to_vec();
     let mut events = None;
-    let mut passed = None;
     let mut context = None;
+    let mut items = Vec::new();
     for pair in args[2..].chunks(2) {
         if pair.len() != 2 {
             return crate::exit::USAGE;
         }
         match pair[0].as_str() {
-            "--carry-context" => context = Some(pair[1].clone()),
-            "--passed-lint-packages" => {
-                passed = match std::fs::read_to_string(&pair[1])
+            "--passed-input-items" => {
+                items = match std::fs::read_to_string(&pair[1])
                     .map_err(|e| e.to_string())
-                    .and_then(|text| crate::lint_content::read_passed(&text))
+                    .and_then(|text| crate::input_content::read(&text))
                 {
-                    Ok(passed) => Some(passed),
+                    Ok(items) => items,
                     Err(why) => {
-                        eprintln!("cannot read lint package evidence: {why}");
+                        eprintln!("cannot read source-check input evidence: {why}");
                         return crate::exit::COULD_NOT_RUN;
                     }
                 };
             }
+            "--carry-context" => context = Some(pair[1].clone()),
             "--checks" => {
                 let names: Vec<_> = pair[1].split(',').collect();
                 if names.iter().any(|name| !NAMES.contains(name)) {
@@ -545,14 +546,14 @@ pub fn run_cli(args: &[String], root: &Path) -> i32 {
             return crate::exit::COULD_NOT_RUN;
         }
     };
-    let code = match judge_with_lint(
+    let code = match judge_with_inputs(
         root,
         &args[1],
         &tip,
         &checks,
         events,
         &mut std::io::stdout(),
-        LintCarry { passed, context },
+        InputCarry { context, items },
     ) {
         Ok(note) => {
             println!("{note}");
@@ -750,6 +751,57 @@ mod tests {
         ]);
         r.git(&["update-ref", "HEAD", &merged]);
         assert_eq!(r.input(&base).paths, ["seed"]);
+    }
+
+    /// An octopus merge's input is every path where it differs from any parent, as
+    /// `--diff-merges=separate` reads it, gathered one parent at a time. Here both tips are
+    /// already released, so the archive merge alone is owed, with its new file and each path
+    /// where it differs from a tip.
+    ///
+    /// NEGATIVE CONTROL: read the first parent's diff alone and the paths are `manifest` only;
+    /// read it as one `--diff-merges=separate` capture and a large enough archive merge
+    /// overflows the complete-capture limit, the refusal of 0.193.0's first dry run on main's
+    /// 60-parent preservation merge 7514a3dd04d.
+    #[test]
+    fn an_octopus_merge_owes_every_path_where_it_differs_from_a_parent() {
+        let r = Repo::new();
+        let base = r.git(&["rev-parse", "HEAD"]);
+        r.write("tip-a", "a\n");
+        let a = r.commit("tip a");
+        r.git(&["checkout", "-q", "--detach", &base]);
+        r.write("tip-b", "b\n");
+        let b = r.commit("tip b");
+        r.git(&["merge", "-q", "--no-edit", &a]);
+        let released = r.git(&["rev-parse", "HEAD"]);
+        r.write("manifest", "kept\n");
+        r.git(&["add", "."]);
+        let tree = r.git(&["write-tree"]);
+        let merged = r.git(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &released,
+            "-p",
+            &a,
+            "-p",
+            &b,
+            "-m",
+            "archive",
+        ]);
+        r.git(&["update-ref", "HEAD", &merged]);
+        let input = r.input(&released);
+        assert_eq!(input.commits, std::slice::from_ref(&merged));
+        assert_eq!(input.paths, ["manifest", "tip-a", "tip-b"]);
+        let separate = r.git(&[
+            "show",
+            "--format=",
+            "--name-only",
+            "--no-renames",
+            "--diff-merges=separate",
+            &merged,
+        ]);
+        let separate: BTreeSet<&str> = separate.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(separate, BTreeSet::from(["manifest", "tip-a", "tip-b"]));
     }
 
     /// Choosing a parent's old content can undo a checked fix. A combined diff omits that
@@ -1101,20 +1153,20 @@ mod tests {
         );
         let first = r.commit("dry tip");
         let logs = aterm_tempfile::tempdir().unwrap();
-        let run = |tip: &str, previous: Option<crate::lint_content::Passed>, name: &str| {
+        let run = |tip: &str, previous: Option<Vec<crate::input_content::Proof>>, name: &str| {
             let events = logs.path().join(format!("{name}.events"));
             let mut output = Vec::new();
             let start = std::time::Instant::now();
-            let result = judge_with_lint(
+            let result = judge_with_inputs(
                 r.0.path(),
                 &base,
                 tip,
                 &[Check::Lint],
                 Some(crate::event_log::EventLog::open(&events).unwrap()),
                 &mut output,
-                LintCarry {
-                    passed: previous,
+                InputCarry {
                     context: Some("ab".repeat(32)),
+                    items: previous.unwrap_or_default(),
                 },
             );
             assert!(
@@ -1122,33 +1174,33 @@ mod tests {
                 "{result:?}\n{}",
                 String::from_utf8_lossy(&output)
             );
-            let mut passed = crate::lint_content::Passed::new();
+            let mut passed = Vec::new();
             let mut ran = BTreeSet::new();
+            let mut items = crate::input_content::Collector::default();
             for line in std::fs::read_to_string(events).unwrap().lines() {
                 let Some(text) = line.strip_prefix("verify-event: ") else {
                     continue;
                 };
                 let row: aterm_json::Value = aterm_json::from_str(text).unwrap();
-                if row["event"].as_str() != Some("lint-package-finished") {
+                let Some(proof) = items.observe(&row).unwrap() else {
+                    continue;
+                };
+                if proof.check != "lint" {
                     continue;
                 }
-                let spec = row["spec"].as_str().unwrap().to_string();
-                assert_eq!(row["inputs_bounded"].as_bool(), Some(true), "{row}");
+                let spec = proof
+                    .item
+                    .split('#')
+                    .next()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned();
                 if row["carried"].as_bool() != Some(true) {
-                    ran.insert(spec.clone());
+                    ran.insert(spec);
                 }
-                passed.insert(
-                    spec.clone(),
-                    crate::lint_content::CarryProof {
-                        schema: crate::lint_content::SCHEMA,
-                        spec,
-                        outcome: "ok".into(),
-                        content_key: row["content_key"].as_str().map(str::to_owned),
-                        inputs_bounded: true,
-                        input_reason: None,
-                        execution_s: row["execution_s"].as_f64().unwrap(),
-                    },
-                );
+                passed.push(proof);
             }
             let wall = start.elapsed().as_secs_f64();
             println!(
@@ -1171,8 +1223,8 @@ mod tests {
         let (_, ran, _) = run(&bumped, Some(prior), "bump");
         assert_eq!(
             ran,
-            BTreeSet::from(["aterm".into()]),
-            "only the version-inheriting leaf reads the product version"
+            BTreeSet::from(["a".into(), "aterm".into(), "b".into(), "c".into()]),
+            "Tippy records the workspace manifest as an input of every compiler unit"
         );
         // ABBA uses the actual old preflight path (no package context) as its negative
         // control. The recorded walls are measurements, never latency assertions.

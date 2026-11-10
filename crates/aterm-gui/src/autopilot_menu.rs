@@ -1839,9 +1839,14 @@ impl App {
         else {
             return;
         };
-        if let MenuAct::Fact(fact, crate::fact_menu::FactAct::Type(slash)) = act {
+        if let MenuAct::Fact(
+            fact,
+            fact_act
+            @ (crate::fact_menu::FactAct::Type(_) | crate::fact_menu::FactAct::SwitchModel),
+        ) = act
+        {
             let (anchor, keyboard) = (menu.anchor, menu.highlight.is_some());
-            self.choose_fact_type(wid, session, fact, slash, anchor, keyboard);
+            self.choose_fact_type(wid, session, fact, fact_act, anchor, keyboard);
             return;
         }
         self.close_autopilot_menu();

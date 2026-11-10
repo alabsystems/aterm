@@ -1248,6 +1248,7 @@ fn a_public_upload_an_earlier_run_owed_is_finished_before_the_index() {
         &public,
         "atpkg-clean-20",
         atpkg_publish::host::fake::FakeRelease {
+            published_at: None,
             draft: false,
             prerelease: true,
             assets,

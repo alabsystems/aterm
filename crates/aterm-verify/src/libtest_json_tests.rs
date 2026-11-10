@@ -2,6 +2,33 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+
+#[test]
+fn completed_case_times_rank_cases_and_ignore_suite_totals_and_untimed_cases() {
+    let raw = [
+        r#"{"type":"test","event":"started","name":"short"}"#,
+        r#"{"type":"test","event":"ok","name":"short","exec_time":1.0}"#,
+        r#"{"type":"test","event":"started","name":"long"}"#,
+        r#"{"type":"test","event":"ok","name":"long","exec_time":9.0}"#,
+        r#"{"type":"suite","event":"ok","exec_time":100.0}"#,
+        r#"{"type":"test","event":"started","name":"untimed"}"#,
+        r#"{"type":"test","event":"ok","name":"untimed"}"#,
+    ]
+    .join("\n");
+    let read = |raw: &str| {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("events");
+        std::fs::write(&path, raw).unwrap();
+        slow_cases(&crate::exec::case_observations(&path, true).timings)
+    };
+    let times = read(&raw);
+    assert_eq!(times.len(), 2);
+    assert_eq!(times[0]["case"].as_str(), Some("long"));
+    assert_eq!(times[0]["execution_s"].as_f64(), Some(9.0));
+    // The planted long case must move behind short when its measured time is removed.
+    let control = read(&raw.replace(r#""name":"long","exec_time":9.0"#, r#""name":"long"#));
+    assert_eq!(control[0]["case"].as_str(), Some("short"));
+}
 use crate::libtest::{self, COULD_NOT_RUN_SENTINEL};
 use crate::libtest_fixture::{FIXTURE, NONCE};
 

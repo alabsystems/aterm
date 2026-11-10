@@ -205,6 +205,58 @@ fn completed_successor_keeps_transport_until_its_preserved_source_changes() {
 }
 
 #[test]
+fn native_source_holds_the_completed_successor_and_all_ancestor_controls() {
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    let registry = crate::alab::Registry::at(original.clone());
+    registry.open().unwrap();
+    let config = original.home.join("config.toml");
+    let old = registry
+        .with_admitted_source(&config, None, |source| Ok(source.revision().clone()))
+        .unwrap();
+    let mut selection = reserved(&lab);
+    let next = move_admitted_candidate(&mut lab);
+    import(&mut selection).unwrap();
+    assert!(
+        registry
+            .with_admitted_source::<()>(&config, Some(&old), |_| panic!("stale actor admitted"))
+            .is_err()
+    );
+    registry
+        .with_admitted_source(&config, None, |_| {
+            for paths in [&original, &next] {
+                for (dir, name) in [
+                    (paths.dir.clone(), ".lock"),
+                    (paths.dir.join("commons/control"), "control.lock"),
+                ] {
+                    assert_eq!(
+                        PrivateLock::take(&dir, name, Duration::ZERO, "source held")
+                            .err()
+                            .map(|error| error.kind()),
+                        Some(std::io::ErrorKind::WouldBlock),
+                        "{} / {name}",
+                        dir.display()
+                    );
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    for paths in [&original, &next] {
+        drop(PrivateLock::take(&paths.dir, ".lock", Duration::ZERO, "released").unwrap());
+        drop(
+            PrivateLock::take(
+                &paths.dir.join("commons/control"),
+                "control.lock",
+                Duration::ZERO,
+                "released",
+            )
+            .unwrap(),
+        );
+    }
+}
+
+#[test]
 fn a_busy_ancestor_releases_every_partial_source_read_before_waiting() {
     let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
     data(&lab);

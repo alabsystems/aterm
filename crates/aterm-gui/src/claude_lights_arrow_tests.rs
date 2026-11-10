@@ -611,19 +611,11 @@ fn a_pointer_move_after_the_rule_moved_hovers_the_arrow() {
     assert_eq!(slot(&app, wid), words, "the next capture draws its words");
 
     let b = switch(&app, wid);
-    let marks: Vec<std::ops::Range<usize>> = app.windows[&wid]
-        .claude_lights
-        .mark_hits
-        .iter()
-        .filter(|m| m.frame_row == b.frame_row)
-        .map(|m| m.cols.clone())
-        .collect();
     let off = (0..140)
         .find(|c| {
             ![Some(b.cols.clone()), b.label.clone(), b.arrow.clone()]
                 .iter()
                 .flatten()
-                .chain(&marks)
                 .any(|r| r.contains(c))
         })
         .expect("a rule cell off the glass");

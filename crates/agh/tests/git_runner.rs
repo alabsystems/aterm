@@ -3030,6 +3030,63 @@ fn fetch_rows(rows: &[(&str, &str, &str)]) -> FetchBatch {
 }
 
 #[test]
+fn exact_object_import_checks_the_remote_and_creates_no_caller_refs() {
+    let world = World::canonical("git-object-import");
+    let bare = bare_repo(world.path(), "app");
+    let receiver = world.path().join("receiver.git");
+    std::fs::create_dir(&receiver).unwrap();
+    host_git(&receiver, &["init", "--quiet", "--bare"]);
+    let oid = host_git(&bare, &["rev-parse", "main"]);
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    let refs = || {
+        host_git(
+            &receiver,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        )
+    };
+    assert!(refs().is_empty());
+    gh.run_git(&GitRun::fetch_batch(
+        &slug,
+        &receiver,
+        FetchBatch::objects(vec![oid.clone()]).unwrap(),
+        true,
+    ))
+    .unwrap();
+    assert!(refs().is_empty(), "an import cannot publish cache refs");
+    assert_eq!(host_git(&receiver, &["cat-file", "-t", &oid]), "commit");
+    assert!(
+        gh.fx()
+            .children_run()
+            .iter()
+            .all(|child| !child.args.iter().any(|arg| arg == "update-ref"))
+    );
+    assert!(
+        gh.run_git(&GitRun::fetch_batch(
+            &slug,
+            &receiver,
+            FetchBatch::objects(vec!["f".repeat(40)]).unwrap(),
+            true
+        ))
+        .is_err(),
+        "an unadvertised missing object cannot become evidence"
+    );
+    assert!(refs().is_empty());
+    // The explicit ref-publishing mode is the negative control over the same backend.
+    gh.run_git(&GitRun::fetch_batch(
+        &slug,
+        &receiver,
+        fetch_rows(&[(&oid, "refs/agh/control", &oid)]),
+        true,
+    ))
+    .unwrap();
+    assert_eq!(host_git(&receiver, &["rev-parse", "refs/agh/control"]), oid);
+}
+
+#[test]
 fn batch_fetch_checks_raw_tag_identities_in_one_transfer_and_preserves_the_checkout() {
     let world = World::canonical("git-batch-fetch");
     let bare = bare_repo(world.path(), "app");

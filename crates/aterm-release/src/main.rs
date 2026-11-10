@@ -145,6 +145,16 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
     cutter::judge_at_start();
+    #[cfg(not(test))]
+    if let Some(result) = release_steps::step_one_probe_if_asked(&args) {
+        return match result {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(why) => {
+                eprintln!("step 1 source instrument: {why}");
+                std::process::ExitCode::from(2)
+            }
+        };
+    }
     #[cfg(all(debug_assertions, not(test)))]
     if let Some(result) = release_steps::cutter_probe_if_asked(&args) {
         return match result {

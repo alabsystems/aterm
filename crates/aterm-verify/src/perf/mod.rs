@@ -374,8 +374,8 @@ impl Lane {
                  Metal's clock)"
             }
             Lane::Deck => {
-                "macOS, targo (opt-test build of aterm-gui's tests; release build of aterm with \
-                 dev-seams and a build of aterm-lab for the idle take)"
+                "macOS, targo (opt-test build of aterm-gui's tests; attested debug builds of \
+                 aterm and aterm-lab for the diagnostic idle take)"
             }
             Lane::Wasm => {
                 "chrome-headless-shell (verify provision), the checkout's stock pin + \

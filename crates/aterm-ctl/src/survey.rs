@@ -1063,12 +1063,17 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
         line.push_str(&format!(" human={}", age(ms)));
     }
     // A name in words at content (a tab's name, `<host> (node <head>) over the fleet`), shown as
-    // the title is.
+    // the title is. A local typist's credit is news for [`NEWLY_DONE_MS`]; another Mac's drive
+    // says whose the tab is at any age, until a person types in it after the drive.
     let mut kept = 0;
-    if let (Some(by), Some(ms)) = (
-        s.get("typed_by"),
-        s.number("typed_ms").filter(|&ms| ms < NEWLY_DONE_MS),
-    ) {
+    let typed = s
+        .get("typed_by")
+        .zip(s.number("typed_ms"))
+        .filter(|&(by, ms)| {
+            let driven = credit_shown(by, LINE_CHARS).1;
+            ms < NEWLY_DONE_MS || (driven && !s.number("human_ms").is_some_and(|human| human < ms))
+        });
+    if let Some((by, ms)) = typed {
         let (head, ago) = (" typed by ", format!(" {} ago", age(ms)));
         let spent = line.chars().count() + head.len() + ago.len();
         let (credit, whole) = credit_shown(by, LINE_CHARS.saturating_sub(spent));

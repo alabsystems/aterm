@@ -3,6 +3,67 @@
 
 use super::*;
 
+#[test]
+fn only_successful_completed_runs_keep_a_learned_partition() {
+    let binary = binary();
+    let output = [
+        r#"{"type":"suite","event":"started","test_count":2}"#,
+        r#"{"type":"test","event":"started","name":"a::one"}"#,
+        r#"{"type":"test","event":"ok","name":"a::one","exec_time":1.0}"#,
+        r#"{"type":"test","event":"started","name":"b::one"}"#,
+        r#"{"type":"test","event":"ok","name":"b::one","exec_time":1.0}"#,
+        r#"{"type":"suite","event":"ok","passed":2,"failed":0,"ignored":0,"measured":0,"filtered_out":0,"exec_time":180.0}"#,
+    ].join("\n");
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("case-events");
+    std::fs::write(&path, format!("{output}\n")).unwrap();
+    let observations = crate::exec::case_observations(&path, true);
+    assert_eq!(observations.timings.len(), 2);
+    for ok in [true, false] {
+        let run = Run {
+            ok,
+            code: Some(if ok { 0 } else { 101 }),
+            output: crate::libtest_json::render(&output, None),
+            case_observations: Some(observations.clone()),
+            ..Run::default()
+        };
+        let ran = Ran::of(run, Duration::ZERO, Duration::from_secs(180));
+        let (_, line, sample) = binary_event(&binary, &ran, true, None, true);
+        let event: aterm_json::Value =
+            aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
+        if ok {
+            assert_eq!(event["partition"]["filter"].as_str(), Some("a::"));
+            assert_eq!(event["partition"]["selected_cases"].as_u64(), Some(1));
+            assert_eq!(event["partition"]["remaining_cases"].as_u64(), Some(1));
+            assert_eq!(event["partition"]["selected_case_s"].as_f64(), Some(1.0));
+        } else {
+            assert!(event["partition"].is_null());
+        }
+        let sample = sample.unwrap();
+        assert_eq!(
+            sample.partition.as_deref(),
+            if ok { Some("a::") } else { None }
+        );
+    }
+    std::fs::write(&path, &output).unwrap();
+    let partial = crate::exec::case_observations(&path, true);
+    let run = Run {
+        ok: true,
+        code: Some(0),
+        output: crate::libtest_json::render(&output, None),
+        case_observations: Some(partial),
+        ..Run::default()
+    };
+    let ran = Ran::of(run, Duration::ZERO, Duration::from_secs(180));
+    assert_eq!(
+        binary_event(&binary, &ran, true, None, true)
+            .2
+            .unwrap()
+            .partition,
+        None
+    );
+}
+
 fn binary() -> Binary {
     Binary {
         harness: false,

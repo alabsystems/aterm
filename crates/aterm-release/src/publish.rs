@@ -25,6 +25,9 @@ use crate::{
     verify,
 };
 
+#[path = "publish/draft.rs"]
+mod draft;
+
 /// Every `cut` flag, parsed by `cli.rs`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CutOptions {
@@ -48,6 +51,8 @@ pub struct CutOptions {
 pub enum CutKind {
     Real,
     DryRun,
+    /// Private uploads under the release's reservation, before its ledger claim.
+    Draft,
 }
 
 /// How an operator runs a cut.
@@ -5766,7 +5771,7 @@ pub fn fresh_cut_journal_triage(existing: Option<&JournalHeader>, kind: CutKind)
     }
     let at = j.position();
     match kind {
-        CutKind::Real => Err(Error::new(format!(
+        CutKind::Real | CutKind::Draft => Err(Error::new(format!(
             "a cut is already in progress: v{} (build {}) is journaled {at} — finish it with \
              `{CUT_COMMAND}`, discard it with `{CUT_COMMAND} --abandon v{}`, or \
              delete dist/cut-state.toml",
@@ -6128,6 +6133,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         CutKind::Real if recut => " [recut]",
         CutKind::Real => "",
         CutKind::DryRun => " [dry-run]",
+        CutKind::Draft => unreachable!("drafts are prepared by cut --sign"),
     };
     println!("aterm-release · cut v{version} ({head8}){flavor}");
 
@@ -6453,6 +6459,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             );
             (claim.build, claim.commit)
         }
+        CutKind::Draft => unreachable!("drafts never claim"),
         CutKind::DryRun => {
             step(
                 "claim",
@@ -6527,6 +6534,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         };
         j.save(&journal_path)?;
         ctx.journal = Some(j);
+        draft::adopt(&mut ctx)?;
     }
 
     drop(journal_timing);
@@ -6587,8 +6595,11 @@ fn sign_beside_journal(existing: Option<&JournalHeader>, path: &Path) -> Result<
 /// all under the reserved number and commit and all private, then keep the record the claim
 /// adopts ([`SignedRecord`], [`adopted_copy`]). It reads its release from this clone's release
 /// journal (R, the reservation, the bundle), never from the publication engine, so it runs
-/// beside `pub publish`: it claims nothing, pushes nothing, uploads nothing, takes no release
-/// lock and no publisher fence, and leaves the Linux workers to the claim. A standing record of
+/// beside `pub publish`: it claims nothing and takes no release lock or publisher fence.
+/// After signing, it stages the manifest and uploads every asset into a journaled private
+/// draft; the engine attaches its source attestation to that exact draft without publishing
+/// it. Linux workers receive the reserved commit as a private bundle, and every declared
+/// handoff is imported before its manifest is signed. A standing record of
 /// these bytes is adopted as it is. `--sign-prepare` uses the built bundle before verification
 /// ends, executes no product, and writes only a prepared record. After verification `--sign`
 /// re-proves it, runs the local self-check and writes the record the claim may adopt.
@@ -6667,7 +6678,8 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
     );
     // A dry run's context: no ledger claim, no journal, no release lock and no publisher fence;
     // the claim that adopts this copy holds all four.
-    let ctx = CutCtx {
+    let attributed = signature_verdict.cut_attribution();
+    let mut ctx = CutCtx {
         credentials: credentials.cloned(),
         apple,
         repo: repo.to_path_buf(),
@@ -6676,11 +6688,11 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
         journal_path,
         slug,
         tag: format!("v{version}"),
-        notes_section: version.clone(),
+        notes_section: "Unreleased".to_string(),
         version,
         build: verified.reserved.build,
         commit: verified.reserved.commit.clone(),
-        min_build: None,
+        min_build: opts.min_build,
         artifact: Some(verified.complete.key.clone()),
         macho_sha256: Some(verified.complete.macho_sha256.clone()),
         linux: None,
@@ -6688,9 +6700,9 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey,
         verify_pubkey: None,
-        signature_machine_id: None,
-        attribution: None,
-        roster: None,
+        signature_machine_id: attributed.machine_id,
+        attribution: attributed.attribution,
+        roster: attributed.roster,
         release_id: None,
         release_intent: false,
         upload_intents: Vec::new(),
@@ -6724,6 +6736,16 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
             );
             Ok(())
         })?;
+    }
+    if !opts.sign_prepare {
+        let mut declaration = opts.clone();
+        if !declaration.mac_only && declaration.linux_artifacts.is_none() {
+            declaration.mac_only = release.linux.mac_only;
+            declaration.linux_artifacts = release.linux.artifacts;
+            declaration.linux_targets = release.linux.targets;
+            declaration.linux_workers = release.linux.workers;
+        }
+        draft::prepare(&mut ctx, &declaration)?;
     }
     println!(
         "\nDONE cut {} v{} (build {}) in {}s — private record ({})",
@@ -7026,6 +7048,7 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
             );
         }
         CutKind::DryRun => unreachable!("dry-run returned after selfcheck"),
+        CutKind::Draft => unreachable!("draft preparation never runs the claimed pipeline"),
     }
     Ok(())
 }
@@ -7058,10 +7081,14 @@ fn ensure_ctx_release_lease(ctx: &CutCtx) -> Result<()> {
 struct ReleaseSession {
     repo: PathBuf,
     guards: Option<(ReleaseLeaseGuard, PublisherFenceGuard)>,
+    reservation: Option<(String, u64)>,
 }
 
 impl ReleaseSession {
     fn check(&self) -> Result<()> {
+        if let Some((commit, build)) = &self.reservation {
+            return draft::authority(&self.repo, commit, *build);
+        }
         let Some((lease, fence)) = &self.guards else {
             return Ok(());
         };
@@ -7072,10 +7099,18 @@ impl ReleaseSession {
 }
 
 fn release_session(ctx: &CutCtx) -> Result<ReleaseSession> {
+    if ctx.kind == CutKind::Draft {
+        return Ok(ReleaseSession {
+            repo: ctx.repo.clone(),
+            guards: None,
+            reservation: Some((ctx.commit.clone(), ctx.build)),
+        });
+    }
     if ctx.kind != CutKind::Real {
         return Ok(ReleaseSession {
             repo: ctx.repo.clone(),
             guards: None,
+            reservation: None,
         });
     }
     let lease = ctx
@@ -7089,6 +7124,7 @@ fn release_session(ctx: &CutCtx) -> Result<ReleaseSession> {
     Ok(ReleaseSession {
         repo: ctx.repo.clone(),
         guards: Some((lease, fence)),
+        reservation: None,
     })
 }
 
@@ -7308,8 +7344,11 @@ fn spent_remedy(version: &str, build: u64) -> String {
 }
 
 fn step_sign(ctx: &mut CutCtx) -> Result<()> {
+    if ctx.kind == CutKind::Real && draft::staged(ctx)? {
+        return Ok(());
+    }
     if let Some(handoff) = &mut ctx.linux {
-        handoff.run_workers(&ctx.version, ctx.build, &ctx.commit)?;
+        handoff.run_workers(&ctx.repo, &ctx.version, ctx.build, &ctx.commit)?;
         handoff.import(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
         if let Some(journal) = &mut ctx.journal {
             journal.linux = Some(handoff.clone());
@@ -7422,6 +7461,14 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         journal
             .signature_machine_id
             .clone_from(&ctx.signature_machine_id);
+    }
+    if ctx.kind == CutKind::Real {
+        let slug = ctx.slug.clone();
+        channel::stage_on_channel(&mut LiveChannelRelease {
+            ctx,
+            slug: &slug,
+            bound: None,
+        })?;
     }
     Ok(())
 }
@@ -8054,6 +8101,10 @@ pub(crate) fn signed_copy_stands(
 /// staging directory a live process held).
 pub(crate) fn discard_signed(dist: &Path, version: &str, build: u64) -> Vec<String> {
     let mut left = Vec::new();
+    if let Err(error) = draft::discard(dist, version, build) {
+        left.push(error.to_string());
+        return left;
+    }
     if let Err(error) = forget_signed_record(dist, build) {
         left.push(error.to_string());
     }
@@ -8087,6 +8138,14 @@ pub(crate) fn discard_signed(dist: &Path, version: &str, build: u64) -> Vec<Stri
         }
     }
     left
+}
+
+pub(crate) fn discard_draft(dist: &Path, version: &str, build: u64) -> Vec<String> {
+    draft::discard(dist, version, build)
+        .err()
+        .into_iter()
+        .map(|e| e.to_string())
+        .collect()
 }
 
 /// The self-check of a copy `cut --sign` signed and the claim adopted: the manifest's `team` is
@@ -8781,11 +8840,12 @@ fn step_publish(ctx: &mut CutCtx) -> Result<()> {
     ensure_ctx_release_lease(ctx)?;
     let slug = ctx.slug.clone();
     preflight_channel_target(&slug, true)?;
-    channel::publish_on_channel(&mut LiveChannelRelease {
+    channel::publish_staged_on_channel(&mut LiveChannelRelease {
         ctx,
         slug: &slug,
         bound: None,
     })?;
+    draft::forget_published(ctx)?;
     step(
         "publish",
         &format!("v{} (build {}) published on {slug}", ctx.version, ctx.build),
@@ -8921,6 +8981,11 @@ fn bind_channel_release(ctx: &mut CutCtx, slug: &str) -> Result<(u64, bool)> {
             release.id
         }
         channel::BindPlan::ConvergeVisible => {
+            if ctx.kind == CutKind::Draft {
+                return Err(Error::new(
+                    "private uploads require a draft; the source engine must keep the release private until cut",
+                ));
+            }
             let release = observed.expect("visible release decision");
             if ctx.release_intent {
                 step(
@@ -9006,7 +9071,7 @@ impl LiveChannelRelease<'_> {
         self.bound.ok_or_else(|| {
             Error::new(
                 "the channel sequence reached a release call before binding a release; \
-                 refusing (channel::publish_on_channel binds right after the floors)",
+                 refusing (channel::publish_staged_on_channel binds right after the floors)",
             )
         })
     }
@@ -9127,6 +9192,9 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
     }
 
     fn make_head(&mut self) -> Result<()> {
+        if self.ctx.kind == CutKind::Draft {
+            return Err(Error::new("private draft staging cannot publish a release"));
+        }
         let _timing = crate::cut_timing::Timer::new("publish full and latest");
         let (release_id, adopted) = self.bound()?;
         let (slug, expect_draft) = (self.slug, !adopted);
@@ -9705,10 +9773,12 @@ pub(crate) fn upload_pool<T: Sync>(
         .map_or(Ok(()), |(_, error)| Err(error))
 }
 
-/// The channel's finite, validated payload set starts together. Each one-shot
-/// POST retains its own durable intent; the manifest barrier stays in channel.
+/// The channel's validated payloads share the measured request pool. Each
+/// one-shot POST retains its durable intent; the manifest barrier stays in channel.
 fn payload_pool<T: Sync>(files: &[T], upload: &(impl Fn(&T) -> Result<()> + Sync)) -> Result<()> {
-    upload_pool(files, files.len(), upload)
+    // Equal-volume private GitHub upload ABBA: 2=73.55s, 4=45.33s,
+    // 8=23.78s (128 MiB). See docs/measured/release-draft-tail-2026-11-09.md.
+    upload_pool(files, 8, upload)
 }
 
 #[cfg(test)]
@@ -9729,32 +9799,6 @@ mod upload_pool_tests {
                 assert!(event["confirmed_bytes"].is_null());
             }
         }
-    }
-
-    /// NEGATIVE CONTROL: the former four-worker cap cannot enter all payloads
-    /// while the completion gate is closed.
-    #[test]
-    fn every_payload_starts_before_any_payload_must_finish() {
-        let gate = (Mutex::new(false), Condvar::new());
-        let (tx, rx) = mpsc::channel();
-        std::thread::scope(|scope| {
-            let worker = scope.spawn(|| {
-                payload_pool(&[0; 10], &|_| {
-                    tx.send(()).unwrap();
-                    drop(
-                        gate.1
-                            .wait_while(gate.0.lock().unwrap(), |open| !*open)
-                            .unwrap(),
-                    );
-                    Ok(())
-                })
-            });
-            let entered = (0..10).all(|_| rx.recv_timeout(Duration::from_secs(60)).is_ok());
-            *gate.0.lock().unwrap() = true;
-            gate.1.notify_all();
-            worker.join().unwrap().unwrap();
-            assert!(entered, "all payloads must enter before any finishes");
-        });
     }
 
     /// NEGATIVE CONTROL: losing the caller's thread-local route would let a

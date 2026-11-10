@@ -91,30 +91,20 @@ fn paths(git: &dyn GitRunner, before: &str, after: &str) -> Result<Vec<String>, 
 }
 
 fn touched(git: &dyn GitRunner, before: &str, after: &str) -> Result<Vec<String>, String> {
-    let commits = text(git, &["rev-list", &format!("{before}..{after}")])?;
-    let mut touched = Vec::new();
-    for commit in commits.lines() {
-        let out = git_ok(
-            git,
-            &[
-                "diff-tree",
-                "--no-commit-id",
-                "--name-only",
-                "-r",
-                "-m",
-                "-z",
-                commit,
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-        touched.extend(
-            out.stdout_utf8()
-                .split('\0')
-                .filter(|p| !p.is_empty())
-                .map(str::to_owned),
-        );
-    }
-    Ok(touched)
+    aterm_verify::git_paths::range(
+        &mut |args| {
+            crate::ledger::git_read_ok(git, args)
+                .map(|out| out.stdout)
+                .map_err(|e| e.to_string())
+        },
+        before,
+        after,
+        aterm_verify::git_paths::MergeDiff::AllParents,
+        &[],
+    )?
+    .into_iter()
+    .map(|path| String::from_utf8(path).map_err(|e| e.to_string()))
+    .collect()
 }
 
 pub(crate) fn record(
@@ -440,6 +430,73 @@ mod tests {
         assert_ne!(text(&f.git(), &["rev-parse", "HEAD"]).unwrap(), tip);
         recover(&f.git(), &f.journal, &tip, false).unwrap();
         assert_eq!(text(&f.git(), &["rev-parse", "HEAD"]).unwrap(), tip);
+    }
+
+    #[test]
+    fn octopus_bump_recovery_checks_parents_already_in_the_base() {
+        for overlap in [false, true] {
+            let f = Fixture::new();
+            let git = f.git();
+            let base = text(&git, &["rev-parse", "HEAD"]).unwrap();
+            let tree = text(&git, &["rev-parse", "HEAD^{tree}"]).unwrap();
+            if overlap {
+                std::fs::write(f.repo.join("Cargo.lock"), "other parent's lock\n").unwrap();
+            }
+            text(&git, &["add", "."]).unwrap();
+            let other = text(&git, &["write-tree"]).unwrap();
+            let a = text(&git, &["commit-tree", &other, "-p", &base, "-m", "a"]).unwrap();
+            let b = text(&git, &["commit-tree", &tree, "-p", &base, "-m", "b"]).unwrap();
+            let released = text(
+                &git,
+                &["commit-tree", &tree, "-p", &a, "-p", &b, "-m", "released"],
+            )
+            .unwrap();
+            text(&git, &["reset", "--hard", &released]).unwrap();
+            f.bump();
+            let archive = text(
+                &git,
+                &[
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &released,
+                    "-p",
+                    &a,
+                    "-p",
+                    &b,
+                    "-m",
+                    "archive",
+                ],
+            )
+            .unwrap();
+            // NEGATIVE CONTROL: the first-parent and combined diff both miss a
+            // lock chosen from a parent. The release floor already reaches a and b.
+            assert!(paths(&git, &released, &archive).unwrap().is_empty());
+            assert!(
+                text(
+                    &git,
+                    &[
+                        "show",
+                        "--format=",
+                        "--name-only",
+                        "--diff-merges=combined",
+                        &archive
+                    ]
+                )
+                .unwrap()
+                .is_empty()
+            );
+            assert_eq!(
+                touched(&git, &released, &archive)
+                    .unwrap()
+                    .contains(&"Cargo.lock".into()),
+                overlap
+            );
+            assert_eq!(
+                recover(&git, &f.journal, &archive, true).unwrap().is_some(),
+                !overlap
+            );
+        }
     }
 
     #[test]

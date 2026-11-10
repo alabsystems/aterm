@@ -55,20 +55,23 @@ fn seam_reset(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 
 fn check_file(file: &SourceFile, whole_file_is_test: bool, out: &mut Vec<Finding>) {
     let code = &file.lexed().code;
-    let test_only = if whole_file_is_test {
-        None
-    } else {
-        Some(crate::lock_order::unmasked_lines(
-            code,
-            &super::debug_seam::release_never_compiles,
-        ))
+    // The lines a release compiles, and where each line starts, are read once a reset asks.
+    let lines = std::cell::OnceCell::new();
+    let lines = || {
+        lines.get_or_init(|| {
+            let test_only = (!whole_file_is_test).then(|| {
+                crate::lock_order::unmasked_lines(code, &super::debug_seam::release_never_compiles)
+            });
+            let starts: Vec<usize> = std::iter::once(0)
+                .chain(code.match_indices('\n').map(|(at, _)| at + 1))
+                .collect();
+            (test_only, starts)
+        })
     };
-    let starts: Vec<usize> = std::iter::once(0)
-        .chain(code.match_indices('\n').map(|(at, _)| at + 1))
-        .collect();
-    let line_of = |at: usize| starts.partition_point(|&start| start <= at) - 1;
+    let line_of = |at: usize| lines().1.partition_point(|&start| start <= at) - 1;
     let gated = |at: usize| {
-        test_only
+        lines()
+            .0
             .as_ref()
             .is_none_or(|shipped| !shipped.get(line_of(at)).copied().unwrap_or(true))
     };

@@ -45,7 +45,7 @@ pub fn names(token: &str) -> bool {
 
 /// `aterm doctor`'s grammar after its name.
 pub const GRAMMAR: &str = "[--read-only] [--json] [--verbose] [--only <id,...>] | (--check \
-                           [--verbose] | --apply | --restore) [--json]";
+                           [--verbose] | --apply | --restore) [--json] | --file-events <seconds>";
 
 /// One line per way to run `aterm doctor`, as `aterm doctor --help` and `aterm help doctor`
 /// print them under the grammar.
@@ -55,7 +55,148 @@ pub const HELP_ROWS: &str = concat!(
     "  aterm doctor --read-only   the same checks, changing nothing (--json: the report as JSON)\n",
     "  aterm doctor --only <id,…> only those items, families or layers\n",
     "  aterm doctor --check       this Mac's profile, in its scope (--apply, --restore change it)\n",
+    "  aterm doctor --file-events <seconds>  sample aterm's delivered file-event sources (macOS)\n",
 );
+
+/// Parse the explicit, read-only file-event census (1–3600 seconds). Other doctor forms
+/// return `None` and keep their existing grammar.
+pub fn file_events_duration(rest: &[String]) -> Option<Result<std::time::Duration, &'static str>> {
+    if rest.first().map(String::as_str) != Some("--file-events") {
+        return None;
+    }
+    Some(match rest {
+        [_, seconds] => seconds
+            .parse::<u64>()
+            .ok()
+            .filter(|s| (1..=3600).contains(s))
+            .map(std::time::Duration::from_secs)
+            .ok_or("usage: aterm doctor --file-events <seconds: 1..3600>"),
+        _ => Err("usage: aterm doctor --file-events <seconds: 1..3600>"),
+    })
+}
+
+/// Generated event sources of an aterm checkout, including a linked worktree's common Git
+/// directory. Other checkouts select none. This reads only bounded local Git metadata.
+#[must_use]
+pub fn checkout_event_roots(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    if !root.join("crates/aterm-verify/Cargo.toml").is_file() {
+        return Vec::new();
+    }
+    let mut roots = vec![root.join("target")];
+    if let Some(common) = checkout_common_dir(root) {
+        roots.push(common.join("aterm-release"));
+        roots.push(common.join("refs/agh/aterm-release"));
+    }
+    roots
+}
+
+fn checkout_common_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    use aterm_uds::atomic_file::read_regular_text;
+    let dot = root.join(".git");
+    let anchored = |base: &std::path::Path, text: &str| {
+        let path = std::path::Path::new(text.trim_end_matches(['\r', '\n']));
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base.join(path)
+        }
+    };
+    let git = if dot.is_dir() {
+        dot
+    } else {
+        let text = read_regular_text(&dot, 4096).ok()?;
+        anchored(root, text.strip_prefix("gitdir: ")?)
+    };
+    if !git.is_dir() {
+        return None;
+    }
+    let common = match read_regular_text(&git.join("commondir"), 4096) {
+        Ok(text) => anchored(&git, &text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git,
+        Err(_) => return None,
+    };
+    common.canonicalize().ok().filter(|path| path.is_dir())
+}
+
+#[cfg(test)]
+mod file_events_tests {
+    use super::{checkout_event_roots, file_events_duration};
+    #[test]
+    fn explicit_census_is_bounded_and_other_doctor_forms_are_untouched() {
+        let parse = |args: &[&str]| {
+            file_events_duration(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            parse(&["--file-events", "60"]),
+            Some(Ok(std::time::Duration::from_secs(60)))
+        );
+        assert_eq!(parse(&["--read-only"]), None);
+        for args in [
+            vec!["--file-events"],
+            vec!["--file-events", "0"],
+            vec!["--file-events", "3601"],
+            vec!["--file-events", "1", "--apply"],
+        ] {
+            assert!(parse(&args).unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn checkout_sources_include_real_clone_and_linked_worktree_caches_but_not_foreign_roots() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let source = scratch.path().join("source");
+        std::fs::create_dir_all(source.join("crates/aterm-verify")).unwrap();
+        std::fs::write(source.join("crates/aterm-verify/Cargo.toml"), b"").unwrap();
+        let source = source.canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let mut command = aterm_uds::spawnfd::command("git");
+            command.current_dir(&source).args(args);
+            let output = aterm_uds::deadline::output_within(
+                &mut command,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        let linked = scratch.path().join("linked");
+        git(&[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ]);
+        let linked = linked.canonicalize().unwrap();
+        let expected = |root: &std::path::Path| {
+            vec![
+                root.join("target"),
+                source.join(".git/aterm-release"),
+                source.join(".git/refs/agh/aterm-release"),
+            ]
+        };
+        assert_eq!(checkout_event_roots(&source), expected(&source));
+        assert_eq!(checkout_event_roots(&linked), expected(&linked));
+        assert!(checkout_event_roots(scratch.path()).is_empty());
+        // Negative control: a malformed Git pointer must not select arbitrary cache paths.
+        std::fs::write(linked.join(".git"), b"not a Git pointer\n").unwrap();
+        assert_eq!(checkout_event_roots(&linked), vec![linked.join("target")]);
+    }
+}
 
 /// `aterm doctor --help`: the grammar and [`HELP_ROWS`].
 #[must_use]

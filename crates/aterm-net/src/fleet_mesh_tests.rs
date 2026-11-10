@@ -9,6 +9,7 @@ use super::*;
 use crate::fleet_member::{MemberKeys, Standing};
 use aterm_uds::CtlStream;
 use std::net::TcpListener;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 /// The hang detector of every wait here: a loopback handshake that must happen.
@@ -69,7 +70,7 @@ type Seen = (FleetOp, Option<NodeProof>, bool);
 /// loopback: each proved connection is told to `seen` and echoed.
 struct Running {
     addr: SocketAddr,
-    running: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     serving: Option<std::thread::JoinHandle<()>>,
     seen: mpsc::Receiver<Seen>,
 }
@@ -83,7 +84,7 @@ impl Running {
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let (tell, seen) = mpsc::channel::<Seen>();
         let tell = Arc::new(Mutex::new(tell));
         let listening = Listening {
@@ -96,7 +97,7 @@ impl Running {
             lifetime: HANG,
         };
         let serving = {
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 serve_offering_with_ask_within(
                     &listener,
@@ -106,7 +107,7 @@ impl Running {
                         deny,
                     ),
                     ask,
-                    &running,
+                    &stop,
                     HANG,
                     move |served, op| {
                         let _ = tell.lock().unwrap().send((
@@ -132,7 +133,7 @@ impl Running {
         };
         Self {
             addr,
-            running,
+            stop,
             serving: Some(serving),
             seen,
         }
@@ -153,7 +154,7 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
+        self.stop.set();
         if let Some(serving) = self.serving.take() {
             let _ = serving.join();
         }

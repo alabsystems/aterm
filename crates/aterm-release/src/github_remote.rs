@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agh::git::{FetchBatch, FetchRow, GitRun};
+use agh::git::{FetchBatch, GitRun};
 use agh::policy::{Named, Router, Tier};
 use agh::{Github, GithubBuilder, Slug};
 
@@ -224,17 +224,8 @@ impl Remote {
         self.ensure_origin()?;
         let objects = objects.into_iter().collect::<BTreeSet<_>>();
         if !objects.is_empty() {
-            let batch = FetchBatch::new(
-                objects
-                    .into_iter()
-                    .map(|oid| FetchRow {
-                        source: oid.clone(),
-                        into: format!("refs/agh/aterm-release/object/{oid}"),
-                        expected_oid: oid,
-                    })
-                    .collect(),
-            )
-            .map_err(|error| self.client.redactor().apply(&error.why))?;
+            let batch = FetchBatch::objects(objects.into_iter().collect())
+                .map_err(|error| self.client.redactor().apply(&error.why))?;
             self.run(GitRun::fetch_batch(&self.slug, &self.repo, batch, false))?;
         }
         self.ensure_origin()
@@ -655,16 +646,13 @@ impl Remote {
         Ok(refs.remove(reference))
     }
 
-    /// Import this advertised raw object into agh's cache namespace. The native
+    /// Import an advertised raw object without publishing a cache ref. The native
     /// runner preserves branches, tags, tracking refs, index and FETCH_HEAD.
     pub(crate) fn fetch_exact(&self, oid: &str) -> Result<(), String> {
         if !agh::path::is_sha(oid) {
             return Err("an exact release fetch needs a raw lowercase object ID".into());
         }
-        self.ensure_origin()?;
-        let into = format!("refs/agh/aterm-release/object/{oid}");
-        self.run(GitRun::fetch_ref(&self.slug, &self.repo, oid, &into, false))?;
-        self.ensure_origin()
+        self.import_snapshot([oid.to_owned()])
     }
 
     /// Read a blob from the imported raw tree, ignoring replacement refs and

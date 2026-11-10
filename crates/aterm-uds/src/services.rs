@@ -3,7 +3,7 @@
 
 //! macOS's own services' footprints, read without root, for [`aterm_vitals::services`].
 
-pub use aterm_vitals::services::{Member, Reading, Restart, Service};
+pub use aterm_vitals::services::{FSEVENTSD, Member, Reading, Restart, Service};
 
 /// What one look at a service aterm restarts found ([`look`]).
 #[derive(Clone, Debug, PartialEq, Eq)]

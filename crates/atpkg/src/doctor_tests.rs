@@ -1608,7 +1608,7 @@ fn the_doctor_reads_zsh_s_own_zshrc_and_says_the_app_s_aterm_toml() {
         unify: None,
     };
     let said = rows(&Probes {
-        config_split: Some(split),
+        config_split: Ok(Some(split)),
         ..Probes::default()
     });
     let row = said
@@ -1628,6 +1628,18 @@ fn the_doctor_reads_zsh_s_own_zshrc_and_says_the_app_s_aterm_toml() {
         rows(&Probes::default()).iter().all(|r| r.id != split_id),
         "one folder, no row"
     );
+    let cause = "launchd lookup did not complete";
+    let unread = rows(&Probes {
+        config_split: Err(cause.to_owned()),
+        ..Probes::default()
+    });
+    let row = unread.iter().find(|row| row.id == split_id).unwrap();
+    assert_eq!(row.outcome, aterm_converge::Outcome::Unknown);
+    assert!(row.why.as_deref().is_some_and(|why| why.contains(cause)));
+    assert!(matches!(
+        &row.explain.as_ref().unwrap().remedy,
+        aterm_converge::Remedy::None
+    ));
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 }

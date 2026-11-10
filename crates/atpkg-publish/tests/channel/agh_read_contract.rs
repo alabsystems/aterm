@@ -73,6 +73,7 @@ impl World for FakeWorld {
             atpkg_publish::host::fake::FakeRelease {
                 draft,
                 prerelease,
+                published_at: (!draft).then(|| "2026-10-01T00:00:00Z".into()),
                 ..Default::default()
             },
         );
@@ -486,6 +487,7 @@ fn release(tag: &str, draft: bool, prerelease: bool, assets: &[&str]) -> Release
         tag: tag.to_string(),
         draft,
         prerelease,
+        published_at: (!draft).then(|| "2026-10-01T00:00:00Z".into()),
         assets: assets.iter().map(|a| (*a).to_string()).collect(),
     }
 }

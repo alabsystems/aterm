@@ -11,6 +11,8 @@ use std::process::Command;
 use crate::scope::Scope;
 use crate::toolchain::Toolchain;
 
+mod exclusions;
+
 /// One workspace member reported by the resolved dependency graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
@@ -241,12 +243,16 @@ pub fn replan_everything() -> Replan {
 /// Compute the [`Replan`] for a root `Cargo.toml` diff from `base` to `work`.
 #[must_use]
 pub fn manifest_replan(base: Option<&str>, work: Option<&str>) -> Replan {
-    use aterm_toml::Value;
     let (Some(base), Some(work)) = (parse_toml(base), parse_toml(work)) else {
         return Replan::Everything("it does not parse here, or it was added or removed".into());
     };
+    manifest_tables_replan(&base, &work)
+}
+
+fn manifest_tables_replan(base: &aterm_toml::Table, work: &aterm_toml::Table) -> Replan {
+    use aterm_toml::Value;
     let mut seeds = BTreeSet::new();
-    for key in changed_keys(&base, &work) {
+    for key in changed_keys(base, work) {
         let (b, w) = (base.get(key), work.get(key));
         match key {
             "workspace" => {
@@ -695,6 +701,15 @@ pub fn resolve_paths(
     from: Option<&str>,
 ) -> Selection {
     let members = read_members(root, tools, path_env);
+    // Shared-input discovery can only add crates. Once a changed compiler/configuration
+    // input already demands every crate, that scan cannot change the selection. Archive
+    // merges can owe tens of thousands of paths: do not cross them with every source file
+    // merely to rediscover the same workspace-wide obligation.
+    for p in paths.iter().filter(|p| replans_everything(p)) {
+        if let Replan::Everything(why) = replan_of(root, path_env, merge_base, p, &members) {
+            return Selection::Widened(format!("{p} changed: {why}"));
+        }
+    }
     let listed = if paths.is_empty() {
         Vec::new()
     } else {
@@ -725,7 +740,7 @@ pub fn resolve_paths(
         &members,
         &|| read_path_packages(root, tools, path_env, &members),
         &|c| invert(root, &tools.targo, path_env, members.spec(c), &members),
-        &|p| replan_of(root, path_env, merge_base, p),
+        &|p| replan_of(root, path_env, merge_base, p, &members),
         // What another member reads, or a file that reads another's, is the cone's to follow.
         &|member, owned| {
             owned
@@ -765,7 +780,13 @@ fn listed_files(root: &Path, path_env: &OsStr) -> Result<Vec<String>, String> {
 }
 
 /// Replan for `path` since `merge_base` ([`manifest_replan`], [`lock_replan`]).
-fn replan_of(root: &Path, path_env: &OsStr, merge_base: &str, path: &str) -> Replan {
+fn replan_of(
+    root: &Path,
+    path_env: &OsStr,
+    merge_base: &str,
+    path: &str,
+    members: &Members,
+) -> Replan {
     let read = || {
         let out = git(root, path_env)
             .args(["show", &format!("{merge_base}:{path}")])
@@ -778,7 +799,18 @@ fn replan_of(root: &Path, path_env: &OsStr, merge_base: &str, path: &str) -> Rep
     };
     let work = || crate::read_regular_text(root.join(path)).ok();
     match path {
-        "Cargo.toml" => manifest_replan(read().as_deref(), work().as_deref()),
+        "Cargo.toml" => {
+            let (base, work) = (read(), work());
+            exclusions::replan(
+                root,
+                path_env,
+                merge_base,
+                base.as_deref(),
+                work.as_deref(),
+                members,
+            )
+            .unwrap_or_else(|| manifest_replan(base.as_deref(), work.as_deref()))
+        }
         "Cargo.lock" => lock_replan(read().as_deref(), work().as_deref()),
         _ => replan_everything(),
     }
@@ -823,6 +855,11 @@ fn with_shared_inputs(
             })
             .map(|m| m.dir.as_str())
     };
+    // Each path's owner once, and one trie walk per source for every path its text spells: a
+    // pair-by-pair `text.contains` over thousands of paths and sources ran for hours on an
+    // archive merge's input (27,657 paths against 9,009 sources).
+    let owners: Vec<_> = paths.iter().map(|p| owner(p)).collect();
+    let spelled = PathTrie::new(paths.iter().map(String::as_str));
     let mut sources = Vec::new();
     for source in listed {
         if !source.ends_with(".rs") {
@@ -841,23 +878,23 @@ fn with_shared_inputs(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("cannot read shared input {}: {e}", file.display())),
         };
-        named.extend(
-            paths
-                .iter()
-                .filter(|p| owner(p) != Some(member.dir.as_str()) && text.contains(p.as_str()))
-                .cloned(),
-        );
+        for index in spelled.contained(&text) {
+            if owners[index] != Some(member.dir.as_str()) {
+                named.insert(paths[index].clone());
+            }
+        }
         if text.contains("../") {
             sources.push((source.clone(), file, text, root.join(&member.dir)));
         }
     }
+    let mut present: BTreeSet<String> = paths.iter().cloned().collect();
     loop {
-        let changed: Vec<_> = paths.iter().map(|p| root.join(p)).collect();
+        let changed: BTreeSet<_> = paths.iter().map(|p| root.join(p)).collect();
         let before = paths.len();
         for (source, file, text, member) in &sources {
             if !readers.contains(source) && shares_changed_input(file, text, member, &changed) {
                 readers.insert(source.clone());
-                if !paths.contains(source) {
+                if present.insert(source.clone()) {
                     paths.push(source.clone());
                 }
             }
@@ -873,6 +910,60 @@ fn with_shared_inputs(
         readers,
         named,
     })
+}
+
+/// A byte trie of paths. One walk from each position of a text finds every path the text
+/// contains: exactly the paths for which `text.contains(path)` holds, by the same byte match.
+struct PathTrie {
+    nodes: Vec<TrieNode>,
+}
+
+#[derive(Default)]
+struct TrieNode {
+    /// The next byte and its node, sorted by byte.
+    next: Vec<(u8, usize)>,
+    /// The indices of the paths that end here.
+    ends: Vec<usize>,
+}
+
+impl PathTrie {
+    fn new<'a>(paths: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut nodes = vec![TrieNode::default()];
+        for (index, path) in paths.into_iter().enumerate() {
+            let mut at = 0;
+            for &byte in path.as_bytes() {
+                at = match nodes[at].next.binary_search_by_key(&byte, |&(b, _)| b) {
+                    Ok(found) => nodes[at].next[found].1,
+                    Err(slot) => {
+                        nodes.push(TrieNode::default());
+                        let new = nodes.len() - 1;
+                        nodes[at].next.insert(slot, (byte, new));
+                        new
+                    }
+                };
+            }
+            nodes[at].ends.push(index);
+        }
+        Self { nodes }
+    }
+
+    /// The indices of the paths `text` contains, each once, in index order.
+    fn contained(&self, text: &str) -> BTreeSet<usize> {
+        let bytes = text.as_bytes();
+        let mut found: BTreeSet<usize> = self.nodes[0].ends.iter().copied().collect();
+        for start in 0..bytes.len() {
+            let mut at = 0;
+            for byte in &bytes[start..] {
+                let node = &self.nodes[at];
+                let Ok(next) = node.next.binary_search_by_key(byte, |&(b, _)| b) else {
+                    break;
+                };
+                at = node.next[next].1;
+                found.extend(self.nodes[at].ends.iter().copied());
+            }
+        }
+        found
+    }
 }
 
 /// The path a literal continues from a directory it does not spell: what follows its leading `/`
@@ -897,7 +988,7 @@ pub(crate) fn shares_changed_input(
     source: &Path,
     text: &str,
     member: &Path,
-    changed: &[std::path::PathBuf],
+    changed: &BTreeSet<std::path::PathBuf>,
 ) -> bool {
     let Some(parent) = source.parent() else {
         return false;
@@ -926,10 +1017,19 @@ pub(crate) fn shares_changed_input(
                 }
             }
             let folder = folder && !member.starts_with(&target);
+            // A changed path at or above `target` is one of its ancestors. One under it sorts
+            // first at or after it, since paths order by components and a folder's
+            // descendants follow it before any path that is not one.
             !target.starts_with(member)
-                && changed
-                    .iter()
-                    .any(|p| target.starts_with(p) || (folder && p.starts_with(&target)))
+                && (target.ancestors().any(|a| changed.contains(a))
+                    || (folder
+                        && changed
+                            .range::<Path, _>((
+                                std::ops::Bound::Included(target.as_path()),
+                                std::ops::Bound::Unbounded,
+                            ))
+                            .next()
+                            .is_some_and(|p| p.starts_with(&target))))
         })
     })
 }
@@ -2805,6 +2905,86 @@ checksum = "aaa"
         tools: Toolchain,
     }
 
+    /// A workspace-wide config obligation from an octopus already selects every crate.
+    /// NEGATIVE CONTROL: without that path the unreadable shared source must still be
+    /// visited and reported; ordinary selections cannot skip shared-input discovery.
+    #[test]
+    fn an_octopus_config_obligation_needs_no_shared_input_cross_product() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let physical = dir.path().canonicalize().unwrap();
+        let root = physical.as_path();
+        std::fs::create_dir_all(root.join("a/src")).unwrap();
+        std::fs::create_dir(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver='2'\nmembers=['a']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("a/Cargo.toml"),
+            "[package]\nname='a'\nversion='1.0.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = 'a'\nversion = '1.0.0'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a/src/lib.rs"), "pub fn value() {}\n").unwrap();
+        std::fs::write(root.join("a/src/unreadable.rs"), [0xff]).unwrap();
+        let fixture = Committed::new(root);
+        let read = |args: &[&str]| {
+            let out = git(root, &fixture.path)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        let base = read(&["rev-parse", "HEAD"]);
+        let tree = read(&["rev-parse", "HEAD^{tree}"]);
+        let a = read(&["commit-tree", &tree, "-p", &base, "-m", "a"]);
+        let b = read(&["commit-tree", &tree, "-p", &base, "-m", "b"]);
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            "# compilation configuration\n",
+        )
+        .unwrap();
+        fixture.git(&["add", "."]);
+        let tree = read(&["write-tree"]);
+        let tip = read(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &base,
+            "-p",
+            &a,
+            "-p",
+            &b,
+            "-m",
+            "archive",
+        ]);
+        let input = crate::release_input::discover(root, &fixture.path, &base, &tip).unwrap();
+        assert_eq!(input.paths, [".cargo/config.toml"]);
+        let pick = |paths| resolve_paths(root, &fixture.tools, &fixture.path, &base, paths, None);
+        let selected = pick(input.paths);
+        assert!(
+            matches!(selected, Selection::Widened(ref why) if why.starts_with(".cargo/config.toml changed:")),
+            "{selected:?}"
+        );
+        let control = pick(vec!["a/src/lib.rs".into()]);
+        assert!(
+            matches!(control, Selection::Widened(ref why) if why.contains("cannot read shared input")),
+            "{control:?}"
+        );
+    }
+
     impl<'a> Committed<'a> {
         fn new(root: &'a Path) -> Self {
             let mut tools = Toolchain::discover(
@@ -3070,7 +3250,15 @@ checksum = "aaa"
                 &m,
                 &no_packages,
                 &|name| graph(EDGES)(name).map(linking),
-                &|p| replan_of(Path::new("/no-such-checkout"), OsStr::new(""), "HEAD", p),
+                &|p| {
+                    replan_of(
+                        Path::new("/no-such-checkout"),
+                        OsStr::new(""),
+                        "HEAD",
+                        p,
+                        &m,
+                    )
+                },
                 &|_, _| false,
             )
         };
@@ -3374,7 +3562,7 @@ checksum = "aaa"
     fn a_directory_literal_seeds_its_consumer() {
         let root = Path::new("/repo");
         let member = root.join("crates/aterm-theme-pack");
-        let changed = [root.join("contrib/themes/pack/Iceberg Dark.conf")];
+        let changed = BTreeSet::from([root.join("contrib/themes/pack/Iceberg Dark.conf")]);
         let build = member.join("build.rs");
         let test = member.join("src/tests.rs");
         let folder = "let pack = dir.join(\"../../contrib/themes/pack/\");";
@@ -3383,7 +3571,7 @@ checksum = "aaa"
         let path = "let pack = dir.join(\"../../contrib/themes/pack\");";
         assert!(!shares_changed_input(&build, path, &member, &changed));
         assert!(!shares_changed_input(&test, path, &member, &changed));
-        let elsewhere = [root.join("contrib/fonts/x.ttf")];
+        let elsewhere = BTreeSet::from([root.join("contrib/fonts/x.ttf")]);
         assert!(!shares_changed_input(&build, folder, &member, &elsewhere));
     }
 
@@ -3398,7 +3586,7 @@ checksum = "aaa"
         let member = root.join("crates/a");
         let test = member.join("tests/pin.rs");
         let lib = member.join("src/lib.rs");
-        let changed = [root.join("crates/b/x")];
+        let changed = BTreeSet::from([root.join("crates/b/x")]);
         for text in [
             "include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../b/x\"));",
             "format!(\"{}/../b/x\", env!(\"CARGO_MANIFEST_DIR\"));",
@@ -3418,13 +3606,13 @@ checksum = "aaa"
 
         let continued = "concat!(dir, \"/../../b/x\");";
         let relative = "include_str!(\"../../b/x\");";
-        let above = [root.join("b/x")];
+        let above = BTreeSet::from([root.join("b/x")]);
         assert!(shares_changed_input(&lib, relative, &member, &changed));
         assert!(shares_changed_input(&lib, relative, &member, &above));
         assert!(!shares_changed_input(&lib, continued, &member, &changed));
         assert!(shares_changed_input(&lib, continued, &member, &above));
 
-        let under_a_folder = [root.join("crates/b/steps/one.jsonl")];
+        let under_a_folder = BTreeSet::from([root.join("crates/b/steps/one.jsonl")]);
         let folder = "concat!(dir, \"/../b/steps/\");";
         let no_slash = "concat!(dir, \"/../b/steps\");";
         assert!(shares_changed_input(&lib, folder, &member, &under_a_folder));
@@ -3454,7 +3642,7 @@ checksum = "aaa"
         let root = Path::new("/repo");
         let member = root.join("crates/x");
         let lib = member.join("src/lib.rs");
-        let changed = [root.join("crates/y/src/z.rs")];
+        let changed = BTreeSet::from([root.join("crates/y/src/z.rs")]);
         for text in [
             "if s.starts_with(\"../\") {}",
             "let up = \"../../\";",
@@ -3472,6 +3660,117 @@ checksum = "aaa"
         }
         let named = "let y = dir.join(\"../y/\");";
         assert!(shares_changed_input(&lib, named, &member, &changed));
+    }
+
+    /// The trie finds exactly the paths `text.contains` finds: nested and overlapping paths, a
+    /// path repeated in the list, one that only a later start spells, prefixes that never
+    /// complete, and text around multi-byte characters.
+    ///
+    /// NEGATIVE CONTROL: walk from the first byte only, or report only the deepest path of a
+    /// walk, and `b/c` or `a` goes missing from what this asserts.
+    #[test]
+    fn the_path_trie_finds_what_contains_finds() {
+        let paths = [
+            "a",
+            "a/b",
+            "a/b/c.rs",
+            "b/c",
+            "a/b",
+            "crates/x/src/lib.rs",
+            "crates/x/src/lib.rs.bak",
+            "zz/never",
+            "é/ü.rs",
+        ];
+        let trie = PathTrie::new(paths);
+        for text in [
+            "",
+            "a",
+            "xa/b/c.rs",
+            "include!(\"../../crates/x/src/lib.rs\");",
+            "crates/x/src/lib.r",
+            "zz/neve and b/c",
+            "«é/ü.rs»",
+            "aaaa/b/c",
+        ] {
+            let want: BTreeSet<usize> = paths
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| text.contains(*p))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(trie.contained(text), want, "{text:?}");
+        }
+    }
+
+    /// The set lookups answer what the scan over every changed path answered: a changed path at
+    /// or above the target, or, for a folder literal, one under it; a sibling sharing a name
+    /// prefix (`steps2`, `steps.txt`) is neither.
+    #[test]
+    fn changed_set_lookups_match_the_scan_they_replace() {
+        let root = Path::new("/repo");
+        let member = root.join("crates/a");
+        let lib = member.join("src/lib.rs");
+        let scan = |text: &str, changed: &[std::path::PathBuf]| {
+            let parent = lib.parent().unwrap();
+            text.split('"').any(|literal| {
+                if !literal.contains("../") {
+                    return false;
+                }
+                let (path, start) = match continued_path(literal) {
+                    Some(path) => (path, member.as_path()),
+                    None => (literal, parent),
+                };
+                let folder = path.ends_with('/')
+                    && path
+                        .split('/')
+                        .any(|segment| !segment.is_empty() && segment != "." && segment != "..");
+                [start, member.as_path()].into_iter().any(|base| {
+                    let mut target = std::path::PathBuf::new();
+                    for component in base.join(path).components() {
+                        match component {
+                            std::path::Component::ParentDir => {
+                                target.pop();
+                            }
+                            std::path::Component::CurDir => {}
+                            component => target.push(component.as_os_str()),
+                        }
+                    }
+                    let folder = folder && !member.starts_with(&target);
+                    !target.starts_with(&member)
+                        && changed
+                            .iter()
+                            .any(|p| target.starts_with(p) || (folder && p.starts_with(&target)))
+                })
+            })
+        };
+        let sets: [&[&str]; 7] = [
+            &["crates/b/steps/one.jsonl"],
+            &["crates/b/steps2/one.jsonl"],
+            &["crates/b/steps.txt"],
+            &["crates/b/steps.txt", "crates/b/steps/one.jsonl"],
+            &["crates/b"],
+            &["crates/b/steps"],
+            &["crates/c/x", "crates/b/x"],
+        ];
+        let texts = [
+            "concat!(dir, \"/../b/steps/\");",
+            "concat!(dir, \"/../b/steps\");",
+            "include_str!(\"../../b/steps/one.jsonl\");",
+            "include_str!(\"../../b/x\");",
+            "concat!(dir, \"/../b/\");",
+            "let up = \"../../\";",
+        ];
+        for set in sets {
+            let list: Vec<_> = set.iter().map(|p| root.join(p)).collect();
+            let changed: BTreeSet<_> = list.iter().cloned().collect();
+            for text in texts {
+                assert_eq!(
+                    shares_changed_input(&lib, text, &member, &changed),
+                    scan(text, &list),
+                    "{text} with {set:?}"
+                );
+            }
+        }
     }
 
     #[test]

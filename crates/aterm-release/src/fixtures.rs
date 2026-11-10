@@ -13,6 +13,30 @@ use crate::gates::{
 };
 use crate::ledger::{Error, GitRunner, Origin, RefWrite, Result, git_ok, rev_parse};
 
+// A worker may import main through its second parent: its ordinary commits are already
+// counted, so two-parent merges owe only their remerge resolutions. Combined diffs lose
+// resolutions equal to one parent. An octopus has no remerge; judge every parent's paths,
+// one listing at a time, including when a parent already belongs to the excluded base.
+fn touched(
+    git: &dyn GitRunner,
+    base: &str,
+    tip: &str,
+    restrict: &[&str],
+) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+    aterm_verify::git_paths::range(
+        &mut |args| {
+            crate::ledger::git_read_ok(git, args)
+                .map(|out| out.stdout)
+                .map_err(|e| e.to_string())
+        },
+        base,
+        tip,
+        aterm_verify::git_paths::MergeDiff::Resolutions,
+        restrict,
+    )
+    .map_err(Error::new)
+}
+
 #[cfg(test)]
 #[path = "fixture_reader_inputs.rs"]
 mod reader_inputs;
@@ -830,21 +854,7 @@ impl MainReader {
             HANDOFF_FIXTURE_GUARD,
             SHIPPED_STATE_CORPUS,
         ];
-        // A worker may merge main as its second parent. Separate-parent diffs
-        // would report old main edits as new; combined diffs keep actual merge
-        // edits, while ordinary commits retain the branch's own file changes.
-        let mut args = vec![
-            "log",
-            "--format=",
-            "--name-only",
-            "--diff-merges=combined",
-            "--full-history",
-            "--no-renames",
-        ];
-        let range = format!("{base}..{tip}");
-        args.extend([range.as_str(), "--"]);
-        args.extend(paths);
-        if !git_ok(&git, &args).ok()?.stdout.is_empty() {
+        if !touched(&git, &base, &tip, &paths).ok()?.is_empty() {
             return None;
         }
         let mut args = vec!["diff", "--quiet", previous, preview, "--"];
@@ -1432,25 +1442,7 @@ pub fn land(
                 .map(<[u8]>::to_vec)
                 .collect())
             };
-            let range = format!("{tip}..{next}");
-            let touched = git_ok(
-                git,
-                &[
-                    "log",
-                    "--format=",
-                    "--name-only",
-                    "-z",
-                    "--diff-merges=combined",
-                    "--full-history",
-                    "--no-renames",
-                    &range,
-                ],
-            )?
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect();
+            let touched = touched(git, &tip, &next, &[])?;
             if !files(&tip, &commit)?.is_disjoint(&touched) {
                 tip = next;
                 break;
@@ -1492,6 +1484,67 @@ fn fixture_preview(git: &dyn GitRunner, tip: &str, staged: &Staged, pins: &Pins)
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// Both prebuilt reuse (restricted to fixture inputs) and disjoint composition
+    /// (all paths) must see an octopus's parent-equal fixture resolution.
+    #[test]
+    fn octopus_fixture_history_is_not_a_combined_diff() {
+        use super::*;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = crate::ledger::GitCli::new(root);
+        let read = |args: &[&str]| git_ok(&git, args).unwrap().stdout_utf8().trim().to_owned();
+        read(&["init", "-q"]);
+        read(&["config", "user.name", "Fixture"]);
+        read(&["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(root.join("guard"), "old\n").unwrap();
+        read(&["add", "."]);
+        read(&["commit", "-qm", "a"]);
+        let a = read(&["rev-parse", "HEAD"]);
+        let old_tree = read(&["rev-parse", "HEAD^{tree}"]);
+        let b = read(&["commit-tree", &old_tree, "-p", &a, "-m", "b"]);
+        std::fs::write(root.join("guard"), "current\n").unwrap();
+        read(&["add", "."]);
+        let tree = read(&["write-tree"]);
+        let base = read(&["commit-tree", &tree, "-p", &a, "-p", &b, "-m", "released"]);
+        std::fs::write(root.join("manifest"), "kept\n").unwrap();
+        read(&["add", "."]);
+        let tree = read(&["write-tree"]);
+        let tip = read(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &base,
+            "-p",
+            &a,
+            "-p",
+            &b,
+            "-m",
+            "archive",
+        ]);
+        let restricted = touched(&git, &base, &tip, &["guard"]).unwrap();
+        let all = touched(&git, &base, &tip, &[]).unwrap();
+        assert_eq!(
+            restricted,
+            std::collections::BTreeSet::from([b"guard".to_vec()])
+        );
+        assert_eq!(
+            all,
+            std::collections::BTreeSet::from([b"guard".to_vec(), b"manifest".to_vec()])
+        );
+        assert!(touched(&git, &base, &base, &["guard"]).unwrap().is_empty());
+        // NEGATIVE CONTROL: the old range query hides guard, unsafely reusing or composing.
+        assert_eq!(
+            read(&[
+                "log",
+                "--format=",
+                "--name-only",
+                "--diff-merges=combined",
+                &format!("{base}..{tip}")
+            ]),
+            "manifest"
+        );
+    }
+
     use super::files_under;
 
     /// Historical forward windows, not a timing assertion or a release operation.
@@ -1548,26 +1601,17 @@ mod tests {
                 .stdout_utf8();
             samples += 1;
             cone += usize::from(paths.lines().any(|p| !inputs.ignores(Path::new(p))));
-            let range = format!("{base}..{tip}");
-            let touched = git_ok(
-                &git,
-                &[
-                    "log",
-                    "--format=",
-                    "--name-only",
-                    "--diff-merges=combined",
-                    "--full-history",
-                    "--no-renames",
-                    &range,
-                ],
-            )
-            .unwrap()
-            .stdout_utf8();
-            fixtures += usize::from(touched.lines().any(|p| {
-                p.starts_with(HANDOFF_FIXTURE_ROOT)
-                    || p == HANDOFF_FIXTURE_GUARD
-                    || p == SHIPPED_STATE_CORPUS
-            }));
+            let touched = touched(&git, base, tip, &[]).unwrap();
+            fixtures += usize::from(
+                touched
+                    .iter()
+                    .filter_map(|p| std::str::from_utf8(p).ok())
+                    .any(|p| {
+                        p.starts_with(HANDOFF_FIXTURE_ROOT)
+                            || p == HANDOFF_FIXTURE_GUARD
+                            || p == SHIPPED_STATE_CORPUS
+                    }),
+            );
         }
         println!(
             "head {head}; 7-minute windows: {samples}; reader cone changed: {cone}; any fixture edit: {fixtures}"

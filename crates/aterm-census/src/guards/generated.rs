@@ -40,10 +40,10 @@ fn generated_seal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         .text(ATTRIBUTES)
         .map(|t| declarations(&t))
         .unwrap_or_default();
-    let mut declared = vec![false; tree.corpus.paths.len()];
+    let mut declared = vec![false; tree.corpus.paths().len()];
     for row in &rows {
         let mut named = false;
-        for (at, rel) in tree.corpus.paths.iter().enumerate() {
+        for (at, rel) in tree.corpus.paths().iter().enumerate() {
             if matches(&row.pattern, rel) {
                 declared[at] = row.set;
                 named = true;
@@ -62,7 +62,7 @@ fn generated_seal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             });
         }
     }
-    for (rel, declared) in tree.corpus.paths.iter().zip(declared) {
+    for (rel, declared) in tree.corpus.paths().iter().zip(declared) {
         let rust = rel.ends_with(".rs") && !rel.starts_with("vendor/");
         if !declared && !rust {
             continue;

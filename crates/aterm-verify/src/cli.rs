@@ -57,6 +57,8 @@ pub struct Args {
     pub test_threads: Option<NonZeroU32>,
     /// Requested ceiling on the test run's CPU share; admission may grant less.
     pub test_cores: Option<NonZeroU32>,
+    /// Planning duration records to read and update; never a verdict source.
+    pub test_history: Option<PathBuf>,
     /// Replay every libtest binary's cases in a deterministic shuffled order.
     pub test_seed: Option<u64>,
     /// `--timeout`: `Some(None)` is `off`; `None` keeps the default ceiling.
@@ -192,6 +194,7 @@ where
             }
             "--test-threads" => a.test_threads = Some(count("--test-threads", &value(&flag)?)?),
             "--test-cores" => a.test_cores = Some(count("--test-cores", &value(&flag)?)?),
+            "--test-history" => a.test_history = Some(PathBuf::from(value(&flag)?)),
             "--test-seed" => {
                 let raw = value(&flag)?;
                 a.test_seed = Some(raw.parse().map_err(|_| {
@@ -562,10 +565,13 @@ Options:
       --test-cores <n>    request at most n CPU cores for test execution;
                           admission and the release pool may grant less
       --test-seed <n>     deterministic libtest shuffle at each planned width
+      --test-history <path>
+                          planning durations to read and update (default: account history);
+                          never reuses a verdict
       --timeout <s|off>   hang ceiling on each child's work (default 3h); its
                           waits for a lock or for room are left out
       --log <path>        where the full log goes (default: a new file in
-                          <target>/verify/logs.noindex/runs.noindex; retention
+                          <target>/verify/.ubd/logs.noindex/runs.noindex; retention
                           targets 20 while preserving all running logs)
       --passed-binaries <path>
                           with release and its test check: binaries that passed

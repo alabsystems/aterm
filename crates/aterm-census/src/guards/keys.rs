@@ -34,7 +34,7 @@ fn key_material(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let tool_dir = format!("{KEY_TOOL}/");
     let tool: Vec<String> = tree
         .corpus
-        .paths
+        .paths()
         .iter()
         .filter(|rel| rel.starts_with(&tool_dir))
         .cloned()
@@ -47,7 +47,7 @@ fn key_material(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         let loaded = tree
             .corpus
             .get(rel)
-            .map(|f| Ok(std::borrow::Cow::Borrowed(f.raw.as_str())))
+            .map(|f| Ok(std::borrow::Cow::Borrowed(f.raw())))
             .unwrap_or_else(|| {
                 crate::tree::read_bytes(&tree.root.join(rel)).map(|bytes| {
                     std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
@@ -72,7 +72,7 @@ fn key_material(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             Err(e) => out.push(unreadable(rel, &e.to_string())),
         }
     }
-    for rel in &tree.corpus.paths {
+    for rel in tree.corpus.paths() {
         if key_file_name(rel.rsplit('/').next().unwrap_or(rel)) {
             out.push(Finding {
                 rule: KEY_MATERIAL.id,
@@ -274,12 +274,8 @@ mod tests {
             (".git/signing.key".to_string(), String::new()),
         ]);
         let root = disk_tree("aterm-census-guards", "key-material", &files);
-        let corpus = super::super::Corpus::read(&root).expect("the synth tree reads");
-        let tree = Tree {
-            root: &root,
-            corpus: &corpus,
-            engine: crate::guards::tests::NO_ENGINE,
-        };
+        let corpus = super::super::Corpus::at(&root).expect("the synth tree reads");
+        let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
         let mut found = Vec::new();
         key_material(&tree, &mut found);
         let _ = std::fs::remove_dir_all(&root);

@@ -99,8 +99,8 @@ pub const VERBS: &[Verb] = &[
     },
     Verb {
         name: "status",
-        synopsis: "status [--quad DIR]",
-        does: "print the verified channel head or a local quad",
+        synopsis: "status [--quad DIR] [--releases [PRODUCT…]]",
+        does: "print the verified index, or human release versions, UTC dates, platforms and verification status",
     },
     Verb {
         name: "lane",

@@ -60,7 +60,9 @@ fn untold() -> (Arc<Accts>, WorkerIdle, AccountLook) {
         account_land(&idle.sid, &idle.kept, &idle.hooks, Landing::Asked),
         Applied::Yes
     );
-    let look = idle.account_look(&a.roster()).unwrap();
+    let look = idle
+        .account_look(&(idle.hooks.acts.account_seat)().unwrap(), &a.roster())
+        .unwrap();
     (a, idle, look)
 }
 
@@ -177,7 +179,9 @@ fn loss_time_tracks_authentication_context_and_allows_record_metadata() {
     let a = Accts::new();
     a.spawn("s-local-loss", ACCT_TALK_A, "main");
     let idle = a.worker("s-local-loss", &on());
-    let old = idle.account_look(&a.roster()).unwrap();
+    let old = idle
+        .account_look(&(idle.hooks.acts.account_seat)().unwrap(), &a.roster())
+        .unwrap();
     assert_eq!(idle.lost_seen(&old, login_wall(), 10), Some(10));
     let mut next = AccountLook {
         screen_wall: None,
@@ -186,6 +190,7 @@ fn loss_time_tracks_authentication_context_and_allows_record_metadata() {
         who: old.who.clone(),
         label: old.label.clone(),
         generation: Arc::clone(&old.generation),
+        seen: aterm_agent::harness::observe::Observation::Unread,
     };
     next.snap.argv.push("--new-auth-context".into());
     idle.kept.lock().unwrap().snapshot = Some(next.snap.clone());
@@ -228,6 +233,7 @@ fn local_case(case: i64) -> [i64; 3] {
             label: None,
             snap: base,
             generation: Arc::clone(&k.account.landing),
+            seen: aterm_agent::harness::observe::Observation::Unread,
         }
     };
     {

@@ -1034,7 +1034,7 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         AnyScopeMeta,
         "self-updater [status|check|apply]: OK current_build= staged_build= outcome=",
-        "— one line: `enabled= current_build= commit= staged_build= staged_version= staged_commit= \
+        "— one line: `enabled= auto_apply= current_build= commit= staged_build= staged_version= staged_commit= \
          staged_is_same_commit= relaunch_ready= apply_posture= failing=<n>[:<kind>] \
          failing_applies= persistent= outcome=\"…\"`, plus, where they apply, \
          `stale_check=<rfc3339>` (no check in 4 h) or `check_unrecorded=true`, `checked_at= \
@@ -1045,7 +1045,9 @@ pub const VERBS: &[VerbSpec] = &[
          `linux_installed_build= linux_staged_build= linux_trial=<phase|none> linux_trial_starts= \
          linux_trial_healthy=`, `apply_refusal= apply_refusal_detail= apply_refusal_at= apply_failure= trial_wait=`, the \
          handoff timings `freeze_seed_ms= handoff_capture_ms= handoff_park_ms=`, and `changelog=` \
-         (prose pct-encoded). `apply_posture`: `automatic`, `automatic-idle`, `next-launch` \
+         (prose pct-encoded). `enabled` is automatic checking; `auto_apply=true|false|unknown` \
+         is the live automatic-install setting, even with no staged update (`unknown` when \
+         the live settings could not be read). `apply_posture`: `automatic`, `automatic-idle`, `next-launch` \
          (installs once aterm is quit and opened again), `manual-config`, `disabled-env`, \
          `retry-wait`, `manual-only`, `handoff-unavailable`, `applying`, `unreconciled`, `none`, \
          `disabled`, `unknown`. `apply_phase`: `prefer-idle`, `prefer-output-gap`, `keys-only`, \

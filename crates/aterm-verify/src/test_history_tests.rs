@@ -17,7 +17,59 @@ fn sample(at_ms: u64) -> Sample {
         peak_bytes: Some(1 << 30),
         width: 4,
         tests: Some(133),
+        partition: None,
     }
+}
+
+fn first_sample_fields(value: &mut aterm_json::Value) -> &mut aterm_json::Map {
+    value
+        .as_object_mut()
+        .unwrap()
+        .get_mut("rows")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()[0]
+        .as_object_mut()
+        .unwrap()
+        .get_mut("samples")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()[0]
+        .as_object_mut()
+        .unwrap()
+}
+
+#[test]
+fn an_explicit_history_selects_its_records_and_leaves_account_history_unchanged() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let default = super::planning_path(None, Some(dir.path().to_path_buf())).unwrap();
+    keep(&default, vec![("default".into(), sample(1))]).unwrap();
+    let before = std::fs::read(&default).unwrap();
+    let explicit = dir.path().join("experiment.json");
+    let parsed = crate::cli::parse(["test", "--test-history", explicit.to_str().unwrap()]).unwrap();
+    let selected =
+        super::planning_path(parsed.test_history, Some(dir.path().to_path_buf())).unwrap();
+    keep(
+        &selected,
+        vec![(
+            "planted-long".into(),
+            Sample {
+                wall_ms: 600_000,
+                ..sample(2)
+            },
+        )],
+    )
+    .unwrap();
+    assert!(load(&selected).seen("planted-long").is_some());
+    assert!(load(&selected).seen("default").is_none());
+    assert_eq!(std::fs::read(&default).unwrap(), before);
+    // Without the override, the same account still supplies its own records.
+    assert!(
+        load(&super::planning_path(None, Some(dir.path().to_path_buf())).unwrap())
+            .seen("default")
+            .is_some()
+    );
+    assert_eq!(super::planning_path(None, None), None);
 }
 
 /// A history reads back what it wrote, an unread figure as unread (`null`), and a text it cannot
@@ -39,6 +91,14 @@ fn a_history_reads_back_what_it_wrote_and_nothing_from_what_it_cannot_read() {
     );
     let text = h.encode();
     assert_eq!(History::decode(&text), h);
+    let mut fields: aterm_json::Value = aterm_json::from_str(&text).unwrap();
+    first_sample_fields(&mut fields).insert("partition".into(), aterm_json::Value::Bool(false));
+    assert_eq!(History::decode(&fields.to_string()), History::default());
+    first_sample_fields(&mut fields).remove("partition");
+    assert_eq!(
+        History::decode(&fields.to_string()).seen("-p a --lib"),
+        h.seen("-p a --lib")
+    );
     for unread in [
         String::new(),
         "{".to_owned(),
@@ -180,6 +240,7 @@ fn a_history_that_cannot_be_read_is_left_as_it_is() {
 /// A run of `wall_ms` that used `cpu_ms` at `width`, libtest having said it runs `tests`.
 fn run(wall_ms: u64, cpu_ms: u64, width: u32, tests: Option<u64>, outcome: &str) -> Sample {
     Sample {
+        partition: None,
         outcome: outcome.to_owned(),
         wall_ms,
         cpu_ms: Some(cpu_ms),
@@ -267,6 +328,7 @@ fn a_stopped_red_keeps_the_prior_timing_and_marks_the_binary_failed() {
             peak_bytes: None,
             width: 2,
             tests: Some(3),
+            partition: None,
         },
     );
 

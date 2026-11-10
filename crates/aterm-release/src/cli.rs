@@ -185,9 +185,10 @@ USAGE
         --sign             what the release runs beside `pub publish`: the bundle
                            its release journal names copied into dist/, signed,
                            notarized, packaged and self-checked under its reserved
-                           number, and kept for the claim, which adopts it when
-                           every digest still matches; nothing claimed or
-                           published. Combines only with --release-credentials
+                           number, then every asset uploaded into a private draft.
+                           The claim verifies its digests and publishes it.
+                           Accepts the floor and Linux flags; without them, reads
+                           its release journal's Linux declaration
         --sign-prepare     private signing, notarization and packaging beside the
                            bundle checks; executes no product and writes only a
                            prepared record. --sign checks it after READY before
@@ -207,8 +208,9 @@ USAGE
                            ship only these architectures (repeatable); default
                            both
         --linux-worker ARCH=HOST:REPO
-                           after the claim, build ARCH on HOST over ssh (a
-                           throwaway worktree of REPO at the claim commit) and
+                           before the claim, build ARCH on HOST over ssh (a
+                           throwaway worktree of REPO at the privately transferred
+                           reserved commit) and
                            copy its pair into --linux-artifacts, checked like a
                            hand-carried one
         --mac-only         ship no Linux build, on purpose
@@ -1272,21 +1274,8 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             other => return Err(format!("unknown cut flag {other:?}")),
         }
     }
-    if opts.sign
-        && (abandon.is_some()
-            || opts.dry_run
-            || opts.resume
-            || opts.linux_artifacts.is_some()
-            || !opts.linux_workers.is_empty()
-            || opts.mac_only
-            || opts.min_build.is_some())
-    {
-        return Err(
-            "--sign combines only with --release-credentials (it signs the bundle its \
-             release journal names, under that reservation, and leaves Linux and the \
-             floor to the claim)"
-                .to_string(),
-        );
+    if opts.sign && (abandon.is_some() || opts.dry_run || opts.resume) {
+        return Err("--sign cannot combine with --abandon, --dry-run or --resume".to_string());
     }
     if abandon.is_some()
         && (opts.dry_run

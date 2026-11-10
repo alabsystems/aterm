@@ -863,3 +863,62 @@ fn wide_spacer_mirror_preserves_an_indexed_underline_colour() {
         "an indexed colour resolves at draw time, so the RGB slot stays empty"
     );
 }
+
+#[test]
+fn hyperlink_presence_matches_restored_spans_in_both_materializers() {
+    use crate::grid::scroll_convert::ScrolledRowExtras;
+    use crate::grid::scroll_materialize::{materialize_from_line, materialize_from_row_extras};
+    use aterm_scrollback::HyperlinkSpan;
+    use std::sync::Arc;
+
+    let url: Arc<str> = Arc::from("https://presence.example/");
+    let mut grid = Grid::new(3, 12);
+    for ch in "abcdefgh".chars() {
+        grid.write_char(ch);
+    }
+    assert!(!grid.visible_row_may_have_hyperlinks(0));
+    for spans in [
+        vec![],
+        vec![HyperlinkSpan::new(0, 2, url.clone())],
+        vec![HyperlinkSpan::new(5, 8, url.clone())],
+        vec![HyperlinkSpan::new(3, 99, url.clone())],
+        vec![HyperlinkSpan::new(4, 4, url.clone())],
+    ] {
+        let line = Line::with_hyperlinks("abcdefgh", Rle::<CellAttrs>::new(), spans.clone());
+        let extras = ScrolledRowExtras {
+            hyperlinks: spans,
+            ..ScrolledRowExtras::default()
+        };
+        for cols in [1, 4, 8, 12] {
+            let mut clipped = Grid::new(3, 12);
+            for ch in "abcdefgh".chars().take(usize::from(cols)) {
+                clipped.write_char(ch);
+            }
+            for mut row in [
+                materialize_from_line(&line, cols),
+                materialize_from_row_extras(clipped.row(0).unwrap(), Some(&extras), cols).unwrap(),
+            ] {
+                let actual = row
+                    .extras_iter()
+                    .any(|(_, extra)| extra.hyperlink().is_some());
+                // Restored links must not depend on a live-cell claim bit.
+                for cell in &mut row.cells {
+                    cell.set_has_extras(false);
+                }
+                assert_eq!(row.has_hyperlinks(), actual, "cols={cols}");
+            }
+        }
+    }
+    grid.cell_extra_mut(0, 0).set_hyperlink(Some(url));
+    assert!(grid.visible_row_may_have_hyperlinks(0));
+    assert!(!grid.visible_row_may_have_hyperlinks(u16::MAX));
+}
+
+#[test]
+#[ignore = "manual materialized-row inline layout measurement"]
+fn materialized_row_layout_cost() {
+    println!(
+        "materialized-row-layout bytes={}",
+        std::mem::size_of::<crate::MaterializedRow>()
+    );
+}

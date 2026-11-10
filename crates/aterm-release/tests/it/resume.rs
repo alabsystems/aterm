@@ -1385,9 +1385,6 @@ fn cli_refuses_invocations_that_would_drop_a_safety_answer() {
         &["cut", "--resume", "--dry-run"],
         &["cut", "--sign", "--dry-run"],
         &["cut", "--sign", "--resume"],
-        &["cut", "--sign", "--mac-only"],
-        &["cut", "--sign", "--linux-artifacts", "/handoff"],
-        &["cut", "--sign", "--min-build", "7"],
         &["cut", "--sign", "--abandon", "v0.55.0"],
         &["release", "--bump", "--commit", "a"],
         &["release", "--commit", "a", "--commit", "b"],
@@ -1397,7 +1394,7 @@ fn cli_refuses_invocations_that_would_drop_a_safety_answer() {
     }
 }
 
-/// `cut --sign` needs no Linux declaration (the claim carries Linux) and keeps the credential
+/// `cut --sign` can read the journal's Linux declaration and keeps the credential
 /// profile it was handed: the parse the release's step 7 depends on.
 #[test]
 fn cut_sign_parses_with_its_credentials_and_no_linux_declaration() {
@@ -1416,6 +1413,38 @@ fn cut_sign_parses_with_its_credentials_and_no_linux_declaration() {
         panic!("a real cut parses");
     };
     assert!(!opts.sign, "only --sign signs beside a publish");
+}
+
+#[test]
+fn cut_sign_carries_the_floor_and_every_declared_linux_asset_into_the_draft() {
+    let Ok(cli::Cmd::Cut { opts, .. }) = parse(&[
+        "cut",
+        "--sign",
+        "--linux-artifacts",
+        "/handoff",
+        "--linux-target",
+        "aarch64",
+        "--linux-worker",
+        "aarch64=worker:/srv/source",
+        "--min-build",
+        "7",
+    ]) else {
+        panic!("the private draft carries the cut's complete declaration");
+    };
+    assert!(opts.sign);
+    assert_eq!(opts.min_build, Some(7));
+    assert_eq!(opts.linux_targets, ["aarch64-unknown-linux-gnu"]);
+    assert_eq!(opts.linux_workers, ["aarch64=worker:/srv/source"]);
+    assert!(
+        parse(&[
+            "cut",
+            "--sign",
+            "--mac-only",
+            "--linux-artifacts",
+            "/handoff"
+        ])
+        .is_err()
+    );
 }
 
 #[test]

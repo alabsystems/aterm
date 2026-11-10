@@ -1604,10 +1604,38 @@ impl App {
         }
     }
 
-    /// Ends relaunch exceptions and pending claims for tabs that have closed, and the failed
-    /// worker facts of the same tabs.
+    /// Withdraws credit-claim worker facts (`harness.accounts.<offer>.claim-started`) whose
+    /// worker tab has closed: reaping or closing the worker tab ends the link to that tab without
+    /// claiming the offer was fixed.
+    fn end_claim_started_lines_of_closed_tabs(&mut self) {
+        let prefix = Family::Accounts.prefix();
+        let candidates: Vec<(String, String)> = self
+            .messages
+            .digest()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.key.starts_with(&prefix) && entry.key.ends_with(".claim-started"))
+            .filter_map(|entry| {
+                let sid = claim_started_sid(&entry)?.to_string();
+                Some((entry.key, sid))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let live = self.shown_session_sids();
+        for (key, sid) in candidates {
+            if !live.contains(&sid) {
+                self.except_withdraw(&key);
+            }
+        }
+    }
+
+    /// Ends relaunch exceptions and pending claims for tabs that have closed, and the failed or
+    /// finished worker facts of the same tabs.
     pub(crate) fn end_relaunch_lines_of_closed_tabs(&mut self) {
         self.end_worker_failed_lines_of_closed_tabs();
+        self.end_claim_started_lines_of_closed_tabs();
         let mut keys: Vec<String> = self
             .messages
             .digest_keys_under(&Family::Supervisor.prefix())
@@ -1903,6 +1931,29 @@ fn is_relaunch_key(key: &str) -> bool {
     key.strip_prefix(&Family::Supervisor.prefix())
         .and_then(|rest| rest.rsplit_once('.'))
         .is_some_and(|(_, cause)| matches!(cause, "not-back" | "gone" | "lost" | "not-restored"))
+}
+
+/// Extracts the worker session ID from a `.claim-started` digest entry, reading its
+/// `ShowSession` navigation action first and falling back to an `@s-...` token in older
+/// adopted entries whose log line predates `ShowSession`.
+fn claim_started_sid(entry: &aterm_messages::DigestEntry) -> Option<&str> {
+    for action in &entry.actions {
+        if let aterm_messages::Intent::ShowSession { session, .. } = action {
+            return Some(session.as_str());
+        }
+    }
+    for text in [&entry.why, &entry.then] {
+        for word in text.split_whitespace() {
+            if let Some(sid) = word
+                .strip_prefix('@')
+                .map(|s| s.trim_end_matches([',', ';', ':', '.', ')']))
+                .filter(|s| s.starts_with("s-") && s.len() > 2)
+            {
+                return Some(sid);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

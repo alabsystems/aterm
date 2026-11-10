@@ -400,11 +400,8 @@ fn ghost_glyphs(blank: RenderCell, rule: RenderCell, lit: bool) -> Vec<RenderCel
             },
             cell: (7, 14),
             clip: aterm_core::render::PxRect::EVERYWHERE,
-            mark_hover: false,
-            title_gen: 0,
         },
         &mut top,
-        None,
         None,
         &[],
     );

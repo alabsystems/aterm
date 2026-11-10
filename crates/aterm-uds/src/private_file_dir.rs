@@ -146,7 +146,7 @@ impl DirectoryView<'_> {
                 _ => PrivateFileError::Io(error),
             })?;
         let (file, metadata, _) = super::judge_opened(file, Opening::Read)?;
-        super::read_capped_with_len(file, metadata.len(), max)
+        super::read_capped_with_len(&file, metadata.len(), max)
     }
 
     /// Stream this directory's entry names from an independent file description.

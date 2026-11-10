@@ -500,10 +500,28 @@ impl Log {
         self.append_bound
     }
     pub(crate) fn retry(&self, actor: Actor, command: &Command) -> Result<Option<Digest>> {
+        Ok(self
+            .resolve_request(actor, command.request(), |old| Ok(old == command))?
+            .map(|(id, _)| id))
+    }
+
+    /// Resolve an exact request from all retained records, not only the visible
+    /// candidates. Identical copies choose the original eligible receipt;
+    /// a conflicting or unavailable command cannot masquerade as its retry.
+    pub(crate) fn resolve_request(
+        &self,
+        actor: Actor,
+        request: [u8; 16],
+        matches: impl Fn(&Command) -> Result<bool>,
+    ) -> Result<Option<(Digest, &Command)>> {
         let mut first = None;
         for (id, (operation, old)) in &self.records {
-            if operation.header.actor == actor && operation.request == Some(command.request()) {
-                if old.as_ref() != Some(command) || self.conflicts.contains(id) {
+            if operation.header.actor == actor && operation.request == Some(request) {
+                let matched = match old {
+                    Some(old) => matches(old)?,
+                    None => false,
+                };
+                if !matched || self.conflicts.contains(id) {
                     return Err(Error::new(
                         "request identity reused with different commands",
                     ));
@@ -520,7 +538,11 @@ impl Log {
                     "the prior proposal receipt is not currently eligible",
                 ));
             }
-            return Ok(Some(id));
+            let command = self.records[&id]
+                .1
+                .as_ref()
+                .ok_or_else(|| Error::new("proposal command is unavailable"))?;
+            return Ok(Some((id, command)));
         }
         Ok(None)
     }

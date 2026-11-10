@@ -51,9 +51,12 @@ fn state_word(word: &str) -> Option<&'static str> {
         .find(|state| *state == word)
 }
 
-/// The sign-in word an event states, where it states one.
-const fn event_state(kind: Kind) -> Option<&'static str> {
-    match kind {
+/// The sign-in word an event states, where it states one. A `seen` states none: a profile file
+/// names its account long after the login ended, so a sighting never says `in` over an
+/// `ended`; and a `wrong-account` that names a tab is a belief corrected, not a sign-in word.
+const fn event_state(event: &Event) -> Option<&'static str> {
+    match event.kind {
+        Kind::WrongAccount if event.tab.is_some() => None,
         Kind::SignedIn | Kind::Renewed => Some("in"),
         Kind::SignedOut | Kind::Displaced => Some("out"),
         Kind::LoginEnded => Some("ended"),
@@ -388,7 +391,7 @@ impl Seen {
         let Some(account) = event.account else {
             return;
         };
-        if let Some(state) = event_state(event.kind) {
+        if let Some(state) = event_state(event) {
             self.sign(account.as_str(), uuid, state, event.t, event.cli.as_str());
         }
         // A workspace's figures are its sub-account's (§4.13's derivation, no lookup).

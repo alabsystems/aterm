@@ -32,6 +32,7 @@ fn prepare() -> Prepare {
         settles: None,
     };
     Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         id: "12".repeat(16),
         host_epoch: "34".repeat(16),
@@ -61,6 +62,51 @@ fn prepare() -> Prepare {
         boot: None,
         custody: None,
     }
+}
+
+#[test]
+fn complete_receipt_mode_is_anchored_explicit_and_not_a_legacy_spelling() {
+    let mut original = prepare();
+    original.boot = Some(BootStamp {
+        host: format!("macos:{}", "ab".repeat(16)),
+        boot: "cd".repeat(16),
+    });
+    original.custody = Some("ef".repeat(32));
+    original.rejection_domain = Some("12".repeat(32));
+    let legacy = Request::prepare(original.clone()).encode().unwrap();
+    original.receipt_mode = Some(ReceiptMode::Recipients5);
+    let request = Request::prepare(original.clone());
+    let wire = request.encode().unwrap();
+    assert!(wire.contains(" receipts=recipients5"));
+    assert_eq!(Request::parse(&wire), Some(request.clone()));
+    assert_eq!(wire.replace(" receipts=recipients5", ""), legacy);
+    assert!(!request.matches_retained(&legacy));
+    assert!(!Request::parse(&legacy).unwrap().matches_retained(&wire));
+    for bad in [
+        wire.replace("receipts=recipients5", "receipts=legacy"),
+        wire.replace("receipts=recipients5", "receipts=recipients6"),
+        wire.replace("receipts=recipients5", "receipts=Recipients5"),
+        format!("{wire} receipts=recipients5"),
+    ] {
+        assert!(Request::parse(&bad).is_none(), "{bad}");
+    }
+    for missing in 0..3 {
+        let mut incomplete = original.clone();
+        match missing {
+            0 => incomplete.boot = None,
+            1 => incomplete.custody = None,
+            _ => incomplete.rejection_domain = None,
+        }
+        assert!(Request::prepare(incomplete).encode().is_none());
+    }
+    let Request::Prepare(mut own) = super::tests::fixture() else {
+        unreachable!()
+    };
+    own.receipt_mode = original.receipt_mode;
+    own.boot = original.boot;
+    own.custody = original.custody;
+    own.rejection_domain = original.rejection_domain;
+    assert!(Request::Prepare(own).encode().is_none());
 }
 
 #[test]

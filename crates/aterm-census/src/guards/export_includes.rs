@@ -59,9 +59,9 @@ fn held_to(corpus: &Corpus, manifest: Option<&str>, out: &mut Vec<Finding>) {
             return;
         }
     };
-    let present: BTreeSet<&str> = corpus.paths.iter().map(String::as_str).collect();
+    let present: BTreeSet<&str> = corpus.paths().iter().map(String::as_str).collect();
     let astream = format!("{ASTREAM}/");
-    for file in &corpus.files {
+    for file in corpus.under(&[""]) {
         if !selection.selects(&file.rel) || !file.mentions(&MACROS) {
             continue;
         }
@@ -76,7 +76,7 @@ fn held_to(corpus: &Corpus, manifest: Option<&str>, out: &mut Vec<Finding>) {
                 None => (!selection.selects(&target)).then(|| format!("{MANIFEST} withholds it")),
             };
             if let Some(why) = left_out {
-                let line = file.raw[..at].matches('\n').count() + 1;
+                let line = file.raw()[..at].matches('\n').count() + 1;
                 out.push(file.finding(
                     EXPORT_INCLUDES.id,
                     line,

@@ -344,7 +344,7 @@ mod tests {
                 per_source: 1,
                 lifetime: aterm_spec::wait::MUST_HAPPEN,
             },
-            &AtomicBool::new(true),
+            &aterm_uds::stop::Stop::new(),
             |_, _| panic!("withdrawn listener must not admit a peer"),
             move |e| {
                 if matches!(e, crate::fleet::FleetEvent::Stopped(_)) {

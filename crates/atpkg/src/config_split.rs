@@ -124,9 +124,9 @@ const LAUNCHCTL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 const LAUNCHCTL_CLEANUP: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// launchd's `XDG_CONFIG_HOME` for this account, the one an app opened from Finder inherits;
-/// `None` when it has none or `launchctl` did not answer.
+/// `None` when a successful query reports no value.
 #[cfg(target_os = "macos")]
-fn launchd_xdg_config_home() -> Option<std::ffi::OsString> {
+fn launchd_xdg_config_home() -> Result<Option<std::ffi::OsString>, String> {
     let mut cmd = aterm_uds::spawnfd::command("/bin/launchctl");
     cmd.args(["getenv", "XDG_CONFIG_HOME"]);
     let (out, ()) = match aterm_uds::deadline::output_until_complete_stdout_retained(
@@ -137,11 +137,10 @@ fn launchd_xdg_config_home() -> Option<std::ffi::OsString> {
     ) {
         Ok(answer) => answer,
         Err(failure) => {
-            let (_, custody) = failure.into_parts();
-            // An unavailable value needs no group-drain receipt, but the actual child
-            // remains owned until a positive reap. Never interpret failure as no dispatch.
+            let (error, custody) = failure.into_parts();
+            // Keep any dispatched child owned until a positive reap.
             custody.reap_in_background();
-            return None;
+            return Err(format!("read launchd's XDG_CONFIG_HOME: {error}"));
         }
     };
     launchd_value(out)
@@ -149,32 +148,42 @@ fn launchd_xdg_config_home() -> Option<std::ffi::OsString> {
 
 /// Decode only the complete stdout of a successful query, preserving native path bytes.
 #[cfg(any(target_os = "macos", all(test, unix)))]
-fn launchd_value(out: std::process::Output) -> Option<std::ffi::OsString> {
+fn launchd_value(out: std::process::Output) -> Result<Option<std::ffi::OsString>, String> {
     use std::os::unix::ffi::OsStringExt as _;
+    if !out.status.success() {
+        return Err(format!(
+            "launchctl getenv XDG_CONFIG_HOME failed: {}",
+            out.status
+        ));
+    }
     let mut value = out.stdout;
     while value.last().is_some_and(|b| *b == b'\n') {
         value.pop();
     }
-    (out.status.success() && !value.is_empty()).then(|| std::ffi::OsString::from_vec(value))
+    Ok((!value.is_empty()).then(|| std::ffi::OsString::from_vec(value)))
 }
 
 /// The split for this process on macOS: its `XDG_CONFIG_HOME` against launchd's. Elsewhere,
-/// and in a test binary ([`aterm_types::dirs::test_root`]), `None`: a desktop session there
+/// and in a test binary ([`aterm_types::dirs::test_root`]), `Ok(None)`: a desktop session there
 /// starts apps with the session's environment, and a test never asks the host's launchd.
-#[must_use]
-pub fn of_process() -> Option<Split> {
+/// # Errors
+/// On macOS, the home directory cannot be resolved, or launchd's environment query fails
+/// or does not complete.
+pub fn of_process() -> Result<Option<Split>, String> {
     #[cfg(target_os = "macos")]
     {
         if aterm_types::dirs::test_root().is_some() {
-            return None;
+            return Ok(None);
         }
-        let home = aterm_types::dirs::home_dir()?;
+        let home = aterm_types::dirs::home_dir()
+            .ok_or_else(|| "the home directory is unavailable".to_string())?;
         let here = std::env::var_os("XDG_CONFIG_HOME");
-        split(here.as_deref(), launchd_xdg_config_home().as_deref(), &home)
+        let app = launchd_xdg_config_home()?;
+        Ok(split(here.as_deref(), app.as_deref(), &home))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        None
+        Ok(None)
     }
 }
 

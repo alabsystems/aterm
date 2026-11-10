@@ -23,9 +23,11 @@ use aterm_agent::harness::accounts_pool;
 use aterm_agent::harness::accounts_sync::UpkeepStep;
 use aterm_agent::harness::agent_image;
 use aterm_agent::harness::contract::Scope;
+use aterm_agent::harness::journal;
 use aterm_agent::harness::laps;
 use aterm_agent::harness::login_latch::{self, LoginLatches};
 use aterm_agent::harness::netwatch::Route;
+use aterm_agent::harness::observe::{self, Observation};
 use aterm_agent::harness::profile;
 use aterm_agent::harness::provider_read;
 use aterm_agent::harness::relaunch::{
@@ -93,6 +95,9 @@ static USAGE_CREDITS: AtomicBool = AtomicBool::new(false);
 static LIVE_ACCOUNTS_MODE: AtomicU8 = AtomicU8::new(ACCOUNTS_OFF);
 
 const TAP_NOT_OWN: &str = "reading not this machine's own login's";
+/// A tap reading of an account no roster row lists: the journal takes it, no row's record does
+/// (`docs/DESIGN-account-discovery-2026-11-09.md`, decision 7).
+const TAP_UNLISTED: &str = "reading of an account no roster row lists";
 
 static AGENTS_OFF: Mutex<Vec<Program>> = Mutex::new(Vec::new());
 
@@ -566,15 +571,12 @@ fn restored_again(step: &str, outcome: &Outcome) -> bool {
 
 /// The steps of a restored relaunch that waits on its record's native operation: one the
 /// ended host kept, which the replay answers once its deadline (at most a crash plan's 120 s
-/// after its prepare, so before this host started plus 120 s) has passed (`native-lapsed`, after
-/// which the next pass plans afresh), or the fresh one whose outcome is pending. Each is tried
+/// after its prepare, so before this host started plus 120 s) has passed, or the fresh one whose
+/// outcome is pending. A proven lapse uses the no-grant retry path instead. Each wait is tried
 /// past [`RESTORED_TRIES`] until it has waited [`relaunch::STALE_S`], as a typed line's resume is:
 /// the attempt budget alone would end the relaunch before the kept operation can lapse.
-const RESTORED_NATIVE_WAITS: [&str; 3] = [
-    "wait:native-unresolved-operation",
-    "wait:native-lapsed",
-    "wait:native-outcome",
-];
+const RESTORED_NATIVE_WAITS: [&str; 2] =
+    ["wait:native-unresolved-operation", "wait:native-outcome"];
 
 /// Whether `step` is one that is tried until stale ([`RESTORED_NATIVE_WAITS`], or a typed
 /// line's resume).
@@ -1655,6 +1657,9 @@ struct AccountKept {
     /// ([`WorkerIdle::idle_point`]) and the loop decides the point again, its resume or
     /// continuation included.
     adopted_ahead: bool,
+    /// The session's sightings of the account its login file names
+    /// (`docs/DESIGN-account-discovery-2026-11-09.md`): what was noted, and when.
+    sighted: observe::Sightings,
 }
 
 /// [`AccountKept::probing`]: the claim of one `/usage` probe and the process it was made for.
@@ -5399,6 +5404,25 @@ fn latch_tab(sid: &str) -> String {
     format!("@{sid}")
 }
 
+/// A tap reading's 5-hour and week windows.
+type TapWindows = (Option<tap::Window>, Option<tap::Window>);
+
+/// The unlisted account, the windows and the time of a reading sent to the journal.
+type TapUnlisted = (journal::Key, TapWindows, i64);
+
+/// Whether a tap reading of an unlisted account `key` is news to the journal at `now`: another
+/// account or other windows than the last one sent, or that one a heartbeat old.
+fn tap_unlisted_due(
+    last: Option<&TapUnlisted>,
+    key: journal::Key,
+    windows: TapWindows,
+    now: i64,
+) -> bool {
+    last.is_none_or(|(was, sent, at)| {
+        *was != key || *sent != windows || now.saturating_sub(*at) >= accounts::READING_HEARTBEAT_S
+    })
+}
+
 /// What a worker keeps of its session's usage tap ([`WorkerIdle::usage_tap`]).
 #[derive(Debug, Default)]
 pub(crate) struct TapKept {
@@ -5410,6 +5434,9 @@ pub(crate) struct TapKept {
     noted: Option<TapNoted>,
     /// When a busy read last took the tap's reading ([`TapAt::Busy`]).
     busy_at: Option<i64>,
+    /// The account no row lists, the windows and the time of the reading this worker last sent
+    /// to the journal ([`WorkerIdle::tap_unlisted`]).
+    unlisted: Option<TapUnlisted>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -6671,7 +6698,7 @@ impl IdleHost for WorkerIdle {
         }
         let seat = (self.hooks.acts.account_seat)()?;
         let roster = roster_read(&seat).ok()?;
-        let look = self.account_look(&roster)?;
+        let look = self.account_look(&seat, &roster)?;
         let to = route_offered(&seat, &roster, &look.who)?;
         aterm_log::info!(
             "harness @{}: route move offered: onto its {}",
@@ -6726,7 +6753,7 @@ impl IdleHost for WorkerIdle {
                         return wait();
                     }
                 };
-                let Some(look) = self.account_look(&roster) else {
+                let Some(look) = self.account_look(&seat, &roster) else {
                     return wait();
                 };
                 (roster, look, seat.claude_store())
@@ -6782,6 +6809,9 @@ impl IdleHost for WorkerIdle {
         let Some((seat, roster, look)) = self.account_ctx() else {
             return;
         };
+        // The believed row, on purpose: whose login this is is read at the writer, under its
+        // lock ([`Self::login_identity_permits`]), so a profile the look read stale never decides
+        // (`AccountServedIdentity`); a profile that names another account is refused there.
         let me = look.who.me(&roster);
         let Some(label) = me
             .account
@@ -6942,7 +6972,7 @@ impl IdleHost for WorkerIdle {
             }
             Err(RosterUnread::Nothing) => return Some(RosterWord::Unlisted),
         };
-        let Some(look) = self.account_look(&roster) else {
+        let Some(look) = self.account_look(&seat, &roster) else {
             return Some(RosterWord::Unread);
         };
         if look.label.is_none() {
@@ -6962,7 +6992,7 @@ impl IdleHost for WorkerIdle {
             &roster,
             &state,
             &enrolled,
-            &look.who.me(&roster),
+            &look.me(&roster),
             &at,
             self.switches.accounts(),
             seat.now,
@@ -7223,7 +7253,7 @@ fn account_answered(this: &WorkerIdle, bad: AccountBad) {
             k.account.came_back = None;
             lost_seen_of(k, &look.snap, lost, seat.now)
         });
-        if look.who.me(&roster).account.is_none() {
+        if look.me(&roster).account.is_none() {
             aterm_log::info!(
                 "harness @{}: account {label}: a superseded login's end is no news of the \
                  renewed one's; nothing struck",
@@ -7267,7 +7297,7 @@ fn account_answered(this: &WorkerIdle, bad: AccountBad) {
         let Some(row) = roster.row(label) else {
             return;
         };
-        this.account_observed(&seat, row, &look.who, |state, now| {
+        this.account_observed(&seat, row, (&look.who, &look.seen), |state, now| {
             Ok(accounts::strike(state, label, &this.sid, &why, now))
         })
     };
@@ -7326,7 +7356,7 @@ impl WorkerIdle {
         }
         let seat = (self.hooks.acts.account_seat)()?;
         let roster = account_roster(&seat).filter(renewable_listed)?;
-        let look = self.account_look(&roster)?;
+        let look = self.account_look(&seat, &roster)?;
         let label = roster
             .row(look.judged(&roster)?)
             .filter(|row| row.email.is_some())?
@@ -7422,7 +7452,17 @@ impl WorkerIdle {
                 return None;
             }
             Err(word) => {
-                self.tap_untake(before);
+                // A reading the journal took stays taken: untaken, the next step would admit
+                // and publish it again, and every step after.
+                let taken = word == TAP_UNLISTED
+                    && self.tap_unlisted(
+                        &seat,
+                        (reading.five_hour, reading.seven_day),
+                        &reading.tap_read(tap::Beside::default(), None),
+                    );
+                if !taken {
+                    self.tap_untake(before);
+                }
                 return Some(word);
             }
         };
@@ -7487,6 +7527,12 @@ impl WorkerIdle {
             born: Some(born),
             ..reading.tap_read(beside, key)
         };
+        // What the login file said of the row the reading is filed under: a re-created account
+        // resets its record, another account's reading never reaches it.
+        let owner = accounts::ReadingOwner::of(
+            &accounts::reconcile(captured.roster(), &look.who, &look.seen),
+            &label,
+        );
         let mut held_back = false;
         let mut low_or_limited = false;
         let mut verify = None;
@@ -7495,7 +7541,7 @@ impl WorkerIdle {
         let noted = self.usage_observed(
             &seat,
             &captured,
-            &look.who,
+            (&look.who, &look.seen),
             |state, now| {
                 // Under `accounts.lock`, before this reading is folded into the row: so the basis
                 // a token's verification compares with is the stored login's, never the token's
@@ -7503,7 +7549,7 @@ impl WorkerIdle {
                 if let Some(standing) = token.as_ref() {
                     verify = token_served(&seat, standing, &label, state, &read, now);
                 }
-                let (events, held) = accounts::note_reading_held(state, &label, &read, now);
+                let (events, held) = accounts::note_reading_held(state, &label, &read, now, owner);
                 held_back = held;
                 let record = state.accounts.get(&label);
                 low_or_limited = !events.is_empty()
@@ -7636,13 +7682,53 @@ impl WorkerIdle {
             .claude_store()
             .read_usage_roster(seat.roster.as_deref(), seat.now)
             .map_err(|_| TAP_NOT_OWN)?;
-        let Some(look) = self.account_look(captured.roster()) else {
+        let Some(look) = self.account_look(seat, captured.roster()) else {
             return Ok(None);
         };
-        if look.snap.pid != pid || look.judged(captured.roster()).is_none() {
+        if look.snap.pid != pid {
             return Err(TAP_NOT_OWN);
         }
+        if look.judged(captured.roster()).is_none() {
+            return Err(
+                match accounts::reconcile(captured.roster(), &look.who, &look.seen) {
+                    accounts::Reconciled::Unlisted(_) => TAP_UNLISTED,
+                    _ => TAP_NOT_OWN,
+                },
+            );
+        }
         Ok(Some((captured, look)))
+    }
+
+    /// A tap reading of an account no roster row lists ([`TAP_UNLISTED`]): its windows go to the
+    /// journal as `quota`, keyed by the observed account, and no row's record takes them. They
+    /// go once: the same windows of the same account are sent again only after
+    /// [`accounts::READING_HEARTBEAT_S`], as a listed account's are recorded. Whether the
+    /// journal has the reading, sent now or before; not where its account could not be read.
+    fn tap_unlisted(
+        &self,
+        seat: &AccountSeat,
+        windows: (Option<tap::Window>, Option<tap::Window>),
+        read: &accounts::TapRead,
+    ) -> bool {
+        let Some(look) = account_roster(seat).and_then(|roster| self.account_look(seat, &roster))
+        else {
+            return false;
+        };
+        let Some(key) = look.seen.email().and_then(journal::claude_email_key) else {
+            return false;
+        };
+        let due = {
+            let mut kept = self.tap.lock().unwrap_or_else(PoisonError::into_inner);
+            let due = tap_unlisted_due(kept.unlisted.as_ref(), key, windows, seat.now);
+            if due {
+                kept.unlisted = Some((key, windows, seat.now));
+            }
+            due
+        };
+        if due {
+            journal::publish(&journal::quota_notes(accounts::Cli::Claude, key, read));
+        }
+        true
     }
 
     /// A tapped process went silent ([`Self::tap_step`]).
@@ -7654,7 +7740,7 @@ impl WorkerIdle {
             let _ = self.usage_observed(
                 seat,
                 &captured,
-                &look.who,
+                (&look.who, &look.seen),
                 |_, now| {
                     Ok(vec![
                         accounts::Event::new(now, accounts::Kind::NoTap, label)
@@ -8554,7 +8640,7 @@ impl WorkerIdle {
         {
             return true;
         }
-        let noted = self.account_observed(&seat, row, &look.who, |state, now| {
+        let noted = self.account_observed(&seat, row, (&look.who, &look.seen), |state, now| {
             seen.note(state, now);
             Ok(Vec::new())
         });
@@ -8743,6 +8829,9 @@ impl WorkerIdle {
         look: &AccountLook,
         label: &str,
     ) {
+        // The believed row, on purpose: whose login this is is read at the writer, under its
+        // lock ([`Self::login_identity_permits`]), so a profile the look read stale never decides
+        // (`AccountServedIdentity`); a profile that names another account is refused there.
         let me = look.who.me(roster);
         // A sign-in is a stored login's service.
         if !me.default_home || !me.route.is_stored() || me.account != Some(label) {
@@ -8840,7 +8929,7 @@ impl WorkerIdle {
         if !self.accounts_act(&roster) {
             return None;
         }
-        let look = self.account_look(&roster)?;
+        let look = self.account_look(&seat, &roster)?;
         Some((seat, roster, look))
     }
 
@@ -8855,8 +8944,8 @@ impl WorkerIdle {
         look.with_current(&self.kept, |k| lost_seen_of(k, &look.snap, point, now))
     }
 
-    /// What the agent's own process says of its login ([`AccountLook`]; the recorder's read is [`account_wall_of`]).
-    fn account_look(&self, roster: &accounts::Roster) -> Option<AccountLook> {
+    /// What the agent's own process says of its login ([`AccountLook`]; the recorder's read is [`account_wall_of`]), and what its login file in `seat`'s home says.
+    fn account_look(&self, seat: &AccountSeat, roster: &accounts::Roster) -> Option<AccountLook> {
         let (snap, generation) = with_kept_of(&self.kept, |k| {
             Some((k.snapshot.clone()?, Arc::clone(&k.account.landing)))
         })?;
@@ -8876,14 +8965,22 @@ impl WorkerIdle {
         } else {
             who
         };
-        let label = who.me(roster).label().map(str::to_owned);
+        let profile_env = profile_environment(&env);
+        // Read afresh on every look, in the home of the seat the caller read: a `/login` in
+        // another tab rewrites the file while this process runs.
+        let seen = login_seen(&env, &seat.home, who.route, roster);
+        // The account it runs on is the observed one (`docs/DESIGN-account-discovery-2026-11-09.md`).
+        let label = accounts::observed_me(roster, &who, &seen)
+            .label()
+            .map(str::to_owned);
         Some(AccountLook {
             who,
             label,
             screen_wall: self.account_screen_wall(&snap),
             snap,
             generation,
-            profile_env: profile_environment(&env),
+            profile_env,
+            seen,
         })
     }
 
@@ -8927,6 +9024,7 @@ impl WorkerIdle {
                 snap,
                 generation,
                 profile_env: Vec::new(),
+                seen: Observation::Unread,
             },
             env,
         ))
@@ -8998,7 +9096,7 @@ impl WorkerIdle {
             accounts_tell(&self.switches, &self.hooks, AccountsSaid::Nothing, false);
             return None;
         }
-        let Some(look) = self.account_look(&roster) else {
+        let Some(look) = self.account_look(&seat, &roster) else {
             return self.account_unjudged("its process's login could not be read", None);
         };
         // A lost login on a session the token wrapper served is the token's refusal (§5.6 of
@@ -9076,7 +9174,7 @@ impl WorkerIdle {
         if at == accounts::Point::TurnEnd {
             self.login_served(&seat, &roster, &look);
         }
-        let me = asked_at(look.who.me(&roster), point, self.switches.logins());
+        let me = asked_at(look.me(&roster), point, self.switches.logins());
         let advice =
             checked_account_advice(&roster, &state, &mut judged.identities, seat.now, |state| {
                 accounts::advise(&roster, state, &enrolled, &me, &at, mode, seat.now)
@@ -9202,6 +9300,7 @@ impl WorkerIdle {
         look: &AccountLook,
         state: &accounts::State,
     ) {
+        self.note_sighting(seat, roster, look, state);
         let Some(label) = look.judged(roster) else {
             return;
         };
@@ -9229,7 +9328,7 @@ impl WorkerIdle {
             return;
         };
         if self
-            .account_observed(seat, row, &look.who, |state, now| {
+            .account_observed(seat, row, (&look.who, &look.seen), |state, now| {
                 let events = look
                     .note_session(&self.kept, state, &self.sid, label, held, now)
                     .ok_or_else(|| ACCOUNT_CHANGED.to_string())?;
@@ -9244,6 +9343,53 @@ impl WorkerIdle {
         }
     }
 
+    /// What the session's login file says it runs on, told to the journal and the registry
+    /// (`docs/DESIGN-account-discovery-2026-11-09.md`): its sighting when one is due, a
+    /// disagreement with the believed row once, and for an account no row lists its session's
+    /// start keyed by that account ([`observe::sighting`]).
+    fn note_sighting(
+        &self,
+        seat: &AccountSeat,
+        roster: &accounts::Roster,
+        look: &AccountLook,
+        state: &accounts::State,
+    ) {
+        if look.seen.seen().is_none() {
+            return;
+        }
+        let tab = journal::Tab::of(&state.machine, &self.sid);
+        let harness = accounts::Cli::of(self.agent).map_or("claude", accounts::Cli::id);
+        let sighted = with_kept_of(&self.kept, |k| {
+            observe::sighting(
+                roster,
+                &look.who,
+                &look.seen,
+                &mut k.account.sighted,
+                tab,
+                harness,
+                seat.now,
+            )
+        });
+        if sighted
+            .notes
+            .iter()
+            .any(|note| note.kind == "wrong-account")
+            && let Some(observed) = look.seen.seen()
+        {
+            aterm_log::info!(
+                "harness @{}: account observed {} from {}, not the roster's {}",
+                self.sid,
+                observed.email,
+                observed.path.display(),
+                accounts::judged_label(roster, &look.who).unwrap_or("default row")
+            );
+        }
+        journal::publish(&sighted.notes);
+        if let Some(login) = &sighted.login {
+            journal::observed(login);
+        }
+    }
+
     /// Publish tap usage only while its source and the host's writer context agree; `seen`
     /// reads the state the edit leaves with the keys the same transaction learns
     /// ([`accounts::Store::observe_usage_within`]).
@@ -9251,7 +9397,7 @@ impl WorkerIdle {
         &self,
         seat: &AccountSeat,
         captured: &accounts::UsageRoster,
-        who: &accounts::ProcessLogin,
+        who: (&accounts::ProcessLogin, &Observation),
         edit: impl FnOnce(&mut accounts::State, i64) -> Result<Vec<accounts::Event>, String>,
         seen: impl FnOnce(&accounts::State, i64) -> T,
     ) -> Result<(Vec<accounts::Event>, T), String> {
@@ -9275,12 +9421,14 @@ impl WorkerIdle {
         )
     }
 
-    /// An account-wide observation, retaining attribution across credential renewal.
+    /// An account-wide observation, retaining attribution across credential renewal. `row` is
+    /// the reconciled one ([`AccountLook::judged`]) and `seen` what chose it, so the writer
+    /// checks the same account under its lock.
     fn account_observed(
         &self,
         seat: &AccountSeat,
         row: &accounts::Row,
-        who: &accounts::ProcessLogin,
+        (who, seen): (&accounts::ProcessLogin, &Observation),
         edit: impl FnOnce(&mut accounts::State, i64) -> Result<Vec<accounts::Event>, String>,
     ) -> Result<Vec<accounts::Event>, String> {
         self.reset_flush(seat);
@@ -9293,6 +9441,7 @@ impl WorkerIdle {
                 roster_path: seat.roster.as_deref().ok_or("account roster is missing")?,
                 row,
                 who,
+                seen,
             },
             |state, _| {
                 Ok(edit(state, now)?
@@ -9351,8 +9500,8 @@ impl WorkerIdle {
         let row = roster.row(&label).ok_or(NoProbe::NotJudged)?.clone();
         let path = seat.roster.clone().ok_or(NoProbe::State)?;
         let enrolled = accounts::enrolled(&roster);
-        let me = look.who.me(&roster);
-        let claimed = self.account_observed(&seat, &row, &look.who, |state, now| {
+        let me = look.me(&roster);
+        let claimed = self.account_observed(&seat, &row, (&look.who, &look.seen), |state, now| {
             // The claim's own test first, for its own word: the roster's
             // advice folds a standing claim into "nothing due".
             if accounts::probe_held(state, &label, now) {
@@ -9433,19 +9582,24 @@ impl WorkerIdle {
             return "sample dropped: not the process it was claimed for";
         }
         let mut low_or_limited = false;
-        let noted = self.account_observed(&seat, &probing.row, &probing.who, |state, now| {
-            let sample = accounts::Sample {
-                at: now,
-                ..sample.clone()
-            };
-            let events = accounts::note_sample(state, &probing.label, sample, now);
-            low_or_limited = !events.is_empty()
-                && state
-                    .accounts
-                    .get(&probing.label)
-                    .is_some_and(|a| a.low(now) || a.limited_until(now).is_some());
-            Ok(events)
-        });
+        let noted = self.account_observed(
+            &seat,
+            &probing.row,
+            (&probing.who, &look.seen),
+            |state, now| {
+                let sample = accounts::Sample {
+                    at: now,
+                    ..sample.clone()
+                };
+                let events = accounts::note_sample(state, &probing.label, sample, now);
+                low_or_limited = !events.is_empty()
+                    && state
+                        .accounts
+                        .get(&probing.label)
+                        .is_some_and(|a| a.low(now) || a.limited_until(now).is_some());
+                Ok(events)
+            },
+        );
         match noted {
             Ok(events) if events.is_empty() => "sample dropped: no figure, or none newer",
             Ok(_) => {
@@ -9466,7 +9620,7 @@ impl WorkerIdle {
         }
         let seat = (self.hooks.acts.account_seat)().ok_or(NoReset::Unread)?;
         let roster = account_roster_or_own(&seat).ok_or(NoReset::Roster)?;
-        let look = self.account_look(&roster).ok_or(NoReset::Unread)?;
+        let look = self.account_look(&seat, &roster).ok_or(NoReset::Unread)?;
         Ok((seat, roster, look))
     }
 
@@ -9792,7 +9946,7 @@ impl WorkerIdle {
             return None;
         }
         let roster = accounts::Roster::own();
-        let look = self.account_look(&roster)?;
+        let look = self.account_look(seat, &roster)?;
         let label = look.judged(&roster)?;
         let (state, _) = store.load(seat.now).ok()?;
         if accounts::reset_in_flight(&state, label, seat.now).is_some() {
@@ -9813,7 +9967,7 @@ impl WorkerIdle {
             &roster,
             &state,
             &accounts::enrolled(&roster),
-            &look.who.me(&roster),
+            &look.me(&roster),
             &at,
             self.switches.accounts(),
             seat.now,
@@ -9966,7 +10120,7 @@ impl WorkerIdle {
         };
         let enrolled = accounts::enrolled(&roster);
         let advise = |state: &accounts::State, now: i64| {
-            let me = asked_at(look.who.me(&roster), advised.point, controls.logins);
+            let me = asked_at(look.me(&roster), advised.point, controls.logins);
             let mut identities = AccountIdentities::new(&seat, &look.profile_env);
             // The writer calls this again after validating the complete bound roster.
             checked_account_advice(&roster, state, &mut identities, now, |state| {
@@ -11229,7 +11383,16 @@ fn forget_snapshot(job: &WorkerJob, hooks: &Hooks) {
 /// The session's agent left and nothing brings it back, so the accounts recorder forgets the session ([`Acts::account_gone`]).
 fn account_gone(job: &WorkerJob, hooks: &Hooks) {
     if accounts_for(job.agent) {
-        with_kept(job, |k| k.account = AccountKept::default());
+        let mut sighted = with_kept(job, |k| std::mem::take(&mut k.account).sighted);
+        // The journal hears the end of what the tab was seen running: a session it opened on
+        // an account no row lists, and the registry's count of this Mac's tabs on its login.
+        if let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) {
+            let ended = sighted.end(now);
+            journal::publish(&ended.notes);
+            if let Some(login) = &ended.login {
+                journal::observed(login);
+            }
+        }
         (hooks.acts.account_gone)(&job.sid);
     }
 }
@@ -20437,7 +20600,7 @@ fn account_wall_at(
         screen_wall: agent.screen_wall,
         started: process_started(&agent.snap.start),
     };
-    account_wall_of(store, &roster, sid, &read, now)
+    account_wall_of((store, Some(home)), &roster, sid, &read, now)
 }
 
 /// The unix second a process started, from its kernel start as the snapshot keeps it ([`Snapshot::start`]: `ps -o lstart=` in UTC).
@@ -20534,9 +20697,11 @@ struct WallRead<'a> {
     started: Option<i64>,
 }
 
-/// The recorder's call ([`account_wall_live`]) over what was read ([`WallRead`]).
+/// The recorder's call ([`account_wall_live`]) over what was read ([`WallRead`]). The wall is
+/// the account's the process's login file names under `home` ([`login_seen`]; unread with no
+/// home), never the believed row's of another account.
 fn account_wall_of(
-    store: &accounts::Store,
+    (store, home): (&accounts::Store, Option<&Path>),
     captured: &accounts::UsageRoster,
     sid: &str,
     read: &WallRead<'_>,
@@ -20557,12 +20722,17 @@ fn account_wall_of(
     let Some(started) = read.started else {
         return ("no-start", None);
     };
-    let recorded = accounts::record_wall(store, captured, sid, &who, wall, started, now);
+    let seen = home.map_or(Observation::Unread, |home| {
+        login_seen(read.env, home, who.route, roster)
+    });
+    let recorded = accounts::record_wall(store, captured, sid, (&who, &seen), wall, started, now);
     let label = match recorded {
         accounts::Recorded::NotListed
         | accounts::Recorded::NotStored
         | accounts::Recorded::Refused(_) => None,
-        _ => who.me(roster).account.map(str::to_owned),
+        _ => accounts::observed_me(roster, &who, &seen)
+            .account
+            .map(str::to_owned),
     };
     let word = if recorded.lock_held() {
         WALL_LOCK_HELD
@@ -21286,7 +21456,7 @@ fn account_usage_live(
         answered: &answered,
         said: &said,
     };
-    account_usage_of((&state, &store), &roster, sid, &read, now)
+    account_usage_of((&state, &store, home), &roster, sid, &read, now)
 }
 
 /// What `seen` says, as true at `at` in the zone `offset` seconds east of UTC.
@@ -21378,9 +21548,10 @@ struct UsageRead<'a> {
 }
 
 /// The usage recorder's call, assembled ([`account_usage_live`]), on the accounts `store` under
-/// the harness state `state`.
+/// the harness state `state`, for the account the process's login file names under `home`
+/// ([`login_seen`]; unread with no home).
 fn account_usage_of(
-    (state, store): (&Path, &accounts::Store),
+    (state, store, home): (&Path, &accounts::Store, Option<&Path>),
     captured: &accounts::UsageRoster,
     sid: &str,
     read: &UsageRead<'_>,
@@ -21405,7 +21576,11 @@ fn account_usage_of(
     } else {
         now
     };
-    let recorded = accounts::record_usage(store, captured, sid, &who, &(read.said)(at), now);
+    let seen = home.map_or(Observation::Unread, |home| {
+        login_seen(read.env, home, who.route, roster)
+    });
+    let recorded =
+        accounts::record_usage(store, captured, sid, (&who, &seen), &(read.said)(at), now);
     // The readings series takes the wall the store just committed, under its own lock
     // (docs/DESIGN-account-stats-2026-10-15.md §5).
     if let Some((account, walled)) = recorded.walled() {
@@ -21748,6 +21923,7 @@ fn login_transact_of(
         roster_path: seat.roster.as_deref().ok_or("account roster is missing")?,
         row: roster.row(label).ok_or("observed account is missing")?,
         who: &look.who,
+        seen: &look.seen,
     };
     seat.claude_store()
         .observe_login_within(seat.ladder, now, observation, |state, logins| {
@@ -23613,18 +23789,33 @@ fn accounts_look(switches: &Switches, hooks: &Hooks, latches: &LoginLatches, aga
 /// What a worker read of its agent for an account judgment ([`WorkerIdle::account_look`]).
 struct AccountLook {
     who: accounts::ProcessLogin,
+    /// The label of the row the process runs on once reconciled ([`AccountLook::me`]): the one
+    /// its login file names, never a believed row the file contradicts.
     label: Option<String>,
     screen_wall: Option<ScreenAccountWall>,
     snap: Snapshot,
     generation: Arc<Mutex<()>>,
     /// Only the profile selectors from the same process environment as `who`.
     profile_env: Vec<String>,
+    /// What the process's login file says it runs on, read when `who` was
+    /// ([`observe::claude`]); unread for another CLI until its observer lands.
+    seen: Observation,
 }
 
 impl AccountLook {
-    /// The account the roster's judgments are about for this process (`accounts::judged_label`).
+    /// The account the roster's judgments are about for this process: the row its login file
+    /// names, where the file contradicts the belief (`accounts::observed_label`); none for an
+    /// account no row lists, so nothing of a row is done on another account's behalf. The
+    /// execution hold, the probe and the tap read it.
     fn judged<'a>(&self, roster: &'a accounts::Roster) -> Option<&'a str> {
-        accounts::judged_label(roster, &self.who)
+        accounts::observed_label(roster, &self.who, &self.seen)
+    }
+
+    /// The process's [`accounts::Me`] once reconciled ([`accounts::observed_me`]): the row its
+    /// login file names, never the believed row of another account. Every reader that acts for
+    /// the running account (advice, a move's landing, a sign-in, a reset) reads this.
+    fn me<'a>(&self, roster: &'a accounts::Roster) -> accounts::Me<'a> {
+        accounts::observed_me(roster, &self.who, &self.seen)
     }
 
     /// Apply a local edit only while this captured observation remains current.
@@ -23875,7 +24066,7 @@ fn renewable_listed(roster: &accounts::Roster) -> bool {
 
 /// The renewable row whose own login the process holds.
 fn renewable_own(roster: &accounts::Roster, look: &AccountLook) -> Option<String> {
-    let me = look.who.me(roster);
+    let me = look.me(roster);
     // Renewal is a stored login's service: a token row is left out.
     let label = me
         .account
@@ -24354,16 +24545,41 @@ fn account_served_identity_environment() {}
 /// Retain profile selectors, without retaining unrelated process credentials.
 fn profile_environment(env: &[String]) -> Vec<String> {
     env.iter()
-        .filter(|entry| {
-            entry.split_once('=').is_some_and(|(name, _)| {
-                matches!(
-                    name,
-                    accounts::HOMEDIR_ENV | accounts::HOME_ENV | "CLAUDE_CODE_CUSTOM_OAUTH_URL"
-                )
-            })
-        })
+        .filter(|entry| profile_selector(entry))
         .cloned()
         .collect()
+}
+
+/// What the login file of a process with exec environment `env` says it runs on, for a user
+/// whose home is `home`, on `route` ([`observe::claude`]). Only the profile selectors and the
+/// login directory are read from `env`, and no credential: a process whose environment carries
+/// none of them reads the default home's profile.
+fn login_seen(
+    env: &[String],
+    home: &Path,
+    route: accounts::AuthRoute,
+    roster: &accounts::Roster,
+) -> Observation {
+    let login_env: Vec<String> = env
+        .iter()
+        .filter(|entry| {
+            profile_selector(entry)
+                || entry
+                    .split_once('=')
+                    .is_some_and(|(name, _)| name == accounts::LOGIN_ENV)
+        })
+        .cloned()
+        .collect();
+    observe::claude(&login_env, home, route, Some(roster))
+}
+
+fn profile_selector(entry: &str) -> bool {
+    entry.split_once('=').is_some_and(|(name, _)| {
+        matches!(
+            name,
+            accounts::HOMEDIR_ENV | accounts::HOME_ENV | "CLAUDE_CODE_CUSTOM_OAUTH_URL"
+        )
+    })
 }
 
 /// The dedicated login's captured profile, or the default profile under the

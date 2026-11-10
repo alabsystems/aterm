@@ -11,7 +11,7 @@ const SERVES: &[FleetOp] = &[FleetOp::Survey, FleetOp::Drive];
 struct Peer {
     addr: SocketAddr,
     asked: Arc<AtomicUsize>,
-    running: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -36,13 +36,13 @@ impl Peer {
     ) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
-        let running = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(Stop::new());
         let asked = Arc::new(AtomicUsize::new(0));
         let thread = std::thread::spawn({
-            let running = Arc::clone(&running);
+            let stop = Arc::clone(&stop);
             let asked = Arc::clone(&asked);
             move || {
-                while drops > 0 && running.load(Ordering::Acquire) {
+                while drops > 0 && !stop.is_set() {
                     match aterm_uds::accept(
                         &listener,
                         aterm_uds::AcceptWait::Ready,
@@ -58,7 +58,7 @@ impl Peer {
                         Err(error) => panic!("accepting a dropped handshake: {error}"),
                     }
                 }
-                if !running.load(Ordering::Acquire) {
+                if stop.is_set() {
                     return;
                 }
                 let node_name = node.node().to_owned();
@@ -74,7 +74,7 @@ impl Peer {
                 serve_with_handshake(
                     &listener,
                     &listening,
-                    &running,
+                    &stop,
                     HANG,
                     move |served, op| {
                         if let Some(proved) = &proved {
@@ -115,7 +115,7 @@ impl Peer {
         Self {
             addr,
             asked,
-            running,
+            stop,
             thread: Some(thread),
         }
     }
@@ -123,7 +123,7 @@ impl Peer {
 
 impl Drop for Peer {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
+        self.stop.set();
         if let Some(thread) = self.thread.take() {
             thread.join().unwrap();
         }

@@ -47,6 +47,7 @@ struct Publication<'a> {
     target: Option<SyncTarget<'a>>,
     wake: WakeRule,
     retire_legacy: bool,
+    outbox: Option<Image>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -65,6 +66,7 @@ enum ImageRole {
     Roster,
     Fleet,
     SourcePolicy,
+    Outbox,
 }
 
 impl ImageRole {
@@ -76,6 +78,7 @@ impl ImageRole {
             Self::Roster => MAX_ROSTER_BYTES,
             Self::Fleet => MAX_FLEET,
             Self::SourcePolicy => super::source_policy::MAX_BYTES,
+            Self::Outbox => super::outbox::MAX_BYTES,
         }
     }
 
@@ -87,6 +90,7 @@ impl ImageRole {
             Self::Roster => 4,
             Self::Fleet => 5,
             Self::SourcePolicy => 6,
+            Self::Outbox => 7,
         }
     }
 }
@@ -155,6 +159,8 @@ struct Plan {
     fleet: Option<FleetImage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_policy: Option<Image>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outbox: Option<Image>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -352,6 +358,12 @@ impl Plan {
         if include_policy {
             paths.push((ImageRole::SourcePolicy, store.source_policy_file()));
         }
+        let include_outbox = self.outbox.is_some();
+        #[cfg(test)]
+        let include_outbox = include_outbox && super::outbox::MUTANT.get() != 1;
+        if include_outbox {
+            paths.push((ImageRole::Outbox, store.outbox_file()));
+        }
         Ok(paths)
     }
 
@@ -375,6 +387,26 @@ impl Plan {
             }
         } else {
             store.source_policy_unfenced()?;
+        }
+        if let Some(image) = &self.outbox {
+            image.check(super::outbox::MAX_BYTES)?;
+            let before = image
+                .before
+                .as_deref()
+                .map(super::outbox::Queue::decode)
+                .transpose()?
+                .unwrap_or_default();
+            let after = super::outbox::Queue::decode(
+                image
+                    .after
+                    .as_deref()
+                    .ok_or("publication outbox cannot be removed")?,
+            )?;
+            after.preserves_ordinals_after(&before)?;
+            let witness = read(&store.outbox_witness(), 0)?;
+            if image.before.is_some() && witness.is_none() {
+                return Err("publication outbox witness is missing".into());
+            }
         }
         if self.roster_mode.is_some_and(|mode| mode & !0o777 != 0) {
             return Err("account sync receipt has invalid roster permissions".into());
@@ -427,6 +459,7 @@ impl Plan {
             .into_iter()
             .chain(self.fleet.iter().map(|fleet| &fleet.image))
             .chain(self.source_policy.iter())
+            .chain(self.outbox.iter())
     }
 
     /// Fresh intent admission requires its captured before-images. Recovery may
@@ -458,6 +491,10 @@ impl Plan {
                 .source_policy
                 .as_ref()
                 .ok_or_else(|| "account receipt lost its source policy".to_owned()),
+            ImageRole::Outbox => self
+                .outbox
+                .as_ref()
+                .ok_or_else(|| "account receipt lost its publication outbox".to_owned()),
         }
     }
 }
@@ -511,6 +548,8 @@ fn validate_external_target(store: &Store, target: &Path) -> Result<(), String> 
         store.dir.join(LOCK_FILE),
         store.source_policy_file(),
         store.source_policy_witness(),
+        store.outbox_file(),
+        store.outbox_witness(),
     ] {
         if usage_target(Some(&path))?.as_deref() == Some(target.as_path()) {
             return Err("sync destination aliases account authority".into());
@@ -589,6 +628,7 @@ impl Store {
             wake: Some(changed),
             fleet: None,
             source_policy,
+            outbox: None,
         };
         self.publish_plan_scoped(held, Scope::default(), plan, &[], || Ok(()))?;
         Ok(changed)
@@ -866,6 +906,7 @@ impl Store {
                 .as_ref()
                 .and_then(|target| target.fleet.as_ref().map(|(_, image)| image.clone())),
             source_policy,
+            outbox: None,
         };
         let changed = plan.images().any(|image| image.before != image.after) || !events.is_empty();
         self.publish_plan_scoped(
@@ -911,6 +952,7 @@ impl Store {
                 target: None,
                 wake: WakeRule::Events,
                 retire_legacy: false,
+                outbox: None,
             },
             edit,
             || Ok(()),
@@ -1099,6 +1141,7 @@ impl Store {
                 }),
                 wake,
                 retire_legacy: false,
+                outbox: None,
             },
             |state, logins| {
                 let events = edit(&raw, state, logins)?;
@@ -1193,6 +1236,7 @@ impl Store {
                 }),
                 wake: WakeRule::Events,
                 retire_legacy: false,
+                outbox: None,
             },
             |state, logins| {
                 let events = edit(&raw, state, logins)?;
@@ -1459,7 +1503,7 @@ impl Store {
             }
             let retain = matches!(
                 role,
-                ImageRole::State | ImageRole::Logins | ImageRole::SourcePolicy
+                ImageRole::State | ImageRole::Logins | ImageRole::SourcePolicy | ImageRole::Outbox
             ) && image.after.is_some();
             #[cfg(test)]
             let retain =
@@ -1468,6 +1512,7 @@ impl Store {
                 let witness = match role {
                     ImageRole::State => self.state_witness_file(),
                     ImageRole::Logins => self.logins_witness_file(),
+                    ImageRole::Outbox => self.outbox_witness(),
                     _ => self.source_policy_witness(),
                 };
                 self.retain_witness(&witness)
@@ -1500,7 +1545,9 @@ impl Store {
             self.touch_wake().map_err(|why| why.to_string())?;
         }
         aterm_durable::durable_dir(&self.dir).map_err(|why| why.to_string())?;
-        progress(if plan.source_policy.is_some() {
+        progress(if plan.outbox.is_some() {
+            8
+        } else if plan.source_policy.is_some() {
             7
         } else if plan.fleet.is_some() {
             6
@@ -1549,6 +1596,7 @@ impl Store {
                 target: Some(target),
                 wake: WakeRule::Always,
                 retire_legacy,
+                outbox: None,
             },
             edit,
             auxiliary,
@@ -1598,6 +1646,7 @@ impl Store {
             target,
             wake,
             retire_legacy,
+            outbox,
         } = publication;
         let roster = usage_target(target.as_ref().map(|target| target.path))?;
         let fleet = target
@@ -1741,6 +1790,7 @@ impl Store {
             },
             fleet: fleet.as_ref().map(|(_, image)| image.clone()),
             source_policy: self.source_policy_image(retire_legacy, now)?,
+            outbox,
         };
         self.publish_plan_scoped(
             held,
@@ -1787,6 +1837,75 @@ impl Store {
             before,
             after: Some(after),
         }))
+    }
+
+    /// Commit a local account edit and its immutable description publication
+    /// together. This sends nothing and acquires no Commons writer.
+    /// A pending paired receipt still requires separately scoped recovery.
+    pub fn enqueue_publication_within(
+        &self,
+        ladder: &[std::time::Duration],
+        now: i64,
+        draft: aterm_db::accounts::publication::Draft,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+    ) -> Result<(super::outbox::Entry, Vec<Event>), String> {
+        let held = self
+            .acquire_within(ladder)
+            .map_err(|why| why.to_string())?
+            .ok_or_else(|| LOCK_HELD.to_owned())?;
+        self.recover_sync_at(&held, None, &mut |_| Ok(()))?;
+        let (before, mut queue) = self.outbox_unfenced()?;
+        let entry = queue.enqueue(draft)?;
+        let events = self.transact_outbox_held(&held, now, before, queue.encode()?, edit)?;
+        Ok((entry, events))
+    }
+
+    /// Retire only an exact queued publication after its actual local
+    /// application receipt. A late acknowledgment cannot clear a newer entry.
+    pub fn acknowledge_publication_within(
+        &self,
+        ladder: &[std::time::Duration],
+        now: i64,
+        entry: &super::outbox::Entry,
+        completion: &aterm_db::accounts::publication::Completion,
+    ) -> Result<bool, String> {
+        let held = self
+            .acquire_within(ladder)
+            .map_err(|why| why.to_string())?
+            .ok_or_else(|| LOCK_HELD.to_owned())?;
+        self.recover_sync_at(&held, None, &mut |_| Ok(()))?;
+        let (before, mut queue) = self.outbox_unfenced()?;
+        if !queue.acknowledge(entry, completion)? {
+            return Ok(false);
+        }
+        self.transact_outbox_held(&held, now, before, queue.encode()?, |_, _| Ok(Vec::new()))?;
+        Ok(true)
+    }
+
+    fn transact_outbox_held(
+        &self,
+        held: &Lock,
+        now: i64,
+        before: Option<String>,
+        after: String,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+    ) -> Result<Vec<Event>, String> {
+        self.transact_images_held(
+            held,
+            now,
+            &mut None,
+            Publication {
+                target: None,
+                wake: WakeRule::Always,
+                retire_legacy: false,
+                outbox: Some(Image {
+                    before,
+                    after: Some(after),
+                }),
+            },
+            edit,
+            || Ok(()),
+        )
     }
 
     fn publish_plan_scoped(

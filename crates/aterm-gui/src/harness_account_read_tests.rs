@@ -110,6 +110,7 @@ fn pending_roster(a: &Accts) {
                 roster_path: &a.roster_path(),
                 row,
                 who: &who,
+                seen: &aterm_agent::harness::observe::Observation::Unread,
             },
             |state, logins| Ok(accounts::note_login_end(state, logins, "main", a.clock())),
         )

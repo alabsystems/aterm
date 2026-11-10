@@ -108,6 +108,44 @@ impl std::fmt::Debug for SubKey {
     }
 }
 
+/// A tab, as a journal note names it: the first 8 hex digits of SHA-256 over this Mac's machine
+/// id and the session's sid (`docs/DESIGN-account-discovery-2026-11-09.md`, until the registry
+/// mints a tab id), held inline. The sid itself never leaves the Mac.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Tab([u8; 8]);
+
+impl Tab {
+    /// The tab `sid` is on the Mac whose machine id is `machine`.
+    #[must_use]
+    pub fn of(machine: &str, sid: &str) -> Tab {
+        let mut hasher = aterm_digest::Sha256::new();
+        hasher.update(machine.as_bytes());
+        hasher.update([0]);
+        hasher.update(sid.as_bytes());
+        let digest = hasher.finalize();
+        let mut out = [0u8; 8];
+        for (i, byte) in digest.iter().take(4).enumerate() {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            out[2 * i] = HEX[usize::from(byte >> 4)];
+            out[2 * i + 1] = HEX[usize::from(byte & 0xf)];
+        }
+        Tab(out)
+    }
+
+    /// The tab id.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Only ASCII hex is ever stored.
+        std::str::from_utf8(&self.0).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for Tab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Every kind word a note can carry; each is a word of the journal's `ev` vocabulary.
 pub const KINDS: &[&str] = &[
     "session-start",
@@ -135,6 +173,7 @@ pub const KINDS: &[&str] = &[
     "token-fallback",
     "token-offered",
     "token-removed",
+    "seen",
 ];
 /// Every window word a note can carry.
 pub const WINDOWS: &[&str] = &["5h", "7d", "7d-model"];
@@ -147,6 +186,11 @@ pub const SOURCES: &[&str] = &[
     "signin-flow",
     "error",
     "probe",
+    // Where an observed login was read (`seen`, [`ObservedSrc`]).
+    "profile",
+    "auth-file",
+    "cli-log",
+    "vault-token",
 ];
 /// Every reset-resolution word a note can carry.
 pub const RESES: &[&str] = &["exact", "hour"];
@@ -176,6 +220,9 @@ pub const WHYS: &[&str] = &[
     "rejected",
     "mismatched",
     "unreadable",
+    // Why a tab's sighting is noted ([`SeenWhy`]); `seen` above is the hourly refresh.
+    "first",
+    "changed",
 ];
 
 /// One journal note: an event about one account, in the journal's closed vocabulary. `Copy`,
@@ -207,8 +254,13 @@ pub struct Note {
     pub src: &'static str,
     /// One of [`WHYS`].
     pub why: Option<&'static str>,
-    /// The other account of a switch or a displacement.
+    /// The other account of a switch or a displacement; the believed account of a
+    /// `wrong-account` a tab's observation contradicted.
     pub to: Option<Key>,
+    /// The tab a sighting, a wrong account or a session is about.
+    pub tab: Option<Tab>,
+    /// The harness word of that tab's session (`[a-z0-9-]`, 16 bytes at most).
+    pub harness: Option<&'static str>,
 }
 
 impl Note {
@@ -227,6 +279,8 @@ impl Note {
             src,
             why: None,
             to: None,
+            tab: None,
+            harness: None,
         }
     }
 }
@@ -291,12 +345,165 @@ pub fn wrong_token_account(account: Key, t: u64) -> Note {
     Note::new(t, "wrong-account", account, Cli::Claude, "signin-flow")
 }
 
+/// Where a tab's observed login was read, as a `seen` note's source word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedSrc {
+    /// Claude Code's profile (`.claude.json` and its variants).
+    Profile,
+    /// A CLI's auth file (Codex, Muse, Grok, Kimi).
+    AuthFile,
+    /// A CLI's own log (agy).
+    CliLog,
+    /// The vault token entry a token route runs on.
+    VaultToken,
+}
+
+impl ObservedSrc {
+    /// The source word, one of [`SOURCES`].
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::AuthFile => "auth-file",
+            Self::CliLog => "cli-log",
+            Self::VaultToken => "vault-token",
+        }
+    }
+}
+
+/// Why a tab's sighting is noted now: its (tab, account) pair is new, the tab's account changed,
+/// or the hourly refresh of a pair still running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeenWhy {
+    First,
+    Changed,
+    Refresh,
+}
+
+impl SeenWhy {
+    /// The reason word, one of [`WHYS`]: a first sighting and a change are sharp, the refresh is
+    /// not (`aterm_db::alab::journal::Event::sharp`).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Changed => "changed",
+            Self::Refresh => "seen",
+        }
+    }
+}
+
+/// The note of a tab's sighting of `cli`'s account `account` at `t`
+/// (`docs/DESIGN-account-discovery-2026-11-09.md`): read from `src`, in `tab`, run by `harness`.
+#[must_use]
+pub fn seen_note(
+    cli: Cli,
+    account: Key,
+    tab: Tab,
+    harness: &'static str,
+    src: ObservedSrc,
+    why: SeenWhy,
+    t: u64,
+) -> Note {
+    let mut note = Note::new(t, "seen", account, cli, src.word());
+    note.tab = Some(tab);
+    note.harness = Some(harness);
+    note.why = Some(why.word());
+    note
+}
+
+/// The note of a tab whose login file names `observed` while the roster believed `believed`
+/// (`wrong-account` with `to` the believed account and `x` the tab).
+#[must_use]
+pub fn wrong_account_note(
+    cli: Cli,
+    observed: Key,
+    believed: Option<Key>,
+    tab: Tab,
+    src: ObservedSrc,
+    t: u64,
+) -> Note {
+    let mut note = Note::new(t, "wrong-account", observed, cli, src.word());
+    note.to = believed;
+    note.tab = Some(tab);
+    note
+}
+
+/// The `quota` notes of a tap reading `read` of `account`, one per window it carried: what a
+/// tap reads of an account no roster row here names (`docs/DESIGN-account-discovery-2026-11-09.md`,
+/// decision 7), which the fleet and the projection take from the journal alone, never from a
+/// row's record.
+#[must_use]
+pub fn quota_notes(cli: Cli, account: Key, read: &super::accounts::TapRead) -> Vec<Note> {
+    [
+        (super::accounts::SESSION_LIMIT, read.five_hour),
+        (super::accounts::WEEK_LIMIT, read.seven_day),
+    ]
+    .into_iter()
+    .filter_map(|(name, window)| {
+        let window = window?;
+        let fig = WindowFig {
+            pct_x10: window.pct_x10,
+            reset: window.reset,
+            at: read.at,
+            by: String::new(),
+            source: super::accounts::SOURCE_TAP.to_owned(),
+            epoch_at: None,
+        };
+        of_reading(cli, account, name, &fig)
+    })
+    .collect()
+}
+
+/// The state of a login this Mac observed ([`ObservedLogin`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginState {
+    /// A running tab's CLI reads it.
+    Running,
+    /// It is present on this Mac with no tab on it.
+    Idle,
+    /// The file is there and names no account.
+    SignedOut,
+}
+
+impl LoginState {
+    /// The registry's `account-obs.state` word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Idle => "idle",
+            Self::SignedOut => "signed-out",
+        }
+    }
+}
+
+/// One login this Mac observed, for the registry's `account-obs` rows (the sink's
+/// [`Sink::observed`]): the account by its claims realm and login email, never a credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedLogin {
+    pub cli: Cli,
+    /// The claims realm ([`LeaseKey::pool`]).
+    pub realm: String,
+    /// The login email the file names.
+    pub email: String,
+    pub state: LoginState,
+    /// The tab that runs it, where one does.
+    pub tab: Option<Tab>,
+    /// When, Unix seconds.
+    pub at: u64,
+    pub src: ObservedSrc,
+}
+
 /// Where notes go, and how an account is keyed: the `aterm` executable's journal glue.
 pub trait Sink: Send + Sync {
     /// The account key of the canonical claims `realm` and claims email (design §5), or none.
     fn account_pk(&self, realm: &str, email: &str) -> Option<String>;
     /// Note one event: a bounded append, no lock, no allocation; a failure is dropped.
     fn note(&self, note: &Note);
+    /// Take up a login this Mac observed, for the registry: the executable hands it to a thread
+    /// of its own and never makes the caller wait. Nothing by default.
+    fn observed(&self, _login: &ObservedLogin) {}
 }
 
 static SINK: OnceLock<&'static dyn Sink> = OnceLock::new();
@@ -343,6 +550,21 @@ pub fn note(note: &Note) {
     if let Some(sink) = SINK.get() {
         sink.note(note);
     }
+}
+
+/// Hand `login` to the installed sink's registry path; nothing without one.
+pub fn observed(login: &ObservedLogin) {
+    if let Some(sink) = SINK.get() {
+        sink.observed(login);
+    }
+}
+
+/// The claims realm and claims email of `cli`'s observed login `email` ([`LeaseKey::for_cli`]),
+/// as the registry and the keyer take it.
+#[must_use]
+pub fn claims_of(cli: Cli, email: &str) -> Option<(String, String)> {
+    let lease = LeaseKey::for_cli(cli, None, email).ok()?;
+    Some((lease.pool, lease.email))
 }
 
 /// The account key of an unpooled CLI's login, by its realm (`google` for agy, `meta` for Muse)
@@ -540,6 +762,8 @@ pub fn probe_note(
                 src: "probe",
                 why: Some(event.why.word()),
                 to: None,
+                tab: None,
+                harness: None,
             });
         }
     };

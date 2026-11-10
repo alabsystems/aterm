@@ -1318,6 +1318,7 @@ fn a_binary_that_failed_last_run_starts_first() {
     assert!(failed.failed && failed.tests == 1, "{failed:?}");
     assert!(!kept.seen("-p fixture --test a").expect("a was kept").failed);
     let took = |wall_ms: u64, outcome: &str| aterm_verify::test_history::Sample {
+        partition: None,
         at_ms: 1,
         outcome: outcome.to_owned(),
         wall_ms,
@@ -1369,6 +1370,7 @@ fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
         vec![(
             "-p fixture --test b".to_owned(),
             aterm_verify::test_history::Sample {
+                partition: None,
                 at_ms: 1,
                 outcome: "ok".to_owned(),
                 wall_ms: 10,

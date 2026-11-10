@@ -162,10 +162,14 @@ fn a_stage_that_started_no_child_keeps_that_it_held_nothing() {
         doctests.id,
         &crate::scope::Scope::crate_only("aterm-capacity"),
     );
-    assert_eq!(book.need(&doctests, &key).bytes, 12 * GIB, "cold");
+    assert_eq!(book.need(&doctests, &key, None).bytes, 12 * GIB, "cold");
     book.keep(&doctests, &key, none.held().expect("held nothing"))
         .expect("kept");
-    assert_eq!(book.need(&doctests, &key).bytes, GIB, "the margin alone");
+    assert_eq!(
+        book.need(&doctests, &key, None).bytes,
+        GIB,
+        "the margin alone"
+    );
 }
 
 /// One member read at `cpu_ms` of CPU, twice that runnable, holding `held` GiB.

@@ -35,12 +35,8 @@ fn findings(
             .map(|(path, text)| (format!("crates/{bridge}/{path}"), (*text).to_owned())),
     );
     let root = disk_tree("aterm-census-guards", "keeper-native-source", &files);
-    let corpus = Corpus::read(&root).unwrap();
-    let tree = Tree {
-        root: &root,
-        corpus: &corpus,
-        engine: crate::guards::tests::NO_ENGINE,
-    };
+    let corpus = Corpus::at(&root).unwrap();
+    let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
     let mut out = Vec::new();
     keeper_gui_deps(&tree, &mut out);
     let _ = std::fs::remove_dir_all(root);
@@ -198,11 +194,11 @@ fn direct_keeper_and_uds_runtime_sends_remain_forbidden() {
             "unsafe extern \"C\" { fn objc_msgSend(); }\n",
         ),
     ]);
-    let tree = Tree {
-        root: std::path::Path::new("."),
-        corpus: &corpus,
-        engine: crate::guards::tests::NO_ENGINE,
-    };
+    let tree = Tree::new(
+        std::path::Path::new("."),
+        &corpus,
+        crate::guards::tests::NO_ENGINE,
+    );
     let mut found = Vec::new();
     super::keeper_gui(&tree, &mut found);
     assert_eq!(found.len(), 2, "{found:?}");

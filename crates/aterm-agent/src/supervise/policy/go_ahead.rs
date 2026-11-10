@@ -269,7 +269,15 @@ fn read_park(turn_said: &str, tail: &str) -> Option<Park> {
     for (i, unit) in units.iter().enumerate() {
         let before = i.checked_sub(1).map(|b| &units[b]);
         let after = units.get(i + 1);
-        if let Some(token) = judged(unit, before, after) {
+        // A clause a `;` joins reads its sentence's context as the sentence would: the clauses
+        // before it back to the sentence's start, and the sentence before that, but for the
+        // agent's own report of finished work, whose nouns are its code (`Rewrote the token
+        // parser`, `Fixed the OAuth callback`).
+        let start = (1..=i).rev().find(|&k| !units[k].prior_clause).unwrap_or(0);
+        let outer = &units[start.saturating_sub(1)..i.saturating_sub(1)];
+        if let Some(token) = judged(unit, before, after)
+            .filter(|_| !outer.iter().any(|o| !reports_done(o) && excluded(o, None)))
+        {
             room |= [before, Some(unit), after]
                 .into_iter()
                 .flatten()
@@ -315,6 +323,21 @@ fn read_park(turn_said: &str, tail: &str) -> Option<Park> {
         needs: answers,
         lands,
     })
+}
+
+/// Whether `unit` opens as the agent's report of work it finished: a past-tense verb first, after
+/// an `I`, `I've` or `we` (`Rewrote the token parser`, `I fixed the login form`).
+fn reports_done(unit: &Unit) -> bool {
+    const IRREGULAR: &[&str] = &[
+        "rewrote", "wrote", "made", "built", "rebuilt", "ran", "reran", "split", "cut", "put",
+        "set", "kept", "found", "took", "brought",
+    ];
+    let first = usize::from(matches!(
+        unit.word(0),
+        "i" | "i've" | "we" | "we've" | "just"
+    ));
+    let w = unit.word(first);
+    (w.len() > 4 && w.ends_with("ed")) || IRREGULAR.contains(&w)
 }
 
 /// The acts that land the agent's work, in any inflection: a park that names one parks unlanded
@@ -1810,6 +1833,10 @@ fn person_only_words(unit: &Unit) -> impl Iterator<Item = (usize, bool)> + '_ {
         "paid",
         "spent",
         "cost",
+        "bills",
+        "1password",
+        "bitwarden",
+        "lastpass",
     ];
     const INFLECTED: &[&str] = &[
         "authenticate",
@@ -1847,9 +1874,14 @@ fn person_only_words(unit: &Unit) -> impl Iterator<Item = (usize, bool)> + '_ {
         &["permission", "denied"],
         &["not", "permitted"],
         &["credit", "card"],
+        &["your", "signature"],
+        &["refund", "the"],
+        &["refund", "them"],
+        &["refund", "it"],
     ];
     unit.words.iter().enumerate().filter_map(|(i, (at, w))| {
-        let sigil = w.contains('$') || (w.starts_with("env") && unit.lower[..*at].ends_with('.'));
+        let sigil = (w.contains('$') && w.len() > 1)
+            || (w.starts_with("env") && unit.lower[..*at].ends_with('.'));
         let w = w.as_str();
         let plural = w.strip_suffix('s').unwrap_or(w);
         let hit = sigil
@@ -1914,6 +1946,17 @@ fn person_first(unit: &Unit) -> bool {
         let act = unit.word(at);
         inflects_any(act, ACTS) || matches!(act, "chose" | "chosen" | "picked")
     }) || reviewed_first(unit)
+        || (unit.any(&["yourself", "yourselves"])
+            && !unit.any(&["rather", "prefer", "or", "unless", "want", "like"]))
+        || (0..unit.len()).any(|i| {
+            // `you need to choose between the two schemas`, `you have to pick the theme`.
+            unit.word(i) == "you"
+                && matches!(unit.word(i + 1), "need" | "needs" | "have" | "must")
+                && {
+                    let at = i + 2 + usize::from(unit.word(i + 2) == "to");
+                    inflects_any(unit.word(at), &["choose", "pick", "decide"])
+                }
+        })
 }
 
 /// The light verbs a person's act may follow (`had a look`, `take a look`, `give it a read`).
@@ -2071,6 +2114,30 @@ fn outward(unit: &Unit, says_at: Option<usize>) -> bool {
         &["rolling", "out"],
         &["rolled", "out"],
         &["cut", "over"],
+        &["to", "the", "app", "store"],
+        &["to", "the", "play", "store"],
+        &["to", "testflight"],
+        &["on", "for", "all", "users"],
+        &["out", "to", "all", "users"],
+        &["on", "for", "every", "user"],
+        &["out", "to", "every", "user"],
+        &["against", "the", "live", "database"],
+        &["on", "the", "live", "database"],
+        &["against", "the", "production", "database"],
+        &["on", "the", "production", "database"],
+        &["no", "snapshot", "to", "go"],
+        &["no", "snapshot", "to", "restore"],
+        &["no", "snapshot", "to", "roll"],
+        &["no", "backup", "to", "go"],
+        &["no", "backup", "to", "restore"],
+        &["no", "backup", "to", "roll"],
+        &["transfer", "ownership"],
+        &["mail", "the"],
+        &["mail", "it"],
+        &["mail", "everyone"],
+        &["file", "a", "bug"],
+        &["file", "the", "bug"],
+        &["feedback", "assistant"],
     ];
     if force_push(&unit.lower)
         || unit.lower.contains("push --force")
@@ -2103,8 +2170,34 @@ fn outward(unit: &Unit, says_at: Option<usize>) -> bool {
             || OUTWARD_PREFIXES.iter().any(|p| w.starts_with(p))
             || PHRASES.iter().any(|p| unit.at(i, p))
             || (inflects(w, "push") && pushes_elsewhere(unit, i))
+            // `message Alice`, `email the reviewer`, `respond to the reviewer`, `invite Bob`: a
+            // word to someone else (`the message author field` is code).
+            || (inflects_any(w, &["message", "email", "ping", "dm", "invite"])
+                && addressed(unit, i + 1))
+            || (inflects_any(w, &["respond", "reply"])
+                && unit.word(i + 1) == "to"
+                && addressed(unit, i + 2))
             || ends_a_process(unit, i)
     })
+}
+
+/// Whether word `k` addresses someone: a name (`Alice`), a handle (`@sam`), or past an article a
+/// [`PEOPLE_NOUNS`] or [`PARTIES`] word but the person, one modifier allowed (`the reviewer`,
+/// `the platform team`; `the Trust toolchain` is a thing).
+fn addressed(unit: &Unit, k: usize) -> bool {
+    let party = |k: usize| {
+        let w = unit.word(k);
+        let one = w.trim_end_matches('s');
+        (PEOPLE_NOUNS.contains(&one) || PARTIES.contains(&one)) && !THE_PERSON.contains(&w)
+    };
+    if matches!(unit.word(k), "the" | "a" | "an") {
+        return party(k + 1) || party(k + 2);
+    }
+    named(unit, k)
+        || unit
+            .words
+            .get(k)
+            .is_some_and(|(at, _)| unit.lower[..*at].ends_with('@'))
 }
 
 /// Whether word `i` is `end`, `stop` or `shut down` (`shutdown`), in any form (`ending`,
@@ -2466,17 +2559,30 @@ fn possessed(unit: &Unit) -> bool {
         "to", "on", "for", "of", "with", "my", "the", "a", "an", "this", "that", "its", "and",
         "or", "in", "at", "into", "before", "after",
     ];
+    // A fix or a review is someone's by a possessive that names them (`Priya's fix`, `Dana's
+    // review`; `your review` is the person's) or a `from` or `by` (`the fix from Priya`).
+    const THEIRS: &[&str] = &["fix", "fixes", "review", "reviews"];
     (0..unit.len()).any(|i| {
-        WORK_NOUNS.contains(&unit.word(i))
-            && (owned_after(unit, i)
-                || (1..=3).any(|back| {
-                    i.checked_sub(back).is_some_and(|k| {
-                        foreign(unit, k)
-                            && (k + 1..i).all(|j| {
-                                !BETWEEN.contains(&unit.word(j)) && consent_at(unit, j).is_none()
-                            })
-                    })
-                }))
+        let w = unit.word(i);
+        let named_possessor = THEIRS.contains(&w)
+            && i.checked_sub(1).is_some_and(|k| {
+                foreign(unit, k) && !matches!(unit.word(k), "your" | "their" | "his" | "her")
+            });
+        named_possessor
+            || ((WORK_NOUNS.contains(&w) || THEIRS.contains(&w))
+                && matches!(unit.word(i + 1), "from" | "by")
+                && addressed(unit, i + 2))
+            || WORK_NOUNS.contains(&w)
+                && (owned_after(unit, i)
+                    || (1..=3).any(|back| {
+                        i.checked_sub(back).is_some_and(|k| {
+                            foreign(unit, k)
+                                && (k + 1..i).all(|j| {
+                                    !BETWEEN.contains(&unit.word(j))
+                                        && consent_at(unit, j).is_none()
+                                })
+                        })
+                    }))
     })
 }
 
@@ -2613,6 +2719,14 @@ fn someone_else(unit: &Unit) -> bool {
         "workers",
     ];
     if possessed(unit)
+        || others_approve(unit)
+        || (0..unit.len()).any(|i| {
+            // `my teammate will rebase it`; `the teammate struct` is code.
+            matches!(
+                unit.word(i),
+                "teammate" | "teammates" | "colleague" | "colleagues"
+            ) && matches!(unit.before(i, 1), "my" | "our" | "your")
+        })
         || unclaimed_request(unit)
         || bot_branch(unit)
         || consent_owned_elsewhere(unit)
@@ -2682,11 +2796,81 @@ fn someone_else(unit: &Unit) -> bool {
             };
             c.any(WORDS)
                 || PHRASES.iter().any(|p| c.has(p))
+                || (0..c.len()).any(|i| {
+                    c.at(i, &["other", "team"]) || c.at(i, &["other", "teams"])
+                } && counts(&c, i))
                 || owned("their")
                 || (clause.contains("owner's") && owned("owner"))
                 || clause.contains("worker's")
                 || c.words.iter().any(|(_, w)| session_id(w))
         })
+}
+
+/// The parties besides [`PEOPLE_NOUNS`] whose approval a reply can wait on (`the client hasn't
+/// approved the mockups`).
+const PARTIES: &[&str] = &[
+    "client",
+    "vendor",
+    "manager",
+    "compliance",
+    "legal",
+    "board",
+    "lead",
+    "codeowners",
+    "marketing",
+];
+
+/// Whether someone other than the person has yet to approve, review, sign or agree: a name or a
+/// party ([`PEOPLE_NOUNS`] but the person, [`PARTIES`]) before such a verb, pending by an
+/// auxiliary between (at most four: `Marcus still has to approve the design`, `Ana has not
+/// reviewed it`, `Lena asked to review it first`, `the security team must review it first`,
+/// `until Sam has finished reviewing it`, `once Priya has had a look`) or by a condition before
+/// (`after the client approves the copy`, `once Priya OKs it`, `once the security team gives the
+/// green light`). A report of what code does is no approval (`the client accepts stale frames`),
+/// nor is a name before a noun (`the GitHub review comment parser`) or a tool's state (`Clippy is
+/// happy`: `happy` is a party's alone).
+fn others_approve(unit: &Unit) -> bool {
+    const BETWEEN: &[&str] = &[
+        "still", "has", "have", "had", "to", "must", "needs", "need", "not", "hasn't", "haven't",
+        "yet", "finished", "finishes", "is", "are", "isn't", "aren't", "will", "should", "first",
+        "also", "gets", "got", "asked", "wants", "wanted", "take", "takes", "taken",
+    ];
+    const OPENS: &[&str] = &[
+        "once", "after", "until", "till", "when", "unless", "provided", "but", "though",
+    ];
+    const APPROVES: &[&str] = &[
+        "approve", "review", "sign", "agree", "confirm", "accept", "ok", "okay",
+    ];
+    (0..unit.len()).any(|i| {
+        let w = unit.word(i);
+        let one = w.trim_end_matches('s');
+        let party =
+            (PEOPLE_NOUNS.contains(&one) && !THE_PERSON.contains(&w)) || PARTIES.contains(&one);
+        let name = named(unit, i) && !matches!(w, "please" | "ready" | "your" | "their");
+        let possessive = unit.lower[unit.words[i].0 + w.len()..].starts_with('\'');
+        if !(party || name) || possessive || unit.before(i, 1) == "you" {
+            return false;
+        }
+        // The condition stands right before the subject, or before its article and at most one
+        // modifier (`once the security team`).
+        let conditioned = (1..=3).filter_map(|back| i.checked_sub(back)).any(|j| {
+            OPENS.contains(&unit.word(j))
+                && (j + 1..i)
+                    .all(|m| (m == j + 1 && unit.word(m) == "the") || (m == j + 2 && party))
+        });
+        let mut k = i + 1;
+        while k < i + 5 && BETWEEN.contains(&unit.word(k)) {
+            k += 1;
+        }
+        let v = unit.word(k);
+        let gives = inflects(v, "give") || matches!(v, "gave" | "given");
+        let approves = (inflects_any(v, APPROVES) && !matches!(v, "approval" | "approvals"))
+            || matches!(v, "oks" | "okays")
+            || (party && v == "happy")
+            || (k > i + 1 && matches!(v, "a" | "another") && unit.word(k + 1) == "look")
+            || (gives && (k + 1..k + 4).any(|g| consent_at(unit, g).is_some()));
+        approves && (k > i + 1 || conditioned)
+    })
 }
 
 /// Whether `unit` names a pull request, patch or fork no `my` or `our` claims in the two words
@@ -2750,7 +2934,10 @@ fn session_id(word: &str) -> bool {
         .is_some_and(|hex| hex.len() >= 6 && hex.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// A decline, a rejection or a deadlock: a go-ahead does not lift those.
+/// A decline, a rejection or a deadlock: a go-ahead does not lift those. The agent's own refusal
+/// to land this work (`I won't merge this into main, because…`, `I've decided not to push it`) is
+/// one, unless the person's word is what it waits on (`I won't land it without your go-ahead`) or
+/// it narrows what lands (`I won't commit the generated files, only the sources`).
 fn declined(unit: &Unit) -> bool {
     const WORDS: &[&str] = &[
         "syspolicyd",
@@ -2763,7 +2950,32 @@ fn declined(unit: &Unit) -> bool {
         "hook",
         "hooks",
     ];
-    unit.any(WORDS)
+    const REFUSALS: &[&[&str]] = &[
+        &["i", "won't"],
+        &["we", "won't"],
+        &["rather", "not"],
+        &["decided", "not", "to"],
+        &["don't", "think", "we", "should"],
+        &["don't", "think", "i", "should"],
+        &["not", "going", "to"],
+        &["prefer", "not", "to"],
+        &["don't", "want", "to"],
+    ];
+    let refuses = (0..unit.len()).any(|i| {
+        REFUSALS.iter().any(|r| {
+            unit.at(i, r)
+                && inflects_any(unit.word(i + r.len()), LANDING)
+                && matches!(
+                    unit.word(i + r.len() + 1),
+                    "this" | "it" | "that" | "these" | "them"
+                )
+        })
+    }) && !unit.any(&[
+        "without", "until", "till", "before", "unless", "only", "just", "yet", "own", "myself",
+        "alone", "first",
+    ]);
+    refuses
+        || unit.any(WORDS)
         || unit.has(&["not", "the", "user"])
         || unit.has(&["doesn't", "want", "to", "proceed"])
         || unit.has(&["does", "not", "want", "to", "proceed"])

@@ -48,6 +48,9 @@ mod outlook_report;
 #[path = "cli_history_tests.rs"]
 mod history_report;
 
+#[path = "cli_observed_tests.rs"]
+mod observed_report;
+
 #[path = "cli_account_backfill_tests.rs"]
 mod account_backfill;
 
@@ -1211,7 +1214,6 @@ fn usage_names_the_account_its_claude_code_runs_under() {
         ("refused", Some(refused)),
         ("no file", None),
         ("no rows", Some("# nothing listed yet\n")),
-        ("one row", Some(one.as_str())),
     ] {
         match text {
             Some(text) => std::fs::write(&roster, text).expect("write"),
@@ -1219,6 +1221,11 @@ fn usage_names_the_account_its_claude_code_runs_under() {
         }
         assert_eq!(shown(&env, &unread), "account", "{what}");
     }
+    // One row is named only where the process's login file contradicts it, so its process is
+    // read; none here does (no profile), and the line names no account.
+    std::fs::write(&roster, &one).expect("write");
+    let lone = FakeClaude::with(&[home]);
+    assert_eq!(shown(&env, &lone), "account", "one row");
 
     std::fs::write(&roster, &two).expect("write");
     assert_eq!(shown(&env, &main), "main", "the roster is back");

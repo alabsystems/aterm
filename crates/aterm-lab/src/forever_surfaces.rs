@@ -961,11 +961,11 @@ fn no_footer(c: &Chip) -> bool {
     c.face == "-" && c.drawn.is_none() && c.why.as_deref() == Some("no-footer")
 }
 
-/// Whether harness `program` leaves `c`'s footer bare: agy with its harness switch off, under
-/// the master's or its agent's switch (`claude_footer::bare_while_off`); Autopilot Off keeps the
-/// harness on, and its footer.
-fn bare_under_switch(program: &str, c: &Chip) -> bool {
-    program == "agy" && matches!(c.face.as_str(), "agent-off" | "master-off")
+/// Whether `c`'s footer is left bare: every program's with its harness switch off, under the
+/// master's or its agent's switch (`claude_footer::bare_while_off`, 2026-11-09: the switch off
+/// leaves the switch alone); Autopilot Off keeps the harness on, and its footer.
+fn bare_under_switch(c: &Chip) -> bool {
+    matches!(c.face.as_str(), "agent-off" | "master-off")
 }
 
 /// Whether `c` is `chrome`'s `drawn=- why=switch-only` line.
@@ -2211,7 +2211,7 @@ fn title_words(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
             undrawn_n += 1;
             continue;
         }
-        if bare_under_switch(cx.program, c) && switch_only(c) {
+        if bare_under_switch(c) && switch_only(c) {
             if title == "-" {
                 bare += 1;
             } else {
@@ -2268,7 +2268,7 @@ fn title_words(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         },
         if bare > 0 {
             format!(
-                "; {bare} undrawn (agy's footer bare under its off switch), no title, as no chip is drawn to hover"
+                "; {bare} undrawn (the footer bare under its off switch), no title, as no chip is drawn to hover"
             )
         } else {
             String::new()
@@ -3287,7 +3287,7 @@ pub(crate) fn idle_counts_beside(m: &str, p: &str, also: &[&str]) -> Vec<String>
 
 /// Judges the end-of-run idle window and resting surfaces across `desk` and `tabs`.
 #[must_use]
-pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdict {
+pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)]) -> Verdict {
     let Some(idle) = &desk.idle else {
         return Verdict::Unobserved("END's idle window was never had".into());
     };
@@ -3377,14 +3377,14 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
             continue;
         }
         let c = chip(l);
-        let (ok, want) = if bare_under_switch(program, &c) {
+        let (ok, want) = if bare_under_switch(&c) {
             let ok = switch_only(&c);
             if ok {
                 bare.push(chain.name());
             }
             (
                 ok,
-                " (wanted drawn=- why=switch-only: agy's footer is bare under its off switch)",
+                " (wanted drawn=- why=switch-only: the footer is bare under its off switch)",
             )
         } else {
             (drawn_is_face(&c), "")

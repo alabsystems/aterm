@@ -2167,8 +2167,10 @@ fn roster_or_last_until(
     )
 }
 
-/// [`roster_or_last`] through a peer check's `look` ([`aterm_secrets::client::VaultLook`]).
-fn roster_or_last_in(
+/// [`roster_or_last`] through `look` ([`aterm_secrets::client::VaultLook`]), a Commons peer
+/// check's or a table session admission's (`Session::peer_member_in`), which reads the roster of
+/// the vault the look is at.
+pub(crate) fn roster_or_last_in(
     look: &aterm_secrets::client::VaultLook<'_>,
 ) -> Option<Option<aterm_secrets::swarm_roster::SwarmRoster>> {
     roster_after(

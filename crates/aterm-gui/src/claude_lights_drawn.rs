@@ -139,7 +139,7 @@ impl WindowLights {
             } else if self.border_toggles.iter().any(|b| {
                 b.session == session
                     && !covered(b.term_row)
-                    && crate::claude_footer::bare_while_off(Some(b.program), Some(b.face))
+                    && crate::claude_footer::bare_while_off(Some(b.face))
             }) {
                 Drawn::SwitchOnly
             } else {

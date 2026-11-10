@@ -907,7 +907,6 @@ impl Runtime {
         let task = thread::Builder::new()
             .name("commons-owner".into())
             .spawn(move || {
-                let observer_dir = crate::network_state::directory(&observer_config);
                 let mut window_claim = None;
                 let mut previous = None;
                 let mut report = |status: Status| {
@@ -919,6 +918,9 @@ impl Runtime {
                 // One streak of refusals ([`Refusals`]).
                 let mut refusals = Refusals::new(background);
                 while !worker.is_set() {
+                    // Opening an observer can migrate this directory. Never retain its
+                    // pre-migration name across a startup or another owner's handoff.
+                    let observer_dir = crate::network_state::directory(&observer_config);
                     if yields && owner::window_claimed(&observer_dir) {
                         let publication = waiting_publication(
                             &paths,
@@ -953,11 +955,17 @@ impl Runtime {
                             continue;
                         }
                     };
+                    if !background && window_claim.is_none() {
+                        window_claim = owner::WindowClaim::acquire(
+                            &crate::network_state::directory(&observer_config),
+                        )
+                        .ok();
+                    }
                     while !worker.is_set() {
                         let mut serving = None;
                         let mut served = serve_mode_with_recovery(
                             (&paths, &config, recover_writer),
-                            yields.then_some(observer_dir.as_path()),
+                            yields,
                             &worker,
                             &mut |status| {
                                 if matches!(status, Status::Active { .. } | Status::Pending) {
@@ -978,7 +986,9 @@ impl Runtime {
                             history.unconfirm_local();
                             if yields
                                 && status == Status::Waiting
-                                && owner::window_claimed(&observer_dir)
+                                && owner::window_claimed(&crate::network_state::directory(
+                                    &observer_config,
+                                ))
                             {
                                 report(Status::Waiting);
                                 break;
@@ -1145,7 +1155,7 @@ fn serve(
 ) -> std::result::Result<(), Status> {
     serve_mode(
         (paths, config),
-        None,
+        false,
         stop,
         report,
         history,
@@ -1162,7 +1172,7 @@ fn serve(
 )]
 fn serve_mode(
     (paths, config): (&Paths, &Path),
-    yield_to_window: Option<&Path>,
+    yield_to_window: bool,
     stop: &Stop,
     report: &mut impl FnMut(Status),
     history: &mut Observer,
@@ -1188,7 +1198,7 @@ fn serve_mode(
 )]
 fn serve_mode_with_recovery(
     (paths, config, recover_writer): (&Paths, &Path, bool),
-    yield_to_window: Option<&Path>,
+    yield_to_window: bool,
     stop: &Stop,
     report: &mut impl FnMut(Status),
     history: &mut Observer,
@@ -1198,7 +1208,7 @@ fn serve_mode_with_recovery(
 ) -> std::result::Result<(), Status> {
     // A background owner yields to a window's claim before it reads its configuration, so one
     // its configuration refuses still yields.
-    if yield_to_window.is_some_and(owner::window_claimed) {
+    if yield_to_window && owner::window_claimed(&crate::network_state::directory(config)) {
         return Err(Status::Waiting);
     }
     if !enabled(config).map_err(refusal("configuration"))? {
@@ -1231,7 +1241,7 @@ fn serve_mode_with_recovery(
 )]
 fn serve_selected(
     (paths, config): (&Paths, &Path),
-    yield_to_window: Option<&Path>,
+    yield_to_window: bool,
     stop: &Stop,
     report: &mut impl FnMut(Status),
     history: &mut Observer,
@@ -1240,7 +1250,7 @@ fn serve_selected(
     board: &Board,
 ) -> std::result::Result<(), Status> {
     history.unconfirm_local();
-    if yield_to_window.is_some_and(owner::window_claimed) {
+    if yield_to_window && owner::window_claimed(&crate::network_state::directory(config)) {
         return Err(Status::Waiting);
     }
     if !enabled(config).map_err(refusal("configuration"))? {
@@ -1337,7 +1347,9 @@ fn serve_selected(
                 stop.sleep(rest);
             },
             |now, round| {
-                if yield_to_window.is_some_and(owner::window_claimed) {
+                if yield_to_window
+                    && owner::window_claimed(&crate::network_state::directory(config))
+                {
                     return Err(Status::Waiting);
                 }
                 if round {
@@ -1805,13 +1817,13 @@ fn contact_time(now_ms: u64, observed: Instant, authenticated: Instant) -> u64 {
 
 fn serve_presence(
     (paths, config): (&Paths, &Path),
-    yield_to_window: Option<&Path>,
+    yield_to_window: bool,
     stop: &Stop,
     report: &mut impl FnMut(Status),
     history: &mut Observer,
     network: &Network,
 ) -> std::result::Result<(), Status> {
-    if yield_to_window.is_some_and(owner::window_claimed) {
+    if yield_to_window && owner::window_claimed(&crate::network_state::directory(config)) {
         return Err(Status::Waiting);
     }
     let candidates = network.addresses()?;
@@ -1828,7 +1840,7 @@ fn serve_presence(
             stop.sleep(rest);
         },
         |now, round| {
-            if yield_to_window.is_some_and(owner::window_claimed) {
+            if yield_to_window && owner::window_claimed(&crate::network_state::directory(config)) {
                 return Err(Status::Waiting);
             }
             if round {

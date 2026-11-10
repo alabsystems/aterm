@@ -2119,3 +2119,174 @@ fn a_slash_press_behind_queued_input_types_nothing_and_says_why() {
     assert!(pty(&mut reader, 0).is_empty(), "no probe was typed");
     sink.retire_ordered_egress();
 }
+
+fn claude_with(app: &App, session: u64, model: &str, effort: &str) {
+    let entry = app.pool.get(session).expect("session");
+    let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    timeline.set_claude_footer(
+        PGID,
+        None,
+        Some(FooterFacts {
+            model: Some(model.into()),
+            effort: Some(effort.into()),
+            path: Some("~/aterm".into()),
+            branch: Some("main".into()),
+            version: Some("2.1.304".into()),
+            ..FooterFacts::default()
+        }),
+    );
+}
+
+fn in_flight(app: &App, session: u64) -> Option<Slash> {
+    app.claude_facts
+        .get(&session)
+        .and_then(|f| f.press.as_ref())
+        .map(|p| p.slash)
+}
+
+/// From a probe written for `slash`: its echo, the rest, the Enter and Claude's answer, the
+/// composer let go.
+fn typed_through(
+    app: &mut App,
+    session: u64,
+    reader: &mut std::os::unix::net::UnixStream,
+    slash: Slash,
+) {
+    assert_eq!(in_flight(app, session), Some(slash));
+    assert_eq!(pty(reader, 1), b"/", "{slash:?}: the probe");
+    echo(app, session, CARET, "/");
+    let at = Instant::now();
+    app.advance_slash_presses(at);
+    assert_eq!(pty(reader, rest(slash).len()), rest(slash), "{slash:?}");
+    echo(app, session, CARET, &slash.text());
+    app.advance_slash_presses(at);
+    app.advance_slash_presses(at + QUIET);
+    assert_eq!(pty(reader, 1), b"\r", "{slash:?}: the Enter");
+    answered(app, session, TOP, false);
+    app.advance_slash_presses(at + QUIET);
+}
+
+#[test]
+fn a_model_click_types_opus_then_xhigh_and_a_click_back_types_the_remembered_pick() {
+    use crate::claude_facts::Pick;
+    use crate::claude_slash::ModelArg;
+    use aterm_agent::harness::footer::FactMask;
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Sonnet 4.5", "high");
+    frame(&mut app, wid);
+    assert_eq!(
+        app.fact_title(session, Fact::Model).1,
+        "click: switch to Opus 5.5 xhigh"
+    );
+    app.press_claude_fact(wid, session, Fact::Model, FactMask::default());
+    assert_eq!(
+        app.fact_mask(session),
+        FactMask::default(),
+        "nothing hidden"
+    );
+    let model = Slash::Model(ModelArg::new("claude-opus-5-5"));
+    typed_through(&mut app, session, &mut reader, model);
+    let effort = Slash::Effort("xhigh");
+    assert_eq!(
+        in_flight(&app, session),
+        Some(effort),
+        "the `/effort` follows once `/model` is answered"
+    );
+    typed_through(&mut app, session, &mut reader, effort);
+    assert_eq!(ended(&app, session), Some(SlashEnd::Done));
+    assert!(pty(&mut reader, 0).is_empty(), "two commands, no more");
+    let sonnet = Pick {
+        model: ModelArg::new("claude-sonnet-4-5"),
+        effort: Some("high"),
+    };
+    let switch = app
+        .model_switch(session)
+        .expect("a Claude Code session switches");
+    assert_eq!(
+        (switch.back, switch.then, switch.half),
+        (Some(sonnet), None, false)
+    );
+
+    claude_with(&app, session, "Opus 5.5", "xhigh");
+    frame(&mut app, wid);
+    assert_eq!(
+        app.fact_title(session, Fact::Effort).1,
+        "click: back to Sonnet 4.5 high"
+    );
+    app.press_claude_fact(wid, session, Fact::Effort, FactMask::default());
+    typed_through(
+        &mut app,
+        session,
+        &mut reader,
+        Slash::Model(ModelArg::new("claude-sonnet-4-5")),
+    );
+    typed_through(&mut app, session, &mut reader, Slash::Effort("high"));
+    assert_eq!(ended(&app, session), Some(SlashEnd::Done));
+    assert!(pty(&mut reader, 0).is_empty());
+    assert_eq!(
+        app.model_switch(session).and_then(|s| s.back),
+        Some(sonnet),
+        "kept"
+    );
+}
+
+#[test]
+fn a_refused_model_click_types_nothing_remembers_nothing_and_says_why() {
+    use aterm_agent::harness::footer::FactMask;
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Sonnet 4.5", "high");
+    echo(&app, session, CARET, "draft");
+    frame(&mut app, wid);
+    app.press_claude_fact(wid, session, Fact::Model, FactMask::default());
+    assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
+    assert_eq!(in_flight(&app, session), None);
+    assert_eq!(
+        app.model_switch(session),
+        Some(crate::claude_facts::ModelSwitch::default()),
+        "nothing remembered"
+    );
+    assert_eq!(
+        said(&app, wid, session).as_deref(),
+        Some("the composer holds a draft; nothing typed")
+    );
+    assert!(
+        menu_notes(&app)
+            .iter()
+            .any(|n| n == "the composer holds a draft; nothing typed"),
+        "the model's menu opens under the note"
+    );
+    assert_eq!(
+        app.fact_mask(session),
+        FactMask::default(),
+        "nothing hidden"
+    );
+}
+
+#[test]
+fn a_switch_whose_model_is_refused_types_no_effort() {
+    use crate::claude_slash::ModelArg;
+    use aterm_agent::harness::footer::FactMask;
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Sonnet 4.5", "high");
+    frame(&mut app, wid);
+    app.press_claude_fact(wid, session, Fact::Model, FactMask::default());
+    let model = Slash::Model(ModelArg::new("claude-opus-5-5"));
+    assert_eq!(in_flight(&app, session), Some(model));
+    assert_eq!(pty(&mut reader, 1), b"/");
+    echo(&app, session, CARET, "/x");
+    app.advance_slash_presses(Instant::now());
+    assert_eq!(
+        ended(&app, session),
+        Some(SlashEnd::Stopped(SlashRefusal::Changed))
+    );
+    assert_eq!(in_flight(&app, session), None, "no `/effort` follows");
+    let switch = app
+        .model_switch(session)
+        .expect("a Claude Code session switches");
+    assert_eq!(switch.then, None);
+    assert!(
+        !switch.half,
+        "a stopped switch is over: the next click remembers what the session then shows"
+    );
+    assert!(pty(&mut reader, 0).is_empty());
+}

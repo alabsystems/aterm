@@ -382,7 +382,6 @@ pub(crate) fn built_executable(messages: &str, name: &str, kind: &str) -> Result
 
 /// A normal debug executable whose compiler profile enables the checkout's lab identity.
 /// Test harnesses and missing or disabled debug assertions cannot supply that fixture.
-#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn built_debug_app(messages: &str, name: &str) -> Result<PathBuf, String> {
     built_executable_checked(messages, name, "bin", |message| {
         let profile = message.get("profile");

@@ -705,7 +705,17 @@ fn a_registry_lab_read_is_partial_while_an_operation_awaits_its_parent() {
         matches!(second.lab(&config, None), Ok(Some(LabRead::Partial))),
         "a partial history"
     );
+    assert!(
+        second
+            .with_admitted_source::<()>(&config, None, |_| panic!("partial source admitted"))
+            .is_err()
+    );
+    assert!(second.observe_source(&config).is_err());
     receive(&lab, 1, scope, &parent);
     assert!(second.view().unwrap().complete, "the parent arrived");
     projects("a history made whole projects");
+    assert!(second.observe_source(&config).unwrap().is_some());
+    second
+        .with_admitted_source(&config, None, |_| Ok(()))
+        .unwrap();
 }

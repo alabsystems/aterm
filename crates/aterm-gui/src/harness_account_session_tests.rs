@@ -13,6 +13,7 @@ fn write_session(state: &aterm_spec::interp::State) -> [i64; 4] {
         label: Some("work-2".into()),
         snap: observed.clone(),
         generation: Arc::clone(&generation),
+        seen: aterm_agent::harness::observe::Observation::Unread,
     };
     let mut kept = Kept::default();
     kept.account.landing = if state["generation"] == 1 {
@@ -187,7 +188,9 @@ fn a_delayed_periodic_note_does_not_reattribute_the_replacement_session() {
         .store(ACCT_NOW + ACCOUNT_ROW_STALE_S + 1, Ordering::SeqCst);
     let seat = a.seat();
     let roster = a.roster();
-    let look = idle.account_look(&roster).unwrap();
+    let look = idle
+        .account_look(&(idle.hooks.acts.account_seat)().unwrap(), &roster)
+        .unwrap();
     let before = a.state();
     let kept = Arc::clone(&idle.kept);
     a.at_seat_read(1, move |a| replace_session(a, &kept, sid));
@@ -207,7 +210,9 @@ fn old_session_notes_respect_retirement_and_generation_replacement() {
                 .store(ACCT_NOW + ACCOUNT_ROW_STALE_S + 1, Ordering::SeqCst);
             let seat = a.seat();
             let roster = a.roster();
-            let look = idle.account_look(&roster).unwrap();
+            let look = idle
+                .account_look(&(idle.hooks.acts.account_seat)().unwrap(), &roster)
+                .unwrap();
             let before = a.state();
             let kept = Arc::clone(&idle.kept);
             a.at_seat_read(if served { 2 } else { 1 }, move |a| {
@@ -250,7 +255,9 @@ fn benign_metadata_updates_still_allow_session_refresh() {
             .store(ACCT_NOW + ACCOUNT_ROW_STALE_S + 1, Ordering::SeqCst);
         let seat = a.seat();
         let roster = a.roster();
-        let look = idle.account_look(&roster).unwrap();
+        let look = idle
+            .account_look(&(idle.hooks.acts.account_seat)().unwrap(), &roster)
+            .unwrap();
         let before = a.state();
         let kept = Arc::clone(&idle.kept);
         a.at_seat_read(if served { 2 } else { 1 }, move |a| {

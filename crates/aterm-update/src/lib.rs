@@ -702,6 +702,9 @@ pub struct HandoffCandidateFacts {
     /// The candidate's sealed `Info.plist` declares it rebuilds a window that held only an empty
     /// Workers list.
     pub grant_desk: bool,
+    /// The candidate's sealed `Info.plist` declares ANG5 parsing and historical recovery.
+    /// This does not authorize a writer or attest to other active or rollback images.
+    pub recipient_recovery: bool,
 }
 
 impl HandoffCandidateFacts {
@@ -710,9 +713,7 @@ impl HandoffCandidateFacts {
     pub(crate) fn read(app_root: &std::path::Path) -> Result<Self, String> {
         Self::admitted(
             aterm_update_core::handoff_policy::read_from_bundle(app_root),
-            bundle::declares_grant_chunks(app_root),
-            bundle::declares_grant_empty(app_root),
-            bundle::declares_grant_desk(app_root),
+            bundle::Capabilities::read(app_root),
         )
     }
 
@@ -720,9 +721,7 @@ impl HandoffCandidateFacts {
     #[cfg(target_os = "macos")]
     fn admitted(
         policy: aterm_update_core::handoff_policy::PolicyRead,
-        grant_chunks: Result<bool, String>,
-        grant_empty: Result<bool, String>,
-        grant_desk: Result<bool, String>,
+        capabilities: Result<bundle::Capabilities, String>,
     ) -> Result<Self, String> {
         if let aterm_update_core::handoff_policy::PolicyRead::Unread(why) = &policy {
             return Err(verify::mark_passing(format!(
@@ -736,14 +735,13 @@ impl HandoffCandidateFacts {
                  attempt reads it again"
             ))
         };
-        let grant_chunks = grant_chunks.map_err(plist_unread)?;
-        let grant_empty = grant_empty.map_err(plist_unread)?;
-        let grant_desk = grant_desk.map_err(plist_unread)?;
+        let capabilities = capabilities.map_err(plist_unread)?;
         Ok(Self {
             policy,
-            grant_chunks,
-            grant_empty,
-            grant_desk,
+            grant_chunks: capabilities.grant_chunks,
+            grant_empty: capabilities.grant_empty,
+            grant_desk: capabilities.grant_desk,
+            recipient_recovery: capabilities.recipient_recovery,
         })
     }
 }
@@ -752,7 +750,8 @@ impl HandoffCandidateFacts {
 pub use bundle::{
     HANDOFF_GRANT_CHUNKS_KEY, HANDOFF_GRANT_CHUNKS_TOKEN, HANDOFF_GRANT_DESK_KEY,
     HANDOFF_GRANT_DESK_TOKEN, HANDOFF_GRANT_EMPTY_KEY, HANDOFF_GRANT_EMPTY_TOKEN,
-    plist_declares_grant_chunks, plist_declares_grant_desk, plist_declares_grant_empty,
+    NATIVE_RECIPIENT_RECOVERY_KEY, NATIVE_RECIPIENT_RECOVERY_TOKEN, plist_declares_grant_chunks,
+    plist_declares_grant_desk, plist_declares_grant_empty, plist_declares_recipient_recovery,
     plist_marks_dev_build,
 };
 
@@ -769,6 +768,7 @@ pub fn preverify_staged_for_handoff(
         grant_chunks: false,
         grant_empty: false,
         grant_desk: false,
+        recipient_recovery: false,
     })
 }
 
@@ -5490,7 +5490,7 @@ mod handoff_candidate_facts_tests {
              (os error 24)"
                 .into(),
         );
-        let refused = HandoffCandidateFacts::admitted(unread, Ok(false), Ok(false), Ok(false))
+        let refused = HandoffCandidateFacts::admitted(unread, Ok(bundle::Capabilities::default()))
             .expect_err("an unread policy is not a pass");
         assert!(is_passing_refusal(&refused), "{refused}");
         for policy in [
@@ -5499,12 +5499,21 @@ mod handoff_candidate_facts_tests {
             PolicyRead::Parsed(PolicyFile::default()),
         ] {
             assert_eq!(
-                HandoffCandidateFacts::admitted(policy.clone(), Ok(true), Ok(true), Ok(true)),
+                HandoffCandidateFacts::admitted(
+                    policy.clone(),
+                    Ok(bundle::Capabilities {
+                        grant_chunks: true,
+                        grant_empty: true,
+                        grant_desk: true,
+                        recipient_recovery: true,
+                    })
+                ),
                 Ok(HandoffCandidateFacts {
                     policy: policy.clone(),
                     grant_chunks: true,
                     grant_empty: true,
                     grant_desk: true,
+                    recipient_recovery: true,
                 }),
                 "{policy:?}"
             );
@@ -5517,67 +5526,55 @@ mod handoff_candidate_facts_tests {
                         <string>chunks1</string></dict></plist>";
         let plist = std::path::Path::new("/x/aterm.app/Contents/Info.plist");
         let read = |errno: i32| {
-            bundle::grant_chunks_judged(plist, Err(std::io::Error::from_raw_os_error(errno)))
+            bundle::Capabilities::judge(plist, Err(std::io::Error::from_raw_os_error(errno)))
         };
         for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EIO] {
-            let refused = HandoffCandidateFacts::admitted(
-                PolicyRead::Absent,
-                read(errno),
-                Ok(false),
-                Ok(false),
-            )
-            .expect_err("a moment's read of the Info.plist is not a pass");
-            assert!(is_passing_refusal(&refused), "errno {errno}: {refused}");
-            let refused = HandoffCandidateFacts::admitted(
-                PolicyRead::Absent,
-                Ok(false),
-                read(errno),
-                Ok(false),
-            )
-            .expect_err("a moment's read of the sessionless grant is not a pass");
-            assert!(is_passing_refusal(&refused), "errno {errno}: {refused}");
-            let refused = HandoffCandidateFacts::admitted(
-                PolicyRead::Absent,
-                Ok(false),
-                Ok(false),
-                read(errno),
-            )
-            .expect_err("a moment's read of the desk grant is not a pass");
+            let refused = HandoffCandidateFacts::admitted(PolicyRead::Absent, read(errno))
+                .expect_err("a moment's read of the Info.plist is not a pass");
             assert!(is_passing_refusal(&refused), "errno {errno}: {refused}");
         }
         assert_eq!(
-            HandoffCandidateFacts::admitted(
-                PolicyRead::Absent,
-                read(libc::EACCES),
-                read(libc::EACCES),
-                read(libc::EACCES)
-            ),
+            HandoffCandidateFacts::admitted(PolicyRead::Absent, read(libc::EACCES)),
             Ok(HandoffCandidateFacts {
                 policy: PolicyRead::Absent,
                 grant_chunks: false,
                 grant_empty: false,
                 grant_desk: false,
+                recipient_recovery: false,
             })
         );
         assert_eq!(
-            bundle::grant_chunks_judged(plist, Ok(Some(declared.to_string()))),
-            Ok(true)
+            bundle::Capabilities::judge(plist, Ok(Some(declared.to_string()))),
+            Ok(bundle::Capabilities {
+                grant_chunks: true,
+                ..Default::default()
+            })
         );
-        assert_eq!(bundle::grant_chunks_judged(plist, Ok(None)), Ok(false));
+        assert_eq!(
+            bundle::Capabilities::judge(plist, Ok(None)),
+            Ok(bundle::Capabilities::default())
+        );
     }
 
     #[test]
-    fn the_chunked_grant_is_read_off_a_bundle_on_disk() {
+    fn capability_snapshots_follow_the_bundle_on_disk_without_changing_prior_reads() {
         let root = crate::paths::scratch_dir("grant-chunks");
         let contents = root.join("aterm.app/Contents");
         std::fs::create_dir_all(&contents).unwrap();
         let app = root.join("aterm.app");
         let grants = |read: Result<HandoffCandidateFacts, String>| {
-            read.map(|facts| (facts.grant_chunks, facts.grant_empty, facts.grant_desk))
+            read.map(|facts| {
+                (
+                    facts.grant_chunks,
+                    facts.grant_empty,
+                    facts.grant_desk,
+                    facts.recipient_recovery,
+                )
+            })
         };
         assert_eq!(
             grants(HandoffCandidateFacts::read(&app)),
-            Ok((false, false, false))
+            Ok((false, false, false, false))
         );
         std::fs::write(
             contents.join("Info.plist"),
@@ -5601,9 +5598,19 @@ mod handoff_candidate_facts_tests {
         )
         .unwrap();
         let all = HandoffCandidateFacts::read(&app);
-        assert_eq!(grants(chunks_only), Ok((true, false, false)));
-        assert_eq!(grants(both), Ok((true, true, false)));
-        assert_eq!(grants(all), Ok((true, true, true)));
+        std::fs::write(
+            contents.join("Info.plist"),
+            include_str!("../../../apps/aterm-mac/Info.plist"),
+        )
+        .unwrap();
+        let current = HandoffCandidateFacts::read(&app);
+        std::fs::write(contents.join("Info.plist"), "<plist><dict/></plist>").unwrap();
+        let replaced = HandoffCandidateFacts::read(&app);
+        assert_eq!(grants(chunks_only), Ok((true, false, false, false)));
+        assert_eq!(grants(both), Ok((true, true, false, false)));
+        assert_eq!(grants(all), Ok((true, true, true, false)));
+        assert_eq!(grants(current), Ok((true, true, true, true)));
+        assert_eq!(grants(replaced), Ok((false, false, false, false)));
     }
 }
 

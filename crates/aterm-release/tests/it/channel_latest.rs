@@ -12,6 +12,20 @@ use channel::{ChannelRelease, HeadPatchValue};
 use ledger::{Error, Result, RunOut};
 use publish::PointerProbe;
 
+/// Exercise the complete private/public sequence against the existing model.
+fn publish_on_channel(release: &mut dyn ChannelRelease) -> Result<()> {
+    if release.head_made()? {
+        release.ratchet_head()?;
+        release.make_head()?;
+        return release.prove_head();
+    }
+    channel::stage_on_channel(release)?;
+    release.prove_assets()?;
+    release.ratchet()?;
+    release.make_head()?;
+    release.prove_head()
+}
+
 const OWNER: &str = "alabsystems";
 const REPO: &str = "aterm";
 const SLUG: &str = "alabsystems/aterm";
@@ -547,8 +561,7 @@ fn the_adopted_source_release_takes_latest_only_after_its_appcast_pair() {
 
     let (_dir, files, local_appcast) = dist();
     let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
-    channel::publish_on_channel(&mut channel)
-        .expect("the pointer gate passes once the cut owns latest");
+    publish_on_channel(&mut channel).expect("the pointer gate passes once the cut owns latest");
 
     let uploads = &github.uploads;
     let sig = position(uploads, manifest_out::MANIFEST_SIG_ASSET);
@@ -602,7 +615,7 @@ fn first_pass_dies_on_the_signature(
 ) -> Vec<String> {
     github.fail_upload_once = Some((manifest_out::MANIFEST_SIG_ASSET.to_string(), failure));
     let mut channel = FakeChannel::new(github, id, local_appcast.to_vec(), files.to_vec());
-    let err = channel::publish_on_channel(&mut channel).expect_err("the upload fails");
+    let err = publish_on_channel(&mut channel).expect_err("the upload fails");
     assert!(
         err.to_string()
             .starts_with(&format!("upload {}", manifest_out::MANIFEST_SIG_ASSET)),
@@ -665,7 +678,7 @@ fn a_failure_before_the_head_patch_leaves_latest_and_a_provable_one_flips_once_o
         let after_first = github.releases[id].assets.clone();
 
         let mut channel = FakeChannel::new(&mut github, id, local_appcast, files.clone());
-        channel::publish_on_channel(&mut channel).expect("the resume converges");
+        publish_on_channel(&mut channel).expect("the resume converges");
         assert_eq!(
             github.binds, 2,
             "{failure:?}: the resume re-binds the same release"
@@ -720,8 +733,8 @@ fn a_failure_before_the_head_patch_leaves_latest_and_a_provable_one_flips_once_o
     );
     for resume in 1..=2 {
         let mut channel = FakeChannel::new(&mut github, id, local_appcast.clone(), files.clone());
-        let err = channel::publish_on_channel(&mut channel)
-            .expect_err("a resume never re-POSTs an issued intent");
+        let err =
+            publish_on_channel(&mut channel).expect_err("a resume never re-POSTs an issued intent");
         assert!(
             err.to_string().contains("refusing a duplicate POST"),
             "resume {resume}: {err}"
@@ -744,7 +757,7 @@ fn a_refused_upload_whose_object_is_there_is_converged_and_still_named_by_the_jo
         let (_dir, files, local_appcast) = dist();
         github.fail_upload_once = Some((manifest_out::MANIFEST_SIG_ASSET.to_string(), failure));
         let mut channel = FakeChannel::new(&mut github, id, local_appcast, files.clone());
-        channel::publish_on_channel(&mut channel)
+        publish_on_channel(&mut channel)
             .unwrap_or_else(|err| panic!("{failure:?}: the cut converges on the object: {err}"));
         assert_eq!(
             github.uploads,
@@ -786,7 +799,7 @@ fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
     let mut channel = FakeChannel::new(&mut github, id, local_appcast.clone(), files);
-    channel::publish_on_channel(&mut channel).expect("the cut owns latest");
+    publish_on_channel(&mut channel).expect("the cut owns latest");
     let stale = || PointerProbe::Tag {
         tag: PREVIOUS.to_string(),
         location: download_url(PREVIOUS, manifest_out::MANIFEST_ASSET),
@@ -841,7 +854,7 @@ fn without_the_head_patch_the_pointer_gate_refuses() {
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
     let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
-    let err = channel::publish_on_channel(&mut channel).expect_err("no PATCH, no latest, no pass");
+    let err = publish_on_channel(&mut channel).expect_err("no PATCH, no latest, no pass");
     let msg = err.to_string();
     assert!(
         msg.contains(&format!("names {PREVIOUS}, not {TAG}")),
@@ -864,7 +877,7 @@ fn a_full_source_release_steals_latest_before_the_cut_and_the_cut_refuses_to_ado
     );
     let (_dir, files, local_appcast) = dist();
     let mut channel = FakeChannel::new(&mut github, id, local_appcast.clone(), files.clone());
-    let err = channel::publish_on_channel(&mut channel).expect_err("a full source release");
+    let err = publish_on_channel(&mut channel).expect_err("a full source release");
     assert!(err.to_string().contains("is a FULL release"), "{err}");
     assert_eq!(github.binds, 0, "refused before the bind");
     assert_eq!(github.journal_release, None, "no adoption persisted");
@@ -877,7 +890,7 @@ fn a_full_source_release_steals_latest_before_the_cut_and_the_cut_refuses_to_ado
     github.releases[id].prerelease = true;
     github.latest = Some(0);
     let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
-    channel::publish_on_channel(&mut channel).expect("the resume adopts the prerelease");
+    publish_on_channel(&mut channel).expect("the resume adopts the prerelease");
     assert_eq!(github.head_patches, vec![(true, true)]);
     assert_eq!(github.latest, Some(id));
 }
@@ -932,7 +945,7 @@ fn a_draft_this_cut_created_becomes_latest_through_the_same_patch() {
     let id = github.create(TAG, true, false, &[]);
     let (_dir, files, local_appcast) = dist();
     let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
-    channel::publish_on_channel(&mut channel).expect("draft path");
+    publish_on_channel(&mut channel).expect("draft path");
     assert_eq!(github.head_patches, vec![(true, true)]);
     assert!(!github.releases[id].draft);
     assert_eq!(github.latest, Some(id));
@@ -989,7 +1002,7 @@ fn first_pass_fails_at_the_pointer_gate(
 ) -> BTreeMap<String, Vec<u8>> {
     github.stale_pointer = github.latest;
     let mut channel = FakeChannel::new(github, id, local_appcast.to_vec(), files.to_vec());
-    let err = channel::publish_on_channel(&mut channel).expect_err("the cache outlasts the gate");
+    let err = publish_on_channel(&mut channel).expect_err("the cache outlasts the gate");
     assert!(
         err.to_string()
             .contains(&format!("names {PREVIOUS}, not {TAG}")),
@@ -1012,7 +1025,7 @@ fn a_resume_after_the_head_patch_uploads_nothing_and_reads_no_roster_floor() {
     let uploads = github.uploads.len();
 
     let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
-    channel::publish_on_channel(&mut channel).expect("the resume finishes the head it made");
+    publish_on_channel(&mut channel).expect("the resume finishes the head it made");
     assert_eq!(github.uploads.len(), uploads, "nothing uploaded");
     assert_eq!(
         github.releases[id].assets, redressed,
@@ -1036,7 +1049,7 @@ fn a_resume_that_forgets_its_head_is_refused_by_the_join_since() {
     github.roster_join();
     github.forget_head = true;
     let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
-    let err = channel::publish_on_channel(&mut channel).expect_err("the floors refuse the head");
+    let err = publish_on_channel(&mut channel).expect_err("the floors refuse the head");
     assert!(err.to_string().contains("roster"), "{err}");
     assert!(
         github.published(id),
@@ -1066,7 +1079,7 @@ fn a_non_app_release_holding_latest_is_taken_over() {
         assert!(err.to_string().contains("not an app release"), "{err}");
     }
     let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
-    channel::publish_on_channel(&mut channel).expect("no app head to protect");
+    publish_on_channel(&mut channel).expect("no app head to protect");
     assert_eq!(github.latest, Some(id));
 }
 
@@ -1350,7 +1363,7 @@ fn the_real_sequence_conforms_to_the_derived_head_model() {
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
     let mut bound = model_bound(&mut github, id, None, local_appcast, files);
-    channel::publish_on_channel(&mut bound).expect("conforms");
+    publish_on_channel(&mut bound).expect("conforms");
     assert_eq!(
         bound.actions,
         [
@@ -1374,7 +1387,7 @@ fn a_newer_head_conforms_as_the_models_refusal() {
     let newer = github.app_release("0.92.0", BUILD + 1);
     let (_dir, files, local_appcast) = dist();
     let mut bound = model_bound(&mut github, id, Some(newer), local_appcast, files);
-    channel::publish_on_channel(&mut bound).expect_err("refused");
+    publish_on_channel(&mut bound).expect_err("refused");
     assert_eq!(bound.actions, ["RefuseNewer"]);
     assert_eq!(bound.state["phase"], 4);
     assert_eq!(bound.state["bound"], 0);
@@ -1389,7 +1402,7 @@ fn a_resume_after_the_head_conforms_as_the_models_proof_alone() {
         let (_dir, files, local_appcast) = dist();
         github.stale_pointer = github.latest;
         let mut bound = model_bound(&mut github, id, None, local_appcast, files);
-        channel::publish_on_channel(&mut bound).expect_err("the pointer gate runs out");
+        publish_on_channel(&mut bound).expect_err("the pointer gate runs out");
         assert_eq!(bound.actions.last(), Some(&"MakeHead"));
         assert_eq!(bound.state["phase"], 3);
         bound.inner.github.stale_pointer = None;
@@ -1405,7 +1418,7 @@ fn a_resume_after_the_head_conforms_as_the_models_proof_alone() {
             .expect("a join after the PATCH is the model's too");
         bound.inner.github.forget_head = forget_head;
         bound.restart();
-        let resumed = channel::publish_on_channel(&mut bound);
+        let resumed = publish_on_channel(&mut bound);
         if forget_head {
             let err = resumed.expect_err("the forgotten head is not the model's");
             assert!(
@@ -1437,7 +1450,7 @@ fn a_join_during_the_uploads_is_refused_by_the_second_read_and_withdrawn() {
     let (_dir, files, local_appcast) = dist();
     let mut bound = model_bound(&mut github, id, None, local_appcast, files);
     bound.join_after = Some("UploadSig");
-    let err = channel::publish_on_channel(&mut bound).expect_err("the second read refuses");
+    let err = publish_on_channel(&mut bound).expect_err("the second read refuses");
     assert!(err.to_string().contains("roster"), "{err}");
     assert_eq!(
         bound.actions,
@@ -1550,7 +1563,7 @@ fn the_tier1_binding_refuses_the_pre_fix_orders() {
     github.drop_head_patch = true;
     let id = fresh(&mut github);
     let mut bound = model_bound(&mut github, id, None, local_appcast, files);
-    let err = channel::publish_on_channel(&mut bound).expect_err("no PATCH");
+    let err = publish_on_channel(&mut bound).expect_err("no PATCH");
     assert!(
         err.to_string()
             .contains("after MakeHead, the fake GitHub has latest=0 but the model has 1"),

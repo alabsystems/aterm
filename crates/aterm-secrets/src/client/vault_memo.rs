@@ -131,20 +131,28 @@ pub(crate) fn local_recipient_denied_under(
     })
 }
 
-/// [`swarm_member_heard`](super::steward::swarm_member_heard), read again only when one of the
-/// files it reads ([`observation_inputs`]) moved. The node's LAN responder asks it at each of its
-/// refreshes (one a second), at each route change and before each answer it sends, and its
+/// [`swarm_member_heard`](super::steward::swarm_member_heard): its judgement (this Mac in the ALab
+/// vault, and no evidence denying it) read again only when one of the files it reads
+/// ([`observation_inputs`]) moved, `state.toml` by what it holds but `heard` and the rounds'
+/// receipts ([`stamp_memo_inputs_in`]), and `heard` taken from `state.toml` at each call
+/// ([`state_look`]: one `lstat` while the file stands). The node's LAN responder asks it at each
+/// of its refreshes (one a second), at each route change and before each answer it sends, and its
 /// `_alab._tcp` advert at each tick of the node's watch: each ask read the vault's status, its
 /// envelope again for the signer's chain and its denial evidence again, about a millisecond of
 /// CPU on a vault the owner's size (measured on Linux arm64), of files the vault's subscriber
-/// rewrites about twice a minute.
+/// rewrites about twice a minute; and kept with `heard` under `state.toml`'s metadata, the
+/// judgement was read again at each of those rewrites, which move `heard` alone: the held vault
+/// twice, 2.38 MB, every 25 s on a Linux arm64 node (2026-11-09).
 ///
 /// Quiet, as [`local_swarm_roster_for_log_now`]: while a writer holds the vault's state lock the
-/// fresh read meets it and this Mac is out, as before. What it keeps is when the vault last heard
-/// this Mac, never a verdict at a time: each caller judges that age against its own clock at each
-/// call. A removal, a revocation or a denial rewrites the state, the envelope or the records, so
-/// it is read at the next call. A read that fails is never kept: it is this call's error, and the
-/// next call reads again.
+/// fresh read meets it and this Mac is out, as before. What it keeps is a judgement of files that
+/// have not moved and when the vault last heard this Mac, never a verdict at a time: each caller
+/// judges that age against its own clock at each call. A removal, a revocation or a denial
+/// rewrites the state, the envelope or the records, so it is judged again at the next call; a
+/// round that rewrote `state.toml` between the judgement's stamps and this call's `heard` gives
+/// the `heard` it wrote, only where that state still holds this Mac in. A read that fails is never
+/// kept: it is this call's error, and the next call reads again; a `state.toml` that cannot be
+/// read for `heard` is read afresh, judgement and all.
 ///
 /// The trade: once an answer is kept, a read fault on files whose stamps have not moved (a
 /// descriptor the process ran out of, an I/O error) is never met, and the kept answer, a member's
@@ -161,12 +169,19 @@ pub(crate) fn local_recipient_denied_under(
 /// # Errors
 /// As [`swarm_member_heard`](super::steward::swarm_member_heard).
 pub fn swarm_member_heard_now(paths: &Paths) -> crate::Result<Option<u64>> {
-    static MEMO: Memo<Option<u64>, bool> = Memo::keyed(observation_inputs, true);
-    MEMO.read_keyed(
+    static MEMO: Memo<bool, bool> = Memo::keyed(observation_inputs, true);
+    let member = MEMO.read_keyed(
         paths,
         &super::steward::alab_standing_for_tests(paths),
-        super::steward::swarm_member_heard,
-    )
+        |paths| super::steward::swarm_member_heard(paths).map(|heard| heard.is_some()),
+    )?;
+    if !member {
+        return Ok(None);
+    }
+    match state_look(paths, None) {
+        Some(look) => Ok(look.heard),
+        None => super::steward::swarm_member_heard(paths),
+    }
 }
 
 /// [`config`](super::config), read again only when `source.toml` or the held envelope it takes
@@ -336,8 +351,9 @@ static ROSTER: Memo<Option<crate::swarm_roster::SwarmRoster>> = Memo::keyed(inpu
 ///
 /// A table repair round's local batch takes one for its session's open and the checks it makes at
 /// once after it (`aterm-db`'s `Replica::observe`): the open's custody
-/// (`Bootstrap::revalidate_custody_in`) and access (`Bootstrap::access_observed_in_look`), and the
-/// currency of its peer and of its observation (`Access::is_current_in`).
+/// (`Bootstrap::revalidate_custody_in`) and access (`Bootstrap::access_observed_in_look`), the
+/// currency of its peer and of its observation (`Access::is_current_in`), and its peer's roster
+/// ([`Self::swarm_roster_until`]).
 pub struct VaultLook<'a> {
     paths: &'a Paths,
     observation: Option<super::Observing>,
@@ -483,10 +499,11 @@ static RECORDS: Memo<crate::membership_log::Store> = Memo::keyed(inputs, true);
 /// The files [`swarm_denied_nodes`](super::swarm_denied_nodes) and
 /// [`swarm_roster_until`](super::swarm_roster_until) take their answer from: the configured source
 /// (`source.toml`), the state lock the deny list observes (`.lock`, whose presence and mode decide
-/// that read), the applied state (`state.toml`), this Mac's identity, the held envelope (`vault`)
-/// and the membership history this Mac acknowledged ([`Paths::acknowledged_history_files`]); and,
-/// stamped apart ([`stamp_inputs`]), every file the selection of the membership records' data is
-/// judged by.
+/// that read), the applied state (`state.toml`, which a memo stamps by what it holds but `heard`
+/// and the rounds' receipts: [`stamp_memo_inputs_in`]), this Mac's identity, the held envelope
+/// (`vault`) and the membership history this Mac acknowledged
+/// ([`Paths::acknowledged_history_files`]); and, stamped apart ([`stamp_inputs`]), every file the
+/// selection of the membership records' data is judged by.
 /// The vault folder holds others that change every few seconds and that these reads never open
 /// (the vault server's `served/`, the rest of `commons/`, the jobs' logs, the needs and answers
 /// queues), so a change to them reads nothing again.
@@ -626,6 +643,18 @@ struct Stamp {
     changed: (i64, i64),
 }
 
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            inode: meta.ino(),
+            len: meta.size(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
 /// The directory's identity and access metadata, without the content timestamps that an
 /// unrelated job or server write moves. A symlink here is refused by [`StateLock`], even when
 /// every input path still resolves to the files from an earlier read.
@@ -653,6 +682,10 @@ pub(super) struct InputStamps {
     /// these stamps stand for reads ([`inputs`] and the sets that extend it); `None` for a read
     /// that opens no record ([`config_now`], [`Memo::unrecorded`]).
     records: Option<crate::records_storage::Standing>,
+    /// `state.toml` by what it holds but when the vault last heard this Mac and the receipts of
+    /// its rounds ([`StateLook::standing`]), where a memo's inputs name it ([`Memo::stamps`]);
+    /// `None` where `stamps` stamp it by its metadata or the inputs do not name it.
+    state: Option<Option<[u8; 32]>>,
 }
 
 /// Source inputs and the record limits of a stage-owned materialization selection.
@@ -711,15 +744,54 @@ fn stamp_inputs_in(
 ) -> Option<InputStamps> {
     Some(InputStamps {
         stamps: stamp_files_in(paths, inputs, glance)?,
-        records: if records {
-            Some(crate::records_storage::standing(
-                &paths.records_file(),
-                glance,
-            )?)
+        records: records_standing(paths, records, glance)?,
+        state: None,
+    })
+}
+
+/// [`stamp_inputs_in`] as a memo stamps its inputs ([`Memo::stamps`]): `state.toml`, where they
+/// name it, by what it holds but `heard` and the rounds' receipts ([`state_look`]), which no
+/// memo's answer is read from (a memo that gives `heard`, [`swarm_member_heard_now`], reads it
+/// apart), and every other file by its metadata. A round of the vault's subscriber rewrites
+/// `state.toml` about every 25 s for those fields alone (Linux arm64, 2026-11-09), and each
+/// rewrite read every memo here again: on a fleet node, the deny list its watch asks every two
+/// seconds read the held vault five times over, and its LAN presence twice.
+fn stamp_memo_inputs_in(
+    paths: &Paths,
+    inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
+    records: bool,
+    glance: Option<&fsx::Glance>,
+) -> Option<InputStamps> {
+    let mut files = inputs(paths)?;
+    let state_file = paths.state_file();
+    let named = files.len();
+    files.retain(|file| *file != state_file);
+    Some(InputStamps {
+        stamps: stamp_paths_in(paths, &files, glance)?,
+        records: records_standing(paths, records, glance)?,
+        state: if files.len() < named {
+            Some(state_look(paths, glance)?.standing)
         } else {
             None
         },
     })
+}
+
+/// The membership records' selection as it stands, where `records`; `Some(None)` where not, and
+/// `None` where it cannot be stamped.
+fn records_standing(
+    paths: &Paths,
+    records: bool,
+    glance: Option<&fsx::Glance>,
+) -> Option<Option<crate::records_storage::Standing>> {
+    if records {
+        Some(Some(crate::records_storage::standing(
+            &paths.records_file(),
+            glance,
+        )?))
+    } else {
+        Some(None)
+    }
 }
 
 /// The directory and each of `files`' stamps, without following a final symlink. A missing path
@@ -737,6 +809,15 @@ fn stamp_files_in(
     files: fn(&Paths) -> Option<Vec<PathBuf>>,
     glance: Option<&fsx::Glance>,
 ) -> Option<FileStamps> {
+    stamp_paths_in(paths, &files(paths)?, glance)
+}
+
+/// [`stamp_files_in`] of `files`.
+fn stamp_paths_in(
+    paths: &Paths,
+    files: &[PathBuf],
+    glance: Option<&fsx::Glance>,
+) -> Option<FileStamps> {
     let directory = match fsx::lstat_in(glance, &paths.dir) {
         Ok(Some(meta)) if meta.is_dir() => Some(DirectoryStamp {
             dev: meta.dev(),
@@ -748,21 +829,97 @@ fn stamp_files_in(
         Ok(Some(_)) | Err(_) => return None,
         Ok(None) => None,
     };
-    let files = files(paths)?
+    let files = files
         .iter()
         .map(|path| match fsx::lstat_in(glance, path) {
-            Ok(Some(meta)) => Some(Some(Stamp {
-                dev: meta.dev(),
-                inode: meta.ino(),
-                len: meta.size(),
-                modified: (meta.mtime(), meta.mtime_nsec()),
-                changed: (meta.ctime(), meta.ctime_nsec()),
-            })),
+            Ok(Some(meta)) => Some(Some(Stamp::of(&meta))),
             Ok(None) => Some(None),
             Err(_) => None,
         })
         .collect::<Option<Vec<_>>>()?;
     Some(FileStamps { directory, files })
+}
+
+/// [`state_standing`](super::state_standing) at `paths`, its `lstat` `glance`'s where the caller
+/// looks through one: what the file read to while it shows the stamp it shows now
+/// ([`state_look`]), and a fresh read otherwise.
+///
+/// # Errors
+/// `state.toml` cannot be read.
+pub(crate) fn state_standing_in(
+    paths: &Paths,
+    glance: Option<&fsx::Glance>,
+) -> crate::Result<Option<[u8; 32]>> {
+    match state_look(paths, glance) {
+        Some(look) => Ok(look.standing),
+        None => Ok(super::state_standing_heard(paths)?.map(|(standing, _)| standing)),
+    }
+}
+
+/// What a memo stamps `state.toml` by ([`stamp_memo_inputs_in`]), and when the vault last heard
+/// this Mac, from one read of the file.
+#[derive(Clone, Copy)]
+struct StateLook {
+    /// What it holds but `heard` and the receipts of the vault's rounds
+    /// ([`state_standing`](super::state_standing)); `None` with no file.
+    standing: Option<[u8; 32]>,
+    /// `heard`, where it holds this Mac in its vault.
+    heard: Option<u64>,
+}
+
+/// The last [`StateLook`] of each vault folder's `state.toml` read in this process, with the
+/// stamp of the file it was read from, oldest first: [`MAX_FOLDERS`] of them, the oldest let go
+/// first. In this crate's test process every live folder keeps its one, and a folder that is
+/// gone (its test ended) lets it go, as [`Memo::keep`] does: a law that counts the reads its own
+/// warm memo makes holds whatever other tests read meanwhile.
+static STATE_LOOKS: Mutex<Vec<(PathBuf, Stamp, StateLook)>> = Mutex::new(Vec::new());
+
+/// `state.toml` at `paths` as a memo stamps it ([`StateLook`]), its `lstat` `glance`'s where the
+/// caller looks through one: what the file showing that stamp was read to, where one was, and
+/// otherwise the file read now, kept for that stamp where the file showed it after the read as
+/// well. `None` where the file cannot be stamped or read, or moved during the read (a fresh read
+/// then).
+fn state_look(paths: &Paths, glance: Option<&fsx::Glance>) -> Option<StateLook> {
+    let file = paths.state_file();
+    let stamp = |glance| match fsx::lstat_in(glance, &file) {
+        Ok(meta) => Some(meta.as_ref().map(Stamp::of)),
+        Err(_) => None,
+    };
+    let Some(before) = stamp(glance)? else {
+        return Some(StateLook {
+            standing: None,
+            heard: None,
+        });
+    };
+    let looks = || {
+        STATE_LOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some((_, _, look)) = looks()
+        .iter()
+        .find(|(at, stamp, _)| *at == file && *stamp == before)
+    {
+        return Some(*look);
+    }
+    let (standing, heard) = match super::state_standing_heard(paths) {
+        Ok(Some((standing, heard))) => (Some(standing), heard),
+        Ok(None) | Err(_) => return None,
+    };
+    if stamp(None)? != Some(before) {
+        return None;
+    }
+    let look = StateLook { standing, heard };
+    let mut looks = looks();
+    looks.retain(|(at, _, _)| *at != file);
+    #[cfg(not(test))]
+    if looks.len() >= MAX_FOLDERS {
+        looks.remove(0);
+    }
+    #[cfg(test)]
+    looks.retain(|(at, _, _)| at.parent().is_some_and(std::path::Path::exists));
+    looks.push((file, before, look));
+    Some(look)
 }
 
 struct Held<T, K> {
@@ -853,9 +1010,9 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
         }
     }
 
-    /// The stamps of this memo's inputs now ([`stamp_inputs_in`]).
+    /// The stamps of this memo's inputs now ([`stamp_memo_inputs_in`]).
     fn stamps(&self, paths: &Paths, glance: Option<&fsx::Glance>) -> Option<InputStamps> {
-        stamp_inputs_in(paths, self.inputs, self.records, glance)
+        stamp_memo_inputs_in(paths, self.inputs, self.records, glance)
     }
 
     /// The answer kept for `paths` and `key` under exactly `stamps`, read under this thread's
@@ -968,8 +1125,15 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
             return Ok(answer);
         }
         let observed = read(paths)?;
+        // A file's metadata never comes back, but what `state.toml` holds can: from A to B
+        // between the stamps and the observation (a writer then takes the lock) and back to A
+        // after the read, which then read B. Its standing is taken again under the observation,
+        // and an answer is kept only where it is the one the stamps hold.
+        let unmoved = stamps.state.is_none_or(|standing| {
+            state_look(paths, None).is_some_and(|look| look.standing == standing)
+        });
         drop(observation);
-        if settled {
+        if settled && unmoved {
             self.keep(paths, key, stamps, observed.clone());
         }
         Ok(observed)
@@ -1073,8 +1237,12 @@ mod tests {
         client::save_state(&paths, &original).unwrap();
         assert_eq!(now().unwrap(), expected);
 
+        // A state rewritten with what it held but the time it asked the vault (which no deny
+        // list is read from) moves the memo's stamps, as a round that heard nothing new does not.
+        let mut asked = original.clone();
         let writer = StateLock::take(&paths).unwrap();
-        client::save_state(&paths, &original).unwrap();
+        asked.requested += 1;
+        client::save_state(&paths, &asked).unwrap();
         assert_eq!(now().unwrap(), Snapshot::Unavailable(Why::WriterBusy));
         drop(writer);
         assert_eq!(
@@ -1085,7 +1253,8 @@ mod tests {
 
         let failed = FailedReads(paths.cache_file());
         fsx::fail_reads(&failed.0, usize::MAX);
-        client::save_state(&paths, &original).unwrap();
+        asked.requested += 1;
+        client::save_state(&paths, &asked).unwrap();
         assert!(now().is_err());
         drop(failed);
         assert_eq!(
@@ -1541,6 +1710,35 @@ mod tests {
         .unwrap();
         assert_eq!(now(), Some(vec!["m60".to_owned(), "m61".to_owned()]));
         assert_eq!(reads.load(Ordering::SeqCst), 3);
+    }
+
+    /// What `state.toml` holds can come back where its metadata cannot, and a memo stamps it by
+    /// what it holds but `heard` and the rounds' receipts (`stamp_memo_inputs_in`): a state that
+    /// moved from A to B between a read's stamps and its read, which then read B, and back to A
+    /// after it, would have B's answer given under A's stamps. The answer of a read the state
+    /// moved under is not kept, so the next call under A reads A.
+    ///
+    /// NEGATIVE CONTROL (2026-11-09): with every settled answer kept whatever the state's
+    /// standing after the read (`unmoved` always true), the call under A is given B's answer
+    /// (`left: 4, right: 3`).
+    #[test]
+    fn an_answer_read_after_the_state_moved_is_not_kept_under_its_old_standing() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = vault(home.path());
+        let state = |seq: u64| {
+            let text = format!("membership = \"in\"\nseq = {seq}\n");
+            fsx::write_atomic(&paths.state_file(), text.as_bytes(), 0o600).unwrap();
+        };
+        let seq = |paths: &Paths| crate::client::load_state(paths).map(|state| state.seq);
+        state(3);
+        let memo = Memo::<u64>::new(inputs);
+        let moved = memo.read(&paths, |paths| {
+            state(4);
+            seq(paths)
+        });
+        assert_eq!(moved.unwrap(), 4);
+        state(3);
+        assert_eq!(memo.read(&paths, seq).unwrap(), 3);
     }
 
     /// Callers that miss together after a change wait for one read and take its answer: while

@@ -6375,14 +6375,41 @@ const DOCTOR_CHECKS: &[&str] = &[
     "check_cask_deprecated_disabled",
     "check_dangling_pins",
     "check_deleted_formula",
+    "check_deprecated_cask_taps",
     "check_deprecated_disabled",
+    "check_deprecated_official_taps",
+    "check_brew_git_origin",
+    "check_exist_directories",
+    "check_for_pydistutils_cfg_in_home",
+    "check_for_stray_dylibs",
+    "check_for_stray_headers",
+    "check_for_stray_las",
+    "check_for_stray_pcs",
+    "check_for_stray_static_libs",
+    "check_for_symlinked_cellar",
+    "check_for_git",
+    "check_filesystem_case_sensitive",
+    "check_for_gettext",
+    "check_for_iconv",
+    "check_for_non_prefixed_coreutils",
+    "check_for_non_prefixed_findutils",
     "check_for_unlinked_but_not_keg_only",
+    "check_for_unnecessary_cask_tap",
+    "check_for_unnecessary_core_tap",
+    "check_homebrew_prefix",
+    "check_git_newline_settings",
+    "check_git_version",
     "check_install_receipts",
+    "check_tmpdir",
+    "check_tmpdir_sticky_bit",
+    "check_untrusted_taps",
     "check_user_path_1",
     "check_user_path_2",
     "check_user_path_3",
     "check_for_broken_symlinks",
+    "check_github_api_tokens",
     "check_missing_deps",
+    "check_multiple_cellars",
 ];
 
 /// Ruby `Shellwords.shellescape` as brew's `Utils::Shell.sh_quote`
@@ -6393,7 +6420,7 @@ fn brew_sh_quote(text: &str) -> String {
     }
     let mut out = String::new();
     for c in text.chars() {
-        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ',' | ':' | '/' | '@') {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ',' | ':' | '+' | '/' | '@') {
             out.push(c);
         } else if c == '\n' {
             out.push_str("'\n'");
@@ -6419,8 +6446,460 @@ fn doctor_shell() -> (String, String) {
     (base, profile)
 }
 
-/// Brew's `path_remediation` text for a PATH finding.
-fn path_remediation(path: &str) -> String {
+/// Brew's finding support tier (1-3 or unsupported).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DoctorTier {
+    N(i64),
+    Unsupported,
+}
+
+impl DoctorTier {
+    fn to_jval(self) -> JVal {
+        match self {
+            DoctorTier::N(n) => JVal::Val(aterm_json::Value::Number(n.into())),
+            DoctorTier::Unsupported => jstr("unsupported"),
+        }
+    }
+}
+
+/// One `brew doctor` finding, brew's `Diagnostic::Finding`
+/// shape. Tier defaults to 1 as in brew.
+struct DoctorFinding {
+    text: String,
+    tier: DoctorTier,
+    affects: Vec<String>,
+    links: Vec<String>,
+    remediation: Option<(Vec<String>, String)>,
+}
+
+impl DoctorFinding {
+    fn new(text: impl Into<String>) -> Self {
+        DoctorFinding {
+            text: text.into(),
+            tier: DoctorTier::N(1),
+            affects: Vec::new(),
+            links: Vec::new(),
+            remediation: None,
+        }
+    }
+
+    fn with_remediation(mut self, commands: Vec<String>, text: impl Into<String>) -> Self {
+        self.remediation = Some((commands, text.into()));
+        self
+    }
+
+    /// Brew's `Finding#to_s`: the text, a newline, and the
+    /// remediation text (or its commands form), rstripped.
+    fn render(&self) -> String {
+        let remediation = match &self.remediation {
+            Some((commands, text)) if !text.is_empty() => text.clone(),
+            Some((commands, _)) if !commands.is_empty() => {
+                format!(
+                    "You can solve this by running:\n  {}",
+                    commands.join("\n  ")
+                )
+            }
+            _ => String::new(),
+        };
+        format!("{}\n{}", self.text, remediation.trim())
+            .trim_end()
+            .to_string()
+    }
+
+    fn to_jval(&self) -> JVal {
+        let remediation = match &self.remediation {
+            Some((commands, text)) => JVal::Obj(vec![
+                ("commands".into(), jstrs(commands.clone())),
+                ("text".into(), jstr(text.clone())),
+            ]),
+            None => JVal::Val(aterm_json::Value::Null),
+        };
+        JVal::Obj(vec![
+            ("text".into(), jstr(self.text.clone())),
+            ("tier".into(), self.tier.to_jval()),
+            ("affects".into(), jstrs(self.affects.clone())),
+            ("links".into(), jstrs(self.links.clone())),
+            ("remediation".into(), remediation),
+        ])
+    }
+}
+
+/// Brew's `append_indented_list`: the header followed by each
+/// item as an indented line (header and items keep their
+/// trailing newlines).
+fn append_indented_list(items: &[String], header: &str) -> String {
+    let mut out = header.to_string();
+    for item in items {
+        out.push_str(&format!("  {item}\n"));
+    }
+    out
+}
+
+/// brew's generic default prefix for this platform.
+fn brew_default_prefix() -> &'static str {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "/opt/homebrew"
+    }
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    {
+        "/usr/local"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "/home/linuxbrew/.linuxbrew"
+    }
+}
+
+/// Ruby `String#inspect` for the path spellings doctor prints.
+fn ruby_str_inspect(text: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// brew's `HOMEBREW_TEMP` as brew.sh resolves it: the env value
+/// when writable, else the platform default (`/private/tmp`,
+/// `/var/tmp` or `/tmp`). Doctor's TMPDIR is this value
+/// (gem_setup assigns it at startup).
+fn brew_temp() -> std::path::PathBuf {
+    let default = if cfg!(target_os = "macos") {
+        std::path::PathBuf::from("/private/tmp")
+    } else if crate::platform::dir_writable_by_caller(std::path::Path::new("/var/tmp")) {
+        std::path::PathBuf::from("/var/tmp")
+    } else {
+        std::path::PathBuf::from("/tmp")
+    };
+    match std::env::var_os("HOMEBREW_TEMP") {
+        Some(v) if !v.is_empty() => {
+            let candidate = std::path::PathBuf::from(v);
+            let writable = std::fs::metadata(&candidate).is_ok_and(|m| !m.permissions().readonly());
+            if writable { candidate } else { default }
+        }
+        _ => default,
+    }
+}
+
+/// One path segment of Ruby `Dir.glob` matching: `*` and `?`
+/// never cross `/`.
+fn glob_segment(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    fn go(p: &[char], t: &[char]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+        match p[0] {
+            '*' => (0..=t.len()).any(|i| go(&p[1..], &t[i..])),
+            '?' => !t.is_empty() && go(&p[1..], &t[1..]),
+            c => !t.is_empty() && t[0] == c && go(&p[1..], &t[1..]),
+        }
+    }
+    go(&p, &t)
+}
+
+/// Ruby `Dir.glob` pattern match over a relative path, with
+/// `**` crossing directories.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    fn go(pat: &[&str], path: &[&str]) -> bool {
+        if pat.is_empty() {
+            return path.is_empty();
+        }
+        if pat[0] == "**" {
+            return (0..=path.len()).any(|i| go(&pat[1..], &path[i..]));
+        }
+        !path.is_empty() && glob_segment(pat[0], path[0]) && go(&pat[1..], &path[1..])
+    }
+    let pat: Vec<&str> = pattern.split('/').collect();
+    let segs: Vec<&str> = path.split('/').collect();
+    go(&pat, &segs)
+}
+
+/// brew `__check_stray_files`: regular non-symlink files under
+/// `dir` matching `pattern` but no allow glob; subdir hits
+/// collapse to `dir/name/*` unless verbose.
+fn stray_files(dir: &str, pattern: &str, allow: &[&str], verbose: bool) -> Vec<String> {
+    let root = std::path::Path::new(dir);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                walk(&entry.path(), &rel, out);
+            } else if meta.is_file() {
+                out.push(rel);
+            }
+        }
+    }
+    let mut rels: Vec<String> = Vec::new();
+    walk(root, "", &mut rels);
+    let mut hits: Vec<String> = rels
+        .into_iter()
+        .filter(|rel| glob_match(pattern, rel))
+        .filter(|rel| !allow.iter().any(|a| glob_match(a, rel)))
+        .map(|rel| {
+            let shown = if verbose {
+                rel
+            } else if let Some(slash) = rel.find('/') {
+                format!("{}/*", &rel[..slash])
+            } else {
+                rel
+            };
+            format!("{dir}/{shown}")
+        })
+        .collect();
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
+/// Run git capturing stdout; scrub the global config like
+/// brew's `Utils::Git` when `no_global` is set.
+fn git_capture(args: &[&str], no_global: bool) -> Option<String> {
+    let mut command = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+    if no_global {
+        command.env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
+    }
+    let out = command.args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// brew `Utils::Git.version`: the dotted version from
+/// `git --version`, when git runs.
+fn git_version() -> Option<String> {
+    let stdout = git_capture(&["--version"], true)?;
+    let rest = stdout.trim_end().strip_prefix("git version ")?;
+    let version: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if version.is_empty() || !version.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(version)
+}
+
+/// Dotted-numeric version comparison (brew `Version` on plain
+/// dotted numbers).
+fn dotted_version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut l = left.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    let mut r = right.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    loop {
+        match (l.next(), r.next()) {
+            (None, None) => return Ordering::Equal,
+            (a, b) => match a.unwrap_or(0).cmp(&b.unwrap_or(0)) {
+                Ordering::Equal => continue,
+                other => return other,
+            },
+        }
+    }
+}
+
+/// brew `GitRepository.origin_url_from_config`: the single
+/// url of `[remote "origin"]` in `.git/config`, with brew's
+/// include/ambiguity guards.
+fn origin_url_from_config(repo: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(repo.join(".git/config")).ok()?;
+    let has_include = content.lines().any(|line| {
+        let t = line.trim_start().to_lowercase();
+        let Some(rest) = t.strip_prefix("[include") else {
+            return false;
+        };
+        let rest = rest.strip_prefix("if").unwrap_or(rest);
+        rest.starts_with(|c: char| c.is_whitespace() || c == '"' || c == ']')
+    });
+    if has_include {
+        return None;
+    }
+    let mut urls: Vec<String> = Vec::new();
+    let mut in_origin = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_origin = trimmed == "[remote \"origin\"]";
+            continue;
+        }
+        if !in_origin || trimmed.is_empty() || trimmed.starts_with(['#', ';']) {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("url") {
+            urls.push(value.trim().to_owned());
+        }
+    }
+    if urls.len() != 1 {
+        return None;
+    }
+    let url = urls.remove(0);
+    if url.is_empty() || url.contains(['"', '#', ';', '\\']) {
+        return None;
+    }
+    Some(url)
+}
+
+/// brew `find_relative_paths`: existing files under the
+/// prefix and `/usr/local`.
+fn find_relative_paths(prefix: &Prefix, rels: &[&str]) -> Vec<String> {
+    let mut roots = vec![prefix.root.display().to_string()];
+    if !roots.contains(&"/usr/local".to_string()) {
+        roots.push("/usr/local".to_string());
+    }
+    let mut found: Vec<String> = Vec::new();
+    for root in roots {
+        for rel in rels {
+            let candidate = format!("{root}/{rel}");
+            if std::path::Path::new(&candidate).exists() {
+                found.push(candidate);
+            }
+        }
+    }
+    found
+}
+
+/// The mount point of `path` per `df -P` (brew `Volumes`).
+fn volume_of(path: &str) -> Option<String> {
+    let out = super::fetch::run_capture("/bin/df", &["-P", path]).ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 6
+            && fields[1].chars().all(|c| c.is_ascii_digit())
+            && fields[4].ends_with('%')
+        {
+            // Mount points may contain spaces: re-join the tail.
+            let pct = line.find(fields[4])? + fields[4].len();
+            return Some(line[pct..].trim().to_string());
+        }
+    }
+    None
+}
+
+/// brew `Utils::Curl.curl_version` (system curl lane).
+fn curl_version_string() -> Option<String> {
+    if let Ok(version) = std::env::var("HOMEBREW_CURL_VERSION") {
+        let digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+        let parts: Vec<&str> = version.split('.').collect();
+        if (parts.len() == 2 || parts.len() == 3) && parts.iter().all(|t| digits(t)) {
+            return Some(version);
+        }
+    }
+    let out = super::fetch::run_capture("curl", &["--version"]).ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.lines().next()?;
+    let rest = first.strip_prefix("curl ")?;
+    let version: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if version.is_empty() {
+        return None;
+    }
+    Some(version)
+}
+
+/// Whether the newest keg receipt of `name` carries
+/// `with-<option>` in brew's `used_options`.
+fn keg_built_with(prefix: &Prefix, name: &str, option: &str) -> bool {
+    let Some(inst) = prefix.installed_one(super::prefix::Kind::Formula, name) else {
+        return false;
+    };
+    let receipt = prefix.keg(name, &inst.version).join("INSTALL_RECEIPT.json");
+    let Ok(bytes) = std::fs::read(&receipt) else {
+        return false;
+    };
+    let Ok(value) = aterm_json::from_slice::<aterm_json::Value>(&bytes) else {
+        return false;
+    };
+    value
+        .get("used_options")
+        .and_then(aterm_json::Value::as_array)
+        .is_some_and(|options| {
+            options
+                .iter()
+                .filter_map(aterm_json::Value::as_str)
+                .any(|o| o == format!("with-{option}") || o == option)
+        })
+}
+
+/// Whether `paths` (PATH entries) contains either gnubin of
+/// the installed keg `name` (opt or raw libexec), brew's
+/// non-prefixed coreutils/findutils probes.
+fn gnubin_on_path(prefix: &Prefix, name: &str, paths: &[String]) -> bool {
+    let Some(inst) = prefix.installed_one(super::prefix::Kind::Formula, name) else {
+        return false;
+    };
+    let candidates = [
+        prefix
+            .root
+            .join("opt")
+            .join(name)
+            .join("libexec/gnubin")
+            .display()
+            .to_string(),
+        prefix
+            .keg(name, &inst.version)
+            .join("libexec/gnubin")
+            .display()
+            .to_string(),
+    ];
+    paths.iter().any(|entry| candidates.contains(entry))
+}
+
+/// brew `Utils::Text.to_sentence`.
+fn utils_text_to_sentence(values: &[&str]) -> String {
+    match values {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        _ => format!(
+            "{} and {}",
+            values[..values.len() - 1].join(", "),
+            values[values.len() - 1]
+        ),
+    }
+}
+
+/// Brew's `path_remediation` for a PATH finding: the rendered
+/// text plus its one command.
+fn path_remediation(path: &str) -> (Vec<String>, String) {
     let (shell, profile) = doctor_shell();
     let prepend = match shell.as_str() {
         "fish" => format!("fish_add_path {}", brew_sh_quote(path)),
@@ -6433,7 +6912,8 @@ fn path_remediation(path: &str) -> String {
             brew_sh_quote(&format!("export PATH={}:$PATH", brew_sh_quote(path)))
         ),
     };
-    format!("Consider setting your PATH for example like so:\n  {prepend}")
+    let text = format!("Consider setting your PATH for example like so:\n  {prepend}\n");
+    (vec![prepend], text)
 }
 
 fn path_entries() -> Vec<std::path::PathBuf> {
@@ -6453,14 +6933,6 @@ fn executable_file(path: &std::path::Path) -> bool {
     {
         path.is_file()
     }
-}
-
-fn indented(items: &[String]) -> String {
-    items
-        .iter()
-        .map(|item| format!("\n  {item}"))
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 /// `brew generate-cask-token`: propose a token for an app
@@ -7032,7 +7504,7 @@ fn deprecated_disabled_finding(
     api: &Api,
     formulae: &[super::prefix::Installed],
     flagged: &dyn Fn(&str) -> bool,
-) -> Option<String> {
+) -> Option<DoctorFinding> {
     use std::collections::{BTreeMap, BTreeSet};
     let record_of = |name: &str| api.formula(name).ok().or_else(|| tap::lookup(prefix, name));
     // Tab runtime dependency short names per installed formula
@@ -7184,10 +7656,13 @@ fn deprecated_disabled_finding(
         }
     }
     let remediation = parts.join("\n");
-    Some(format!(
-        "Some installed formulae are deprecated or disabled.\n{}",
-        remediation.trim_end_matches('\n')
-    ))
+    // Brew's affects: the flagged formulae's full names.
+    let mut affects: Vec<String> = deprecated.iter().map(|i| full_name(i)).collect();
+    affects.sort();
+    affects.dedup();
+    let mut finding = DoctorFinding::new("Some installed formulae are deprecated or disabled.");
+    finding.affects = affects;
+    Some(finding.with_remediation(Vec::new(), remediation))
 }
 
 /// `brew postinstall`: formulae provably without a
@@ -7282,6 +7757,8 @@ pub(super) fn cmd_postinstall(prefix: &Prefix, api: &Api, rest: &[String]) -> Ex
 
 pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     let quiet = has_flag(rest, "--quiet", "-q");
+    let doctor_verbose = has_flag(rest, "--verbose", "-v");
+    let json = has_flag(rest, "--json", "");
     if has_flag(rest, "--list-checks", "") {
         for check in DOCTOR_CHECKS {
             println!("{check}");
@@ -7290,7 +7767,17 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
     }
     let named = operands(rest);
     let wanted: Vec<&str> = if named.is_empty() {
-        DOCTOR_CHECKS.to_vec()
+        // Brew drops cask checks from a full run when no
+        // casks are installed.
+        if prefix.installed(Kind::Cask).is_empty() {
+            DOCTOR_CHECKS
+                .iter()
+                .copied()
+                .filter(|c| !c.starts_with("check_cask_"))
+                .collect()
+        } else {
+            DOCTOR_CHECKS.to_vec()
+        }
     } else {
         named.iter().map(String::as_str).collect()
     };
@@ -7312,16 +7799,16 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
         Some(row.deprecated || row.disabled)
     };
 
-    let mut findings: Vec<String> = Vec::new();
+    let mut findings: Vec<DoctorFinding> = Vec::new();
     let mut unknown_check = false;
     for check in wanted {
         match check {
             "check_access_directories" => {
                 if prefix.ensure().is_err() {
-                    findings.push(format!(
+                    findings.push(DoctorFinding::new(format!(
                         "prefix {} cannot be created/written",
                         prefix.root.display()
-                    ));
+                    )));
                     continue;
                 }
                 let mut not_writable: Vec<String> = Vec::new();
@@ -7349,13 +7836,25 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                 if !not_writable.is_empty() {
                     let user = std::env::var("USER").unwrap_or_default();
                     let joined = not_writable.join(" ");
-                    findings.push(format!(
-                        "The following directories are not writable by your user:{}\n\
-                         You should change the ownership of these directories to your user,\n\
-                         and make sure that you have write permission.\n  \
-                         sudo chown -R {user} {joined}\n  chmod u+w {joined}",
-                        indented(&not_writable)
-                    ));
+                    let commands = vec![
+                        format!("sudo chown -R {user} {joined}"),
+                        format!("chmod u+w {joined}"),
+                    ];
+                    findings.push(
+                        DoctorFinding::new(append_indented_list(
+                            &not_writable,
+                            "The following directories are not writable by your user:\n",
+                        ))
+                        .with_remediation(
+                            commands.clone(),
+                            append_indented_list(
+                                &commands,
+                                "You should change the ownership of these directories \
+                                 to your user,\nand make sure that you have write \
+                                 permission.\n",
+                            ),
+                        ),
+                    );
                 }
             }
             "check_for_broken_symlinks" => {
@@ -7364,10 +7863,16 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                     .map(|p| p.display().to_string())
                     .collect();
                 if !broken.is_empty() {
-                    findings.push(format!(
-                        "Broken symlinks were found:{}\nRemove them with `brew cleanup`",
-                        indented(&broken)
-                    ));
+                    findings.push(
+                        DoctorFinding::new(append_indented_list(
+                            &broken,
+                            "Broken symlinks were found:\n",
+                        ))
+                        .with_remediation(
+                            vec!["brew cleanup".to_string()],
+                            "Remove them with `brew cleanup`\n",
+                        ),
+                    );
                 }
             }
             "check_for_unlinked_but_not_keg_only" => {
@@ -7377,12 +7882,15 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                     .map(|i| i.name.clone())
                     .collect();
                 if !unlinked.is_empty() {
-                    findings.push(format!(
+                    let mut finding = DoctorFinding::new(
                         "You have unlinked kegs in your Cellar.\n\
                          Leaving kegs unlinked can lead to build-trouble and cause formulae that depend on\n\
-                         those kegs to fail to run properly once built.\n\
-                         Run `brew link` on these:{}",
-                        indented(&unlinked)
+                         those kegs to fail to run properly once built.\n",
+                    );
+                    finding.affects = unlinked.clone();
+                    findings.push(finding.with_remediation(
+                        unlinked.iter().map(|n| format!("brew link {n}")).collect(),
+                        append_indented_list(&unlinked, "Run `brew link` on these:\n"),
                     ));
                 }
             }
@@ -7433,12 +7941,20 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                 if !lines.is_empty() {
                     all_missing.sort();
                     all_missing.dedup();
-                    findings.push(format!(
-                        "Some installed formulae or casks are missing dependencies:{}\n\
-                         You should `brew install` the missing dependencies:\n  brew install {}",
-                        indented(&lines),
-                        all_missing.join(" ")
-                    ));
+                    let commands = vec![format!("brew install {}", all_missing.join(" "))];
+                    findings.push(
+                        DoctorFinding::new(append_indented_list(
+                            &lines,
+                            "Some installed formulae or casks are missing dependencies:\n",
+                        ))
+                        .with_remediation(
+                            commands.clone(),
+                            append_indented_list(
+                                &commands,
+                                "You should `brew install` the missing dependencies:\n",
+                            ),
+                        ),
+                    );
                 }
             }
             "check_deprecated_disabled" => {
@@ -7459,10 +7975,15 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                 flagged.sort();
                 flagged.dedup();
                 if !flagged.is_empty() {
-                    findings.push(format!(
-                        "Some installed casks are deprecated or disabled.\n\
-                         You should find replacements for the following casks:\n{}",
-                        indented(&flagged)
+                    let mut finding =
+                        DoctorFinding::new("Some installed casks are deprecated or disabled.");
+                    finding.affects = flagged.clone();
+                    findings.push(finding.with_remediation(
+                        Vec::new(),
+                        append_indented_list(
+                            &flagged,
+                            "You should find replacements for the following casks:\n\n",
+                        ),
                     ));
                 }
             }
@@ -7486,11 +8007,172 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                     deleted.sort();
                     deleted.dedup();
                     if !deleted.is_empty() {
-                        findings.push(format!(
+                        let mut finding = DoctorFinding::new(
                             "Some installed kegs have no formulae!\n\
-                             This means they were either deleted or installed manually.\n\
-                             You should find replacements for the following formulae:\n{}",
-                            indented(&deleted)
+                             This means they were either deleted or installed manually.",
+                        );
+                        finding.affects = deleted.clone();
+                        findings.push(finding.with_remediation(
+                            Vec::new(),
+                            append_indented_list(
+                                &deleted,
+                                "You should find replacements for the following formulae:\n",
+                            ),
+                        ));
+                    }
+                }
+            }
+            "check_deprecated_cask_taps" => {
+                let tapped: Vec<String> = tap::list(prefix)
+                    .iter()
+                    .filter(|t| t.user == "caskroom" || t.name() == "phinze/cask")
+                    .map(|t| t.name())
+                    .collect();
+                if !tapped.is_empty() {
+                    let commands = vec![format!("brew untap {}", tapped.join(" "))];
+                    findings.push(
+                        DoctorFinding::new(append_indented_list(
+                            &tapped,
+                            "You have the following deprecated Cask taps installed:\n",
+                        ))
+                        .with_remediation(
+                            commands.clone(),
+                            append_indented_list(&commands, "Please remove it by running:\n"),
+                        ),
+                    );
+                }
+            }
+            "check_deprecated_official_taps" => {
+                const DEPRECATED_OFFICIAL_TAPS: &[&str] = &[
+                    "aliases",
+                    "apache",
+                    "binary",
+                    "bundle",
+                    "cask-drivers",
+                    "cask-eid",
+                    "cask-fonts",
+                    "cask-versions",
+                    "command-not-found",
+                    "completions",
+                    "devel-only",
+                    "dupes",
+                    "emacs",
+                    "formula-analytics",
+                    "fuse",
+                    "games",
+                    "gui",
+                    "head-only",
+                    "linux-fonts",
+                    "livecheck",
+                    "nginx",
+                    "php",
+                    "portable-ruby",
+                    "python",
+                    "science",
+                    "services",
+                    "test-bot",
+                    "tex",
+                    "versions",
+                    "x11",
+                ];
+                // Intersection keeps brew's tap enumeration
+                // order filtered by the deprecated set.
+                let tapped: Vec<String> = tap::list(prefix)
+                    .iter()
+                    .filter(|t| {
+                        t.user == "homebrew" && DEPRECATED_OFFICIAL_TAPS.contains(&t.repo.as_str())
+                    })
+                    .map(|t| t.repo.clone())
+                    .collect();
+                if !tapped.is_empty() {
+                    let names: Vec<String> = tapped
+                        .iter()
+                        .map(|r| format!("Homebrew/homebrew-{r}"))
+                        .collect();
+                    findings.push(
+                        DoctorFinding::new(append_indented_list(
+                            &names,
+                            "You have the following deprecated, official taps tapped:\n",
+                        ))
+                        .with_remediation(
+                            vec!["brew untap".to_string()],
+                            "Untap them with `brew untap`.\n",
+                        ),
+                    );
+                }
+            }
+            "check_exist_directories" => {
+                if !crate::platform::dir_writable_by_caller(&prefix.root) {
+                    let mut dirs: Vec<String> = [
+                        "bin",
+                        "etc",
+                        "include",
+                        "lib",
+                        "sbin",
+                        "share",
+                        "opt",
+                        "var/homebrew/linked",
+                    ]
+                    .iter()
+                    .map(|d| prefix.root.join(d).display().to_string())
+                    .collect();
+                    dirs.push(prefix.cellar().display().to_string());
+                    dirs.sort();
+                    dirs.dedup();
+                    let missing: Vec<String> = dirs
+                        .into_iter()
+                        .filter(|d| !std::path::Path::new(d).exists())
+                        .collect();
+                    if !missing.is_empty() {
+                        let user = std::env::var("USER").unwrap_or_default();
+                        let joined = missing.join(" ");
+                        let commands = vec![
+                            format!("sudo mkdir -p {joined}"),
+                            format!("sudo chown -R {user} {joined}"),
+                        ];
+                        findings.push(
+                            DoctorFinding::new(append_indented_list(
+                                &missing,
+                                "The following directories do not exist:\n",
+                            ))
+                            .with_remediation(
+                                commands.clone(),
+                                append_indented_list(
+                                    &commands,
+                                    "You should create these directories and change \
+                                     their ownership to your user.\n",
+                                ),
+                            ),
+                        );
+                    }
+                }
+            }
+            "check_for_unnecessary_core_tap" | "check_for_unnecessary_cask_tap" => {
+                let developer = super::env_set("HOMEBREW_DEVELOPER");
+                let devcmdrun = tap::setting_bool(prefix, "devcmdrun");
+                let no_api = super::env_set("HOMEBREW_NO_INSTALL_FROM_API");
+                if !developer && !no_api && !devcmdrun {
+                    let (repo, text) = if check == "check_for_unnecessary_core_tap" {
+                        (
+                            "core",
+                            "You have an unnecessary local Core tap!\n\
+                             This can cause problems installing up-to-date formulae.\n",
+                        )
+                    } else {
+                        (
+                            "cask",
+                            "You have an unnecessary local Cask tap.\n\
+                             This can cause problems installing up-to-date casks.\n",
+                        )
+                    };
+                    let tapped = tap::list(prefix)
+                        .iter()
+                        .any(|t| t.user == "homebrew" && t.repo == repo);
+                    if tapped {
+                        let commands = vec![format!("brew untap homebrew/{repo}")];
+                        findings.push(DoctorFinding::new(text).with_remediation(
+                            commands.clone(),
+                            append_indented_list(&commands, "Please remove it by running:\n"),
                         ));
                     }
                 }
@@ -7499,10 +8181,10 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                 for i in &formulae {
                     let receipt = prefix.keg(&i.name, &i.version).join("INSTALL_RECEIPT.json");
                     if !std::fs::symlink_metadata(&receipt).is_ok_and(|m| m.is_file()) {
-                        findings.push(format!(
+                        findings.push(DoctorFinding::new(format!(
                             "{} {} has no install receipt (poured by something else?)",
                             i.name, i.version
-                        ));
+                        )));
                     }
                 }
             }
@@ -7512,11 +8194,13 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                         let name = e.file_name().to_string_lossy().into_owned();
                         if prefix.pinned_version(&name).is_none() {
                             if prefix.pin_link_dangling_ours(&name) {
-                                findings.push(format!(
+                                findings.push(DoctorFinding::new(format!(
                                     "pin for {name} points at a keg that is gone (run: abrew unpin {name})"
-                                ));
+                                )));
                             } else {
-                                findings.push(format!("pin for {name} is not owned by abrew"));
+                                findings.push(DoctorFinding::new(format!(
+                                    "pin for {name} is not owned by abrew"
+                                )));
                             }
                         }
                     }
@@ -7534,11 +8218,649 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                         .zip(std::fs::canonicalize(&brew_file).ok())
                         .is_some_and(|(a, b)| a == b);
                     if !identical {
-                        findings.push(format!(
-                            "Another `brew` shadows this Homebrew installation in your PATH:\n  {}\n\nThis may be a helper, wrapper or another Homebrew installation.\n\n{}",
-                            found.display(),
-                            path_remediation(&format!("{}/bin", prefix.root.display()))
+                        let (commands, text) =
+                            path_remediation(&format!("{}/bin", prefix.root.display()));
+                        findings.push(
+                            DoctorFinding::new(format!(
+                                "Another `brew` shadows this Homebrew installation in your PATH:\n  {}\n\nThis may be a helper, wrapper or another Homebrew installation.\n",
+                                found.display()
+                            ))
+                            .with_remediation(commands, text),
+                        );
+                    }
+                }
+            }
+            "check_untrusted_taps" => {
+                let taps = if std::env::var_os("HOMEBREW_NO_REQUIRE_TAP_TRUST")
+                    .is_some_and(|v| !v.is_empty())
+                {
+                    Vec::new()
+                } else {
+                    super::trust::wholly_untrusted_taps(prefix)
+                };
+                if !taps.is_empty() {
+                    let names: Vec<String> = taps.iter().map(|t| t.name()).collect();
+                    let mut by_formula: std::collections::BTreeMap<String, Vec<String>> =
+                        std::collections::BTreeMap::new();
+                    let mut by_cask: std::collections::BTreeMap<String, Vec<String>> =
+                        std::collections::BTreeMap::new();
+                    for (kind, map) in [
+                        (super::prefix::Kind::Formula, &mut by_formula),
+                        (super::prefix::Kind::Cask, &mut by_cask),
+                    ] {
+                        let mut seen: std::collections::BTreeSet<String> =
+                            std::collections::BTreeSet::new();
+                        for inst in prefix.installed(kind) {
+                            if !seen.insert(inst.name.clone()) {
+                                continue;
+                            }
+                            let full = prefix.full_name(&inst);
+                            let Some((tap, _)) = full.rsplit_once('/') else {
+                                continue;
+                            };
+                            if names.iter().any(|n| n == tap) {
+                                map.entry(tap.to_owned()).or_default().push(full);
+                            }
+                        }
+                    }
+                    let trust_lines = |map: &std::collections::BTreeMap<String, Vec<String>>,
+                                       flag: &str|
+                     -> Vec<String> {
+                        map.values()
+                            .filter(|items| !items.is_empty())
+                            .map(|items| {
+                                let mut sorted = items.clone();
+                                sorted.sort();
+                                format!("brew trust {flag} {}", sorted.join(" "))
+                            })
+                            .collect()
+                    };
+                    let formula_message = trust_lines(&by_formula, "--formula");
+                    let cask_message = trust_lines(&by_cask, "--cask");
+                    let installed_any = !formula_message.is_empty() || !cask_message.is_empty();
+                    let untap_message = append_indented_list(
+                        &[format!("brew untap {}", names.join(" "))],
+                        "Untap them with:\n",
+                    );
+                    let mut generic_types: Vec<&str> = Vec::new();
+                    let mut generic_commands: Vec<String> = Vec::new();
+                    if formula_message.is_empty() {
+                        generic_types.push("formulae");
+                        generic_commands
+                            .push("brew trust --formula <user>/<tap>/<formula>".to_owned());
+                    }
+                    if cask_message.is_empty() {
+                        generic_types.push("casks");
+                        generic_commands.push("brew trust --cask <user>/<tap>/<cask>".to_owned());
+                    }
+                    generic_types.push("commands");
+                    generic_commands.push("brew trust --command <user>/<tap>/<command>".to_owned());
+                    let generic_prefix = if installed_any {
+                        "Trust other specific"
+                    } else {
+                        "Trust specific"
+                    };
+                    let generic_message = append_indented_list(
+                        &generic_commands,
+                        &format!(
+                            "{generic_prefix} {} with:\n",
+                            utils_text_to_sentence(&generic_types)
+                        ),
+                    );
+                    let mut messages: Vec<String> = Vec::new();
+                    if installed_any {
+                        messages.push(
+                            "Prefer trusting only the specific formulae, casks or commands you need.\n"
+                                .to_owned(),
+                        );
+                    } else {
+                        messages.push(untap_message.clone());
+                    }
+                    if !formula_message.is_empty() {
+                        messages.push(append_indented_list(
+                            &formula_message,
+                            "Trust installed formulae from these taps with:\n",
                         ));
+                    }
+                    if !cask_message.is_empty() {
+                        messages.push(append_indented_list(
+                            &cask_message,
+                            "Trust installed casks from these taps with:\n",
+                        ));
+                    }
+                    messages.push(generic_message);
+                    messages.push(format!(
+                        "Whole-tap trust is broader and includes all current and future formulae,\ncasks and commands from the listed taps. Trust whole taps with:\n  brew trust {}\n",
+                        names.join(" ")
+                    ));
+                    if installed_any {
+                        messages.push(untap_message);
+                    }
+                    messages.push(format!(
+                        "For more information, see:\n  {}\n",
+                        super::tty::url("https://docs.brew.sh/Tap-Trust")
+                    ));
+                    let mut message =
+                        append_indented_list(&names, "The following taps are not trusted:\n");
+                    message.push_str(
+                        "\nHomebrew is currently ignoring formulae, casks and commands\nfrom these taps because tap trust is required.",
+                    );
+                    let mut finding =
+                        DoctorFinding::new(message).with_remediation(Vec::new(), messages.concat());
+                    finding.links = vec!["https://docs.brew.sh/Tap-Trust".to_owned()];
+                    findings.push(finding);
+                }
+            }
+            "check_tmpdir" => {
+                let tmpdir = brew_temp();
+                if !tmpdir.is_dir() {
+                    findings.push(DoctorFinding::new(format!(
+                        "TMPDIR {} doesn't exist.\n",
+                        ruby_str_inspect(&tmpdir.to_string_lossy())
+                    )));
+                }
+            }
+            "check_tmpdir_sticky_bit" => {
+                #[cfg(unix)]
+                {
+                    let temp = brew_temp();
+                    use std::os::unix::fs::MetadataExt as _;
+                    if let Ok(meta) = std::fs::metadata(&temp) {
+                        let mode = meta.mode();
+                        if mode & 0o777 == 0o777 && mode & 0o1000 == 0 {
+                            let commands = vec![format!("sudo chmod +t {}", temp.display())];
+                            findings.push(
+                                DoctorFinding::new(format!(
+                                    "{} is world-writable but does not have the sticky bit set.\n",
+                                    temp.display()
+                                ))
+                                .with_remediation(
+                                    commands.clone(),
+                                    append_indented_list(
+                                        &commands,
+                                        "To set it, run the following command:\n",
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            "check_homebrew_prefix" => {
+                let default = brew_default_prefix();
+                let ours = prefix.root.to_string_lossy();
+                let relocatable = std::env::var_os("HOMEBREW_NO_RELOCATE_BUILD_PREFIX")
+                    .is_none_or(|v| v.is_empty());
+                let compatible = ours == default
+                    || (relocatable
+                        && format!("{default}/Cellar").len() >= format!("{ours}/Cellar").len()
+                        && default.len() >= ours.len());
+                if ours != default
+                    && std::env::var_os("HOMEBREW_INTEGRATION_TEST").is_none()
+                    && !compatible
+                {
+                    let mut finding = DoctorFinding::new(format!(
+                        "Your Homebrew's prefix is not {default}.\n\nSome of Homebrew's bottles (binary packages) cannot be used with this prefix.\n",
+                    ))
+                    .with_remediation(
+                        Vec::new(),
+                        "Consider uninstalling Homebrew and reinstalling into the default prefix.",
+                    );
+                    finding.tier = DoctorTier::N(3);
+                    findings.push(finding);
+                }
+            }
+            "check_for_symlinked_cellar" => {
+                let cellar = prefix.cellar();
+                if cellar.exists()
+                    && let Ok(meta) = std::fs::symlink_metadata(&cellar)
+                    && meta.file_type().is_symlink()
+                    && let Ok(real) = std::fs::canonicalize(&cellar)
+                {
+                    findings.push(DoctorFinding::new(format!(
+                        "Symlinked Cellars can cause problems.\nYour Homebrew Cellar is a symlink: {}\n                which resolves to: {}\n\nThe recommended Homebrew installations are either:\n(A) Have Cellar be a real directory inside of your `$HOMEBREW_PREFIX`\n(B) Symlink \"bin/brew\" into your prefix, but don't symlink \"Cellar\".\n\nOlder installations of Homebrew may have created a symlinked Cellar, but this can\ncause problems when two formulae install to locations that are mapped on top of each\nother during the linking step.\n",
+                        cellar.display(),
+                        real.display()
+                    )));
+                }
+            }
+            "check_for_pydistutils_cfg_in_home" => {
+                if let Some(home) = std::env::var_os("HOME")
+                    && std::path::Path::new(&home)
+                        .join(".pydistutils.cfg")
+                        .exists()
+                {
+                    let mut finding = DoctorFinding::new(format!(
+                        "A '.pydistutils.cfg' file was found in $HOME, which may cause Python\nbuilds to fail. See:\n  {}\n  {}\n",
+                        super::tty::url("https://bugs.python.org/issue6138"),
+                        super::tty::url("https://bugs.python.org/issue4655")
+                    ));
+                    finding.links = vec![
+                        "https://bugs.python.org/issue6138".to_owned(),
+                        "https://bugs.python.org/issue4655".to_owned(),
+                    ];
+                    findings.push(finding);
+                }
+            }
+            "check_for_stray_dylibs" => {
+                let allow = [
+                    "libfuse.2.dylib",
+                    "libfuse3.*.dylib",
+                    "libfuse_ino64.2.dylib",
+                    "libfuse-t*.dylib",
+                    "libmacfuse_i32.2.dylib",
+                    "libmacfuse_i64.2.dylib",
+                    "libosxfuse_i32.2.dylib",
+                    "libosxfuse_i64.2.dylib",
+                    "libosxfuse.2.dylib",
+                    "libTrAPI.dylib",
+                    "libntfs-3g.*.dylib",
+                    "libntfs.*.dylib",
+                    "libublio.*.dylib",
+                    "libUFSDNTFS.dylib",
+                    "libUFSDExtFS.dylib",
+                    "libecomlodr.dylib",
+                    "libsymsea*.dylib",
+                    "sentinel.dylib",
+                    "sentinel-*.dylib",
+                    "libASAF.dylib",
+                    "JPKI*.dylib",
+                ];
+                let files = stray_files("/usr/local/lib", "*.dylib", &allow, doctor_verbose);
+                if !files.is_empty() {
+                    findings.push(DoctorFinding::new(append_indented_list(
+                        &files,
+                        "Unbrewed dylibs were found in /usr/local/lib.\nIf you didn't put them there on purpose they could cause problems when\nbuilding Homebrew formulae and may need to be deleted.\n\nUnexpected dylibs:\n",
+                    )));
+                }
+            }
+            "check_for_stray_static_libs" => {
+                let allow = [
+                    "libfuse-t*.a",
+                    "libfuse3.a",
+                    "libntfs-3g.a",
+                    "libntfs.a",
+                    "libublio.a",
+                    "libappfirewall.a",
+                    "libautoblock.a",
+                    "libautosetup.a",
+                    "libconnectionsclient.a",
+                    "liblocationawareness.a",
+                    "libpersonalfirewall.a",
+                    "libtrustedcomponents.a",
+                ];
+                let files = stray_files("/usr/local/lib", "*.a", &allow, doctor_verbose);
+                if !files.is_empty() {
+                    findings.push(DoctorFinding::new(append_indented_list(
+                        &files,
+                        "Unbrewed static libraries were found in /usr/local/lib.\nIf you didn't put them there on purpose they could cause problems when\nbuilding Homebrew formulae and may need to be deleted.\n\nUnexpected static libraries:\n",
+                    )));
+                }
+            }
+            "check_for_stray_headers" => {
+                let allow = [
+                    "fuse.h",
+                    "fuse/**/*.h",
+                    "fuse3/**/*.h",
+                    "macfuse/**/*.h",
+                    "osxfuse/**/*.h",
+                    "ntfs/**/*.h",
+                    "ntfs-3g/**/*.h",
+                ];
+                let files = stray_files("/usr/local/include", "**/*.h", &allow, doctor_verbose);
+                if !files.is_empty() {
+                    findings.push(DoctorFinding::new(append_indented_list(
+                        &files,
+                        "Unbrewed header files were found in /usr/local/include.\nIf you didn't put them there on purpose they could cause problems when\nbuilding Homebrew formulae and may need to be deleted.\n\nUnexpected header files:\n",
+                    )));
+                }
+            }
+            "check_for_stray_las" => {
+                let allow = [
+                    "libfuse.la",
+                    "libfuse_ino64.la",
+                    "libosxfuse_i32.la",
+                    "libosxfuse_i64.la",
+                    "libosxfuse.la",
+                    "libntfs-3g.la",
+                    "libntfs.la",
+                    "libublio.la",
+                ];
+                let files = stray_files("/usr/local/lib", "*.la", &allow, doctor_verbose);
+                if !files.is_empty() {
+                    findings.push(DoctorFinding::new(append_indented_list(
+                        &files,
+                        "Unbrewed '.la' files were found in /usr/local/lib.\nIf you didn't put them there on purpose they could cause problems when\nbuilding Homebrew formulae and may need to be deleted.\n\nUnexpected '.la' files:\n",
+                    )));
+                }
+            }
+            "check_for_stray_pcs" => {
+                let allow = [
+                    "fuse.pc",
+                    "fuse3.pc",
+                    "fuse-t.pc",
+                    "macfuse.pc",
+                    "osxfuse.pc",
+                    "libntfs-3g.pc",
+                    "libublio.pc",
+                ];
+                let files = stray_files("/usr/local/lib/pkgconfig", "*.pc", &allow, doctor_verbose);
+                if !files.is_empty() {
+                    findings.push(DoctorFinding::new(append_indented_list(
+                        &files,
+                        "Unbrewed '.pc' files were found in /usr/local/lib/pkgconfig.\nIf you didn't put them there on purpose they could cause problems when\nbuilding Homebrew formulae and may need to be deleted.\n\nUnexpected '.pc' files:\n",
+                    )));
+                }
+            }
+            "check_for_git" => {
+                if git_version().is_none() {
+                    let commands = vec!["brew install git".to_string()];
+                    findings.push(
+                        DoctorFinding::new(
+                            "Git could not be found in your PATH.\nHomebrew uses Git for several internal functions and some formulae use Git\ncheckouts instead of stable tarballs.\n",
+                        )
+                        .with_remediation(
+                            commands.clone(),
+                            append_indented_list(&commands, "You may want to install Git:\n"),
+                        ),
+                    );
+                }
+            }
+            "check_git_version" => {
+                let minimum = std::env::var("HOMEBREW_MINIMUM_GIT_VERSION")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "2.30.0".to_string());
+                if let Some(version) = git_version()
+                    && dotted_version_cmp(&version, &minimum) == std::cmp::Ordering::Less
+                {
+                    let verb = if prefix
+                        .installed_one(super::prefix::Kind::Formula, "git")
+                        .is_some()
+                    {
+                        "upgrade"
+                    } else {
+                        "install"
+                    };
+                    let commands = vec![format!("brew {verb} git")];
+                    findings.push(
+                        DoctorFinding::new(format!(
+                            "An outdated version ({version}) of Git was detected in your PATH.\nGit {minimum} or newer is required for Homebrew.\n",
+                        ))
+                        .with_remediation(
+                            commands.clone(),
+                            append_indented_list(&commands, "Please upgrade:\n"),
+                        ),
+                    );
+                }
+            }
+            "check_git_newline_settings" => {
+                if git_version().is_some() {
+                    let root = prefix.root.display().to_string();
+                    let autocrlf = git_capture(
+                        &["-C", root.as_str(), "config", "--get", "core.autocrlf"],
+                        false,
+                    )
+                    .map(|v| v.trim_end_matches(['\n', '\r']).to_string())
+                    .unwrap_or_default();
+                    if autocrlf == "true" {
+                        let commands = vec!["git config --global core.autocrlf input".to_string()];
+                        findings.push(
+                            DoctorFinding::new(format!(
+                                "Suspicious Git newline settings found.\n\nThe detected Git newline settings will cause checkout problems:\n  core.autocrlf = {autocrlf}\n",
+                            ))
+                            .with_remediation(
+                                commands.clone(),
+                                append_indented_list(
+                                    &commands,
+                                    "If you are not routinely dealing with Windows-based projects,\nconsider removing these by running:\n",
+                                ),
+                            ),
+                        );
+                    }
+                }
+            }
+            "check_brew_git_origin" => {
+                let repo_path = prefix.root.clone();
+                if git_version().is_some() && repo_path.join(".git").exists() {
+                    let desired = std::env::var("HOMEBREW_BREW_GIT_REMOTE")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "https://github.com/Homebrew/brew".to_string());
+                    let desired_remote = |url: &str| {
+                        super::trust::same_remote(url, &desired)
+                            || [
+                                desired.as_str(),
+                                &format!("{desired}.git"),
+                                &format!("{desired}/"),
+                            ]
+                            .iter()
+                            .any(|cand| url.eq_ignore_ascii_case(cand))
+                    };
+                    let repo = repo_path.display().to_string();
+                    let current = origin_url_from_config(&repo_path).or_else(|| {
+                        git_capture(
+                            &[
+                                "-C",
+                                repo.as_str(),
+                                "config",
+                                "--local",
+                                "--get",
+                                "remote.origin.url",
+                            ],
+                            true,
+                        )
+                        .map(|v| v.trim_end_matches(['\n', '\r']).to_string())
+                        .filter(|v| !v.is_empty())
+                    });
+                    if !current.as_deref().is_some_and(desired_remote) {
+                        let remotes = git_capture(&["-C", repo.as_str(), "remote", "-v"], false)
+                            .unwrap_or_default();
+                        let mut other: Option<(String, String)> = None;
+                        for line in remotes.lines() {
+                            let mut parts = line.split_whitespace();
+                            if let (Some(name), Some(url), Some(dir)) =
+                                (parts.next(), parts.next(), parts.next())
+                                && name != "origin"
+                                && dir == "(fetch)"
+                                && desired_remote(url)
+                            {
+                                other = Some((name.to_string(), url.to_string()));
+                                break;
+                            }
+                        }
+                        let finding = match (&current, &other) {
+                            (None, _) => Some(
+                                DoctorFinding::new(format!(
+                                    "Missing {desired} git origin remote.\n\nWithout a correctly configured origin, Homebrew won't update properly.\n",
+                                ))
+                                .with_remediation(
+                                    vec![format!(
+                                        "git -C \"{repo}\" remote add origin {desired}"
+                                    )],
+                                    format!(
+                                        "You can solve this by adding the remote:\n  git -C \"{repo}\" remote add origin {}\n",
+                                        super::tty::url(&desired)
+                                    ),
+                                ),
+                            ),
+                            (Some(cur), Some((name, url))) => Some(
+                                DoctorFinding::new(format!(
+                                    "The current git origin is:\n  {cur}\nbut the `{name}` remote is:\n  {url}\n\nWith a non-standard origin, Homebrew won't update properly\nand `--changed` options compare against the wrong branch.\n",
+                                ))
+                                .with_remediation(
+                                    vec![
+                                        format!("git -C \"{repo}\" remote rename origin fork"),
+                                        format!("git -C \"{repo}\" remote rename {name} origin"),
+                                    ],
+                                    format!(
+                                        "You can solve this by renaming the remotes:\n  git -C \"{repo}\" remote rename origin fork\n  git -C \"{repo}\" remote rename {name} origin\n",
+                                    ),
+                                ),
+                            ),
+                            (Some(cur), None) => Some(
+                                DoctorFinding::new(format!(
+                                    "The current git origin is:\n  {cur}\n\nWith a non-standard origin, Homebrew won't update properly.\n",
+                                ))
+                                .with_remediation(
+                                    vec![format!(
+                                        "git -C \"{repo}\" remote set-url origin {desired}"
+                                    )],
+                                    format!(
+                                        "You can solve this by setting the origin remote:\n  git -C \"{repo}\" remote set-url origin {}\n",
+                                        super::tty::url(&desired)
+                                    ),
+                                ),
+                            ),
+                        };
+                        if let Some(finding) = finding {
+                            findings.push(finding);
+                        }
+                    }
+                }
+            }
+            "check_filesystem_case_sensitive" => {
+                let dirs = [prefix.root.clone(), prefix.cellar(), brew_temp()];
+                let mut vols: Vec<String> = Vec::new();
+                for dir in &dirs {
+                    if !dir.exists() {
+                        continue;
+                    }
+                    let text = dir.display().to_string();
+                    let up = std::path::Path::new(&text.to_uppercase()).exists();
+                    let down = std::path::Path::new(&text.to_lowercase()).exists();
+                    if !(up && down)
+                        && let Some(vol) = volume_of(&text)
+                        && !vols.contains(&vol)
+                    {
+                        vols.push(vol);
+                    }
+                }
+                if !vols.is_empty() {
+                    findings.push(DoctorFinding::new(format!(
+                        "The filesystem on {} appears to be case-sensitive.\nThe default macOS filesystem is case-insensitive. Please report any apparent problems.\n",
+                        vols.join(",")
+                    )));
+                }
+            }
+            "check_for_gettext" => {
+                let found = find_relative_paths(
+                    prefix,
+                    &[
+                        "lib/libgettextlib.dylib",
+                        "lib/libintl.dylib",
+                        "include/libintl.h",
+                    ],
+                );
+                if !found.is_empty() {
+                    let cellar_gettext = format!("{}/gettext", prefix.cellar().display());
+                    let linked = prefix.optlinked_version("gettext").is_some();
+                    let mut allow = vec![cellar_gettext];
+                    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                        allow.push("/opt/homebrew/Cellar/gettext".to_string());
+                    }
+                    let all_ours = linked
+                        && found.iter().all(|path| {
+                            std::fs::canonicalize(path).is_ok_and(|real| {
+                                let real = real.display().to_string();
+                                allow.iter().any(|a| real.starts_with(a.as_str()))
+                            })
+                        });
+                    if !all_ours {
+                        findings.push(
+                            DoctorFinding::new(
+                                "gettext files detected at a system prefix.\nThese files can cause compilation and link failures, especially if they\nare compiled with improper architectures.\n",
+                            )
+                            .with_remediation(
+                                Vec::new(),
+                                append_indented_list(&found, "Consider removing these files:\n"),
+                            ),
+                        );
+                    }
+                }
+            }
+            "check_for_iconv" => {
+                let found = find_relative_paths(prefix, &["lib/libiconv.dylib", "include/iconv.h"]);
+                if !found.is_empty() {
+                    let cellar_iconv = format!("{}/libiconv", prefix.cellar().display());
+                    let from_keg = prefix.optlinked_version("libiconv").is_some()
+                        && found.iter().any(|path| {
+                            std::fs::canonicalize(path).is_ok_and(|real| {
+                                real.display().to_string().starts_with(&cellar_iconv)
+                            })
+                        });
+                    if from_keg {
+                        findings.push(DoctorFinding::new(
+                            "A libiconv formula is installed and linked.\nThis will break stuff. For serious. Unlink it.\n",
+                        ));
+                    } else {
+                        findings.push(
+                            DoctorFinding::new(
+                                "libiconv files detected at a system prefix other than /usr.\nHomebrew doesn't provide a libiconv formula and expects to link against\nthe system version in /usr. libiconv in other prefixes can cause\ncompile or link failure, especially if compiled with improper\narchitectures. macOS itself never installs anything to /usr/local so\nit was either installed by a user or some other third party software.\n",
+                            )
+                            .with_remediation(
+                                Vec::new(),
+                                append_indented_list(&found, "Consider removing these files:\n"),
+                            ),
+                        );
+                    }
+                }
+            }
+            "check_for_non_prefixed_coreutils" => {
+                let paths: Vec<String> = path_entries()
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                if gnubin_on_path(prefix, "coreutils", &paths) {
+                    findings.push(DoctorFinding::new(
+                        "Putting non-prefixed coreutils in your path can cause GMP builds to fail.\n",
+                    ));
+                }
+            }
+            "check_for_non_prefixed_findutils" => {
+                let paths: Vec<String> = path_entries()
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                if prefix
+                    .installed_one(super::prefix::Kind::Formula, "findutils")
+                    .is_some()
+                    && (keg_built_with(prefix, "findutils", "default-names")
+                        || gnubin_on_path(prefix, "findutils", &paths))
+                {
+                    findings.push(DoctorFinding::new(
+                        "Putting non-prefixed findutils in your path can cause python builds to fail.\n",
+                    ));
+                }
+            }
+            "check_multiple_cellars" => {
+                // Brew compares HOMEBREW_PREFIX with a distinct
+                // HOMEBREW_REPOSITORY; an abrew prefix is its own
+                // repository, so the two always coincide (brew's
+                // first return).
+            }
+            "check_github_api_tokens" => {
+                let token_set = [
+                    "HOMEBREW_GITHUB_API_TOKEN",
+                    "HOMEBREW_GITHUB_PACKAGES_TOKEN",
+                ]
+                .iter()
+                .any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()));
+                if token_set && let Some(version) = curl_version_string() {
+                    let minimum = std::env::var("HOMEBREW_CURL_HEADER_FILE_MIN_VERSION")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "7.55.0".to_string());
+                    if dotted_version_cmp(&version, &minimum) == std::cmp::Ordering::Less {
+                        findings.push(
+                            DoctorFinding::new(format!(
+                                "GitHub API tokens are set, but curl {version} is older than {minimum}.\nHomebrew does not pass these tokens to curl. Requests use unauthenticated\nrate limits and cannot access private repositories or write to GitHub.\n",
+                            ))
+                            .with_remediation(
+                                Vec::new(),
+                                format!("Upgrade curl to {minimum} or newer to use GitHub API tokens."),
+                            ),
+                        );
                     }
                 }
             }
@@ -7575,15 +8897,18 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                             }
                             conflicts.sort();
                             if !conflicts.is_empty() {
-                                findings.push(format!(
-                                    "/usr/bin occurs before {}/bin in your PATH.\nThis means that system-provided programs will be used instead of those\nprovided by Homebrew.\n\nThe following tools exist at both paths:{}\n\n{}",
-                                    prefix.root.display(),
-                                    indented(&conflicts),
-                                    path_remediation(&format!(
-                                        "{}/bin",
-                                        prefix.root.display()
+                                let (commands, text) =
+                                    path_remediation(&format!("{}/bin", prefix.root.display()));
+                                findings.push(
+                                    DoctorFinding::new(append_indented_list(
+                                        &conflicts,
+                                        &format!(
+                                            "/usr/bin occurs before {}/bin in your PATH.\nThis means that system-provided programs will be used instead of those\nprovided by Homebrew.\n\nThe following tools exist at both paths:\n",
+                                            prefix.root.display()
+                                        ),
                                     ))
-                                ));
+                                    .with_remediation(commands, text),
+                                );
                             }
                         }
                     }
@@ -7598,21 +8923,29 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                                 .unwrap_or_default();
                             let only_keepme = children.len() == 1 && children[0] == ".keepme";
                             if !children.is_empty() && !only_keepme {
-                                findings.push(format!(
-                                    "Homebrew's \"sbin\" was not found in your PATH but you have installed\nformulae that put executables in {}/sbin.\n{}",
-                                    prefix.root.display(),
-                                    path_remediation(&sbin.display().to_string())
-                                ));
+                                let (commands, text) =
+                                    path_remediation(&sbin.display().to_string());
+                                findings.push(
+                                    DoctorFinding::new(format!(
+                                        "Homebrew's \"sbin\" was not found in your PATH but you have installed\nformulae that put executables in {}/sbin.\n",
+                                        prefix.root.display()
+                                    ))
+                                    .with_remediation(commands, text),
+                                );
                             }
                         }
                     }
                     // check_user_path_2 (and the abrew-era alias)
                     _ => {
                         if !seen_bin {
-                            findings.push(format!(
-                                "Homebrew's \"bin\" was not found in your PATH.\n{}",
-                                path_remediation(&format!("{}/bin", prefix.root.display()))
-                            ));
+                            let (commands, text) =
+                                path_remediation(&format!("{}/bin", prefix.root.display()));
+                            findings.push(
+                                DoctorFinding::new(
+                                    "Homebrew's \"bin\" was not found in your PATH.\n",
+                                )
+                                .with_remediation(commands, text),
+                            );
                         }
                     }
                 }
@@ -7630,6 +8963,38 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
         prefix.restore_stale_asides();
         let _ = prefix.rebuild_state();
     }
+    if json {
+        // Finding.support_tier: unsupported wins, else the max
+        // numeric tier, at least 1.
+        let tier = if findings.iter().any(|f| f.tier == DoctorTier::Unsupported) {
+            DoctorTier::Unsupported
+        } else {
+            DoctorTier::N(
+                findings
+                    .iter()
+                    .map(|f| match f.tier {
+                        DoctorTier::N(n) => n,
+                        DoctorTier::Unsupported => 1,
+                    })
+                    .max()
+                    .unwrap_or(1)
+                    .max(1),
+            )
+        };
+        let doc = JVal::Obj(vec![
+            ("tier".into(), tier.to_jval()),
+            (
+                "findings".into(),
+                JVal::Arr(findings.iter().map(DoctorFinding::to_jval).collect()),
+            ),
+        ]);
+        println!("{}", jpretty(&doc));
+        return if findings.is_empty() && !unknown_check {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
+    }
     if !findings.is_empty() {
         if !quiet {
             eprintln!(
@@ -7643,7 +9008,7 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
         }
         for finding in &findings {
             eprintln!();
-            super::tty::opoo!("Warning: {finding}");
+            super::tty::opoo!("Warning: {}", finding.render());
         }
     }
     if findings.is_empty() && !unknown_check {
@@ -12349,7 +13714,47 @@ fn print_update_report(r: &UpdateReport) -> bool {
     printed
 }
 
-pub(super) fn cmd_update(prefix: &Prefix, api: &Api) -> ExitCode {
+pub(super) fn cmd_update(prefix: &Prefix, api: &Api, args: &[String], rest: &[String]) -> ExitCode {
+    // Brew's cmd/update.sh token loop, left to right: a
+    // disabled --merge or an unknown long option (with the
+    // help text after the error) fails at its position; the
+    // first operand hands off to `brew upgrade "$@"`.
+    let mut seen_operand = false;
+    for token in rest {
+        match token.as_str() {
+            "--merge" => {
+                return failed(
+                    "Error: Calling the `--merge` switch is disabled! There is no replacement.",
+                );
+            }
+            "--force"
+            | "--auto-update"
+            | "--simulate-from-current-branch"
+            | "--verbose"
+            | "--quiet"
+            | "--debug" => {}
+            _ if token.starts_with("--") => {
+                super::tty::onoe!("Error: Unknown option: {token}");
+                print!("{}", super::brew_help_text("update"));
+                return ExitCode::from(1);
+            }
+            _ if token.starts_with('-') && token.len() > 1 => {
+                // Common short options and -f; brew silently
+                // ignores other short letters here.
+            }
+            _ => {
+                seen_operand = true;
+                break;
+            }
+        }
+    }
+    if seen_operand {
+        super::tty::opoo!(
+            "Warning: Use `brew upgrade {}` to upgrade formulae; running it instead.",
+            rest.join(" ")
+        );
+        return cmd_upgrade(prefix, api, args, rest);
+    }
     let old_f = api.cached_index_rows(false);
     let old_c = api.cached_index_rows(true);
     let mut tap_failures = 0usize;
@@ -14330,6 +15735,62 @@ pub(super) fn cmd_list(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
     let full_name = has_flag(rest, "--full-name", "");
     let long = has_flag(rest, "--long", "-l");
     let named = operands(rest);
+    // Brew's filtered list: installation-kind switches print
+    // matching formulae (with status labels when several are
+    // given); formula arguments are a usage error.
+    let kind_statuses: Vec<(&str, &str)> = [
+        ("`--installed-on-request`", "installed on request"),
+        ("`--no-installed-on-request`", "installed as dependency"),
+        ("`--poured-from-bottle`", "poured from bottle"),
+        ("`--built-from-source`", "built from source"),
+    ]
+    .into_iter()
+    .zip([
+        has_flag(rest, "--installed-on-request", ""),
+        has_flag(rest, "--no-installed-on-request", ""),
+        has_flag(rest, "--poured-from-bottle", ""),
+        has_flag(rest, "--built-from-source", ""),
+    ])
+    .filter(|(_, on)| *on)
+    .map(|(pair, _)| pair)
+    .collect();
+    if !kind_statuses.is_empty() {
+        if !named.is_empty() {
+            let flags: Vec<&str> = kind_statuses.iter().map(|(f, _)| *f).collect();
+            return super::usage_failed(
+                "list",
+                &format!(
+                    "Error: Invalid usage: Cannot use {} with formula arguments.",
+                    flags.join(", ")
+                ),
+            );
+        }
+        let show_status = kind_statuses.len() > 1;
+        for i in ordered_installed(prefix, Kind::Formula, rest) {
+            let keg = prefix.keg(&i.name, &i.version);
+            let on_request = super::prefix::receipt_on_request(&keg);
+            let poured = super::prefix::receipt_poured_from_bottle(&keg);
+            let statuses: Vec<&str> = kind_statuses
+                .iter()
+                .filter(|(_, status)| match *status {
+                    "installed on request" => on_request,
+                    "installed as dependency" => !on_request,
+                    "poured from bottle" => poured,
+                    _ => !poured,
+                })
+                .map(|(_, status)| *status)
+                .collect();
+            if statuses.is_empty() {
+                continue;
+            }
+            if show_status {
+                println!("{}: {}", i.name, statuses.join(", "));
+            } else {
+                println!("{}", i.name);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
     if multiple {
         let mut failed_any = false;
         let rows: Vec<Installed> = if named.is_empty() {
@@ -18579,6 +20040,10 @@ pub(super) fn cmd_bundle(
             Some(entries) => bundle_check(prefix, api, rest, &entries),
             None => failed("abrew: Brewfile was not admitted"),
         },
+        "env" => match prepared {
+            Some(entries) => bundle_env(prefix, api, args, rest, &entries),
+            None => failed("abrew: Brewfile was not admitted"),
+        },
         "list" => bundle_list(rest),
         "cleanup" => bundle_cleanup(prefix, api, rest),
         _ => super::unsupported("bundle subcommand is not native"),
@@ -19296,6 +20761,381 @@ fn bundle_check(
     }
     eprintln!("Satisfy missing dependencies with `brew bundle install`.");
     ExitCode::from(1)
+}
+
+/// `brew bundle env`: print the export lines for the build
+/// environment brew's bundle exec would set up (superenv
+/// restricted to the Brewfile's formulae), following
+/// `bundle/subcommand/exec.rb`: sorted keys, HOMEBREW_* and
+/// unchanged variables skipped, PATH-like values reduced to
+/// their new entries with a `:${KEY:-}` suffix.
+fn bundle_env(
+    prefix: &Prefix,
+    api: &Api,
+    args: &[String],
+    rest: &[String],
+    entries: &[bundle::BrewfileEntry],
+) -> ExitCode {
+    let check = has_flag(rest, "--check", "")
+        || std::env::var_os("HOMEBREW_BUNDLE_CHECK").is_some_and(|v| !v.is_empty());
+    if check {
+        let code = bundle_check(prefix, api, &["--quiet".to_string()], entries);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    }
+    if has_flag(rest, "--install", "") {
+        let code = bundle_file(prefix, api, args, entries);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    }
+    let no_secrets = has_flag(rest, "--no-secrets", "")
+        || std::env::var_os("HOMEBREW_BUNDLE_NO_SECRETS").is_some_and(|v| !v.is_empty());
+
+    // Resolve the Brewfile's formulae like Formulary.factory.
+    struct Dep {
+        name: String,
+        keg_only: bool,
+        version: String,
+    }
+    let mut deps: Vec<Dep> = Vec::new();
+    for entry in entries {
+        let bundle::BrewfileEntry::Brew(name) = entry else {
+            continue;
+        };
+        let Some(record) = api.formula(name).ok().or_else(|| tap::lookup(prefix, name)) else {
+            return failed(&format!("Error: {}", formula_unavailable(api, name)));
+        };
+        deps.push(Dep {
+            name: record.name.clone(),
+            keg_only: record.keg_only,
+            version: record.version.clone(),
+        });
+    }
+
+    let old_env: std::collections::BTreeMap<String, String> = std::env::vars_os()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    let mut env = old_env.clone();
+    if no_secrets {
+        let sensitive = |k: &str| {
+            let k = k.to_ascii_lowercase();
+            ["cookie", "key", "token", "password", "passphrase", "auth"]
+                .iter()
+                .any(|s| k.contains(s))
+        };
+        env.retain(|k, _| !sensitive(k));
+    }
+    // SharedEnvExtension#reset.
+    for key in [
+        "CDPATH",
+        "CLICOLOR_FORCE",
+        "CPATH",
+        "C_INCLUDE_PATH",
+        "CPLUS_INCLUDE_PATH",
+        "OBJC_INCLUDE_PATH",
+        "CC",
+        "CXX",
+        "OBJC",
+        "OBJCXX",
+        "CPP",
+        "MAKE",
+        "LD",
+        "LDSHARED",
+        "CFLAGS",
+        "CXXFLAGS",
+        "OBJCFLAGS",
+        "OBJCXXFLAGS",
+        "LDFLAGS",
+        "CPPFLAGS",
+        "MACOSX_DEPLOYMENT_TARGET",
+        "SDKROOT",
+        "DEVELOPER_DIR",
+        "CMAKE_PREFIX_PATH",
+        "CMAKE_INCLUDE_PATH",
+        "CMAKE_FRAMEWORK_PATH",
+        "GOBIN",
+        "GOPATH",
+        "GOROOT",
+        "PERL_MB_OPT",
+        "PERL_MM_OPT",
+        "LIBRARY_PATH",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "LD_RUN_PATH",
+        "RUSTFLAGS",
+    ] {
+        env.remove(key);
+    }
+
+    let root = prefix.root.display().to_string();
+    let all_keg_only = env
+        .remove("HOMEBREW_BUNDLE_EXEC_ALL_KEG_ONLY_DEPS")
+        .is_some_and(|v| !v.is_empty());
+    let keg_only: Vec<&Dep> = if all_keg_only {
+        deps.iter().collect()
+    } else {
+        deps.iter().filter(|d| d.keg_only).collect()
+    };
+    let existing = |paths: Vec<String>| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for p in paths {
+            if std::path::Path::new(&p).exists() && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
+    };
+    let join_paths = |paths: Vec<String>| -> Option<String> {
+        let kept = existing(paths);
+        if kept.is_empty() {
+            None
+        } else {
+            Some(kept.join(":"))
+        }
+    };
+    let set_or_delete =
+        |env: &mut std::collections::BTreeMap<String, String>, key: &str, value: Option<String>| {
+            match value {
+                Some(v) => {
+                    env.insert(key.to_string(), v);
+                }
+                None => {
+                    env.remove(key);
+                }
+            }
+        };
+
+    let dev = super::machine::DeveloperDir::this();
+    let sdk = dev.sdk_path().map(|p| p.display().to_string());
+    if let Some(sdk) = &sdk {
+        env.insert("HOMEBREW_SDKROOT".into(), sdk.clone());
+    }
+    let cc = old_env
+        .get("HOMEBREW_CC")
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "clang".to_string());
+    let cxx = old_env
+        .get("HOMEBREW_CXX")
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .unwrap_or_else(|| cc.replace("gcc", "g++").replace("clang", "clang++"));
+    env.insert("CC".into(), cc.clone());
+    env.insert("OBJC".into(), cc);
+    env.insert("CXX".into(), cxx.clone());
+    env.insert("OBJCXX".into(), cxx);
+    let jobs = old_env
+        .get("HOMEBREW_MAKE_JOBS")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|j| *j > 0)
+        .map(|j| j.to_string())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .to_string()
+        });
+    env.entry("MAKEFLAGS".into())
+        .or_insert_with(|| format!("-j{jobs}"));
+    env.insert(
+        "RUSTC_WRAPPER".into(),
+        format!("{root}/Library/Homebrew/shims/shared/rustc_wrapper"),
+    );
+
+    // Superenv.determine_path (+ exec's HOMEBREW_PATH append).
+    let shims_bin = format!("{root}/Library/Homebrew/shims/mac/super/bin");
+    let mut path_parts: Vec<String> = vec![shims_bin.clone()];
+    path_parts.extend(deps.iter().map(|d| format!("{root}/opt/{}/bin", d.name)));
+    let mut pythons: Vec<&Dep> = deps
+        .iter()
+        .filter(|d| d.name == "python" || d.name.starts_with("python@"))
+        .collect();
+    pythons.sort_by(|a, b| version_cmp(&b.version, &a.version));
+    path_parts.extend(
+        pythons
+            .iter()
+            .map(|d| format!("{root}/opt/{}/libexec/bin", d.name)),
+    );
+    path_parts.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(String::from));
+    let mut path = existing(path_parts);
+    if let Some(hp) = env.get("HOMEBREW_PATH").cloned() {
+        for part in hp.split(':') {
+            if !part.is_empty() && !path.contains(&part.to_string()) {
+                path.push(part.to_string());
+            }
+        }
+    }
+    env.insert("PATH".into(), path.join(":"));
+
+    let pkg_config: Vec<String> = deps
+        .iter()
+        .map(|d| format!("{root}/opt/{}/lib/pkgconfig", d.name))
+        .chain(
+            deps.iter()
+                .map(|d| format!("{root}/opt/{}/share/pkgconfig", d.name)),
+        )
+        .collect();
+    set_or_delete(&mut env, "PKG_CONFIG_PATH", join_paths(pkg_config));
+    let libdir = super::machine::macos_major().map(|major| {
+        vec![
+            "/usr/lib/pkgconfig".to_string(),
+            format!("{root}/Library/Homebrew/os/mac/pkgconfig/{major}"),
+        ]
+    });
+    set_or_delete(
+        &mut env,
+        "PKG_CONFIG_LIBDIR",
+        libdir.and_then(join_paths).or_else(|| Some(String::new())),
+    );
+    let mut cmake_prefix = vec![format!("{root}/Library/Homebrew/shims/mac/super")];
+    cmake_prefix.extend(keg_only.iter().map(|d| format!("{root}/opt/{}", d.name)));
+    cmake_prefix.push(root.clone());
+    set_or_delete(&mut env, "CMAKE_PREFIX_PATH", join_paths(cmake_prefix));
+    let gl = |leaf: &str| {
+        sdk.as_ref().map(|sdk| {
+            format!("{sdk}/System/Library/Frameworks/OpenGL.framework/Versions/Current/{leaf}")
+        })
+    };
+    set_or_delete(
+        &mut env,
+        "CMAKE_INCLUDE_PATH",
+        join_paths(gl("Headers").into_iter().collect()),
+    );
+    set_or_delete(
+        &mut env,
+        "CMAKE_LIBRARY_PATH",
+        join_paths(gl("Libraries").into_iter().collect()),
+    );
+    set_or_delete(&mut env, "CMAKE_FRAMEWORK_PATH", None);
+    let mut aclocal: Vec<String> = keg_only
+        .iter()
+        .map(|d| format!("{root}/opt/{}/share/aclocal", d.name))
+        .collect();
+    aclocal.push(format!("{root}/share/aclocal"));
+    set_or_delete(&mut env, "ACLOCAL_PATH", join_paths(aclocal));
+
+    for (key, value) in [
+        ("OPENSSL_NO_VENDOR", "1"),
+        ("GOTOOLCHAIN", "local"),
+        ("MATURIN_NO_INSTALL_RUST", "1"),
+        ("HIDAPI_SYSTEM_HIDAPI", "1"),
+        ("PYZMQ_NO_BUNDLE", "1"),
+        ("SODIUM_INSTALL", "system"),
+        ("BUNDLE_FORCE_RUBY_PLATFORM", "true"),
+        ("BUNDLE_VERSION", "system"),
+        ("BUNDLE_WITHOUT", "development:test"),
+        ("OPAMNODEPEXTS", "1"),
+        ("OPAMYES", "1"),
+        ("ZERO_AR_DATE", "1"),
+        ("HOMEBREW_INSIDE_BUNDLE", "1"),
+    ] {
+        env.insert(key.into(), value.into());
+    }
+    if let Some(major) = super::machine::macos_major().and_then(|m| m.parse::<u32>().ok()) {
+        env.insert(
+            "VERSIONER_PERL_VERSION".into(),
+            if major >= 14 {
+                "5.34".into()
+            } else {
+                "5.30".into()
+            },
+        );
+        if major >= 14 {
+            env.insert("am_cv_func_iconv_works".into(), "yes".into());
+        }
+    }
+
+    // nodenv/pyenv/rbenv shims for deps of those names.
+    for dep in &deps {
+        if ["nodenv", "pyenv", "rbenv"].contains(&dep.name.as_str()) {
+            let upper = dep.name.to_ascii_uppercase();
+            let home = old_env.get("HOME").cloned().unwrap_or_default();
+            let tool_root = old_env
+                .get(&format!("HOMEBREW_{upper}_ROOT"))
+                .cloned()
+                .unwrap_or_else(|| format!("{home}/.{}", dep.name));
+            let shims = format!("{tool_root}/shims");
+            let current = env.get("PATH").cloned().unwrap_or_default();
+            let mut parts: Vec<String> = current.split(':').map(String::from).collect();
+            parts.retain(|p| p != &shims);
+            parts.insert(0, shims);
+            env.insert("PATH".into(), parts.join(":"));
+        }
+    }
+
+    // HOMEBREW_BUNDLE_FORMULA_VERSION_<NAME>: rewrite opt
+    // references to the requested Cellar versions.
+    let mut version_rewrites: Vec<(String, String)> = Vec::new();
+    for dep in &deps {
+        let env_name = dep
+            .name
+            .to_ascii_uppercase()
+            .replace('@', "AT")
+            .replace('+', "X")
+            .replace('-', "_");
+        if let Some(v) = env.remove(&format!("HOMEBREW_BUNDLE_FORMULA_VERSION_{env_name}")) {
+            version_rewrites.push((dep.name.clone(), v));
+        }
+    }
+    for (name, version) in &version_rewrites {
+        let opt = format!("/opt/{name}");
+        let cellar = format!("/Cellar/{name}/{version}");
+        for value in env.values_mut() {
+            if value.contains(&opt) {
+                *value = value.replace(&opt, &cellar);
+            }
+        }
+    }
+
+    // Exec's final path sanitation: no Homebrew shims.
+    let path_like = |v: &str| v.split_once(':').is_some_and(|(head, _)| !head.is_empty());
+    for (key, value) in env.iter_mut() {
+        if key.contains("PATH") && path_like(value) {
+            *value = value
+                .split(':')
+                .filter(|p| !p.contains("/Homebrew/shims/"))
+                .collect::<Vec<_>>()
+                .join(":");
+        }
+    }
+
+    for (key, value) in &env {
+        if key.starts_with("HOMEBREW_") || key.starts_with("PORTABLE_RUBY_") {
+            continue;
+        }
+        if value.trim().is_empty() {
+            continue;
+        }
+        let old_value = old_env.get(key);
+        if old_value.is_some_and(|o| o == value) {
+            continue;
+        }
+        if key.contains("PATH") && path_like(value) {
+            let old_parts: Vec<&str> = old_value
+                .map(|o| o.split(':').collect())
+                .unwrap_or_default();
+            let new_parts: Vec<&str> = value
+                .split(':')
+                .filter(|p| !old_parts.contains(p))
+                .collect();
+            if new_parts.is_empty() {
+                continue;
+            }
+            println!(
+                "export {key}=\"{}:${{{key}:-}}\"",
+                brew_sh_quote(&new_parts.join(":"))
+            );
+        } else {
+            println!("export {key}=\"{}\"", brew_sh_quote(value));
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn bundle_file(
@@ -20869,6 +22709,49 @@ mod tests {
     }
 
     #[test]
+    fn doctor_finding_renders_brew_text_and_json_shapes() {
+        // Brew Finding#to_s: text, newline, stripped
+        // remediation; a list-bodied text keeps its trailing
+        // newline, producing the blank line before remediation.
+        let f = DoctorFinding::new(append_indented_list(
+            &["/x/broken".to_string()],
+            "Broken symlinks were found:\n",
+        ))
+        .with_remediation(
+            vec!["brew cleanup".to_string()],
+            "Remove them with `brew cleanup`\n",
+        );
+        assert_eq!(
+            f.render(),
+            "Broken symlinks were found:\n  /x/broken\n\nRemove them with `brew cleanup`"
+        );
+        let json = jpretty(&JVal::Obj(vec![
+            (
+                "tier".into(),
+                JVal::Val(aterm_json::Value::Number(1i64.into())),
+            ),
+            ("findings".into(), JVal::Arr(vec![f.to_jval()])),
+        ]));
+        assert_eq!(
+            json,
+            "{\n  \"tier\": 1,\n  \"findings\": [\n    {\n      \"text\": \
+             \"Broken symlinks were found:\\n  /x/broken\\n\",\n      \"tier\": 1,\n      \
+             \"affects\": [],\n      \"links\": [],\n      \"remediation\": {\n        \
+             \"commands\": [\n          \"brew cleanup\"\n        ],\n        \
+             \"text\": \"Remove them with `brew cleanup`\\n\"\n      }\n    }\n  ]\n}"
+        );
+        // No remediation serializes as null; commands-only
+        // remediation renders brew's "You can solve" form.
+        let bare = DoctorFinding::new("plain");
+        assert!(jpretty(&bare.to_jval()).contains("\"remediation\": null"));
+        let cmds = DoctorFinding::new("oops\n").with_remediation(vec!["brew fix".to_string()], "");
+        assert_eq!(
+            cmds.render(),
+            "oops\n\nYou can solve this by running:\n  brew fix"
+        );
+    }
+
+    #[test]
     fn doctor_missing_deps_reads_tab_closures_not_declared_graph() {
         let temp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(temp.path());
@@ -21571,6 +23454,64 @@ mod tests {
             None
         );
         assert_eq!(repo_url_of("https://example.com/u/r"), None);
+    }
+
+    #[test]
+    fn dotted_version_and_origin_config() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            super::dotted_version_cmp("2.30.0", "2.9.9"),
+            Ordering::Greater
+        );
+        assert_eq!(super::dotted_version_cmp("2.30", "2.30.0"), Ordering::Equal);
+        assert_eq!(super::dotted_version_cmp("2.4.1", "2.30.0"), Ordering::Less);
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(
+            git.join("config"),
+            "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://github.com/Homebrew/brew.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::origin_url_from_config(dir.path()).as_deref(),
+            Some("https://github.com/Homebrew/brew.git")
+        );
+        std::fs::write(
+            git.join("config"),
+            "[include]\n\tpath = other\n[remote \"origin\"]\n\turl = https://example.invalid/x\n",
+        )
+        .unwrap();
+        assert_eq!(super::origin_url_from_config(dir.path()), None);
+    }
+
+    #[test]
+    fn glob_match_follows_dir_glob_rules() {
+        assert!(super::glob_match("*.dylib", "libfoo.dylib"));
+        assert!(!super::glob_match("*.dylib", "sub/libfoo.dylib"));
+        assert!(super::glob_match("**/*.h", "fuse/old/fuse.h"));
+        assert!(super::glob_match("**/*.h", "top.h"));
+        assert!(super::glob_match("fuse/**/*.h", "fuse/fuse.h"));
+        assert!(!super::glob_match("fuse/**/*.h", "other/fuse.h"));
+        assert!(super::glob_match("libsymsea*.dylib", "libsymsea-1.dylib"));
+    }
+
+    #[test]
+    fn ruby_str_inspect_quotes_like_ruby() {
+        assert_eq!(super::ruby_str_inspect("/tmp/x"), "\"/tmp/x\"");
+        assert_eq!(super::ruby_str_inspect("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(super::ruby_str_inspect("a\nb"), "\"a\\nb\"");
+    }
+
+    #[test]
+    fn utils_text_to_sentence_drops_oxford_comma() {
+        assert_eq!(super::utils_text_to_sentence(&[]), "");
+        assert_eq!(super::utils_text_to_sentence(&["a"]), "a");
+        assert_eq!(super::utils_text_to_sentence(&["a", "b"]), "a and b");
+        assert_eq!(
+            super::utils_text_to_sentence(&["formulae", "casks", "commands"]),
+            "formulae, casks and commands"
+        );
     }
 
     #[test]

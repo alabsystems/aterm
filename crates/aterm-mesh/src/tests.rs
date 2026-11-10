@@ -18,6 +18,7 @@ use aterm_net::fleet::{
 use aterm_secrets::age;
 use aterm_secrets::commons::binding::Request;
 use aterm_secrets::membership_log::{Body, Entrant, Evidence, Log, MemberId, Record};
+use aterm_uds::stop::Stop;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -182,7 +183,7 @@ struct Running {
     mesh: Arc<Mesh>,
     table: Arc<Neighbours>,
     attached: Option<Attached>,
-    serving: Arc<AtomicBool>,
+    serve_stop: Arc<Stop>,
     listener: Option<JoinHandle<()>>,
 }
 
@@ -304,10 +305,13 @@ impl Mac {
         let table = Neighbours::new(me.clone(), cfg);
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
         let addr = listener.local_addr().expect("its address");
-        let serving = Arc::new(AtomicBool::new(true));
+        let serve_stop = Arc::new(Stop::new());
         let thread = {
-            let (serving, table, mesh) =
-                (Arc::clone(&serving), Arc::clone(&table), Arc::clone(&mesh));
+            let (serve_stop, table, mesh) = (
+                Arc::clone(&serve_stop),
+                Arc::clone(&table),
+                Arc::clone(&mesh),
+            );
             let (cut, principal) = (Arc::clone(&lab.cut), self.principal.clone());
             std::thread::spawn(move || {
                 const SERVES: &[FleetOp] = &[FleetOp::Neighbour];
@@ -324,7 +328,7 @@ impl Mac {
                     &listener,
                     (&listening, Arc::new(|| (FleetScope::Content, SERVES)), deny),
                     None,
-                    &serving,
+                    &serve_stop,
                     HANG,
                     move |served, op| {
                         if op == FleetOp::Neighbour {
@@ -376,7 +380,7 @@ impl Mac {
             mesh,
             table,
             attached: Some(attached),
-            serving,
+            serve_stop,
             listener: Some(thread),
         });
     }
@@ -393,7 +397,7 @@ impl Mac {
         }
         run.table.stop();
         drop(run.attached.take());
-        run.serving.store(false, Ordering::Release);
+        run.serve_stop.set();
         if let Some(listener) = run.listener.take() {
             listener.join().expect("the listener ends");
         }

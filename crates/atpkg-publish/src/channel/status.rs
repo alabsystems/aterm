@@ -6,8 +6,10 @@
 use std::path::{Path, PathBuf};
 
 use super::{Log, Scratch, flag_value};
+use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
+use crate::host::Probe;
 use crate::programs;
 use crate::quad::{self, Freshness, VerifiedQuad};
 use crate::triple::Triple;
@@ -184,26 +186,35 @@ pub fn describe(quad: &VerifiedQuad, now_unix: i64) -> Vec<String> {
     out
 }
 
-/// `atpkg-publish status [--quad DIR]`.
+/// `atpkg-publish status [--quad DIR] [--releases [PRODUCT…]]`.
 /// # Errors
 /// A usage error for a bad command line; a refusal when the quad does not verify; a could-not-run
 /// when the channel cannot be read.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let mut dir: Option<PathBuf> = None;
+    let mut releases = false;
+    let mut products = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--quad" => dir = Some(PathBuf::from(flag_value(args, &mut i, "--quad")?)),
+            "--releases" => releases = true,
+            product if releases && !product.starts_with('-') => products.push(product.to_string()),
             other => {
                 return Err(Error::usage(format!(
-                    "status: unknown argument `{other}` (status [--quad DIR])"
+                    "status: unknown argument `{other}` (status [--quad DIR] [--releases [PRODUCT…]])"
                 )));
             }
         }
         i += 1;
     }
     let mut log = Log::echo("atpkg-publish status");
-    for line in lines(ctx, dir.as_deref())? {
+    let output = if releases {
+        release_lines(ctx, dir.as_deref(), &products)?
+    } else {
+        lines(ctx, dir.as_deref())?
+    };
+    for line in output {
         if line == Producer::RetiredShell.line() {
             log.warn(line);
         } else {
@@ -217,14 +228,139 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
 /// # Errors
 /// A refusal when the quad does not verify; a could-not-run when the channel cannot be read.
 pub fn lines(ctx: &Ctx, dir: Option<&Path>) -> Result<Vec<String>> {
-    let quad = match dir {
-        Some(d) => quad::verify_dir_with(ctx, d, Freshness::Ignore)?,
+    Ok(describe(&read_quad(ctx, dir)?, ctx.now_unix))
+}
+
+fn read_quad(ctx: &Ctx, dir: Option<&Path>) -> Result<VerifiedQuad> {
+    match dir {
+        Some(d) => quad::verify_dir_with(ctx, d, Freshness::Ignore),
         None => {
             let scratch = Scratch::new("status")?;
             let (_, q) =
                 quad::fetch_head_with(ctx, &ctx.index_slug(), scratch.path(), Freshness::Ignore)?;
-            q
+            Ok(q)
         }
-    };
-    Ok(describe(&quad, ctx.now_unix))
+    }
+}
+
+/// Human release rows selected by the signed channel, optionally limited to `products`.
+/// Versions come from signed package manifests, dates from the host's `published_at`.
+/// Only metadata is read: neither payload nor local installation verification is implied.
+/// An empty product list reports all pins; target overlays use the client's own channel view.
+///
+/// # Errors
+/// A refusal for invalid signatures or a manifest for a different product/build; a
+/// could-not-run when public metadata cannot be read. Unknown dates remain `UNKNOWN`.
+pub fn release_lines(ctx: &Ctx, dir: Option<&Path>, products: &[String]) -> Result<Vec<String>> {
+    let quad = read_quad(ctx, dir)?;
+    let selected: std::collections::BTreeSet<_> = quad
+        .index
+        .channels
+        .iter()
+        .flat_map(crate::pins::union)
+        .filter(|(p, _)| products.is_empty() || products.contains(p))
+        .collect();
+    for product in products {
+        if !selected.iter().any(|(p, _)| p == product) {
+            return Err(Error::usage(format!(
+                "status: `{product}` has no signed channel pin"
+            )));
+        }
+    }
+    let scratch = Scratch::new("release-report")?;
+    let mut out = vec![
+        "Product | public version | published UTC | platform | status".to_string(),
+        "Installation verification: NOT CHECKED (use `aterm pkg verify PRODUCT`). Payloads are not checked by this report.".to_string(),
+    ];
+    if quad.lapsed(ctx.now_unix) {
+        out.push("LAPSED index: these are historical pins; clients refuse this index.".to_string());
+    }
+    for (product, build) in selected {
+        let repo = quad.index.programs.get(&product).ok_or_else(|| {
+            Error::refused(format!("status: pin `{product}` names no repository"))
+        })?;
+        let agent = atpkg::alab::agent(&product).filter(|a| a.repo == repo.repo);
+        if atpkg::vendor_direct::is_vendor(&product) && agent.is_none() {
+            out.push(format!(
+                "{product} | UNKNOWN | UNKNOWN | UNKNOWN | Vendor-direct; carried pin is not an ALab package release"
+            ));
+            out.push(format!("  build {build}; index {}", quad.index.index_build));
+            continue;
+        }
+        let name = agent.map_or(product.as_str(), |a| a.product);
+        let slug = ctx.public_slug(&repo.repo);
+        let tag = upload::tag(&product, build);
+        let work = scratch.path().join(&tag);
+        let manifest = pkgdoc::manifest_name(&product, build);
+        let signature = pkgdoc::sig_name(&product, build);
+        let mut pair = Vec::new();
+        for name in [&manifest, &signature] {
+            let path = work.join(name);
+            match ctx
+                .hosts
+                .channel
+                .fetch_public(&slug, &tag, name, &path, atpkg::net::MANIFEST_CAP)
+            {
+                Probe::Present => {}
+                Probe::Absent => {
+                    return Err(Error::cannot_run(format!(
+                        "status: public metadata {slug}@{tag}/{name} is absent"
+                    )));
+                }
+                Probe::Unknown(why) => {
+                    return Err(Error::cannot_run(format!(
+                        "status: public metadata {slug}@{tag}/{name} could not be read: {why}"
+                    )));
+                }
+            }
+            pair.push(
+                crate::identity::read_regular_bytes(&path, atpkg::net::MANIFEST_CAP)
+                    .map_err(|e| Error::io("read public package metadata", &e))?,
+            );
+        }
+        let pkg = quad.verify_pkg(&pair[0], &pair[1])?;
+        if pkg.program != product || pkg.build_number != build {
+            return Err(Error::refused(format!(
+                "status: {slug}@{tag} signed metadata names {} build {}, expected {product} build {build}",
+                pkg.program, pkg.build_number
+            )));
+        }
+        let release = ctx.hosts.channel.release(&slug, &tag).ok();
+        let observed = release.as_ref().filter(|r| r.tag == tag && !r.draft);
+        let date = observed
+            .and_then(|r| r.published_at.as_deref())
+            .filter(|s| aterm_types::rfc3339::parse_utc(s).is_some())
+            .unwrap_or("UNKNOWN");
+        let version = if pkg.version.is_empty() {
+            "UNKNOWN"
+        } else {
+            &pkg.version
+        };
+        for channel in &quad.index.channels {
+            for artifact in &pkg.artifacts {
+                let view = channel.for_target(&artifact.target);
+                if view.pin.get(&product) != Some(&build) {
+                    continue;
+                }
+                let status = if atpkg::gate::is_yanked(&view, &product, build) {
+                    "YANKED"
+                } else if build < view.min_build_for(&product) {
+                    "BELOW FLOOR"
+                } else if observed.is_some_and(|r| r.assets.contains(&artifact.asset)) {
+                    "Public release metadata; payload not checked"
+                } else {
+                    "Signed metadata public; payload publication UNKNOWN"
+                };
+                out.push(format!(
+                    "{name} | {version} | {date} | {} | {status}",
+                    artifact.target
+                ));
+                out.push(format!(
+                    "  program {product}; channel {}; build {build}; index {}",
+                    channel.name, quad.index.index_build
+                ));
+            }
+        }
+    }
+    Ok(out)
 }

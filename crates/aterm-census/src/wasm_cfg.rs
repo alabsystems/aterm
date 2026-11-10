@@ -250,7 +250,13 @@ pub(crate) fn unloaded_on_wasm32(
     let mut cannot = |file: &Path, line: usize, why: &str| {
         unplaced.get_or_insert_with(|| format!("{}:{} {why}", file.display(), line + 1));
     };
+    // The lines and masking of each file the loop lexes, which the cuts below name their gates by.
+    let mut views: BTreeMap<&Path, (Vec<&str>, Vec<bool>)> = BTreeMap::new();
     for (file, text) in files {
+        // The loop acts only on a line that may load a file: a file with none is not lexed.
+        if !text.lines().any(may_load) {
+            continue;
+        }
         let lines: Vec<&str> = text.lines().collect();
         let keep = crate::lock_order::unmasked_lines(text, &attr_never_on_wasm32);
         let scope_code = crate::lex::blank_non_code(text);
@@ -334,6 +340,7 @@ pub(crate) fn unloaded_on_wasm32(
                 live,
             });
         }
+        views.insert(file, (lines, keep));
     }
     let dir = |f: &Path| f.parent().map_or_else(PathBuf::new, Path::to_path_buf);
     let included: BTreeSet<PathBuf> = decls
@@ -416,8 +423,7 @@ pub(crate) fn unloaded_on_wasm32(
         if d.live || !ts.iter().any(|t| out.contains(t)) || out.contains(d.from) {
             continue;
         }
-        let text = &files[d.from];
-        let lines: Vec<&str> = text.lines().collect();
+        let (lines, keep) = &views[&d.from];
         let own = lines[..d.line]
             .iter()
             .rev()
@@ -425,7 +431,6 @@ pub(crate) fn unloaded_on_wasm32(
             .take_while(|t| t.starts_with("#[") || t.starts_with("//"))
             .find(|t| attr_never_on_wasm32(t));
         let indent = |l: &str| l.len() - l.trim_start().len();
-        let keep = crate::lock_order::unmasked_lines(text, &attr_never_on_wasm32);
         let enclosing = || {
             (0..d.line)
                 .rev()
@@ -447,6 +452,19 @@ pub(crate) fn unloaded_on_wasm32(
         cuts,
         unplaced: None,
     }
+}
+
+/// Whether [`unloaded_on_wasm32`] acts on the source line `raw`: an `include!(` in its code, or a
+/// `mod` that is neither absent nor an inline module's header.
+fn may_load(raw: &str) -> bool {
+    // `code` is a prefix of `raw` with its literals blanked in place, so it spells nothing `raw`
+    // does not.
+    if !crate::mentions(raw, "mod") && !crate::mentions(raw, "include!(") {
+        return false;
+    }
+    let code = crate::lock_order::mask_literals(crate::strip_line_comment(raw));
+    code.contains("include!(")
+        || matches!(mod_line(raw, &code), ModLine::File(_) | ModLine::Unplaced)
 }
 
 /// What a line says about a `mod` declaration.

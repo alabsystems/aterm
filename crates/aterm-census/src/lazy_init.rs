@@ -5,9 +5,10 @@
 //! Lazy-init reentrancy census (OB-19..OB-21, [`BLOCKING_METHODS`]).
 
 use crate::{CensusOutcome, Floor};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[path = "lazy_init_calls.rs"]
 mod calls;
@@ -138,17 +139,20 @@ struct Edge {
 pub fn run_lazy_init_census(root: &Path) -> CensusOutcome {
     let files = scan_files(root);
     let sources = read_sources(root, &files);
-    let scopes: DependencyScopes = sources
+    let dirs: Vec<&str> = sources
         .iter()
         .filter_map(|(file, _)| source_crate(file))
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .filter_map(|dir| {
-            crate::scan_set::member_dependency_aliases(root, dir)
-                .ok()
-                .map(|aliases| (dir.to_owned(), aliases))
-        })
         .collect();
+    let scopes: DependencyScopes = par_map(&dirs, |dir| {
+        crate::scan_set::member_dependency_aliases(root, dir)
+            .ok()
+            .map(|aliases| ((*dir).to_owned(), aliases))
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     let derived = derive_with_scopes(&sources, &scopes);
     report(&root.display().to_string(), sources.len(), &derived)
 }
@@ -332,15 +336,53 @@ const SELF_EXCLUDED_DIR: &str = "crates/aterm-census/src";
 
 /// Read each source once, as written ([`derive_from_sources`]).
 fn read_sources(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for path in files {
-        let Ok(raw) = crate::tree::read_to_string(path) else {
-            continue;
-        };
-        let rel = crate::rel_path(root, path);
-        out.push((rel, raw));
-    }
-    out
+    par_map(files, |path| {
+        crate::tree::read_to_string(path)
+            .ok()
+            .map(|raw| (crate::rel_path(root, path), raw))
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// `f` of every item, in `items`' order. Scoped worker threads beside this one take the
+/// items one at a time, so a few huge files do not leave the other workers idle; each carries
+/// this thread's memo scope ([`crate::memo::threads`]), so what it reads is the census unit's
+/// question.
+fn par_map<'s, T: Sync, R: Send>(items: &'s [T], f: impl Fn(&'s T) -> R + Sync) -> Vec<R> {
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut done = Vec::new();
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            let Some(item) = items.get(at) else {
+                return done;
+            };
+            done.push((at, f(item)));
+        }
+    };
+    let mut done: Vec<(usize, R)> = crate::memo::threads(|scope| {
+        let helpers: Vec<_> = (1..workers.min(items.len()))
+            .filter_map(|_| {
+                scope
+                    .spawn_named("census-lazy-init-worker".to_string(), 8 << 20, work)
+                    .ok()
+            })
+            .collect();
+        let mut done = work();
+        for helper in helpers {
+            done.extend(
+                helper
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        done
+    });
+    done.sort_unstable_by_key(|(at, _)| *at);
+    done.into_iter().map(|(_, mapped)| mapped).collect()
 }
 
 /// The derivation proper, over `(repo-relative path, raw text)` pairs.
@@ -361,54 +403,119 @@ fn owned_fn(dir: &str, name: &str) -> String {
     format!("{dir}::{name}")
 }
 
+/// What one source contributes before any other file is read: everything but the touches,
+/// which need every file's cells.
+struct FileWalk<'a> {
+    rel: &'a str,
+    /// Each line's code, [`crate::strip_line_comment`] of the line.
+    code: Vec<&'a str>,
+    fns: Enclosing,
+    calls: CallScope<'a>,
+    /// fn name (and its crate-owned name) -> the names it calls directly.
+    local: BTreeMap<String, BTreeSet<String>>,
+    /// The `static` cells declared here, in line order, before [`add_cells`] merges them.
+    statics: Vec<Cell>,
+    /// The field cells declared here, in line order, before [`add_cells`] merges them.
+    fields: Vec<Cell>,
+}
+
+impl<'a> FileWalk<'a> {
+    fn of(
+        rel: &'a str,
+        text: &'a str,
+        scopes: &DependencyScopes,
+        exports: &'a BTreeMap<String, BTreeSet<String>>,
+    ) -> Self {
+        let lines: Vec<&str> = text.lines().collect();
+        let fns = enclosing_fns(&lines);
+        let code: Vec<&str> = lines.iter().map(|line| line_code(line)).collect();
+        let calls = CallScope::new(rel, text, &code, scopes, exports);
+        let dir = source_crate(rel);
+        let mut local: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for span in &fns.spans {
+            let mut targets = BTreeSet::new();
+            for line in &code[span.first..=span.last] {
+                calls.line_callees(line, &mut targets);
+            }
+            if let Some(dir) = dir {
+                local
+                    .entry(owned_fn(dir, &span.name))
+                    .or_default()
+                    .extend(targets.iter().cloned());
+            }
+            local.entry(span.name.clone()).or_default().extend(targets);
+        }
+        let statics = static_cells(&code, rel);
+        let fields = field_cells(&code, rel);
+        Self {
+            rel,
+            code,
+            fns,
+            calls,
+            local,
+            statics,
+            fields,
+        }
+    }
+}
+
+/// [`crate::strip_line_comment`] of `line`, which a line holding no `/` cannot change.
+fn line_code(line: &str) -> &str {
+    if line.as_bytes().contains(&b'/') {
+        crate::strip_line_comment(line)
+    } else {
+        line
+    }
+}
+
 fn derive_with_scopes(raw_sources: &[(String, String)], scopes: &DependencyScopes) -> Derived {
-    let sources: Vec<(String, String)> = raw_sources
-        .iter()
-        .map(|(rel, raw)| (rel.clone(), crate::lock_order::mask_cfg_test_items(raw)))
-        .collect();
+    let sources: Vec<(String, String)> = par_map(raw_sources, |(rel, raw)| {
+        (rel.clone(), crate::lock_order::mask_cfg_test_items(raw))
+    });
     let sources = &sources[..];
     let exports = known_free_exports(sources);
+    let mut files: Vec<FileWalk<'_>> = par_map(sources, |(rel, text)| {
+        FileWalk::of(rel, text, scopes, &exports)
+    });
     let mut cells: Vec<Cell> = Vec::new();
     let mut defs: BTreeMap<String, usize> = BTreeMap::new();
     let mut local: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
 
-    for (rel, text) in sources {
-        let calls = CallScope::new(rel, text, scopes, &exports);
-        let lines: Vec<&str> = text.lines().collect();
-        let enclosing = enclosing_fns(&lines);
-        let per_file = local.entry(rel.clone()).or_default();
-        let mut seen_here: BTreeSet<String> = BTreeSet::new();
-        for (i, line) in lines.iter().enumerate() {
-            let Some(owner) = enclosing[i].as_ref() else {
-                continue;
-            };
-            if seen_here.insert(owner.clone()) {
-                *defs.entry(owner.clone()).or_default() += 1;
-                if let Some(dir) = source_crate(rel) {
-                    *defs.entry(owned_fn(dir, owner)).or_default() += 1;
+    for file in &mut files {
+        let dir = source_crate(file.rel);
+        let mut seen_here: BTreeSet<&str> = BTreeSet::new();
+        for span in &file.fns.spans {
+            if seen_here.insert(&span.name) {
+                *defs.entry(span.name.clone()).or_default() += 1;
+                if let Some(dir) = dir {
+                    *defs.entry(owned_fn(dir, &span.name)).or_default() += 1;
                 }
             }
-            let code = crate::strip_line_comment(line).to_string();
-            let targets = calls.callees(std::slice::from_ref(&code));
-            per_file
-                .entry(owner.clone())
-                .or_default()
-                .extend(targets.iter().cloned());
-            if let Some(dir) = source_crate(rel) {
-                per_file
-                    .entry(owned_fn(dir, owner))
-                    .or_default()
-                    .extend(targets);
+        }
+        let fns = std::mem::take(&mut file.local);
+        let per_file = local.entry(file.rel.to_string()).or_default();
+        if per_file.is_empty() {
+            *per_file = fns;
+        } else {
+            for (name, callees) in fns {
+                per_file.entry(name).or_default().extend(callees);
             }
         }
-        collect_cells(text, rel, &mut cells);
+        add_cells(
+            &mut cells,
+            std::mem::take(&mut file.statics),
+            std::mem::take(&mut file.fields),
+        );
     }
 
+    let deref = DerefNames::of(&cells);
     let mut touches: Vec<Touch> = Vec::new();
     let mut inits: Vec<Initializer> = Vec::new();
-    for (rel, text) in sources {
-        let calls = CallScope::new(rel, text, scopes, &exports);
-        collect_touches_and_inits(text, rel, &cells, &mut touches, &mut inits, &calls);
+    for (file_touches, file_inits) in par_map(&files, |file| {
+        collect_touches_and_inits(file, &cells, &deref)
+    }) {
+        touches.extend(file_touches);
+        inits.extend(file_inits);
     }
 
     let mut triggers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -449,22 +556,35 @@ fn derive_with_scopes(raw_sources: &[(String, String)], scopes: &DependencyScope
     }
 }
 
-/// Collect `static [mut] NAME: ...` lazy-cell declarations.
-fn collect_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
-    for (i, line) in text.lines().enumerate() {
-        let code = crate::strip_line_comment(line);
-        let Some(name) = static_name(code) else {
+/// Merge one file's declarations into `out`, its `static`s before its fields. A `static`
+/// seen before folds into the cell already found; a field never replaces any cell.
+fn add_cells(out: &mut Vec<Cell>, statics: Vec<Cell>, fields: Vec<Cell>) {
+    for cell in statics {
+        if let Some(existing) = out.iter_mut().find(|c| c.name == cell.name) {
+            existing.deref_lazy |= cell.deref_lazy;
+            existing.field = false;
+            continue;
+        }
+        out.push(cell);
+    }
+    for cell in fields {
+        if !out.iter().any(|c| c.name == cell.name) {
+            out.push(cell);
+        }
+    }
+}
+
+/// `static [mut] NAME: ...` lazy-cell declarations, over a file's comment-stripped lines.
+fn static_cells(code: &[&str], rel: &str) -> Vec<Cell> {
+    let mut out = Vec::new();
+    for (i, line) in code.iter().enumerate() {
+        let Some(name) = static_name(line) else {
             continue;
         };
-        let decl = declaration_text(text, i);
+        let decl = declaration_text(code, i);
         let deref_lazy = DEREF_LAZY_TYPES.iter().any(|t| decl.contains(t));
         let method_lazy = METHOD_LAZY_TYPES.iter().any(|t| decl.contains(t));
         if !deref_lazy && !method_lazy {
-            continue;
-        }
-        if let Some(existing) = out.iter_mut().find(|c| c.name == name) {
-            existing.deref_lazy |= deref_lazy;
-            existing.field = false;
             continue;
         }
         let kind = DEREF_LAZY_TYPES
@@ -481,23 +601,20 @@ fn collect_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
             field: false,
         });
     }
-    collect_field_cells(text, rel, out);
+    out
 }
 
-/// Collect lazy cells declared as struct fields.
-fn collect_field_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
-    for (i, line) in text.lines().enumerate() {
-        let code = crate::strip_line_comment(line);
-        let Some(name) = field_cell_name(code) else {
+/// Lazy cells declared as struct fields, over a file's comment-stripped lines.
+fn field_cells(code: &[&str], rel: &str) -> Vec<Cell> {
+    let mut out = Vec::new();
+    for (i, line) in code.iter().enumerate() {
+        let Some(name) = field_cell_name(line) else {
             continue;
         };
-        if out.iter().any(|c| c.name == name) {
-            continue;
-        }
         let kind = DEREF_LAZY_TYPES
             .iter()
             .chain(METHOD_LAZY_TYPES.iter())
-            .find(|t| code.contains(**t))
+            .find(|t| line.contains(**t))
             .map_or("lazy", |t| t.trim_end_matches('<'))
             .to_string();
         out.push(Cell {
@@ -508,12 +625,17 @@ fn collect_field_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
             field: true,
         });
     }
+    out
 }
 
 /// `<name>: <LazyType><..>,` as a struct field.
 fn field_cell_name(code: &str) -> Option<String> {
-    let t = code.trim();
-    if !t.ends_with(',') || t.contains('=') {
+    let t = code.trim_end();
+    if !t.ends_with(',') {
+        return None;
+    }
+    let t = t.trim_start();
+    if t.contains('=') {
         return None;
     }
     for kw in ["let ", "static ", "const ", "fn ", "if ", "match ", "for "] {
@@ -564,12 +686,12 @@ fn static_name(code: &str) -> Option<&str> {
     (!rest[..len].is_empty()).then_some(&rest[..len])
 }
 
-/// The `static` declaration starting at `line_idx`, up to and including its terminating `;`.
-fn declaration_text(text: &str, line_idx: usize) -> String {
+/// The `static` declaration starting at `line_idx` of a file's comment-stripped lines, up to
+/// and including its terminating `;`.
+fn declaration_text(code_lines: &[&str], line_idx: usize) -> String {
     let mut out = String::new();
     let mut depth = 0i32;
-    for line in text.lines().skip(line_idx).take(40) {
-        let code = crate::strip_line_comment(line);
+    for code in code_lines.iter().skip(line_idx).take(40) {
         out.push_str(code);
         out.push('\n');
         let mut done = false;
@@ -590,19 +712,19 @@ fn declaration_text(text: &str, line_idx: usize) -> String {
 
 /// Blocking touches and initializers in one file.
 fn collect_touches_and_inits(
-    text: &str,
-    rel: &str,
+    file: &FileWalk<'_>,
     cells: &[Cell],
-    touches: &mut Vec<Touch>,
-    inits: &mut Vec<Initializer>,
-    calls: &CallScope<'_>,
-) {
-    let lines: Vec<&str> = text.lines().collect();
-    let masked: Vec<String> = lines
-        .iter()
-        .map(|l| crate::strip_line_comment(l).to_string())
-        .collect();
-    let enclosing = enclosing_fns(&lines);
+    deref: &DerefNames<'_>,
+) -> (Vec<Touch>, Vec<Initializer>) {
+    let FileWalk {
+        rel,
+        code: masked,
+        fns: enclosing,
+        calls,
+        ..
+    } = file;
+    let mut touches = Vec::new();
+    let mut inits = Vec::new();
     let joined = masked.join("\n");
     let line_starts = line_start_index(&joined);
     let line_of = |at: usize| match line_starts.binary_search(&at) {
@@ -610,9 +732,26 @@ fn collect_touches_and_inits(
         Err(i) => i.saturating_sub(1),
     };
 
-    for method in BLOCKING_METHODS {
+    // Each method's `.<method>` occurrences, in order: every place [`find_method_call`] would
+    // try, since `.` opens the needle and occurs in it nowhere else, so no two overlap.
+    let mut named: [Vec<usize>; BLOCKING_METHODS.len()] = Default::default();
+    for (at, _) in joined.match_indices('.') {
+        let rest = &joined[at + 1..];
+        for (method, found) in BLOCKING_METHODS.iter().zip(&mut named) {
+            if rest.starts_with(method) {
+                found.push(at);
+            }
+        }
+    }
+    for (method, found) in BLOCKING_METHODS.iter().zip(&named) {
         let mut from = 0usize;
-        while let Some((at, open)) = find_method_call(&joined, method, from) {
+        for &at in found {
+            if at < from {
+                continue;
+            }
+            let Some(open) = call_open(&joined, at + 1 + method.len()) else {
+                continue;
+            };
             from = open + 1;
             let Some(recv) = receiver_before(&joined, at) else {
                 continue;
@@ -623,7 +762,7 @@ fn collect_touches_and_inits(
             let ln = line_of(at);
             touches.push(Touch {
                 cell: cell.name.clone(),
-                in_fn: enclosing.get(ln).cloned().flatten(),
+                in_fn: enclosing.at(ln).map(str::to_string),
                 span: format!("{rel}:{}", ln + 1),
                 how: (*method).to_string(),
             });
@@ -638,7 +777,6 @@ fn collect_touches_and_inits(
         }
     }
 
-    let deref = DerefNames::of(cells);
     for (i, code) in masked.iter().enumerate() {
         if !deref.may_mention(code) {
             continue;
@@ -649,7 +787,7 @@ fn collect_touches_and_inits(
                 continue;
             }
             if declares == Some(cell.name.as_str()) {
-                let decl = declaration_text(text, i);
+                let decl = declaration_text(masked, i);
                 for ctor in LAZY_CTORS {
                     let Some(off) = decl
                         .find(ctor)
@@ -674,12 +812,13 @@ fn collect_touches_and_inits(
             }
             touches.push(Touch {
                 cell: cell.name.clone(),
-                in_fn: enclosing[i].clone(),
+                in_fn: enclosing.at(i).map(str::to_string),
                 span: format!("{rel}:{}", i + 1),
                 how: "deref".to_string(),
             });
         }
     }
+    (touches, inits)
 }
 
 /// Byte offset of the start of each line in `joined`.
@@ -696,15 +835,50 @@ fn line_start_index(joined: &str) -> Vec<usize> {
 /// Find the next `.<method>(` after `from`.
 fn find_method_call(hay: &str, method: &str, from: usize) -> Option<(usize, usize)> {
     let needle = format!(".{method}");
-    let bytes = hay.as_bytes();
     let mut cur = from;
     while let Some(rel) = hay[cur..].find(&needle) {
         let at = cur + rel;
         cur = at + needle.len();
-        if bytes.get(cur).copied().is_some_and(is_ident_byte) {
-            continue;
+        if let Some(open) = call_open(hay, cur) {
+            return Some((at, open));
         }
-        let mut p = cur;
+    }
+    None
+}
+
+/// The `(` that calls the method name ending at `after_name`: the name ends there, and only
+/// whitespace and a turbofish stand before the parenthesis.
+fn call_open(hay: &str, after_name: usize) -> Option<usize> {
+    let bytes = hay.as_bytes();
+    if bytes.get(after_name).copied().is_some_and(is_ident_byte) {
+        return None;
+    }
+    let mut p = after_name;
+    while bytes
+        .get(p)
+        .copied()
+        .is_some_and(|b| b.is_ascii_whitespace())
+    {
+        p += 1;
+    }
+    if hay[p..].starts_with("::<") {
+        let mut depth = 0i32;
+        let mut q = p + 2;
+        while q < bytes.len() {
+            match bytes[q] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        q += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            q += 1;
+        }
+        p = q;
         while bytes
             .get(p)
             .copied()
@@ -712,37 +886,8 @@ fn find_method_call(hay: &str, method: &str, from: usize) -> Option<(usize, usiz
         {
             p += 1;
         }
-        if hay[p..].starts_with("::<") {
-            let mut depth = 0i32;
-            let mut q = p + 2;
-            while q < bytes.len() {
-                match bytes[q] {
-                    b'<' => depth += 1,
-                    b'>' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            q += 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                q += 1;
-            }
-            p = q;
-            while bytes
-                .get(p)
-                .copied()
-                .is_some_and(|b| b.is_ascii_whitespace())
-            {
-                p += 1;
-            }
-        }
-        if bytes.get(p) == Some(&b'(') {
-            return Some((at, p));
-        }
     }
-    None
+    (bytes.get(p) == Some(&b'(')).then_some(p)
 }
 
 /// The receiver identifier before the `.` at `at`.
@@ -755,10 +900,65 @@ fn receiver_before(joined: &str, at: usize) -> Option<&str> {
     crate::ident_ending_at(joined, end)
 }
 
+/// Names looked up word by word. A word whose length or first byte no name has is turned
+/// away before it is hashed.
+struct WordSet<'a> {
+    names: HashSet<&'a str>,
+    /// Bit `n` is set when some name is `n` bytes long, for `n` below 64.
+    lengths: u64,
+    /// Some name is 64 bytes long or longer.
+    long: bool,
+    /// Whether some name starts with the byte.
+    first: [bool; 256],
+}
+
+impl<'a> WordSet<'a> {
+    fn new(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut set = Self {
+            names: HashSet::new(),
+            lengths: 0,
+            long: false,
+            first: [false; 256],
+        };
+        for name in names {
+            set.insert(name);
+        }
+        set
+    }
+
+    fn insert(&mut self, name: &'a str) {
+        match u32::try_from(name.len()) {
+            Ok(len) if len < u64::BITS => self.lengths |= 1 << len,
+            _ => self.long = true,
+        }
+        if let Some(&byte) = name.as_bytes().first() {
+            self.first[usize::from(byte)] = true;
+        }
+        self.names.insert(name);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn contains(&self, word: &str) -> bool {
+        let sized = match u32::try_from(word.len()) {
+            Ok(len) if len < u64::BITS => self.lengths & (1 << len) != 0,
+            _ => self.long,
+        };
+        sized
+            && word
+                .as_bytes()
+                .first()
+                .is_none_or(|&byte| self.first[usize::from(byte)])
+            && self.names.contains(word)
+    }
+}
+
 /// The deref-lazy cells' names, read once per line instead of once per cell per line.
 struct DerefNames<'a> {
     /// Pure `[A-Za-z0-9_]` names matched by [`mentions_ident`].
-    words: std::collections::HashSet<&'a str>,
+    words: WordSet<'a>,
     /// Any other name, which only [`mentions_ident`] itself can judge.
     other: Vec<&'a str>,
 }
@@ -766,7 +966,7 @@ struct DerefNames<'a> {
 impl<'a> DerefNames<'a> {
     fn of(cells: &'a [Cell]) -> Self {
         let mut names = Self {
-            words: std::collections::HashSet::new(),
+            words: WordSet::new([]),
             other: Vec::new(),
         };
         for name in cells.iter().filter(|c| c.deref_lazy).map(|c| &*c.name) {
@@ -781,9 +981,30 @@ impl<'a> DerefNames<'a> {
 
     /// Whether `code` can mention any deref-lazy cell ([`mentions_ident`]).
     fn may_mention(&self, code: &str) -> bool {
-        code.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .any(|w| self.words.contains(w))
-            || self.other.iter().any(|n| mentions_ident(code, n))
+        self.has_word(code) || self.other.iter().any(|n| mentions_ident(code, n))
+    }
+
+    /// Whether a piece of `code` split at every char outside `[A-Za-z0-9_]` is a word name.
+    /// Bytes of one non-ASCII char separate no pieces between them.
+    fn has_word(&self, code: &str) -> bool {
+        let bytes = code.as_bytes();
+        let mut start = 0;
+        let mut at = 0;
+        while at < bytes.len() {
+            if is_ident_byte(bytes[at]) {
+                at += 1;
+                continue;
+            }
+            if self.words.contains(&code[start..at]) {
+                return true;
+            }
+            at += 1;
+            while bytes.get(at).is_some_and(|byte| byte & 0xC0 == 0x80) {
+                at += 1;
+            }
+            start = at;
+        }
+        self.words.contains(&code[start..])
     }
 }
 
@@ -808,9 +1029,33 @@ const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// For every line, the fn whose body it sits in.
-fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
-    let mut out = vec![None; lines.len()];
+/// The fns whose bodies a file's lines sit in, as [`enclosing_fns`] finds them.
+struct Enclosing {
+    /// Disjoint spans in line order.
+    spans: Vec<FnSpan>,
+}
+
+/// One fn's name and the first and last line it covers.
+struct FnSpan {
+    name: String,
+    first: usize,
+    last: usize,
+}
+
+impl Enclosing {
+    /// The fn whose body `line` sits in.
+    fn at(&self, line: usize) -> Option<&str> {
+        let next = self.spans.partition_point(|span| span.last < line);
+        self.spans
+            .get(next)
+            .filter(|span| span.first <= line)
+            .map(|span| span.name.as_str())
+    }
+}
+
+/// The fn bodies of a file's lines: every line of a span sits in that fn's body.
+fn enclosing_fns(lines: &[&str]) -> Enclosing {
+    let mut spans = Vec::new();
     let mut i = 0usize;
     while i < lines.len() {
         let Some((indent, name)) = crate::parse_fn_def(lines[i]) else {
@@ -835,12 +1080,14 @@ fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
                 j += 1;
             }
         }
-        for slot in out.iter_mut().take(end + 1).skip(i) {
-            *slot = Some(name.clone());
-        }
+        spans.push(FnSpan {
+            name,
+            first: i,
+            last: end,
+        });
         i = end + 1;
     }
-    out
+    Enclosing { spans }
 }
 
 /// The text between the `(` at byte offset `at` and its matching `)`.

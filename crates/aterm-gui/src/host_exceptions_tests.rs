@@ -5653,6 +5653,101 @@ fn a_failed_workers_fact_ends_with_its_tab() {
     assert_eq!(entries[0].key, mr::worker_failed_key(&tab));
 }
 
+/// A CREDIT-CLAIM WORKER'S `claim-started` FACT WITHDRAWS WHEN ITS TAB IS GONE (without claiming
+/// `fixed`), whether its tab is named by `ShowSession` or by an adopted `@s-...` token in its
+/// words.
+/// NEGATIVE CONTROL: the `claim-started` fact of a tab still shown stands.
+#[test]
+fn a_claim_started_workers_fact_withdraws_with_its_tab() {
+    use aterm_agent::harness::credit_offers::{Offer, OfferId, OfferKey};
+    use aterm_messages::need::{Reason, Resurface, Then, Why};
+
+    let offer = |id: OfferId, hex: &str, url: &str| Offer {
+        id,
+        words: id.name().to_string(),
+        url: url.to_string(),
+        key: OfferKey::parse(&hex.repeat(16)).expect("offer key"),
+    };
+    let mut app = App::headless_for_test();
+    let tab = front_tab_sid(&mut app);
+    let open_spot = app.upgrade_spot(&tab);
+    assert!(
+        matches!(
+            open_spot.nav,
+            Some(aterm_messages::Intent::ShowSession { .. })
+        ),
+        "{open_spot:?}"
+    );
+    let closed_spot = mr::UpgradeSpot {
+        place: "in Workers \u{25b8} claim API credits".to_string(),
+        nav: Some(aterm_messages::Intent::ShowSession {
+            tab: 2,
+            window: 0,
+            session: CLOSED_SID.to_string(),
+        }),
+    };
+    app.except(&mr::credit_claim_started_entry(
+        &offer(OfferId::CloudCredit, "aa", "https://claude.ai/claim-credit"),
+        &tab,
+        &open_spot,
+    ));
+    app.except(&mr::credit_claim_started_entry(
+        &offer(OfferId::ApiCredits, "bb", "https://clau.de/api-credits"),
+        CLOSED_SID,
+        &closed_spot,
+    ));
+    assert_eq!(app.messages.digest().entries.len(), 2);
+
+    app.end_relaunch_lines_of_closed_tabs();
+    let entries = app.messages.digest().entries;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        entries[0].key,
+        "harness.accounts.cloud-credit.claim-started"
+    );
+    let report = aterm_messages::exceptions_report(
+        app.messages.log(),
+        aterm_messages::ReportScope::Filed,
+        0,
+        0,
+    );
+    assert!(
+        report.iter().any(|l| l.contains("\u{b7} withdrawn")),
+        "{report:#?}"
+    );
+    assert!(
+        !report.iter().any(|l| l.contains("\u{b7} fixed")),
+        "{report:#?}"
+    );
+
+    let legacy = Entry::new(
+        Family::Accounts,
+        OfferId::ApiCredits.word(),
+        "claim-started",
+        "Claiming a free Claude credit",
+        Why::Spent {
+            tried: Reason::new(format!(
+                "started a worker in tab @{CLOSED_SID} to claim it in your own Chrome"
+            )),
+            reason: Reason::new("Claude Code's cached offer says this account can claim it"),
+        },
+        Then::step(format!(
+            "Read tab @{CLOSED_SID} for the worker's last reply"
+        )),
+    )
+    .resurface(Resurface::WAIT);
+    app.except(&legacy);
+    assert_eq!(app.messages.digest().entries.len(), 2);
+
+    app.end_relaunch_lines_of_closed_tabs();
+    let entries = app.messages.digest().entries;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        entries[0].key,
+        "harness.accounts.cloud-credit.claim-started"
+    );
+}
+
 /// This Mac's clock lines follow what the host says (docs/DESIGN-fluid-swarm-2026-10-28.md F22):
 /// an Off clock raises the clock-off line alone, a Split one the clock-split line alone (the Off
 /// line ended), Off again ends the Split line, and a clock that agrees ends both; neither marks

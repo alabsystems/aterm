@@ -91,7 +91,13 @@ fn seeded() -> aterm_tempfile::TempDir {
     let store = accounts::Store::at(dir.path());
     let (mut state, _) = store.load(NOW).expect("an empty store loads");
     let at = NOW - 600;
-    let _ = accounts::note_reading_held(&mut state, "me", &tap(580, NOW + 3 * D, at, true), at);
+    let _ = accounts::note_reading_held(
+        &mut state,
+        "me",
+        &tap(580, NOW + 3 * D, at, true),
+        at,
+        accounts::ReadingOwner::Unobserved,
+    );
     store.save(&state).expect("save");
     set_dir(Some(dir.path()));
     dir
@@ -106,12 +112,19 @@ fn seeded_stop() -> aterm_tempfile::TempDir {
     let (mut state, _) = store.load(NOW).expect("an empty store loads");
     state.active = Some("me".into());
     let week = NOW + 3 * D;
-    let _ = accounts::note_reading_held(&mut state, "me", &tap(580, week, NOW - 600, true), NOW);
+    let _ = accounts::note_reading_held(
+        &mut state,
+        "me",
+        &tap(580, week, NOW - 600, true),
+        NOW,
+        accounts::ReadingOwner::Unobserved,
+    );
     let _ = accounts::note_reading_held(
         &mut state,
         "alt1",
         &tap(960, NOW + 5 * D, NOW - 3 * H, false),
         NOW,
+        accounts::ReadingOwner::Unobserved,
     );
     store.save(&state).expect("save");
     for (hours, pct_x10) in [(24, 420), (16, 470), (8, 520), (0, 580)] {
@@ -269,7 +282,13 @@ fn a_first_reading_is_drawn_at_the_stores_next_move() {
         if s == 5 {
             let (mut state, _) = store.load(NOW + s).expect("load");
             let read = tap(580, NOW + 3 * D, NOW + s, true);
-            let _ = accounts::note_reading_held(&mut state, "me", &read, NOW + s);
+            let _ = accounts::note_reading_held(
+                &mut state,
+                "me",
+                &read,
+                NOW + s,
+                accounts::ReadingOwner::Unobserved,
+            );
             store.save(&state).expect("save");
         }
         if s == 20 {
@@ -638,7 +657,13 @@ fn a_walled_accounts_hover_says_out_once() {
     let (mut state, _) = store.load(NOW).expect("an empty store loads");
     let week = NOW + 3 * D;
     let at = NOW - 600;
-    let _ = accounts::note_reading_held(&mut state, "me", &tap(970, week, at, false), at);
+    let _ = accounts::note_reading_held(
+        &mut state,
+        "me",
+        &tap(970, week, at, false),
+        at,
+        accounts::ReadingOwner::Unobserved,
+    );
     let _ = accounts::note_wall(&mut state, "me", accounts::WEEK_LIMIT, Some(week), NOW, NOW);
     store.save(&state).expect("save");
     set_dir(Some(dir.path()));
@@ -658,9 +683,9 @@ fn a_walled_accounts_hover_says_out_once() {
         }
         let (title, _) = crate::claude_facts::fact_title(&facts, None, Fact::Account);
         assert!(
-            title.starts_with("me \u{b7} ")
+            title.starts_with("me@example.test \u{b7} ")
                 && title.matches("out now").count() == 1
-                && title.contains("the work moves to alt1 at the turn's end")
+                && title.contains("the work moves to alt1@example.test at the turn's end")
                 && !title.contains("97%")
                 && title.ends_with("click: accounts"),
             "{own:?}: {title}"
@@ -1481,7 +1506,8 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
     for words in [&title, &spoken] {
         assert_eq!(box_drawing(words), None, "{words:?}");
     }
-    assert!(title.starts_with("me \u{b7} "), "{title:?}");
+    // Named by its email (§2.5): the label is the row's key alone.
+    assert!(title.starts_with("me@example.test \u{b7} "), "{title:?}");
     drop(dir);
     set_dir(None);
 }
@@ -1545,9 +1571,13 @@ fn seeded_card(
 }
 
 /// A lane row's account: its caption names its week (`alt1's week, …`).
+/// The roster label of the account whose lane `row` is: a lane is said by its account's email
+/// (§2.5), each of these rosters' `<label>@example.test`.
 fn lane_label(row: &MenuRow) -> Option<&str> {
     match row {
-        MenuRow::Plot { spoken, .. } => spoken.split_once("'s week, ").map(|(label, _)| label),
+        MenuRow::Plot { spoken, .. } => spoken
+            .split_once("'s week, ")
+            .map(|(name, _)| name.split_once('@').map_or(name, |(label, _)| label)),
         _ => None,
     }
 }
@@ -1605,7 +1635,8 @@ fn an_item_and_its_lane_are_one_unit_and_the_legend_closes_the_card() {
     let (dir, outlook, accounts) = seeded_card(&pool_roster());
     let listed: Vec<_> = accounts
         .iter()
-        .filter(|a| a.label.split_whitespace().next() != Some("alt1"))
+        // A store row is named by its email (§2.5), each of these `<label>@example.test`.
+        .filter(|a| a.label.split(['@', ' ']).next() != Some("alt1"))
         .cloned()
         .collect();
     let rows = card_menu(&outlook, &listed, None, true);

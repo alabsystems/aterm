@@ -14,6 +14,8 @@ mod models_native_historical_closure;
 mod models_native_observation_continuity;
 mod models_native_unadmitted_prepare;
 mod models_occupancy;
+mod models_recipient_closure;
+mod models_recipient_journal;
 mod models_self_claim_fact;
 mod models_sources;
 mod models_usage_wall;

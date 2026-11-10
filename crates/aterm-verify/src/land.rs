@@ -1200,7 +1200,18 @@ fn live_judge(root: &Path, base: &str, admit: aterm_capacity::Admit) -> Judged {
         Err(e) => return not_run(format!("cannot make a scratch directory: {e}")),
     };
     let events = dir.path().join("verify.events");
-    let mut cmd = judgment_command(&tools.targo, root, base, &events, admit);
+    // This is the native driver, bypassing atpkg's shim. Place its bootstrap too:
+    // main_targo only places children after the nested verifier has already compiled.
+    let build_dir = crate::main_build_dir(&env, root)
+        .or_else(|| crate::fallback_build_dir(&env, root, &crate::physical_target(&env, root)));
+    let mut cmd = judgment_command(
+        &tools.targo,
+        root,
+        base,
+        &events,
+        admit,
+        build_dir.as_deref(),
+    );
     let code = match cmd.status() {
         Ok(status) => status.code().unwrap_or(exit::COULD_NOT_RUN),
         Err(e) => return not_run(format!("{} did not start: {e}", tools.targo.display())),
@@ -1215,8 +1226,12 @@ fn judgment_command(
     base: &str,
     events: &Path,
     admit: aterm_capacity::Admit,
+    build_dir: Option<&str>,
 ) -> Command {
     let mut cmd = aterm_uds::spawnfd::command(targo);
+    if let Some(value) = build_dir {
+        cmd.args(["--config", value]);
+    }
     cmd.current_dir(root)
         .args(["--unverified", "verify", "--base", base, "--events"])
         .arg(events)

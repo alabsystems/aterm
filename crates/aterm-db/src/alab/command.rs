@@ -601,6 +601,12 @@ pub fn run_io(
                 &view.project(&registry::ADDRESS),
                 &view.project(&registry::MAILBOX),
             ));
+            lab.extend(checks::account_obs(
+                view.owned
+                    .get(registry::ACCOUNT_OBS.name)
+                    .unwrap_or(&Default::default()),
+                &view.project(&registry::ACCOUNT),
+            ));
             let registration = match vendors.and_then(|vendors| vendors.this_mac()) {
                 None => Value::Null,
                 Some(mac) => {

@@ -46,7 +46,8 @@ pub fn aterm_beside(atpkg: &Path) -> Option<std::path::PathBuf> {
 /// launch's arguments, its stdin `/dev/null` and its stderr dropped; where that printed a value,
 /// the launch runs with `--settings <value>` ahead of its own arguments, and where it printed
 /// nothing, failed or is not there, the launch runs as typed. It sits after the `--yolo` block,
-/// which reads `--settings` as a posture of the person's own.
+/// which reads `--settings` as a posture of the person's own, and ends with the renderer block
+/// ([`RENDERER_BLOCK`]).
 #[must_use]
 pub fn sh_prelude(program: &str, atpkg: Option<&Path>) -> String {
     if cfg!(windows) || !of(program) {
@@ -72,8 +73,29 @@ pub fn sh_prelude(program: &str, atpkg: Option<&Path>) -> String {
         "  if [ -n \"$__atpkg_tap\" ]; then set -- --settings \"$__atpkg_tap\" \"$@\"; fi\n",
     );
     s.push_str("fi\n");
+    s.push_str(RENDERER_BLOCK);
     s
 }
+
+/// THE RENDERER BLOCK, the last part of [`sh_prelude`]: inside an aterm tab with the harness on
+/// for this launch, a Claude Code launch that names no renderer runs fullscreen
+/// (`CLAUDE_CODE_NO_FLICKER=1`, which starts it ahead of every settings file). Claude Code
+/// otherwise picks its renderer from a server flag it caches only after a start, so the first launch on a new Claude home drew its classic renderer
+/// inline under the last command's output (no clear, no blank top row) and every later one
+/// drew fullscreen (measured on 2.1.321, 2026-11-09). A launch names a renderer, and the block
+/// leaves it alone, by setting `CLAUDE_CODE_NO_FLICKER` or
+/// `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` in its environment (to any value, empty included) or by a `"tui":` key in the person's own
+/// `settings.json` under `$CLAUDE_CONFIG_DIR`, else `$HOME/.claude` (where `/tui` saves the
+/// choice, and its relaunch drops the variable); a `tui` only a project's or a managed settings
+/// file holds is overridden in a tab.
+const RENDERER_BLOCK: &str = "# atpkg: Claude Code's renderer — inside an aterm tab, a launch \
+     that names none (CLAUDE_CODE_NO_FLICKER and CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN unset, no \
+     \"tui\" in your settings.json) runs fullscreen from its first start (aterm help pkg).\n\
+     if [ -n \"${ATERM_PARENT_SESSION_ID-}\" ] && [ -z \"${ATERM_NO_HARNESS-}\" ] \
+     && [ -z \"${CLAUDE_CODE_NO_FLICKER+x}\" ] && [ -z \"${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN+x}\" ] \
+     && ! grep -qs '\"tui\"[[:space:]]*:' \"${CLAUDE_CONFIG_DIR:-${HOME-}/.claude}/settings.json\"; then\n  \
+     CLAUDE_CODE_NO_FLICKER=1; export CLAUDE_CODE_NO_FLICKER\n\
+     fi\n";
 
 /// What the token block asks of the aterm it names, between it and the build: aterm's token
 /// wrapper for a launch a person typed (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.4).

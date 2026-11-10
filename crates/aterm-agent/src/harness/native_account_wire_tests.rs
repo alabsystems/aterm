@@ -55,6 +55,7 @@ fn fixture() -> Predecessor {
         settles: None,
     };
     let prepare = Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),

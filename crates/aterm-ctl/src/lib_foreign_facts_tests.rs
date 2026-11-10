@@ -405,9 +405,7 @@ fn a_foreign_hint_points_at_sys_left_for_exactly_the_adopted_writers() {
 #[test]
 fn a_process_whose_launcher_exited_reads_as_adopted_through_both_readers() {
     use crate::census::{Kernel as _, LiveKernel};
-    use aterm_uds::process::{
-        END_GRACE, EndControlLive, end_proven, read_identity, read_lineage, read_process_path,
-    };
+    use aterm_uds::process::{END_GRACE, EndControlLive, end_proven, read_identity, read_lineage};
     use std::io::BufRead as _;
     let mut launcher = aterm_uds::spawnfd::command("/bin/sh")
         .args([
@@ -424,14 +422,7 @@ fn a_process_whose_launcher_exited_reads_as_adopted_through_both_readers() {
         .expect("the launcher prints its child's pid");
     let pid: u32 = line.trim().parse().expect("a pid");
     let p = i32::try_from(pid).expect("a pid");
-    let started = std::time::Instant::now();
-    while read_process_path(p).as_deref() != Some(std::path::Path::new("/bin/sleep")) {
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "pid {pid} never ran /bin/sleep"
-        );
-        aterm_uds::deadline::poll_yield();
-    }
+    aterm_uds::deadline::execd(p, std::path::Path::new("/bin/sleep"));
     let shell = read_identity(i32::try_from(launcher.id()).expect("a pid"))
         .expect("the launcher reads while it waits on its stdin");
     let sleep = read_lineage(p).expect("the sleep reads");

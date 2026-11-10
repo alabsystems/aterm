@@ -403,6 +403,9 @@ fn probe_hover_cell(
     if !cell_is_under_pointer {
         return (None, false, None);
     }
+    if !mod_held && !t.grid().visible_row_may_have_hyperlinks(row) {
+        return (None, false, None);
+    }
     let col = pointer_cell(t, row, col).0;
     let link = t.hyperlink_at_visible(row, col);
     if link.is_some() || !mod_held {
@@ -410,12 +413,15 @@ fn probe_hover_cell(
     }
     let cells = t.render_row(usize::from(row));
     match plain_url_at(&cells, usize::from(col), min_contrast) {
-        Some(plain) => (plain.faint.then(|| plain.url.into()), true, None),
+        Some(plain) => (
+            plain.faint.then(|| plain.to_url_string().into()),
+            true,
+            None,
+        ),
         None => (
             None,
             false,
-            crate::plain_path_at(&cells, usize::from(col), min_contrast)
-                .map(|span| CitationProbe::new(t, span)),
+            crate::plain_path_at(&cells, usize::from(col)).map(|span| CitationProbe::new(t, span)),
         ),
     }
 }
@@ -4835,7 +4841,7 @@ impl App {
             .or_else(|| {
                 let cells = term.render_row(row as usize);
                 plain_url_at(&cells, col as usize, self.render_knobs.minimum_contrast)
-                    .map(|plain| (plain.url, false))
+                    .map(|plain| (plain.to_url_string(), false))
             })
     }
 
@@ -4881,8 +4887,7 @@ impl App {
             let term = term_lock(&front.term);
             let col = pointer_cell(&term, row, col).0;
             let cells = term.render_row(row as usize);
-            crate::plain_path_at(&cells, col as usize, self.render_knobs.minimum_contrast)
-                .map(|span| CitationProbe::new(&term, span))
+            crate::plain_path_at(&cells, col as usize).map(|span| CitationProbe::new(&term, span))
         }?;
         self.resolve_citation(session, probe).flatten()
     }
@@ -5864,11 +5869,8 @@ impl App {
                 return None;
             }
             // Every button on the glass is the glass's (the harness label's included, which
-            // opens nothing); only the lockup's mark passes its presses to the pane.
-            if self
-                .claude_glass_at(wid, px, py)
-                .is_some_and(|(_, at)| !matches!(at, crate::claude_lights::GlassAt::Mark))
-            {
+            // opens nothing); the lockup is not glass a pointer hits, so its presses are the pane's.
+            if self.claude_glass_at(wid, px, py).is_some() {
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
                     self.settle_rename_edit(wid);

@@ -33,7 +33,7 @@ fn a_set_stop_wakes_every_sleeper_and_stays_set() {
         crate::deadline::poll_yield();
     }
     assert!(!stop.is_set());
-    stop.set();
+    assert!(stop.set(), "the first set is the one that set it");
     for sleeper in sleepers {
         let (woken, slept) = sleeper.join().unwrap();
         assert!(
@@ -42,8 +42,8 @@ fn a_set_stop_wakes_every_sleeper_and_stays_set() {
         );
     }
     assert!(stop.is_set());
-    stop.set();
-    assert!(stop.is_set(), "a second set changes nothing");
+    assert!(!stop.set(), "a second set changes nothing");
+    assert!(stop.is_set());
     let from = std::time::Instant::now();
     assert!(stop.sleep(2 * HANG));
     assert!(
@@ -58,6 +58,55 @@ fn an_unset_stop_sleeps_its_time_out() {
     assert!(!stop.sleep(Duration::from_millis(10)));
     assert!(!stop.sleep(Duration::ZERO));
     assert!(!stop.is_set());
+}
+
+/// A stop's bell polls ready once the stop is set and stays so: a thread in `poll(2)` on it wakes
+/// when another thread sets the stop (one never rung reads no readiness at the hang detector's
+/// minute), the bell is one pipe however often it is asked for, and a bell first asked for after
+/// its stop was set is rung already. NEGATIVE CONTROL: the unset stop's bell, which a poll that
+/// does not wait finds quiet.
+#[cfg(unix)]
+#[test]
+fn a_stops_bell_rings_when_it_is_set_and_stays_rung() {
+    use crate::ready::{Interest, Watch, any_interests_now, until};
+    use std::os::fd::AsRawFd as _;
+
+    let rung = |stop: &Stop| {
+        any_interests_now(&[Watch::new(stop.bell().unwrap(), Interest::Read)])
+            .unwrap()
+            .len()
+            == 1
+    };
+    let stop = Arc::new(Stop::new());
+    assert!(!rung(&stop), "an unset stop's bell is quiet");
+    assert_eq!(
+        stop.bell().unwrap().as_raw_fd(),
+        stop.bell().unwrap().as_raw_fd(),
+        "a stop has one bell"
+    );
+    let poller = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            until(
+                stop.bell().unwrap(),
+                Interest::Read,
+                std::time::Instant::now() + HANG,
+            )
+        })
+    };
+    assert!(stop.set());
+    poller
+        .join()
+        .unwrap()
+        .expect("the bell rang for the thread polling it");
+    assert!(rung(&stop), "and stays rung");
+
+    let late = Stop::new();
+    assert!(late.set());
+    assert!(
+        rung(&late),
+        "a bell first asked for after its stop was set is rung already"
+    );
 }
 
 /// A thread asleep on a stop waits in one condition-variable wait, where a thread that reads a
@@ -162,7 +211,7 @@ fn a_sleeper_waits_in_one_condvar_wait_not_between_timer_sleeps() {
     // waiting, however often that happens; spurious wakeups have the same effect.
     for _ in 0..3 {
         let before = {
-            let _guard = stop.set.lock().unwrap();
+            let _guard = stop.latch.lock().unwrap();
             let before = stop.wakes();
             stop.rung.notify_all();
             before

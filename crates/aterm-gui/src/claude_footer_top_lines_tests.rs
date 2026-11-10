@@ -6,16 +6,8 @@
 use super::probe::*;
 use super::*;
 use crate::autopilot::{HarnessSwitch, SwitchOff};
-use aterm_effects::harness_card::CardPalette;
 
 const PGID: i32 = 4343;
-
-const LIT: SwitchPaint =
-    SwitchPaint::bare(HarnessSwitch::On, Some(aterm_phase::CliHarness::ClaudeCode));
-const OFF: SwitchPaint = SwitchPaint::bare(
-    HarnessSwitch::Off(SwitchOff::Master),
-    Some(aterm_phase::CliHarness::ClaudeCode),
-);
 
 const SLAB: [u8; 3] = [45, 47, 51];
 
@@ -167,233 +159,6 @@ fn switch_of(app: &App, wid: WindowId, session: u64) -> Option<crate::claude_lig
         .cloned()
 }
 
-fn plain_run(len: usize) -> TopRun {
-    TopRun {
-        col: 2,
-        len,
-        rule: RenderCell {
-            ch: '\u{2500}',
-            fg: [90, 90, 90],
-            ..RenderCell::default()
-        },
-        voice: None,
-        tail: None,
-        end: 2 + len,
-    }
-}
-
-fn lockup_key(
-    (program, build): (aterm_phase::Program, Build),
-    run: TopRun,
-    switch: Option<SwitchPaint>,
-    palette: Option<CardPalette>,
-    hover: bool,
-) -> TopKey {
-    TopKey {
-        frame_row: 30,
-        term_row: 20,
-        run,
-        program,
-        build,
-        switch,
-        palette,
-        blank: RenderCell {
-            ch: ' ',
-            fg: [220, 220, 220],
-            ..RenderCell::default()
-        },
-        field: PaneField {
-            col_off: 0,
-            cols: 240,
-        },
-        face: KeyFace::default(),
-        cell: (7, 14),
-        clip: aterm_core::render::PxRect::EVERYWHERE,
-        mark_hover: hover,
-        title_gen: u64::from(hover),
-    }
-}
-
-fn cell_at(top: &ComposedTop, run: TopRun, c: usize) -> RenderCell {
-    c.checked_sub(top.col)
-        .and_then(|k| top.cells.get(k))
-        .copied()
-        .unwrap_or(run.rule)
-}
-
-fn keeps_the_layout(rest: &ComposedTop, hovered: &ComposedTop, run: TopRun) -> Result<(), String> {
-    if rest.switch != hovered.switch {
-        return Err("the switch moved".into());
-    }
-    for c in run.col..run.col + run.len {
-        if !hovered.lockup.contains(&c) && cell_at(rest, run, c) != cell_at(hovered, run, c) {
-            return Err(format!("column {c} changed outside the lockup"));
-        }
-    }
-    let limit = hovered
-        .switch
-        .as_ref()
-        .map_or(run.col + run.len, |s| s.cols.start);
-    if hovered.lockup != rest.lockup {
-        let lead = hovered.lockup.end..limit;
-        if lead.len() < TITLE_LEAD
-            || lead
-                .clone()
-                .any(|c| cell_at(hovered, run, c).ch != '\u{2500}')
-        {
-            return Err(format!(
-                "{} `\u{2500}` before the switch",
-                lead.filter(|&c| cell_at(hovered, run, c).ch == '\u{2500}')
-                    .count()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn title_of(top: &ComposedTop, run: TopRun) -> String {
-    let at = top.lockup.start + aterm_effects::cli_marks::ICON_RUN;
-    (at..top.lockup.end.saturating_sub(1))
-        .map(|c| cell_at(top, run, c).ch)
-        .collect()
-}
-
-#[test]
-fn the_hover_title_never_moves_the_switch() {
-    use aterm_phase::Program;
-    let titles: [((Program, Build), &str, [&str; 3]); 2] = [
-        (
-            (Program::Agy, Build::Vendor),
-            "1.4.0",
-            ["agy", "Antigravity CLI", "Antigravity CLI 1.4.0"],
-        ),
-        (
-            (Program::Claude, Build::Vendor),
-            "2.1.305",
-            ["claude", "Claude Code", "Claude Code 2.1.305"],
-        ),
-    ];
-    let mut caught = 0;
-    let mut cut = 0;
-    for (lockup, version, ranks) in titles {
-        let (program, build) = lockup;
-        let mark = cli_mark(program).expect("a mark");
-        let rank = |title: &str| {
-            ranks
-                .iter()
-                .position(|r| !r.is_empty() && *r == title)
-                .unwrap_or_else(|| panic!("{lockup:?}: not a title: {title:?}"))
-        };
-        let mut seen = [0usize; 3];
-        for (switch, palette) in [
-            (Some(LIT), Some(CardPalette::Cruise)),
-            (Some(LIT), Some(CardPalette::Off)),
-            (Some(OFF), None),
-            (Some(LIT), None),
-            (None, None),
-        ] {
-            let (mut last, mut rung) = (2, None);
-            for len in (8..=80).rev() {
-                let run = plain_run(len);
-                let at = format!("{lockup:?} {len}, {switch:?} {palette:?}");
-                let (mut rest, mut hovered) = (ComposedTop::default(), ComposedTop::default());
-                compose_top(
-                    &lockup_key(lockup, run, switch, palette, false),
-                    &mut rest,
-                    Some(version),
-                    None,
-                    &[],
-                );
-                compose_top(
-                    &lockup_key(lockup, run, switch, palette, true),
-                    &mut hovered,
-                    Some(version),
-                    None,
-                    &[],
-                );
-                keeps_the_layout(&rest, &hovered, run).unwrap_or_else(|e| panic!("{at}: {e}"));
-                let full = rest.lockup.len() == mark.lockup_cells(build);
-                if !full {
-                    assert_eq!(rest.cells, hovered.cells, "{at}: no name, no title");
-                    continue;
-                }
-                assert_eq!(
-                    title_of(&rest, run),
-                    mark.name(build),
-                    "{at}: at rest, the name"
-                );
-                // A rung is whether the switch stands and the label's tier: a narrower label
-                // leaves the title more room.
-                let tier = rest
-                    .switch
-                    .as_ref()
-                    .map(|s| s.label.as_ref().map(|(_, t)| *t));
-                if rung != Some(tier) {
-                    (last, rung) = (2, Some(tier));
-                }
-                let title = title_of(&hovered, run);
-                let r = rank(&title);
-                assert!(r <= last, "{at}: {title:?} after a narrower title");
-                last = r;
-                seen[r] += 1;
-                let mut loose = ComposedTop::default();
-                compose_top_in(
-                    &lockup_key(lockup, run, switch, palette, true),
-                    &mut loose,
-                    Some(version),
-                    None,
-                    &[],
-                    0,
-                );
-                if keeps_the_layout(&rest, &loose, run).is_err() {
-                    caught += 1;
-                }
-                {
-                    let name = mark.name(build);
-                    let short: String = name
-                        .chars()
-                        .take(name.chars().count().saturating_sub(1))
-                        .collect();
-                    assert!(short.len() < mark.name(build).len(), "{at}");
-                    let mut narrow = ComposedTop {
-                        cells: rest.cells.clone(),
-                        col: rest.col,
-                        switch: rest.switch.clone(),
-                        lockup: rest.lockup.clone(),
-                        ..ComposedTop::default()
-                    };
-                    let name_at = narrow.lockup.start + aterm_effects::cli_marks::ICON_RUN;
-                    let pad = narrow.cells[narrow.lockup.start - narrow.col];
-                    for c in name_at..narrow.lockup.end {
-                        narrow.cells[c - narrow.col] = pad;
-                    }
-                    for (k, ch) in short.chars().enumerate() {
-                        narrow.cells[name_at + k - narrow.col].ch = ch;
-                    }
-                    narrow.lockup.end = name_at + short.len() + 1;
-                    assert!(
-                        keeps_the_layout(&rest, &narrow, run).is_err(),
-                        "CONTROL {at}: a title narrower than the name is caught"
-                    );
-                    cut += 1;
-                }
-            }
-        }
-        let want = ranks.iter().filter(|r| !r.is_empty()).count();
-        assert_eq!(
-            seen.iter().filter(|&&n| n > 0).count(),
-            want,
-            "{lockup:?}: every title is seen: {seen:?}"
-        );
-    }
-    assert!(
-        caught > 0,
-        "CONTROL: a title in the switch's lead is caught"
-    );
-    assert!(cut > 0, "CONTROL: a narrower title is caught");
-    hover_title_on_the_glass();
-}
-
 fn cell_px(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
     let (cw, ch) = app.win_cell_size(wid);
     let (ox, oy) = app.frame_origin(wid);
@@ -405,98 +170,6 @@ fn cell_px(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
         "the pixel names the cell"
     );
     (x, y)
-}
-
-fn hover_title_on_the_glass() {
-    let (mut app, wid, session) = probe_glass();
-    {
-        let entry = app.pool.get(session).expect("session");
-        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-        timeline.set_agent_reader_for_test(true);
-    }
-    let _host = held(&mut app, session);
-    for _ in 0..2 {
-        refill(&mut app, wid);
-        let _ = pass(&mut app, wid);
-    }
-    let top = AT_REST.bottom() - 2;
-    let resting = glass_chars(&app, wid, top);
-    let switch = switch_of(&app, wid, session).expect("the switch");
-    let lockup = app.windows[&wid]
-        .claude_lights
-        .mark_hits
-        .iter()
-        .find(|m| m.session == session)
-        .expect("the lockup is a target")
-        .clone();
-    assert!(resting.contains("    claude \u{2500}"), "{resting:?}");
-    let fp_rest = pass(&mut app, wid);
-    let (x, y) = cell_px(&app, wid, (lockup.frame_row, lockup.cols.start + 5));
-    assert_eq!(
-        app.track_claude_light_hover(wid, x, y),
-        crate::claude_lights::OverChips::No,
-        "the lockup is decoration: the motion is the pane's"
-    );
-    assert!(app.windows[&wid].claude_lights.mark_hovered(session));
-    let fp_hover = pass(&mut app, wid);
-    assert_ne!(fp_rest, fp_hover, "the hover is in the repaint key");
-    let hovered = glass_chars(&app, wid, top);
-    assert!(
-        hovered.contains("    Claude Code \u{2500}\u{2500}") && hovered.contains("(v2.1.283)"),
-        "the title, its version on the label: {hovered:?}"
-    );
-    assert_eq!(
-        switch_of(&app, wid, session).map(|b| b.cols),
-        Some(switch.cols.clone()),
-        "the switch stood"
-    );
-    app.windows.get_mut(&wid).expect("window").last_cursor_px = (x, y);
-    assert!(
-        !app.press_claude_light(wid, std::time::Instant::now()),
-        "a press on the lockup is the pane's"
-    );
-    for i in 0..3 {
-        let _ = pass(&mut app, wid);
-        assert!(
-            app.windows[&wid].claude_lights.mark_hovered(session),
-            "CONTROL {i}: the hover stands"
-        );
-        assert_eq!(glass_chars(&app, wid, top), hovered, "CONTROL {i}");
-    }
-    let grown = Live {
-        draft: &["fix the", "tests"],
-        ..AT_REST
-    };
-    feed(&app, session, &screen(&grown));
-    refill(&mut app, wid);
-    let _ = pass(&mut app, wid);
-    let first = glass_chars(&app, wid, top - 1);
-    assert!(
-        first.contains("    claude \u{2500}") && !first.contains("Claude Code"),
-        "the frame that moves the line draws no title for the pointer it left: {first:?}"
-    );
-    assert!(
-        !app.windows[&wid].claude_lights.mark_hovered(session),
-        "the lockup moved from under the pointer: the hover is let go"
-    );
-    let _ = pass(&mut app, wid);
-    let moved = glass_chars(&app, wid, top - 1);
-    assert!(
-        moved.contains("    claude \u{2500}") && !moved.contains("Claude Code"),
-        "the moved line wears the name, at rest: {moved:?}"
-    );
-    assert!(
-        !glass_chars(&app, wid, top).contains("Claude Code"),
-        "and no title is left on the row under the pointer"
-    );
-    feed(&app, session, &screen(&AT_REST));
-    refill(&mut app, wid);
-    let _ = pass(&mut app, wid);
-    let (x, y) = cell_px(&app, wid, (lockup.frame_row - 3, 4));
-    let _ = app.track_claude_light_hover(wid, x, y);
-    assert!(!app.windows[&wid].claude_lights.mark_hovered(session));
-    let _ = pass(&mut app, wid);
-    assert_eq!(glass_chars(&app, wid, top), resting, "the name is back");
 }
 
 fn screen_at(live: &Live<'_>, rows: u16, cols: u16) -> Vec<String> {
@@ -673,66 +346,58 @@ fn a_regrid_hit_tests_the_glass_it_lands_on() {
     );
 }
 
+/// THE LOCKUP KEEPS ITS NAME UNDER THE POINTER: the top rule's lockup is the CLI's icon and its
+/// own word (`claude`), at rest and under the pointer alike. A hover never swaps the word for the
+/// product's name (`Claude Code`), so nothing on the line moves; the lockup is no glass target,
+/// so the motion and a press on it are the pane's. CONTROL: at rest the line wears `claude`.
 #[test]
-fn a_regrid_brings_the_hover_title_under_a_still_pointer() {
+fn the_lockup_keeps_its_name_under_the_pointer() {
+    use crate::claude_lights::OverChips;
     let (mut app, wid, session, _host) = claude_held();
     for _ in 0..2 {
         next_frame(&mut app, wid);
     }
-    let lockup = app.windows[&wid]
-        .claude_lights
-        .mark_hits
-        .iter()
-        .find(|m| m.session == session)
-        .expect("the lockup is a target")
-        .clone();
     let top = AT_REST.bottom() - 2;
     let resting = glass_chars(&app, wid, top);
-    assert!(resting.contains("    claude \u{2500}"), "{resting:?}");
-    let below = (lockup.frame_row + 2, lockup.cols.start + 5);
-    let _ = point_at(&mut app, wid, below);
-    assert!(!app.windows[&wid].claude_lights.mark_hovered(session));
-    app.on_cursor_left(wid);
-    regrid(&mut app, wid, session, ROWS + 2, COLS);
-    next_frame(&mut app, wid);
-    let grown = app.windows[&wid]
-        .claude_lights
-        .mark_hits
-        .iter()
-        .find(|m| m.session == session)
-        .expect("the lockup, re-laid")
-        .clone();
+    let chars: Vec<char> = resting.chars().collect();
+    let word: Vec<char> = " claude \u{2500}".chars().collect();
+    let name_at = 1 + chars
+        .windows(word.len())
+        .position(|w| w == word.as_slice())
+        .unwrap_or_else(|| panic!("CONTROL: the lockup's name at rest: {resting:?}"));
+    let switch = switch_of(&app, wid, session).expect("the switch");
+    let frame_row = {
+        let ws = &app.windows[&wid];
+        ws.input_scratch.cells.len() - usize::from(ws.rows) + top
+    };
     assert_eq!(
-        (grown.frame_row, grown.cols.clone()),
-        (below.0, lockup.cols.clone()),
-        "the lockup moved down two rows"
+        frame_row, switch.frame_row,
+        "the lockup shares the switch's row"
     );
-    assert!(
-        !app.windows[&wid].claude_lights.mark_hovered(session),
-        "CONTROL: no pointer, no title"
-    );
-    next_frame(&mut app, wid);
-    assert!(
-        glass_chars(&app, wid, top + 2).contains("    claude \u{2500}"),
-        "CONTROL: the name"
-    );
-
-    regrid(&mut app, wid, session, ROWS, COLS);
-    next_frame(&mut app, wid);
-    let _ = point_at(&mut app, wid, below);
-    assert!(!app.windows[&wid].claude_lights.mark_hovered(session));
-    regrid(&mut app, wid, session, ROWS + 2, COLS);
-    next_frame(&mut app, wid);
-    assert!(
-        app.windows[&wid].claude_lights.mark_hovered(session),
-        "the frame that laid the lockup under the still pointer hovers it"
-    );
-    next_frame(&mut app, wid);
-    let titled = glass_chars(&app, wid, top + 2);
-    assert!(
-        titled.contains("    Claude Code \u{2500}\u{2500}"),
-        "the title, its version on the label: {titled:?}"
-    );
+    let lockup = name_at - aterm_effects::cli_marks::ICON_RUN..name_at + "claude".len();
+    for col in lockup {
+        assert_eq!(
+            point_at(&mut app, wid, (frame_row, col)),
+            OverChips::No,
+            "column {col}: the lockup is not glass a pointer hits"
+        );
+        next_frame(&mut app, wid);
+        let hovered = glass_chars(&app, wid, top);
+        assert!(
+            !hovered.contains("Claude Code"),
+            "column {col}: {hovered:?}"
+        );
+        assert_eq!(hovered, resting, "column {col}: the line is as at rest");
+        assert_eq!(
+            switch_of(&app, wid, session).map(|b| b.cols),
+            Some(switch.cols.clone()),
+            "column {col}: the switch stood"
+        );
+        assert!(
+            !app.press_claude_light(wid, std::time::Instant::now()),
+            "column {col}: a press on the lockup is the pane's"
+        );
+    }
 }
 
 /// The hosted agy switch keeps one click target.

@@ -15,6 +15,9 @@ fn main() -> std::process::ExitCode {
     if let Some(code) = aterm_uds::tether::entry() {
         return code;
     }
+    // Before a stage can rebuild this executable: the census memo is keyed by the code that
+    // judges (one stat now; the bytes are hashed when the census first runs).
+    aterm_census::pin_code();
     // Before any dispatch: every child of this dedicated CLI process (targo,
     // the test binaries, this binary re-invoked as a recorder or doc driver)
     // inherits the raised limit.

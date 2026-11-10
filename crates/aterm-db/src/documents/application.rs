@@ -186,6 +186,84 @@ pub(crate) fn observe_store<T>(
     observe_store_until(paths, descriptor, admission_deadline(), action)
 }
 
+/// Observe one selected, already-established application session. Descriptor
+/// selection belongs inside `action`, so a preliminary catalog peek cannot
+/// initialize custody or select a different generation. No writer is acquired;
+/// an initially busy vault refuses immediately, as a cache observation does.
+pub(crate) fn observe_existing_session<T>(
+    paths: &Paths,
+    deadline: std::time::Instant,
+    action: impl FnOnce(&Session<'_>) -> Result<T>,
+) -> Result<Option<T>> {
+    use aterm_secrets::commons::{Observation, Unavailable};
+    pass_current(deadline)?;
+    let selected = crate::generation::observed_generation_until(paths, deadline)?;
+    let known = selected != *paths
+        || crate::generation::is_candidate(&selected)
+        || aterm_secrets::commons::bootstrap::custody_opened(&selected)
+            .map_err(crate::table::failure)?;
+    match aterm_secrets::commons::observe(&selected).map_err(crate::table::failure)? {
+        Observation::Unavailable(Unavailable::Unconfigured | Unavailable::ControlNotVisible)
+            if !known =>
+        {
+            return Ok(None);
+        }
+        Observation::Unavailable(reason) => {
+            return Err(aterm_secrets::Error::of_kind(
+                if reason == Unavailable::Busy {
+                    aterm_secrets::ErrorKind::VaultBusy
+                } else {
+                    aterm_secrets::ErrorKind::Other
+                },
+                format!(
+                    "application custody unavailable ({}): {}",
+                    reason.code(),
+                    reason.explanation()
+                ),
+            )
+            .into());
+        }
+        Observation::Visible(_) => {}
+    }
+    let (bootstrap, journal) = Bootstrap::established_with_journal_until(&selected, deadline)
+        .map_err(crate::table::failure)?;
+    let session = observed_session(&bootstrap, journal, deadline, &|| deadline)?;
+    session.require_current_application_generation(deadline)?;
+    let control = session.observation()?;
+    let result = action(&session)?;
+    if session.observation_afresh()? != control {
+        return Err(Error::new("application control changed during observation"));
+    }
+    session.require_current_application_generation(deadline)?;
+    pass_current(deadline)?;
+    Ok(Some(result))
+}
+
+/// Hold an existing application's current local source through a bounded local
+/// receipt write. Vault sources and lineage control writers precede the table
+/// writer. The callback receives no mutable store and must not perform network
+/// I/O, reenter Commons, or acquire an account writer. Opening the table may
+/// recover an interrupted append, but creates no application or declaration.
+pub(crate) fn with_admitted_store<T, C>(
+    paths: &Paths,
+    descriptor: impl FnOnce(&Session<'_>) -> Result<(Descriptor, C)>,
+    deadline: std::time::Instant,
+    action: impl FnOnce(&Session<'_>, &Store, Scope, C) -> Result<T>,
+) -> Result<T> {
+    crate::generation::with_admitted_session(paths, deadline, |bootstrap, session| {
+        let (descriptor, context) = descriptor(session)?;
+        in_session(
+            bootstrap,
+            session,
+            false,
+            |_| Ok(descriptor),
+            deadline,
+            |_, _, _| Ok(()),
+            |session, store, scope| action(session, store, scope, context),
+        )
+    })
+}
+
 pub(crate) fn observe_store_until<T>(
     paths: &Paths,
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
@@ -301,7 +379,7 @@ pub(crate) fn observe_store_in_session<T>(
     Ok(result)
 }
 
-fn observe_declared_in_session<T>(
+pub(crate) fn observe_declared_in_session<T>(
     session: &Session<'_>,
     descriptor: Descriptor,
     deadline: std::time::Instant,

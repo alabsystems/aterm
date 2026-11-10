@@ -270,12 +270,12 @@ impl Drop for Running {
         while Instant::now() < by && !self.physically_retired() {
             std::thread::sleep(Duration::from_millis(20));
         }
-        if !self.physically_retired()
+        if (!self.physically_retired() || std::thread::panicking())
             && let Some(scratch) = self.scratch.take()
         {
             let preserved = scratch.keep();
             eprintln!(
-                "unproved guardian retirement preserves {}",
+                "guardian failure evidence preserves {}",
                 preserved.display()
             );
         }
@@ -387,7 +387,11 @@ fn guardian_sigkill_keeps_other_prefixes_off_the_same_unretired_source() {
         terminal = next.child.try_wait().expect("new owner exit");
         terminal.is_some()
     });
-    assert!(terminal.expect("new owner completed").success());
+    assert!(
+        terminal.expect("new owner completed").success(),
+        "replacement client: {}",
+        std::fs::read_to_string(next.launch.join("client.stderr")).unwrap_or_default()
+    );
     wait(|| next.retired());
     next.assert_unchanged_harness();
 }

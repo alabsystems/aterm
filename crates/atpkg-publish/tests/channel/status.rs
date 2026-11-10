@@ -109,3 +109,122 @@ fn the_head_names_its_producer_and_flags_the_retired_shell_publisher() {
         );
     }
 }
+
+#[test]
+fn release_report_uses_signed_product_versions_host_dates_and_target_overlays() {
+    const MAC: &str = "aarch64-apple-darwin";
+    const LINUX: &str = "x86_64-unknown-linux-gnu";
+    let rig = Rig::new("human-releases");
+    rig.publish_head(&Doc::new(120, &[("ay", 14327)]).overlay(LINUX, &[("ay", 14328)]));
+    for build in [14327, 14328] {
+        let mut pack = rig.pack("ay", build, &[MAC, LINUX]);
+        let mf = format!("pkg-ay-{build}.toml");
+        let version = "1.20261109.1-dev.2+upstream.0.27.0";
+        let raw = String::from_utf8(pack.files.iter().find(|(n, _)| n == &mf).unwrap().1.clone())
+            .unwrap()
+            .replace(&format!("0.1.{build}"), version);
+        for (name, bytes) in &mut pack.files {
+            if name == &mf {
+                *bytes = raw.as_bytes().to_vec();
+            }
+            if name == &format!("{mf}.sig") {
+                *bytes = rig.keys.sign(raw.as_bytes());
+            }
+        }
+        let slug = rig.ctx.public_slug("ay");
+        for (name, bytes) in pack.files {
+            rig.host.put_asset(&slug, &pack.tag, &name, bytes);
+        }
+        let mut release = rig.host.release_of(&slug, &pack.tag).unwrap();
+        release.published_at = Some("2026-11-10T01:29:49Z".into());
+        rig.host.put(&slug, &pack.tag, release);
+    }
+    let rows = status::release_lines(&rig.ctx, None, &["ay".into()]).unwrap();
+    let text = rows.join("\n");
+    assert!(
+        text.contains("ay | 1.20261109.1-dev.2+upstream.0.27.0 | 2026-11-10T01:29:49Z"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Installation verification: NOT CHECKED"),
+        "{text}"
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.starts_with("ay |")).count(),
+        2,
+        "{text}"
+    );
+    assert!(
+        text.contains("channel stable; build 14327; index 120"),
+        "{text}"
+    );
+    assert!(
+        text.contains("channel stable; build 14328; index 120"),
+        "{text}"
+    );
+    assert!(text.contains("| aarch64-apple-darwin | Public release metadata; payload not checked\n  program ay; channel stable; build 14327;"), "{text}");
+    assert!(text.contains("| x86_64-unknown-linux-gnu | Public release metadata; payload not checked\n  program ay; channel stable; build 14328;"), "{text}");
+    assert!(
+        !rig.host.calls().iter().any(|c| c.contains(".tar.zst")),
+        "a report must not download or probe payloads"
+    );
+}
+
+#[test]
+fn release_report_never_invents_a_date_or_accepts_a_foreign_signed_manifest() {
+    let rig = Rig::new("human-release-unknown");
+    rig.publish_head(&Doc::new(120, &[("ay", 14327)]));
+    let pack = rig.lay_pack("alabsystems", "ay", 14327, &["aarch64-apple-darwin"]);
+    for date in [None, Some("not-a-date")] {
+        let slug = rig.ctx.public_slug("ay");
+        let mut release = rig.host.release_of(&slug, &pack.tag).unwrap();
+        release.published_at = date.map(str::to_string);
+        rig.host.put(&slug, &pack.tag, release);
+        let text = status::release_lines(&rig.ctx, None, &[])
+            .unwrap()
+            .join("\n");
+        assert!(
+            text.contains("ay | 0.1.14327 | UNKNOWN | aarch64-apple-darwin"),
+            "{text}"
+        );
+    }
+    let slug = rig.ctx.public_slug("ay");
+    for (program, build) in [("ay", 14328), ("mc", 14327)] {
+        let other = rig.pack(program, build, &["aarch64-apple-darwin"]);
+        for (name, bytes) in other.files {
+            if name.starts_with("pkg-") {
+                rig.host.put_asset(
+                    &slug,
+                    &pack.tag,
+                    &name.replace(&format!("{program}-{build}"), "ay-14327"),
+                    bytes,
+                );
+            }
+        }
+        assert!(status::release_lines(&rig.ctx, None, &[]).is_err());
+    }
+}
+
+#[test]
+fn report_names_codex_alab_and_keeps_carried_vendor_pins_distinct() {
+    let rig = Rig::new("human-codex-vendor");
+    rig.publish_head(&Doc::new(120, &[("codex", 2026110901), ("claude", 1)]));
+    rig.lay_pack(
+        "alabsystems",
+        "codex",
+        2026110901,
+        &["aarch64-apple-darwin"],
+    );
+    let text = status::release_lines(&rig.ctx, None, &[])
+        .unwrap()
+        .join("\n");
+    assert!(
+        text.contains("codex-alab | 0.1.2026110901 | UNKNOWN | aarch64-apple-darwin"),
+        "{text}"
+    );
+    assert!(
+        text.contains("claude | UNKNOWN | UNKNOWN | UNKNOWN | Vendor-direct"),
+        "{text}"
+    );
+    assert!(!rig.host.calls().iter().any(|c| c.contains("atpkg-claude-")));
+}

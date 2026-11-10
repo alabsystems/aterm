@@ -975,7 +975,7 @@ pub fn carry(git: &dyn GitRunner, line: &Line, fixes: &[Fix]) -> Result<Vec<Hop>
 
 /// Put `head` into origin/main's history without changing main's bytes: fetch; when main holds
 /// `head` already, nothing; else the merge `commit-tree <tip>^{tree} -p <tip> -p <head>`
-/// ("release line v<version>: record <head> on main (main's tree unchanged)") pushed
+/// (`"release line v<version>: record <head> on main (main's tree unchanged)"`) pushed
 /// to main with an exact expected-tip compare-and-swap. Only a native conflict
 /// with no side effect is rebuilt on the new tip, up to `max` writes in all;
 /// unknown transaction outcomes stop without a retry. A completed write is

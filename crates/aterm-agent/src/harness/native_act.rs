@@ -928,6 +928,13 @@ impl AskedIntent {
     }
 }
 
+/// An explicit receipt protocol. Recognition grants no permission to write this format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptMode {
+    /// Complete forward and rollback recipient history (ANG5).
+    Recipients5,
+}
+
 /// A preparation's complete data-only expectation; the host independently derives authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prepare {
@@ -939,6 +946,9 @@ pub struct Prepare {
     /// The host's authenticated journal domain, obtained before preparation.
     /// Older hosts reject this marker; unmarked recipes cannot use cross-epoch rejection.
     pub rejection_domain: Option<String>,
+    /// Explicit complete-recipient mode, included in the immutable recipe digest.
+    /// `None` retains the existing issuer protocol and its exact wire spelling.
+    pub receipt_mode: Option<ReceiptMode>,
     /// The actual holder; a private built-in always uses its own holder.
     pub holder: String,
     /// The exact claim revision under which the constructor begins.
@@ -1018,6 +1028,10 @@ pub enum Closure {
     Absent(Option<String>),
     /// The record of this exact prepare (its digest, or its legacy cold digest).
     Exact(Recorded),
+    /// Complete per-recipient history for this exact boot-stamped prepare.
+    /// The reader must still establish the clock, machine and retirement facts.
+    #[cfg(unix)]
+    Recipients(super::native_receipts::RecipientHistory),
     /// A record names the id under another prepare, an account relation or a fence.
     Other,
 }
@@ -1424,6 +1438,19 @@ impl Request {
                     }
                     Some(_) => return None,
                 };
+                let receipt_mode = match words.remove("receipts") {
+                    None => None,
+                    Some("recipients5") => Some(ReceiptMode::Recipients5),
+                    Some(_) => return None,
+                };
+                if receipt_mode.is_some()
+                    && (!matches!(plan, NativePlan::Restart { .. })
+                        || boot.is_none()
+                        || custody.is_none()
+                        || rejection_domain.is_none())
+                {
+                    return None;
+                }
                 if holder.is_empty() {
                     return None;
                 }
@@ -1440,6 +1467,7 @@ impl Request {
                     id,
                     host_epoch,
                     rejection_domain,
+                    receipt_mode,
                     holder,
                     revision,
                     expected_human_seq,
@@ -1513,7 +1541,7 @@ impl Request {
         let Self::Prepare(prepare) = self else {
             return None;
         };
-        if prepare.boot.is_some() || prepare.custody.is_some() {
+        if prepare.receipt_mode.is_some() || prepare.boot.is_some() || prepare.custody.is_some() {
             return None;
         }
         let NativePlan::Restart {
@@ -1579,6 +1607,9 @@ impl Request {
                         return None;
                     }
                     write!(out, " reject={domain}").ok()?;
+                }
+                if let Some(ReceiptMode::Recipients5) = p.receipt_mode {
+                    out.push_str(" receipts=recipients5");
                 }
                 if let Some(seq) = p.expected_human_seq {
                     write!(out, " human-seq={seq}").ok()?;
@@ -2233,13 +2264,14 @@ mod tests {
         );
     }
 
-    fn fixture() -> Request {
+    pub(super) fn fixture() -> Request {
         let image = Image {
             path: b"/private/image \xff".to_vec(),
             device: 7,
             inode: 19,
         };
         Request::prepare(Prepare {
+            receipt_mode: None,
             rejection_domain: None,
             asked: None,
             id: "12".repeat(16),

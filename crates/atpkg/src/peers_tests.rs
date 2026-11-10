@@ -424,22 +424,22 @@ fn sharing_on(
     refresh: Duration,
 ) -> (
     String,
-    Arc<AtomicBool>,
+    Arc<Stop>,
     mpsc::Receiver<String>,
     std::thread::JoinHandle<()>,
 ) {
     let listen = SocketAddr::from(([127, 0, 0, 1], 0));
-    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(Stop::new());
     let (said, notes) = mpsc::channel();
     let (bound, ready) = mpsc::channel();
     let thread = std::thread::spawn({
-        let (layout, running) = ((*layout).clone(), Arc::clone(&running));
+        let (layout, stop) = ((*layout).clone(), Arc::clone(&stop));
         move || {
             share(
                 &layout,
                 &Share {
                     listen,
-                    running: &running,
+                    stop: &stop,
                     members: &*members,
                     refresh,
                     note: &|line| {
@@ -455,7 +455,7 @@ fn sharing_on(
     let at = ready
         .recv_timeout(HANG)
         .expect("the sharing store bound its listener");
-    (at.to_string(), running, notes, thread)
+    (at.to_string(), stop, notes, thread)
 }
 
 /// The note `notes` hears next that contains `word`, within the hang detector.
@@ -499,7 +499,7 @@ fn a_sharing_store_serves_a_kept_unit_by_default_and_lists_nothing() {
     let unit = b"the signed toolset archive".to_vec();
     let (build, dl) = staged(&layout, 7, &unit);
     let sha = sha256_hex(&unit);
-    let (addr, running, notes, thread) = sharing_on(&layout, Arc::new(loopback), HANG);
+    let (addr, stop, notes, thread) = sharing_on(&layout, Arc::new(loopback), HANG);
     heard(&notes, "serving");
     assert!(units_dir(&layout).is_dir(), "the server made units/");
     assert_eq!(
@@ -541,7 +541,7 @@ fn a_sharing_store_serves_a_kept_unit_by_default_and_lists_nothing() {
         );
     }
 
-    running.store(false, Ordering::Release);
+    stop.set();
     thread.join().unwrap();
     // Observe this listener's owner and record: its released port may already belong to
     // another parallel test, so a new connection cannot prove whether this owner closed it.
@@ -551,7 +551,7 @@ fn a_sharing_store_serves_a_kept_unit_by_default_and_lists_nothing() {
 #[test]
 fn the_persons_off_closes_a_sharing_store_and_on_opens_it_again() {
     let layout = crate::testdir::layout("atpkg-peers-share-off-");
-    let (_, running, notes, thread) = sharing_on(&layout, Arc::new(loopback), HANG);
+    let (_, stop, notes, thread) = sharing_on(&layout, Arc::new(loopback), HANG);
     heard(&notes, "serving");
     turn_off(&layout).unwrap();
     heard(&notes, "off");
@@ -567,7 +567,7 @@ fn the_persons_off_closes_a_sharing_store_and_on_opens_it_again() {
         TcpStream::connect(at).is_ok(),
         "--on opened its recorded listener"
     );
-    running.store(false, Ordering::Release);
+    stop.set();
     thread.join().unwrap();
 }
 
@@ -837,12 +837,12 @@ fn a_sharing_store_reads_its_members_once_per_refresh_not_per_connection() {
                 Vec::new()
             }
         });
-        let (addr, running, notes, thread) = sharing_on(&layout, members, refresh);
+        let (addr, stop, notes, thread) = sharing_on(&layout, members, refresh);
         heard(&notes, "serving");
         for _ in 0..3 {
             assert_eq!(ask(&addr, "GET / HTTP/1.1\r\n\r\n"), "", "closed unread");
         }
-        running.store(false, Ordering::Release);
+        stop.set();
         thread.join().unwrap();
         assert_eq!(
             read.load(Ordering::Acquire),
@@ -885,7 +885,7 @@ fn an_oversized_or_incomplete_request_head_is_refused_without_answering() {
     let unit = b"kept unit".to_vec();
     let (build, dl) = staged(&layout, 1, &unit);
     let sha = sha256_hex(&unit);
-    let (addr, running, notes, thread) = sharing_on(&layout, Arc::new(loopback), HANG);
+    let (addr, stop, notes, thread) = sharing_on(&layout, Arc::new(loopback), HANG);
     heard(&notes, "serving");
     keep_with_free(&layout, &dl, &sha, &build, ROOM);
 
@@ -924,7 +924,7 @@ fn an_oversized_or_incomplete_request_head_is_refused_without_answering() {
     );
     assert_eq!(response_length(&mut dup_same), Some(9));
 
-    running.store(false, Ordering::Release);
+    stop.set();
     thread.join().unwrap();
 }
 

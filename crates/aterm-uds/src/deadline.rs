@@ -289,6 +289,17 @@ pub use silent::{
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub use silent::{cat_echoes, ends_within, prints};
 
+#[cfg(all(
+    any(target_vendor = "apple", target_os = "linux"),
+    any(test, debug_assertions)
+))]
+mod execd;
+#[cfg(all(
+    any(target_vendor = "apple", target_os = "linux"),
+    any(test, debug_assertions)
+))]
+pub use execd::execd;
+
 #[cfg(all(unix, any(test, debug_assertions)))]
 mod stopped;
 #[cfg(all(unix, any(test, debug_assertions)))]

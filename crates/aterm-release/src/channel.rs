@@ -473,11 +473,25 @@ pub trait ChannelRelease {
 ///
 /// # Errors
 /// The first failing call.
-pub fn publish_on_channel(release: &mut dyn ChannelRelease) -> Result<()> {
+pub fn publish_staged_on_channel(release: &mut dyn ChannelRelease) -> Result<()> {
     if release.head_made()? {
         release.ratchet_head()?;
         release.make_head()?;
         return release.prove_head();
+    }
+    release.artifacts()?;
+    release.ratchet()?;
+    release.bind()?;
+    release.prove_assets()?;
+    release.ratchet()?;
+    release.make_head()?;
+    release.prove_head()
+}
+
+/// Populate a private draft. This path has no call that can publish a release.
+pub fn stage_on_channel(release: &mut dyn ChannelRelease) -> Result<()> {
+    if release.head_made()? {
+        return Err(Error::new("a published release is never re-cut"));
     }
     let mut files = release.artifacts()?;
     files.sort_by_key(|file| {
@@ -502,10 +516,10 @@ pub fn publish_on_channel(release: &mut dyn ChannelRelease) -> Result<()> {
     for file in &files[payloads..] {
         release.upload(file)?;
     }
-    release.prove_assets()?;
-    release.ratchet()?;
-    release.make_head()?;
-    release.prove_head()
+    // Each upload has proved its own bytes. The source engine may still be
+    // attaching its attestation; the claimed cut checks the complete inventory
+    // after both branches join, rather than racing that expected addition here.
+    Ok(())
 }
 
 #[cfg(test)]

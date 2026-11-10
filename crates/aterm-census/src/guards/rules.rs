@@ -93,16 +93,16 @@ fn engine_shipped(rel: &str) -> bool {
 /// `#[cfg(test)] mod tests { include!("tests_hooks.rs"); }`, `mod imp { #[cfg(test)] mod deep;
 /// }`); every file such a file loads in turn (`#[path = "x_more_tests.rs"] mod more;` in it);
 /// and, for each, the directory of its stem (`rig/` beside `rig.rs`, or `rig/mod.rs`'s own).
-fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
-    let mut out = Vec::new();
-    let push = |out: &mut Vec<String>, file: String| {
+fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Declared {
+    let mut out = Declared::default();
+    let push = |out: &mut Declared, file: String| {
         let own = file
             .strip_suffix("/mod.rs")
             .or_else(|| file.strip_suffix(".rs"))
             .unwrap_or(&file)
             .to_string();
-        out.push(format!("{own}/"));
-        out.push(file);
+        out.0.insert(format!("{own}/"));
+        out.0.insert(file);
     };
     for parent in corpus.under(prefixes) {
         if !parent.mentions(&["mod", "include"]) {
@@ -115,22 +115,38 @@ fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
         }
     }
     loop {
-        let before = out.len();
+        let before = out.0.len();
         for parent in corpus.under(prefixes) {
-            if !in_declared(&out, &parent.rel) || !parent.mentions(&["mod", "include"]) {
+            if !out.holds(&parent.rel) || !parent.mentions(&["mod", "include"]) {
                 continue;
             }
             for load in parent.loads() {
                 if let Some(file) = load.files.iter().find(|f| corpus.get(f).is_some())
-                    && !in_declared(&out, file)
+                    && !out.holds(file)
                 {
                     push(&mut out, file.clone());
                 }
             }
         }
-        if out.len() == before {
+        if out.0.len() == before {
             return out;
         }
+    }
+}
+
+/// The files and directories (each `/`-ended) [`declared_test_modules`] names.
+#[derive(Default)]
+struct Declared(std::collections::BTreeSet<String>);
+
+impl Declared {
+    /// Is `rel` one of the files, or under one of the directories? Each directory `rel` lies
+    /// under is one of its own `/`-ended prefixes, so those are looked up, not every entry
+    /// read.
+    fn holds(&self, rel: &str) -> bool {
+        self.0.contains(rel)
+            || rel
+                .match_indices('/')
+                .any(|(at, _)| self.0.contains(&rel[..=at]))
     }
 }
 
@@ -141,7 +157,7 @@ fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
 /// seam-caller follows what a release build compiles.
 pub(super) struct TestCode {
     /// The files and directories [`declared_test_modules`] names.
-    declared: Vec<String>,
+    declared: Declared,
     /// What a shipped line of a shipped file loads ([`Corpus::shipped_loads`]).
     shipped: std::collections::BTreeSet<String>,
 }
@@ -154,7 +170,7 @@ impl TestCode {
     /// a bench's or an example's.
     pub(super) fn read(corpus: &Corpus) -> Self {
         let declared = declared_test_modules(corpus, PRODUCT);
-        let shipped = corpus.shipped_loads(PRODUCT, &|rel| in_declared(&declared, rel));
+        let shipped = corpus.shipped_loads(PRODUCT, &|rel| declared.holds(rel));
         Self { declared, shipped }
     }
 
@@ -163,15 +179,8 @@ impl TestCode {
     /// path ([`named_for_tests`]), that nothing ships? A file that a shipped `mod` or `include!`
     /// of a shipped file also loads ships, and is read.
     pub(super) fn holds(&self, rel: &str) -> bool {
-        (in_declared(&self.declared, rel) || named_for_tests(rel)) && !self.shipped.contains(rel)
+        (self.declared.holds(rel) || named_for_tests(rel)) && !self.shipped.contains(rel)
     }
-}
-
-/// Is `rel` one of `declared`'s files, or under one of its directories?
-fn in_declared(declared: &[String], rel: &str) -> bool {
-    declared
-        .iter()
-        .any(|t| rel == t || (t.ends_with('/') && rel.starts_with(t.as_str())))
 }
 
 pub(super) const ENGINE_PLATFORM: Rule = Rule {
@@ -1527,7 +1536,8 @@ fn live_call<'r, 't>(
     readers: &'r [LiveReader<'t>],
 ) -> Option<&'r LiveReader<'t>> {
     readers.iter().find(|r| {
-        if r.rel == rel || !r.public {
+        // Either call spells the name: a line that does not is left unread.
+        if r.rel == rel || !r.public || !code.contains(r.name) {
             return false;
         }
         if r.method {
@@ -2126,7 +2136,8 @@ pub(super) fn first_hit<'a>(
     names: impl Iterator<Item = &'a (&'static str, ClockShape, &'static str)>,
     include: impl Fn(&str) -> bool,
 ) -> Option<(&'static str, &'static str)> {
-    for (needle, shape, what) in names {
+    // A name the line does not spell is not searched for.
+    for (needle, shape, what) in names.filter(|(needle, _, _)| code.contains(needle)) {
         for at in hits(code, needle, Bound::Word) {
             let before = code[..at].trim_end_matches([' ', '\t']);
             let after = code[at + needle.len()..].trim_start_matches([' ', '\t']);
@@ -2300,12 +2311,12 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 fn header_gap(file: &SourceFile) -> Option<&'static str> {
     let mut spdx = false;
     let mut copyright = false;
-    for l in file.raw.lines().take(HEADER_LINES) {
+    for l in file.raw().lines().take(HEADER_LINES) {
         spdx |= l.contains("SPDX-License-Identifier:");
         copyright |= contains_ignore_ascii_case(l, "copyright");
     }
     match (spdx, copyright) {
-        (true, true) => change_gap(&file.raw),
+        (true, true) => change_gap(file.raw()),
         (false, true) => Some("no SPDX-License-Identifier line in its first 8 lines"),
         (true, false) => Some("no copyright line in its first 8 lines"),
         (false, false) => Some("no SPDX-License-Identifier or copyright line in its first 8 lines"),
@@ -3114,11 +3125,7 @@ mod tests {
             files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
             let root = disk_tree("aterm-census-guards", label, &files);
             let corpus = super::super::Corpus::of(&[]);
-            let tree = Tree {
-                root: &root,
-                corpus: &corpus,
-                engine: crate::guards::tests::NO_ENGINE,
-            };
+            let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
             let mut found = Vec::new();
             restore_stays_local(&tree, &mut found);
             let _ = std::fs::remove_dir_all(&root);
@@ -3190,11 +3197,7 @@ mod tests {
         files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
         let root = disk_tree("aterm-census-guards", "keeper-deps", &files);
         let corpus = super::super::Corpus::of(&[]);
-        let tree = Tree {
-            root: &root,
-            corpus: &corpus,
-            engine: crate::guards::tests::NO_ENGINE,
-        };
+        let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
         let mut found = Vec::new();
         keeper_gui_deps(&tree, &mut found);
         let _ = std::fs::remove_dir_all(&root);
@@ -3229,12 +3232,8 @@ mod tests {
             "#[link(name = \"AppKit\", kind = \"framework\")]\nunsafe extern \"C\" {}\n",
         )
         .unwrap();
-        let corpus = super::super::Corpus::read(&root).unwrap();
-        let tree = Tree {
-            root: &root,
-            corpus: &corpus,
-            engine: crate::guards::tests::NO_ENGINE,
-        };
+        let corpus = super::super::Corpus::at(&root).unwrap();
+        let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
         let mut found = Vec::new();
         keeper_gui_deps(&tree, &mut found);
         let _ = std::fs::remove_dir_all(&root);
@@ -3257,11 +3256,7 @@ mod tests {
         }
         files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
         let root = disk_tree("aterm-census-guards", "keeper-renamed-gui", &files);
-        let tree = Tree {
-            root: &root,
-            corpus: &corpus,
-            engine: crate::guards::tests::NO_ENGINE,
-        };
+        let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
         let mut found = Vec::new();
         keeper_gui_deps(&tree, &mut found);
         let _ = std::fs::remove_dir_all(&root);
@@ -3302,12 +3297,8 @@ mod tests {
                 let root = disk_tree("aterm-census-guards", "keeper-framework-source", &files);
                 let path = format!("crates/{helper}/src/lib.rs");
                 std::fs::write(root.join(&path), source).unwrap();
-                let corpus = super::super::Corpus::read(&root).unwrap();
-                let tree = Tree {
-                    root: &root,
-                    corpus: &corpus,
-                    engine: crate::guards::tests::NO_ENGINE,
-                };
+                let corpus = super::super::Corpus::at(&root).unwrap();
+                let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
                 let mut found = Vec::new();
                 keeper_gui_deps(&tree, &mut found);
                 let _ = std::fs::remove_dir_all(&root);
@@ -3373,11 +3364,7 @@ mod tests {
         };
         let run_on = |root: &std::path::Path| {
             let corpus = super::super::Corpus::of(&[]);
-            let tree = Tree {
-                root,
-                corpus: &corpus,
-                engine: crate::guards::tests::NO_ENGINE,
-            };
+            let tree = Tree::new(root, &corpus, crate::guards::tests::NO_ENGINE);
             let mut found = Vec::new();
             keeper_gui_deps(&tree, &mut found);
             let _ = std::fs::remove_dir_all(root);

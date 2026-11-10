@@ -2315,7 +2315,7 @@ mod tests {
         assert!(reconnected.reader());
         assert!(!reconnected.manager());
         drop(reconnected); // same owned-state drop as explicit member retirement
-        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
+        drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
     }
 
     #[cfg(unix)]
@@ -2366,9 +2366,7 @@ mod tests {
             readiness.complete(role).unwrap();
             assert!(!readiness.reader());
             assert!(readiness.complete(ReadyRole::ReaderLoaded).is_err());
-            assert!(
-                super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok()
-            );
+            drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
         }
     }
 
@@ -2418,7 +2416,7 @@ mod tests {
         assert!(reservation.native_usage_source(&scope).is_err());
         assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
         drop(borrowed);
-        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
+        drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
     }
 
     #[cfg(unix)]
@@ -2456,7 +2454,7 @@ mod tests {
         assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
         unclaimed.revoke_unclaimed().unwrap();
         let publication =
-            super::super::codex_source_gate::PublicationLock::for_home(home.path()).unwrap();
+            super::super::codex_source_gate::PublicationLock::released_for_home(home.path());
         assert!(
             !registry
                 .state
@@ -2470,7 +2468,7 @@ mod tests {
         assert_eq!(claimed.revoke_unclaimed(), Err(Error::Denied));
         assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
         registry.state.lock().unwrap().launches.clear();
-        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
+        drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
     }
 
     #[cfg(unix)]
@@ -2528,7 +2526,7 @@ mod tests {
                 ._scope
                 .is_none()
         );
-        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
+        drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
         assert_eq!(
             registry
                 .complete_unrelated(
@@ -2659,7 +2657,7 @@ mod tests {
         assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
         assert_eq!(registry.revoke_cancelled_unclaimed().unwrap(), 0);
         registry.state.lock().unwrap().launches.clear();
-        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
+        drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
     }
 
     #[test]

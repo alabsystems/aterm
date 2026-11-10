@@ -94,10 +94,9 @@ fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
     );
     assert_eq!(cost(&mut app, wid).composed, 1);
     let first = glass_row(&app, wid, rule);
-    assert!(first.contains("\u{2386} this login 71%"), "{first:?}");
     assert!(
-        !first.contains("first") && !first.contains("@example.com"),
-        "the email is the hover's: {first:?}"
+        first.contains("\u{2386} first@example.com 71%"),
+        "the email names the account: {first:?}"
     );
     assert!(
         !first.contains("Max 5x"),
@@ -109,16 +108,13 @@ fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
     publish(&app, session, selected("second@example.com", "Pro", None));
     assert_eq!(cost(&mut app, wid).composed, 1);
     let second = glass_row(&app, wid, rule);
-    assert!(second.contains("\u{2386} this login"), "{second:?}");
+    assert!(second.contains("\u{2386} second@example.com"), "{second:?}");
     assert!(!second.contains("Pro"), "{second:?}");
     assert!(
         !second.contains("71%"),
         "no week told, none shown: {second:?}"
     );
-    assert!(
-        !second.contains("first") && !second.contains("second"),
-        "{second:?}"
-    );
+    assert!(!second.contains("first"), "{second:?}");
     assert_eq!(glass_row(&app, wid, rule + 1), mode);
     assert_eq!(cost(&mut app, wid), Cost::default());
 }
@@ -128,12 +124,12 @@ fn unicode_account_label_survives_the_native_splice_and_rests_without_allocation
     for email in [
         "jose\u{0301}@example.com",
         "x\u{0301}\u{0323}@example.com",
-        // A roster label may hold an `@`: this one keeps it beside the emoji, in the label's
-        // twelve cells (`quota_view::NAME_CELLS`).
+        // An `@` beside the emoji, within the name's 32 cells (`quota_view::NAME_CELLS`).
         "使用-x\u{0301}\u{0323}-\u{1f469}\u{200d}\u{1f4bb}@b@example.com",
     ] {
         let name = email.rsplit_once('@').map_or(email, |(name, _)| name);
-        let shown = format!("\u{2386}{name}71%");
+        // The rostered login is named by its profile's email (§2.5), whole.
+        let shown = format!("\u{2386}{email}71%");
         let facts = FooterFacts {
             account: Some(name.into()),
             subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {

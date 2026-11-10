@@ -26,9 +26,10 @@
 //! release-compiled line loads from one, so a test file, an integration test, a debug-only module
 //! and the census's own source are not. A glob import (`use aterm_pty::*`) is not followed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use super::debug_seam::{crate_of, is_ident, module_of, names, release_never_compiles, whole_word};
+use super::debug_seam::{crate_of, is_ident, module_of, names, release_never_compiles};
 use super::rules::CENSUS_CRATE;
 use super::{Finding, Rule, SourceFile, Tree};
 use crate::lex::Lexed;
@@ -70,63 +71,86 @@ struct Seam {
     root: bool,
 }
 
+/// The files under [`SOURCE`], in corpus order, each with the lines of its code view a release
+/// build compiles ([`unmasked_lines`] under [`release_never_compiles`]), worked out at most once
+/// per file, and only for a file whose line a pass asks about.
+struct Sources<'a> {
+    files: Vec<&'a SourceFile>,
+    compiled: Vec<OnceCell<Vec<bool>>>,
+}
+
+impl<'a> Sources<'a> {
+    fn of(tree: &Tree<'a>) -> Self {
+        let files: Vec<&SourceFile> = tree.corpus.under(SOURCE).collect();
+        let compiled = files.iter().map(|_| OnceCell::new()).collect();
+        Self { files, compiled }
+    }
+
+    /// Whether a release build compiles line `at` (0-based) of file `i`'s code view: a line past
+    /// the mask's end is compiled.
+    fn compiled(&self, i: usize, at: usize) -> bool {
+        self.compiled[i]
+            .get_or_init(|| unmasked_lines(&self.files[i].lexed().code, &release_never_compiles))
+            .get(at)
+            .copied()
+            .unwrap_or(true)
+    }
+}
+
 fn seam_caller(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let shipped = released_files(tree);
+    let sources = Sources::of(tree);
+    let shipped = released_files(&sources);
     let read =
         |file: &SourceFile| shipped.contains(&file.rel) && !file.rel.starts_with(CENSUS_CRATE);
     let mut gated = Vec::new();
-    for file in tree.corpus.under(SOURCE).filter(|f| read(f)) {
-        if !file.mentions(&["#[cfg("]) || !file.mentions(&["debug_assertions", "test"]) {
+    for (i, file) in sources.files.iter().enumerate() {
+        if !read(file)
+            || !file.mentions(&["#[cfg("])
+            || !file.mentions(&["debug_assertions", "test"])
+        {
             continue;
         }
-        let (krate, crate_ident) = crate_of(&file.rel);
         let code = &file.lexed().code;
-        let compiled = unmasked_lines(code, &release_never_compiles);
         let lines: Vec<&str> = code.lines().collect();
         for (at, line) in lines.iter().enumerate() {
-            if compiled.get(at).copied().unwrap_or(true) {
-                continue;
-            }
             let Some((reach, name)) = item(line) else {
                 continue;
             };
-            if seam_gate(&lines, at) {
-                gated.push(Seam {
-                    name: name.to_owned(),
-                    file: file.rel.clone(),
-                    line: at,
-                    reach,
-                    krate: krate.clone(),
-                    crate_ident: crate_ident.clone(),
-                    module: module_of(&file.rel),
-                    root: crate_root(&file.rel),
-                });
+            if !seam_gate(&lines, at) || sources.compiled(i, at) {
+                continue;
             }
+            let (krate, crate_ident) = crate_of(&file.rel);
+            gated.push(Seam {
+                name: name.to_owned(),
+                file: file.rel.clone(),
+                line: at,
+                reach,
+                krate,
+                crate_ident,
+                module: module_of(&file.rel),
+                root: crate_root(&file.rel),
+            });
         }
     }
     if gated.is_empty() {
         return;
     }
+    // A name a gated crate also declares on a top-level line a release build compiles has a
+    // release twin, and is no seam.
     let gated_crates: BTreeSet<&str> = gated.iter().map(|s| s.krate.as_str()).collect();
-    let gated_names: Vec<&str> = gated.iter().map(|s| s.name.as_str()).collect();
+    let gated_names: HashSet<&str> = gated.iter().map(|s| s.name.as_str()).collect();
     let mut released: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for file in tree.corpus.under(SOURCE).filter(|f| read(f)) {
-        if !gated_crates.iter().any(|k| file.rel.starts_with(k)) || !file.mentions(&gated_names) {
+    for (i, file) in sources.files.iter().enumerate() {
+        if !read(file) || !gated_crates.iter().any(|k| file.rel.starts_with(k)) {
             continue;
         }
-        let (krate, _) = crate_of(&file.rel);
-        let code = &file.lexed().code;
-        let compiled = unmasked_lines(code, &release_never_compiles);
-        for (at, line) in code.lines().enumerate() {
-            if !compiled.get(at).copied().unwrap_or(true) {
-                continue;
-            }
+        for (at, line) in file.lexed().code.lines().enumerate() {
             let Some((_, name)) = item(line) else {
                 continue;
             };
-            if gated_names.contains(&name) {
+            if gated_names.contains(name) && sources.compiled(i, at) {
                 released
-                    .entry(krate.clone())
+                    .entry(crate_of(&file.rel).0)
                     .or_default()
                     .insert(name.to_owned());
             }
@@ -136,52 +160,173 @@ fn seam_caller(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     if gated.is_empty() {
         return;
     }
-    let words: Vec<&str> = gated.iter().map(|s| s.name.as_str()).collect();
-    for file in tree.corpus.under(SOURCE).filter(|f| read(f)) {
-        if !file.mentions(&words) {
+    let index = Index::of(&gated);
+    for (i, file) in sources.files.iter().enumerate() {
+        if !read(file) {
             continue;
         }
         let code = &file.lexed().code;
-        let compiled = unmasked_lines(code, &release_never_compiles);
-        let line_of = |at: usize| code[..at].matches('\n').count();
-        for seam in &gated {
+        let Some(mentions) = index.mentions(code) else {
+            continue;
+        };
+        let newlines: Vec<usize> = code.match_indices('\n').map(|(at, _)| at).collect();
+        // Each seam in turn, each of its mentions in the order the code holds them.
+        for &(s, at) in &mentions.hits {
+            let seam = &gated[s];
             let same_file = file.rel == seam.file;
             let same_crate = file.rel.starts_with(&seam.krate);
             let reaches = same_file
                 || (seam.reach != Reach::File && same_crate)
-                || (seam.reach == Reach::Dependents && names(code, &seam.crate_ident));
+                || (seam.reach == Reach::Dependents && mentions.names_crate(&index, s, seam, code));
             if !reaches {
                 continue;
             }
-            for (at, _) in code.match_indices(&seam.name) {
-                let line = line_of(at);
-                let before = &code[..at];
-                let after = &code[at + seam.name.len()..];
-                if !whole_word(code, at, seam.name.len())
-                    || !compiled.get(line).copied().unwrap_or(true)
-                    || method(before)
-                    || after.starts_with('!')
-                    || declares(before)
-                    || binds(after)
-                    || gated_on_its_line(before)
-                    || !names_the_seam(path_of(before), seam, same_file, same_crate)
-                {
-                    continue;
-                }
-                out.push(file.finding(
-                    SEAM_CALLER.id,
-                    line + 1,
-                    format!(
-                        "names `{}` ({}:{}), which only a debug build compiles, in code a release \
-                         build compiles",
-                        seam.name,
-                        seam.file,
-                        seam.line + 1
-                    ),
-                ));
+            let line = newlines.partition_point(|&nl| nl < at);
+            let before = &code[..at];
+            let after = &code[at + seam.name.len()..];
+            if method(before)
+                || after.starts_with('!')
+                || declares(before)
+                || binds(after)
+                || gated_on_its_line(before)
+                || !names_the_seam(path_of(before), seam, same_file, same_crate)
+                || !sources.compiled(i, line)
+            {
+                continue;
             }
+            out.push(file.finding(
+                SEAM_CALLER.id,
+                line + 1,
+                format!(
+                    "names `{}` ({}:{}), which only a debug build compiles, in code a release \
+                     build compiles",
+                    seam.name,
+                    seam.file,
+                    seam.line + 1
+                ),
+            ));
         }
     }
+}
+
+/// The seams by the identifier a mention of each is, and the crates the dependents' seams are
+/// named through. A name is an identifier ([`item`] cuts it at the first character [`is_ident`]
+/// refuses), so its whole-word mentions are exactly the identifiers of a code view equal to it.
+struct Index<'s> {
+    /// Each name or crate's identifier: the seams that name is (in seam order) and the crate's
+    /// slot, if it is one.
+    words: HashMap<&'s str, Word>,
+    /// Per seam, the slot of the crate it is named through from another crate; `None` when that
+    /// name is not one identifier (a directory named `a.b`), which [`names`] reads instead.
+    crate_slot: Vec<Option<usize>>,
+    crates: usize,
+    /// Per first byte, the lengths of the words that start with it (bit `min(len, 63)`): most
+    /// identifiers of a file are none of them and are passed over without a lookup.
+    lengths: [u64; 256],
+}
+
+/// What one identifier is to the index: the seams so named, and the crate it names.
+#[derive(Default)]
+struct Word {
+    seams: Vec<usize>,
+    crate_slot: Option<usize>,
+}
+
+/// The mentions of seams one code view holds, as `(seam, offset)` sorted, and which crates'
+/// identifiers it holds as a whole word.
+struct Mentions {
+    hits: Vec<(usize, usize)>,
+    crates: Vec<bool>,
+}
+
+impl<'s> Index<'s> {
+    fn of(gated: &'s [Seam]) -> Self {
+        let mut words: HashMap<&str, Word> = HashMap::new();
+        for (s, seam) in gated.iter().enumerate() {
+            words.entry(seam.name.as_str()).or_default().seams.push(s);
+        }
+        let mut crates = 0;
+        let mut crate_slot = Vec::with_capacity(gated.len());
+        for seam in gated {
+            let ident = seam.crate_ident.as_str();
+            if ident.is_empty() || !ident.chars().all(is_ident) {
+                crate_slot.push(None);
+                continue;
+            }
+            let word = words.entry(ident).or_default();
+            let slot = *word.crate_slot.get_or_insert_with(|| {
+                crates += 1;
+                crates - 1
+            });
+            crate_slot.push(Some(slot));
+        }
+        let mut lengths = [0u64; 256];
+        for word in words.keys() {
+            lengths[usize::from(word.as_bytes()[0])] |= 1 << word.len().min(63);
+        }
+        Self {
+            words,
+            crate_slot,
+            crates,
+            lengths,
+        }
+    }
+
+    /// The seams `code` mentions as a whole word, or `None` when it mentions none.
+    fn mentions(&self, code: &str) -> Option<Mentions> {
+        let mut hits = Vec::new();
+        let mut crates = vec![false; self.crates];
+        for (at, ident) in identifiers(code) {
+            let first = usize::from(ident.as_bytes()[0]);
+            if self.lengths[first] & (1 << ident.len().min(63)) == 0 {
+                continue;
+            }
+            let Some(word) = self.words.get(ident) else {
+                continue;
+            };
+            hits.extend(word.seams.iter().map(|&s| (s, at)));
+            if let Some(slot) = word.crate_slot {
+                crates[slot] = true;
+            }
+        }
+        if hits.is_empty() {
+            return None;
+        }
+        hits.sort_unstable();
+        Some(Mentions { hits, crates })
+    }
+}
+
+impl Mentions {
+    /// Whether `code`, the view these mentions were read from, names the crate of seam `s`
+    /// (`seam`) as a whole word, as [`names`] reads it.
+    fn names_crate(&self, index: &Index<'_>, s: usize, seam: &Seam, code: &str) -> bool {
+        match index.crate_slot[s] {
+            Some(slot) => self.crates[slot],
+            None => names(code, &seam.crate_ident),
+        }
+    }
+}
+
+/// Each identifier of `code` with its byte offset, in order: a maximal run of the bytes
+/// [`is_ident`] accepts (all ASCII, so no run splits a character).
+fn identifiers(code: &str) -> impl Iterator<Item = (usize, &str)> {
+    let bytes = code.as_bytes();
+    let ident = |b: u8| is_ident(char::from(b));
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while at < bytes.len() && !ident(bytes[at]) {
+            at += 1;
+        }
+        if at == bytes.len() {
+            return None;
+        }
+        let start = at;
+        while at < bytes.len() && ident(bytes[at]) {
+            at += 1;
+        }
+        Some((start, &code[start..at]))
+    })
 }
 
 /// The item a top-level line declares, and how far its name reaches: `pub fn x(` is
@@ -273,23 +418,23 @@ fn in_a_debug_build(pred: &str) -> Option<bool> {
 /// target, `build.rs`) and each file a `mod` declaration on a line a release build compiles loads
 /// from one (`x.rs` or `x/mod.rs` beside it, or its `#[path]`). A `mod` in an inline module names
 /// a file this does not look for, so that file is not read.
-fn released_files(tree: &Tree<'_>) -> BTreeSet<String> {
+fn released_files(sources: &Sources<'_>) -> BTreeSet<String> {
     let mut loads: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for file in tree.corpus.under(SOURCE) {
+    for (i, file) in sources.files.iter().enumerate() {
         if !file.mentions(&["mod "]) {
             continue;
         }
         let Lexed { code, text } = file.lexed();
-        let compiled = unmasked_lines(code, &release_never_compiles);
-        let texts: Vec<&str> = text.lines().collect();
-        let (dir, base) = module_dirs(&file.rel);
+        let mut texts: Option<Vec<&str>> = None;
         for (at, line) in code.lines().enumerate() {
             let Some(name) = mod_declaration(line) else {
                 continue;
             };
-            if !compiled.get(at).copied().unwrap_or(true) {
+            if !sources.compiled(i, at) {
                 continue;
             }
+            let texts = texts.get_or_insert_with(|| text.lines().collect());
+            let (dir, base) = module_dirs(&file.rel);
             let path = texts[..at]
                 .iter()
                 .rev()
@@ -302,7 +447,7 @@ fn released_files(tree: &Tree<'_>) -> BTreeSet<String> {
             loads.entry(file.rel.as_str()).or_default().extend(targets);
         }
     }
-    let present: BTreeSet<&str> = tree.corpus.under(SOURCE).map(|f| f.rel.as_str()).collect();
+    let present: BTreeSet<&str> = sources.files.iter().map(|f| f.rel.as_str()).collect();
     let mut shipped: BTreeSet<String> = present
         .iter()
         .filter(|rel| crate_root(rel))
@@ -713,12 +858,12 @@ mod tests {
             ("crates/a/src/orphan.rs", ""),
             ("crates/a/build.rs", ""),
         ]);
-        let tree = Tree {
-            root: Path::new("/nonexistent-aterm-census-root"),
-            corpus: &corpus,
-            engine: crate::guards::tests::NO_ENGINE,
-        };
-        let shipped: Vec<String> = released_files(&tree).into_iter().collect();
+        let tree = Tree::new(
+            Path::new("/nonexistent-aterm-census-root"),
+            &corpus,
+            crate::guards::tests::NO_ENGINE,
+        );
+        let shipped: Vec<String> = released_files(&Sources::of(&tree)).into_iter().collect();
         assert_eq!(
             shipped,
             [
@@ -733,6 +878,70 @@ mod tests {
                 "crates/a/src/lib.rs",
             ]
         );
+    }
+
+    fn seam(name: &str, rel: &str, reach: Reach) -> Seam {
+        let (krate, crate_ident) = crate_of(rel);
+        Seam {
+            name: name.to_owned(),
+            file: rel.to_owned(),
+            line: 0,
+            reach,
+            krate,
+            crate_ident,
+            module: module_of(rel),
+            root: crate_root(rel),
+        }
+    }
+
+    /// A code view's mentions of the seams are its identifiers equal to a seam's name (not a
+    /// longer word, a word after `_`, nor a name past 63 bytes with one more letter; a word after
+    /// a non-ASCII letter is one), one per seam of a name two crates share, each seam in turn
+    /// and its mentions in offset order: the order the rule's findings take within a line. Which
+    /// crates it names reads as [`names`] does, an identifier or not.
+    /// NEGATIVE CONTROLS: leaving the hits in the code's order puts `(2, 9)` second; keeping one
+    /// seam per name loses seam 0's or seam 2's; a length mask without `min(63)` overflows its
+    /// shift on the 70-byte name; reading a non-ASCII byte as a word's loses `(0, 203)`.
+    #[test]
+    fn a_seams_mentions_are_the_identifiers_equal_to_its_name_in_seam_then_offset_order() {
+        let long = "a".repeat(70);
+        let gated = [
+            seam("probe", "crates/aterm-a/src/lib.rs", Reach::Dependents),
+            seam("other", "crates/aterm-a/src/lib.rs", Reach::Crate),
+            seam("probe", "crates/aterm-b/src/x.rs", Reach::Dependents),
+            seam(&long, "crates/aterm-c/src/lib.rs", Reach::File),
+            seam("probe", "crates/a.b/src/lib.rs", Reach::Dependents),
+        ];
+        let index = Index::of(&gated);
+        let code = format!(
+            "aterm_b::probe(); aterm_a::other(probes, re_probe); probe {long} {long}a éprobe"
+        );
+        let mentions = index.mentions(&code).expect("the code names seams");
+        assert_eq!(
+            mentions.hits,
+            [
+                (0, 9),
+                (0, 52),
+                (0, 203),
+                (1, 27),
+                (2, 9),
+                (2, 52),
+                (2, 203),
+                (3, 58),
+                (4, 9),
+                (4, 52),
+                (4, 203),
+            ]
+        );
+        for (s, seam) in gated.iter().enumerate() {
+            assert_eq!(
+                mentions.names_crate(&index, s, seam, &code),
+                names(&code, &seam.crate_ident),
+                "{}",
+                seam.crate_ident
+            );
+        }
+        assert!(index.mentions("fn probes() { re_probe(); }").is_none());
     }
 
     /// Which top-level lines declare an item, and how far its name reaches.

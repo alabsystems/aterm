@@ -111,12 +111,8 @@ fn the_rule_reads_the_checkouts_rows_and_judges_every_capture_it_holds() {
         ),
     ];
     let root = disk_tree("aterm-census-guards", "capture-privacy", &files);
-    let corpus = Corpus::read(&root).expect("the synth tree reads");
-    let tree = Tree {
-        root: &root,
-        corpus: &corpus,
-        engine: crate::guards::tests::NO_ENGINE,
-    };
+    let corpus = Corpus::at(&root).expect("the synth tree reads");
+    let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
     let mut found = Vec::new();
     held_to(&tree, &Err(NO_BASELINE.to_string()), &mut found);
     let _ = std::fs::remove_dir_all(&root);
@@ -208,12 +204,8 @@ fn without_the_exports_rows_the_capture_rows_still_hold() {
         ),
     ];
     let root = disk_tree("aterm-census-guards", "capture-privacy-public", &files);
-    let corpus = Corpus::read(&root).expect("the synth tree reads");
-    let tree = Tree {
-        root: &root,
-        corpus: &corpus,
-        engine: crate::guards::tests::NO_ENGINE,
-    };
+    let corpus = Corpus::at(&root).expect("the synth tree reads");
+    let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
     let mut found = Vec::new();
     held_to(&tree, &Err(NO_BASELINE.to_string()), &mut found);
     let noted = notes(&root, &Err(NO_BASELINE.to_string()));

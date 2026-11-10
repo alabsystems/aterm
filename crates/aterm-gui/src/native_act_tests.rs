@@ -22,6 +22,9 @@ mod closed_restart;
 mod closed_restart_model;
 #[path = "native_continuation_phase_tests.rs"]
 mod continuation_phase;
+#[cfg(unix)]
+#[path = "native_receipt_mode_tests.rs"]
+mod receipt_mode;
 
 #[path = "native_account_continuation_tests.rs"]
 mod account_continuation_tests;
@@ -56,6 +59,9 @@ mod publication;
 #[cfg(unix)]
 #[path = "native_receipt_tests.rs"]
 mod receipts;
+#[cfg(unix)]
+#[path = "native_recipient_recovery_tests.rs"]
+mod recipient_recovery;
 #[cfg(unix)]
 #[path = "native_unadmitted_tests.rs"]
 mod unadmitted;
@@ -116,6 +122,8 @@ struct Facts {
     closure_view: Mutex<Option<Closure>>,
     /// Holds the next `historical_closure`, once, after it has read the journal.
     closure_gate: Mutex<Option<PublicationGate>>,
+    birth_observations: Mutex<BTreeMap<u32, Option<bool>>>,
+    group_observations: Mutex<BTreeMap<u32, Option<bool>>>,
     /// This fake host's machine and boot, at first the process's own.
     boot: Mutex<Option<BootStamp>>,
     #[cfg(unix)]
@@ -302,6 +310,8 @@ impl Facts {
             custody: Mutex::new(Some("c5".repeat(32))),
             closure_view: Mutex::new(None),
             closure_gate: Mutex::new(None),
+            birth_observations: Mutex::new(BTreeMap::new()),
+            group_observations: Mutex::new(BTreeMap::new()),
             // The boot this process runs in, which a harness driven in it stamps.
             boot: Mutex::new(BootStamp::current()),
             #[cfg(unix)]
@@ -916,10 +926,13 @@ impl Kernel for Facts {
     fn own_launcher(&self, image: &Image) -> bool {
         image.inode == 20
     }
-    fn birth_alive(&self, original: &Process) -> Option<bool> {
+    fn birth_is_alive(&self, pid: u32, birth: u64) -> Option<bool> {
+        if let Some(observed) = self.birth_observations.lock().unwrap().get(&pid) {
+            return *observed;
+        }
         Some(
-            self.process(original.pid)
-                .is_some_and(|actual| actual.birth == original.birth),
+            self.process(pid)
+                .is_some_and(|actual| actual.birth == birth),
         )
     }
     fn signal(&self, _: i32, _: &Process, _: &crate::SessionCtx) -> String {
@@ -945,6 +958,9 @@ impl Kernel for Facts {
         ))
     }
     fn group_gone(&self, group: u32) -> Option<bool> {
+        if let Some(observed) = self.group_observations.lock().unwrap().get(&group) {
+            return *observed;
+        }
         Some(
             self.processes
                 .lock()
@@ -1057,6 +1073,7 @@ fn caller() -> SupervisorInputCaller {
 
 fn plan(ctx: &crate::SessionCtx, facts: &Facts) -> Prepare {
     Prepare {
+        receipt_mode: None,
         rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),

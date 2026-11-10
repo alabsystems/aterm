@@ -178,7 +178,7 @@ fn target_roots(tree: &Tree<'_>, out: &mut Vec<Finding>) -> BTreeMap<String, BTr
     let mut add = |rel: String, kind: Kind| {
         roots.entry(rel).or_default().insert(kind);
     };
-    for (rel, text) in &tree.corpus.manifests {
+    for (rel, text) in tree.corpus.manifests() {
         let targets = match crate::scan_set::manifest_targets(text, rel) {
             Ok(targets) if targets.package => targets,
             Ok(_) => continue,
@@ -253,6 +253,19 @@ pub(super) fn where_cargo_looks(kind: &str, name: Option<&str>, own: bool) -> Ve
 /// The first shipped place that selects a stock channel, as its line and what selects it. The
 /// views are read whole, so a call rustfmt wrapped reads as one.
 fn selector(file: &SourceFile) -> Option<(usize, String)> {
+    // What selects is a channel literal ([`channel_literal`]) whose quote, override and channel
+    // sit on one line of the TEXT view, so a file whose TEXT spells none of them selects nothing.
+    let whole = &file.lexed().text;
+    let spelled = std::iter::once("")
+        .chain(OVERRIDES.iter().copied())
+        .any(|prefix| {
+            CHANNELS
+                .iter()
+                .any(|channel| whole.contains(&format!("\"{prefix}{channel}")))
+        });
+    if !spelled {
+        return None;
+    }
     let code = file.shipped_code();
     let text = text_beside(file);
     // A literal opens at `at`: its quote is code, not a literal's blanked contents.
@@ -420,7 +433,7 @@ fn names_toolchain(path: &str) -> bool {
 /// The TEXT view, line for line and byte for byte beside [`SourceFile::shipped_code`]. A
 /// literal on a test-only line is no literal there: its quote is blank in that CODE.
 fn text_beside(file: &SourceFile) -> String {
-    let mut text = String::with_capacity(file.raw.len());
+    let mut text = String::with_capacity(file.raw().len());
     for line in file.lines() {
         text.push_str(line.text);
         text.push('\n');
@@ -893,7 +906,7 @@ fn labelled(file: &SourceFile) -> bool {
     if !file.mentions(LABELS) {
         return false;
     }
-    file.raw.lines().zip(file.lines()).any(|(raw, line)| {
+    file.raw().lines().zip(file.lines()).any(|(raw, line)| {
         LABELS.iter().any(|label| {
             raw.match_indices(label).any(|(at, _)| {
                 line.text

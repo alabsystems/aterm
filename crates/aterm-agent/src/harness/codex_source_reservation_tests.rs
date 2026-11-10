@@ -193,10 +193,8 @@ fn terminal_reservation_keeps_metadata_without_pinning_its_own_custody() {
     // Only outside State/Cell may the real resource and original Scope retire.
     drop(custody);
     assert!(!seal.current());
-    assert!(
-        crate::harness::codex_source_gate::PublicationLock::try_for_home(fixture._home.path())
-            .unwrap()
-            .is_some()
+    drop(
+        crate::harness::codex_source_gate::PublicationLock::released_for_home(fixture._home.path()),
     );
     assert!(!reservation.cell.lock().unwrap().custody_retired());
     let pause = pause
@@ -1497,9 +1495,10 @@ fn owned_preload_retirement_retains_native_count_and_gate_until_actual_worker_dr
         panic!("the retained native fence still requires final settlement");
     };
     assert!(fixture.registry.retire_member_owned(command).unwrap());
-    assert!(
-        super::super::super::codex_source_gate::PublicationLock::for_home(fixture._home.path())
-            .is_ok()
+    drop(
+        super::super::super::codex_source_gate::PublicationLock::released_for_home(
+            fixture._home.path(),
+        ),
     );
     let _drained = match pause.try_wait() {
         Ok(drained) => drained,
@@ -3461,7 +3460,7 @@ fn distinct_target_retains_actual_global_share_without_retaining_a_exclusive() {
     );
     drop(a);
     drop(resource);
-    crate::harness::codex_source_gate::PublicationLock::for_home(fixture._home.path()).unwrap();
+    crate::harness::codex_source_gate::PublicationLock::released_for_home(fixture._home.path());
 }
 
 #[test]

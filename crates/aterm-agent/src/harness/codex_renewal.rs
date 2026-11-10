@@ -2230,6 +2230,7 @@ mod tests {
             dialect: super::super::upgrade::Dialect::Zsh,
         };
         let mut prepare = Prepare {
+            receipt_mode: None,
             rejection_domain: None,
             asked: None,
             id: "ab".repeat(16),

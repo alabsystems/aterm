@@ -71,6 +71,9 @@ pub(crate) enum FactAct {
     Show(FactKind),
     /// Type Claude's own command (`crate::claude_slash`).
     Type(Slash),
+    /// Switch the session to Opus 5.5 at xhigh effort and back, as a click on the model does
+    /// ([`App::switch_model`]).
+    SwitchModel,
     /// Switch/pin onto the account named by the displayed roster row.
     UseAccount(AccountLabel),
     /// Request this machine's CLI-pool pin release and normal upkeep, without changing
@@ -101,6 +104,7 @@ impl FactAct {
             Self::Hide(kind) => format!("hide/{}", Fact::of(kind).key()),
             Self::Show(kind) => format!("show/{}", Fact::of(kind).key()),
             Self::Type(slash) => format!("type/{}", slash.key()),
+            Self::SwitchModel => "switch-model".to_string(),
             Self::UseAccount(label) => format!("use/{}", label.as_str()),
             Self::AutoRotate => "auto-rotate".to_string(),
             Self::AccountSettings => "account-settings".to_string(),
@@ -116,10 +120,12 @@ impl FactAct {
 pub(crate) struct AccountMenuRow {
     /// The canonical identity, independent of the formatted label and row order.
     pub(crate) account: AccountLabel,
-    /// The row's label on the card: its week used (`m27 · preferred · 39% used`, an older
-    /// reading's lower bound `≥39% used`; a wall's `out (limited)`), never what is left.
+    /// The row's label on the card: its email (its roster label where it has none) and its week
+    /// used (`m27@example.com · preferred · 39% used`, an older reading's lower bound
+    /// `≥39% used`; a wall's `out (limited)`), never what is left.
     pub(crate) label: String,
-    /// What a screen reader is told of it (`m27, preferred, at least 39 percent used`).
+    /// What a screen reader is told of it (`m27@example.com, preferred, at least 39 percent
+    /// used`).
     pub(crate) spoken: String,
     /// Whether this account is currently active (`●` at the right edge).
     pub(crate) active: bool,
@@ -376,6 +382,8 @@ pub(crate) struct FactMenuFacts {
     pub(crate) note: Option<String>,
     /// A slash press is in flight for the session: the typed rows wait.
     pub(crate) typing: bool,
+    /// Where the model switch goes, on the model's and the effort's menus.
+    pub(crate) switch_to: Option<crate::claude_facts::SwitchPlan>,
     /// The accounts outlook of Claude Code's pool, from the resolver's snapshot
     /// ([`crate::accounts_outlook::snapshot`]).
     pub(crate) outlook: Option<std::sync::Arc<aterm_agent::harness::outlook::Outlook>>,
@@ -408,6 +416,18 @@ const HIDEABLE: [FactKind; 5] = [
     FactKind::Branch,
     FactKind::Context,
 ];
+
+/// The model switch's row, what a click on the model or its effort does.
+fn switch_row(out: &mut Vec<MenuRow>, fact: Fact, facts: &FactMenuFacts, typed: bool) {
+    if let Some(plan) = facts.switch_to {
+        let label = if plan.back {
+            format!("Back to {}", plan.to.words())
+        } else {
+            format!("Switch to {}", plan.to.words())
+        };
+        out.push(item(fact, "\u{21c4}", &label, FactAct::SwitchModel, typed));
+    }
+}
 
 fn item(fact: Fact, glyph: &'static str, label: &str, act: FactAct, enabled: bool) -> MenuRow {
     MenuRow::Item {
@@ -717,6 +737,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
         Fact::Model => {
             out.push(MenuRow::note(format!("\u{25c6}  {}", value(&facts.model))));
             note(&mut out);
+            switch_row(&mut out, fact, facts, typed);
             out.push(item(
                 fact,
                 "\u{22ef}",
@@ -728,6 +749,9 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
         Fact::Effort | Fact::TopEffort => {
             out.push(MenuRow::note(format!("\u{25c9}  {}", value(&facts.effort))));
             note(&mut out);
+            if fact == Fact::Effort {
+                switch_row(&mut out, fact, facts, typed);
+            }
             if let Some(on) = facts.key_row {
                 out.push(item(
                     fact,
@@ -856,7 +880,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 });
                 out.push(MenuRow::Rule);
             }
-            // Under the outlook each item says its plan, and the email leaves the glass
+            // Under the outlook each item says its email and plan
             // (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.5).
             if let Some(sub) = facts
                 .subscription
@@ -1498,10 +1522,12 @@ pub(crate) fn account_menu_rows_from(
             cond,
             accounts::Condition::SignedOut | accounts::Condition::NotEnrolled
         ) || has_email;
+        // Named by its email, as the glass names it (§2.5); the label stays the row's key.
+        let name = row.shown_name();
         rows.push(AccountMenuRow {
             account,
-            label: format!("{} \u{b7} {class_word} \u{b7} {avail}", row.label),
-            spoken: format!("{}, {class_word}, {said}", row.label),
+            label: format!("{name} \u{b7} {class_word} \u{b7} {avail}"),
+            spoken: format!("{name}, {class_word}, {said}"),
             active: is_active,
             enabled,
         });
@@ -1543,6 +1569,9 @@ impl App {
                 .filter(|(of, _)| *of == fact)
                 .map(|(_, note)| note.clone()),
             typing: state.is_some_and(|f| f.press.is_some()),
+            switch_to: matches!(fact, Fact::Model | Fact::Effort)
+                .then(|| self.switch_plan(session))
+                .flatten(),
             ..FactMenuFacts::default()
         };
         let mut key = false;
@@ -1637,6 +1666,12 @@ impl App {
                         outlook
                     }
                 });
+            // The recovery's words name its accounts as the card's items do, by email (§2.5).
+            if let (Some(progress), Some(outlook)) =
+                (out.account_progress.as_mut(), out.outlook.as_deref())
+            {
+                *progress = progress.named(|label| outlook.name_of(label).to_owned());
+            }
             out.token = (cli == Some(aterm_agent::harness::accounts::Cli::Claude))
                 .then(crate::token_shown::shown)
                 .flatten()
@@ -1902,17 +1937,23 @@ impl App {
         }
     }
 
-    /// Execute a typed `slash` row from `session`'s `fact` menu in window `wid`.
+    /// Execute a typing row (`act`: a [`FactAct::Type`] or [`FactAct::SwitchModel`]) from
+    /// `session`'s `fact` menu in window `wid`.
     pub(crate) fn choose_fact_type(
         &mut self,
         wid: WindowId,
         session: u64,
         fact: Fact,
-        slash: Slash,
+        act: FactAct,
         anchor: (usize, usize),
         keyboard: bool,
     ) {
-        match self.press_slash(wid, session, slash) {
+        let pressed = match act {
+            FactAct::Type(slash) => self.press_slash(wid, session, slash),
+            FactAct::SwitchModel => self.switch_model(wid, session),
+            _ => return,
+        };
+        match pressed {
             Ok(()) => {
                 if let Some(f) = self.claude_facts.get_mut(&session) {
                     f.menu_note = None;
@@ -2154,7 +2195,7 @@ impl App {
                     self.redraw_claude_footer(session);
                 }
             }
-            FactAct::Type(_) => {}
+            FactAct::Type(_) | FactAct::SwitchModel => {}
         }
     }
 

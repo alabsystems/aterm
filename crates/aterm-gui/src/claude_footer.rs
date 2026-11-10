@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use aterm_agent::harness::accounts;
 use aterm_agent::harness::footer::{self, FactKind, FactMask, FooterFacts, LaunchFacts};
+use aterm_agent::harness::observe::{self, Observation};
 use aterm_agent::harness::profile::{
     SubscriptionDisplay, USAGE_SHOWN_S, WEEKLY_OUT, WeeklyFigure, WeeklyGap,
 };
@@ -63,14 +64,51 @@ pub(crate) const fn chip_line(program: aterm_phase::Program) -> Option<ChipLine>
     }
 }
 
-/// Whether `program`'s composer is left bare but for the top rule's switch under `switch` (agy
-/// while its switch holds the harness off, [`crate::autopilot::HarnessSwitch::is_off`]).
-pub(crate) fn bare_while_off(
-    program: Option<aterm_phase::Program>,
-    switch: Option<crate::autopilot::HarnessSwitch>,
-) -> bool {
-    program == Some(aterm_phase::Program::Agy)
-        && switch.is_some_and(crate::autopilot::HarnessSwitch::is_off)
+/// Whether a composer is left bare but for the top rule's switch under `switch`: while the master
+/// switch or its agent's own holds the harness off, or a click turning it on has not read back
+/// ([`crate::autopilot::HarnessSwitch::is_off`]), every program's composer is the program's own
+/// but for the switch, drawn off and pressable to turn the harness on. No lockup, label goal,
+/// top-effort key, card or banner, border palette, line D (facts, lights, chips), line E,
+/// agents panel, mode-row rewrite or transcript restyling (2026-11-09, owner: the switch off
+/// disables all harness UX for the pane).
+pub(crate) fn bare_while_off(switch: Option<crate::autopilot::HarnessSwitch>) -> bool {
+    switch.is_some_and(crate::autopilot::HarnessSwitch::is_off)
+}
+
+/// Whether the top rule's switch stands in `agent`'s composer: Claude Code's, agy's and Muse
+/// Code's top rules carry it ([`App::splice_top_line`]); a program the timeline does not name
+/// has no top rule aterm reads.
+pub(crate) const fn switch_stands(agent: Option<aterm_phase::Program>) -> bool {
+    matches!(
+        agent,
+        Some(aterm_phase::Program::Claude | aterm_phase::Program::Agy | aterm_phase::Program::Muse)
+    )
+}
+
+impl App {
+    /// Whether `agent`'s composer under `view` is left bare of the harness: where its switch
+    /// stands ([`switch_stands`]) and holds the harness off ([`bare_while_off`]), but for the
+    /// switch; and, with no host, where the policy supervises nothing for `agent` (`[harness]
+    /// enabled = false`, or its own switch off): no host can turn it on, so nothing of the
+    /// harness is drawn, the switch included. A pane whose switch cannot stand keeps line D's
+    /// `⊘ off` chip as its way back (`claude_lights`' `press_autopilot_chip`).
+    pub(crate) fn pane_bare(
+        &self,
+        view: crate::autopilot::AutopilotView,
+        agent: Option<aterm_phase::Program>,
+    ) -> bool {
+        (switch_stands(agent) && bare_while_off(crate::autopilot::HarnessSwitch::of(view)))
+            || self.unhosted_off(view, agent)
+    }
+
+    /// With no host, the policy supervises nothing for `agent` ([`Self::pane_bare`]).
+    fn unhosted_off(
+        &self,
+        view: crate::autopilot::AutopilotView,
+        agent: Option<aterm_phase::Program>,
+    ) -> bool {
+        view == crate::autopilot::AutopilotView::Unhosted && !self.unhosted_glass(agent)
+    }
 }
 
 /// One pane's painted light block.
@@ -107,15 +145,6 @@ struct TopHit {
     ghost: bool,
 }
 
-/// A top line's lockup on the glass, the hover title's target.
-struct MarkWrite {
-    frame_row: usize,
-    term_row: usize,
-    edit_col: usize,
-    cols: std::ops::Range<usize>,
-    session: u64,
-}
-
 /// What one pane's top line is spliced with ([`App::splice_top_line`]).
 struct TopLineAt {
     leaf_index: usize,
@@ -127,8 +156,9 @@ struct TopLineAt {
     pane: crate::claude_card::PaneGeom,
     blank: RenderCell,
     switch: Option<SwitchPaint>,
+    /// With no host the policy supervises nothing here ([`App::pane_bare`]): no lockup.
+    unhosted_off: bool,
     palette: Option<aterm_effects::harness_card::CardPalette>,
-    held: bool,
     cell: (u16, u16),
 }
 
@@ -164,8 +194,6 @@ pub(crate) struct SpliceLists {
     /// Sessions whose top rule showed Claude's top-effort tag for a process not yet noted as having
     /// shown it.
     top_seen: Vec<(u64, i32)>,
-    /// The lockups each top line would put on the glass ([`MarkWrite`]).
-    marks: Vec<MarkWrite>,
     /// The harness switches this splice drew on composer top rules.
     border_toggles: Vec<crate::claude_lights::BorderSwitch>,
     lit: Vec<Lit>,
@@ -177,10 +205,6 @@ pub(crate) struct SpliceLists {
     log_owed: Vec<u64>,
     /// The agents panels this frame lights (`crate::claude_panel`).
     panels: Vec<crate::claude_panel::PanelLeaf>,
-    /// The frame cell under the pointer that hovers a switch or a lockup, on the grid this splice
-    /// lays ([`crate::claude_lights::WindowLights::glass_hover_px`]): a hover the last paint's
-    /// hits named holds on a top line only while the pointer is on its new row.
-    pointer: Option<(usize, usize)>,
 }
 
 /// One pane's composition for its composer rule ([`compose_rule_spans`], [`PaneFooter`]).
@@ -218,7 +242,6 @@ impl SpliceLists {
         self.tops.clear();
         self.top_hits.clear();
         self.top_seen.clear();
-        self.marks.clear();
         self.border_toggles.clear();
         self.lit.clear();
         self.facts.clear();
@@ -1647,14 +1670,11 @@ impl PaneFooter {
             self.goal.as_ref().map_or(0, |(_, term)| *term)
         };
         if self.top.key != Some(key) || self.top.goal != goal {
-            let version = (key.title_gen != 0)
-                .then_some(self.shown.version.as_deref())
-                .flatten();
             let text = (!hide_goal)
                 .then_some(self.goal.as_ref())
                 .flatten()
                 .map(|(text, _)| &**text);
-            compose_top(&key, &mut self.top, version, text, tail);
+            compose_top(&key, &mut self.top, text, tail);
             self.top.mark = mark_layer(&key, &self.top, self.session, marks);
             self.top.ring = ring_layer(&key, &self.top, self.session, rings);
             self.top.key = Some(key);
@@ -2715,6 +2735,11 @@ struct Identity {
     unoffered: Option<tap::Refusal>,
     /// Exact captured exec environment, fingerprinted without retaining credentials.
     env_stamp: Option<[u8; 32]>,
+    /// The login address the process's login file named at the first read of this image
+    /// (`started`): a later read that names another says the login moved under the running
+    /// process (another tab's `/login`), which the file's modification time cannot say, since
+    /// Claude Code rewrites its home profile while it runs.
+    first_seen: Option<(Option<u64>, String)>,
 }
 
 /// The kernel's start time of `pid`.
@@ -2970,6 +2995,7 @@ fn resolve_and_post(
         route: aterm_agent::harness::accounts::AuthRoute::Outside,
         unoffered: None,
         env_stamp: None,
+        first_seen: None,
     });
     if identity.launch_for.is_none() {
         identity.dir = claude_dir_of_args((asks.args)(pgid).as_ref(), pgid);
@@ -3085,6 +3111,59 @@ fn resolve_into(
         crate::session_log::transcript::Applied::default()
     };
     (moved, found, logged)
+}
+
+/// What a Claude Code process really runs on ([`observe::claude`]), read afresh from the login
+/// file its own exec environment `args` selects (the pass's one read of it, already checked to be
+/// this image's); unread where no home is known.
+fn claude_observation(
+    args: &atpkg::caller_shell::ProcArgs,
+    asks: &Asks,
+    route: accounts::AuthRoute,
+    roster: Option<&accounts::Roster>,
+) -> Observation {
+    let Some(home) = (asks.home)() else {
+        return Observation::Unread;
+    };
+    observe::claude(&args.env, &home, route, roster)
+}
+
+/// The account title's clause where the login file contradicts the roster's belief:
+/// `believed m22 (brontosaurus…), observed unicorn… from ~/.claude.json`, and where the file named
+/// another address when this image first read it (`first`), `; it named first@… when the
+/// process started`: a login moved under the running process. No age: the clause is a fact of
+/// the pass's read, and the footer's fingerprint hashes it, so it moves only when they do.
+fn account_detail(
+    shown: &accounts::FooterAccount,
+    roster: &accounts::Roster,
+    seen: &Observation,
+    first: Option<&str>,
+) -> Option<String> {
+    let believed = shown.believed.as_deref()?;
+    let observed = seen.seen()?;
+    let named = roster
+        .row(believed)
+        .and_then(accounts::Row::expected_identity_email)
+        .map_or_else(
+            || believed.to_owned(),
+            |email| format!("{believed} ({email})"),
+        );
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = match home
+        .as_deref()
+        .and_then(|h| observed.path.strip_prefix(h).ok())
+    {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => observed.path.display().to_string(),
+    };
+    let moved = first
+        .filter(|first| !accounts::email_matches(first, &observed.email))
+        .map(|first| format!("; it named {first} when the process started"))
+        .unwrap_or_default();
+    Some(format!(
+        "believed {named}, observed {} from {path}{moved}",
+        observed.email
+    ))
 }
 
 /// [`resolve_into`]'s footer half.
@@ -3383,6 +3462,8 @@ fn resolve_facts_at_with_cwd(
                     session_id: format!("{prefix}-{}", identity.pid),
                 }),
                 account: None,
+                account_email: None,
+                account_detail: None,
                 route: None,
                 account_progress: None,
                 account_progress_busy: false,
@@ -3398,11 +3479,49 @@ fn resolve_facts_at_with_cwd(
             });
         }
     }
+    // One read of the process's exec environment a pass, for its observed login and its
+    // profile alike; another image's environment says nothing of this one.
+    let args = if is_claude {
+        (asks.args)(identity.pid).filter(|args| {
+            args.argv == identity.argv && Some(exec_env_stamp(&args.env)) == identity.env_stamp
+        })
+    } else {
+        None
+    };
+    // Observation beats belief (`docs/DESIGN-account-discovery-2026-11-09.md`): the login file
+    // this process reads names its account, read afresh on every pass.
+    let seen = match (args.as_ref(), identity.login.as_ref()) {
+        (Some(args), Some(who)) => claude_observation(
+            args,
+            &asks,
+            who.route,
+            roster.at(std::time::Instant::now(), asks.roster),
+        ),
+        _ => Observation::Unread,
+    };
+    // The address this image's login file named at its first read: a later one that differs
+    // is a login that moved under the running process.
+    if let Some(email) = seen.email()
+        && identity
+            .first_seen
+            .as_ref()
+            .is_none_or(|(started, _)| *started != identity.started)
+    {
+        identity.first_seen = Some((identity.started, email.to_owned()));
+    }
+    let first = identity
+        .first_seen
+        .as_ref()
+        .filter(|(started, _)| *started == identity.started)
+        .map(|(_, email)| email.clone());
     if let (Some(facts), Some(who)) = (facts.as_mut(), identity.login.as_ref()) {
-        facts.account = roster
-            .at(std::time::Instant::now(), asks.roster)
-            .and_then(|listed| accounts::footer_label(listed, who))
-            .map(str::to_owned);
+        let listed = roster.at(std::time::Instant::now(), asks.roster);
+        let shown = listed.and_then(|listed| accounts::footer_account(listed, who, &seen));
+        facts.account = shown.as_ref().and_then(|shown| shown.label.clone());
+        facts.account_email = shown.as_ref().and_then(|shown| shown.email.clone());
+        facts.account_detail = shown
+            .as_ref()
+            .and_then(|shown| account_detail(shown, listed?, &seen, first.as_deref()));
         // The settings evidence only weakens the environment's route (as [`own_label`] reads it).
         facts.route = Some(match identity.route {
             accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => who.route,
@@ -3420,14 +3539,11 @@ fn resolve_facts_at_with_cwd(
         })
         .flatten();
     let read = is_claude.then(|| {
-        (asks.args)(identity.pid).and_then(|args| {
+        args.as_ref().and_then(|args| {
             // A refused auth-source check says nothing, and a registry write
-            // missed during an exec cannot borrow the prior image's verdict. A profile read
-            // leaves a token route out: its profile may be stale (§5.7).
-            if !identity.route.is_stored()
-                || args.argv != identity.argv
-                || Some(exec_env_stamp(&args.env)) != identity.env_stamp
-            {
+            // missed during an exec cannot borrow the prior image's verdict (`args` is this
+            // image's). A profile read leaves a token route out: its profile may be stale (§5.7).
+            if !identity.route.is_stored() {
                 return None;
             }
             let tab = env_value(&args.env, aterm_types::domain::ENV_PARENT_SESSION_ID);
@@ -3459,7 +3575,7 @@ fn resolve_facts_at_with_cwd(
                 facts,
                 identity,
                 gated.as_ref().map(Option::as_deref),
-                roster.at(std::time::Instant::now(), asks.roster),
+                (roster.at(std::time::Instant::now(), asks.roster), &seen),
                 asks,
                 clock.now,
             );
@@ -3554,7 +3670,7 @@ fn resolve_facts_at_with_cwd(
                 &kept,
                 identity,
                 gated.as_ref().map(Option::as_deref),
-                roster.at(std::time::Instant::now(), asks.roster),
+                (roster.at(std::time::Instant::now(), asks.roster), &seen),
                 asks,
                 clock.now,
             );
@@ -3615,13 +3731,13 @@ fn weekly_into(
     facts: &FooterFacts,
     identity: &Identity,
     gated: Option<Option<&str>>,
-    roster: Option<&accounts::Roster>,
+    (roster, seen): (Option<&accounts::Roster>, &Observation),
     asks: Asks,
     now: i64,
 ) {
     let shown = |figure: Option<WeeklyFigure>| figure.filter(|f| f.words(now).is_some());
     let tapped = tap::carried_by(&identity.argv);
-    sub.label = gated.and_then(|_| own_label(identity, roster, asks));
+    sub.label = gated.and_then(|_| own_label(identity, roster, seen, asks));
     let seat = gated.map(|_| (asks.tap.seat)());
     let tap = gated
         .zip(seat.as_ref())
@@ -3630,6 +3746,7 @@ fn weekly_into(
     // Which row Claude shows for the newest run (the quota row's claim, glass design §5.2), read
     // here beside the figure so the frame reads no file.
     sub.tap_own = tap.as_ref().is_some_and(tap::Reading::claimable);
+    sub.model_id = tap.as_ref().and_then(|reading| reading.model.clone());
     let reading = tap.and_then(|reading| own_tap_figure(identity, reading));
     let own = gated.and_then(|_| WeeklyFigure::newer(shown(sub.weekly_figure), shown(reading)));
     let walled = facts
@@ -3641,7 +3758,7 @@ fn weekly_into(
         Some(own) => Some(own),
         None => {
             let store = seat.as_ref().and_then(|seat| {
-                own_stored_week(identity, roster, asks, seat.store.as_deref()?, now)
+                own_stored_week(identity, (roster, seen), asks, seat.store.as_deref()?, now)
             });
             if walled || store.is_some_and(|week| week.walled) {
                 sub.weekly = Some(WEEKLY_OUT.into());
@@ -3830,22 +3947,27 @@ fn store_week(acct: &accounts::Account, now: i64) -> StoreWeek {
 /// reaches its footer.
 fn own_stored_week(
     identity: &Identity,
-    roster: Option<&accounts::Roster>,
+    (roster, seen): (Option<&accounts::Roster>, &Observation),
     asks: Asks,
     store: &std::path::Path,
     now: i64,
 ) -> Option<StoreWeek> {
-    let label = own_label(identity, roster, asks)?;
+    let label = own_label(identity, roster, seen, asks)?;
     let (state, _) = accounts::Store::at(store).load(now).ok()?;
     Some(store_week(state.accounts.get(&label)?, now))
 }
 
 /// The roster label of this process's own account, for a process in the machine's default Claude
-/// home and `HOME` only (the one whose readings the store keeps): the label its login is judged
-/// to (`accounts::judged_label` over `roster`, or the machine's own row where it lists none). The
+/// home and `HOME` only (the one whose readings the store keeps): the row its login file names
+/// (`accounts::observed_label` over `roster`, or the machine's own row where it lists none). The
 /// account menu's row it names is the only one the footer's week reaches
 /// (`SubscriptionDisplay::label`).
-fn own_label(identity: &Identity, roster: Option<&accounts::Roster>, asks: Asks) -> Option<String> {
+fn own_label(
+    identity: &Identity,
+    roster: Option<&accounts::Roster>,
+    seen: &Observation,
+    asks: Asks,
+) -> Option<String> {
     let login = identity.login.as_ref().filter(|login| login.default_home)?;
     let home = (asks.home)()?;
     if !tap::own_records(&home, identity.dir.as_deref()?) {
@@ -3862,7 +3984,16 @@ fn own_label(identity: &Identity, roster: Option<&accounts::Roster>, asks: Asks)
         },
         ..login.clone()
     };
-    accounts::judged_label(roster, &who).map(str::to_owned)
+    // Observation beats belief: the row the login file names (`seen`, this pass's), never the
+    // believed row where the two disagree; an account no row lists has no row whose week the
+    // footer could take. An environment route reads no login file.
+    let unread = Observation::Unread;
+    let seen = if who.route == accounts::AuthRoute::Outside {
+        &unread
+    } else {
+        seen
+    };
+    accounts::observed_label(roster, &who, seen).map(str::to_owned)
 }
 
 /// One known reset occurrence has arrived.
@@ -3961,6 +4092,8 @@ pub(crate) fn fingerprint(
         effort_for,
         owner,
         account,
+        account_email,
+        account_detail,
         // The footer draws no route; a survey row and a status line read it.
         route: _,
         account_progress,
@@ -3991,6 +4124,7 @@ pub(crate) fn fingerprint(
     )
         .hash(&mut h);
     (model_open, effort_open, effort_for, owner, account, off).hash(&mut h);
+    (account_email, account_detail).hash(&mut h);
     subscription.hash(&mut h);
     account_progress.hash(&mut h);
     account_progress_busy.hash(&mut h);
@@ -4862,7 +4996,7 @@ impl App {
             let harness = if shows {
                 let (word, view, supervised, _) =
                     self.session_autopilot_for(session, agent, &claims);
-                if bare_while_off(agent, crate::autopilot::HarnessSwitch::of(view)) {
+                if self.pane_bare(view, agent) {
                     goal = 0;
                 }
                 let theme = crate::autopilot::harness_theme(
@@ -4961,8 +5095,8 @@ impl App {
             pane,
             blank,
             switch,
+            unhosted_off,
             palette,
-            held,
             cell,
         } = *at;
         let Some(top) = texts.top_line(leaf_index, program) else {
@@ -4986,14 +5120,8 @@ impl App {
             return;
         };
         let ground = blank;
-        let hide_lockup = bare_while_off(Some(program), switch.map(|s| s.face));
+        let hide_lockup = bare_while_off(switch.map(|s| s.face)) || unhosted_off;
         let frame_row = region.strip + region.row_off + top;
-        // The hover was named on the last paint's hits: a line this paint moves from under a
-        // still pointer (a relaunch, a regrid) draws no title for it, until the pointer's next
-        // look at the new hits ([`App::settle_glass_hover`]).
-        let mark_hover = !hide_lockup
-            && ws.claude_lights.mark_hovered(session)
-            && lists.pointer.is_none_or(|(row, _)| row == frame_row);
         let footer = texts.footer(leaf_index, session);
         let typed = !hide_lockup && program == aterm_phase::Program::Claude && footer.key_typed();
         let face = if hide_lockup {
@@ -5045,12 +5173,6 @@ impl App {
             face,
             cell,
             clip: pane_grid_px(cell, pane),
-            mark_hover,
-            title_gen: if mark_hover && held {
-                footer.shown_gen
-            } else {
-                0
-            },
         };
         // Claude Code's label zone as the grid holds it: a laid switch moves it whole.
         let tail = run
@@ -5092,15 +5214,6 @@ impl App {
                 });
         }
         if !composed.cells.is_empty() {
-            if !composed.lockup.is_empty() {
-                lists.marks.push(MarkWrite {
-                    frame_row: key.frame_row,
-                    term_row: key.term_row,
-                    edit_col: composed.col,
-                    cols: composed.lockup.clone(),
-                    session,
-                });
-            }
             lists.tops.push(TopWrite {
                 frame_row: key.frame_row,
                 col: composed.col,
@@ -5184,10 +5297,6 @@ impl App {
         grid: Option<crate::app_mouse::GlassGrid>,
     ) {
         let mut cards = Vec::new();
-        lists.pointer = grid.and_then(|grid| {
-            let (x, y) = self.windows.get(&wid)?.claude_lights.glass_hover_px()?;
-            grid.cell_at(x, y)
-        });
         if let Some(ws) = self.windows.get_mut(&wid) {
             undo(&mut ws.claude_footer_undo, &mut ws.input_scratch);
             crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
@@ -5253,9 +5362,8 @@ impl App {
                     {
                         let (_, view, supervised, _) =
                             self.session_autopilot_for(session, agent, &claims);
-                        let agy_switch_off =
-                            bare_while_off(Some(prog), crate::autopilot::HarnessSwitch::of(view));
-                        if view.wears_glass(supervised).is_some() && !agy_switch_off {
+                        let switch_off = self.pane_bare(view, agent);
+                        if view.wears_glass(supervised).is_some() && !switch_off {
                             let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
                             let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
                             let pane_rows = leaf.rect.size.height.round().max(1.0) as usize;
@@ -5701,11 +5809,10 @@ impl App {
                         }
                     }
                 }
-                let agy_switch_off =
-                    bare_while_off(agent, crate::autopilot::HarnessSwitch::of(view));
+                let switch_off = self.pane_bare(view, agent);
                 cards.push(crate::claude_card::card_leaf(
                     texts,
-                    self.config.claude_footer_card() && !agy_switch_off,
+                    self.config.claude_footer_card() && !switch_off,
                     leaf_index,
                     session,
                     pane,
@@ -5745,16 +5852,9 @@ impl App {
                 if read.is_some_and(|r| !r.mode_row) {
                     texts.note_drift(leaf_index, session, version);
                 }
-                let on_glass = read
-                    .filter(|_| !agy_switch_off)
-                    .map(|r| r.rule)
-                    .filter(|&r| {
-                        !self.chrome_owns_terminal_span(
-                            wid,
-                            row_off + r,
-                            col_off..col_off + pane_cols,
-                        )
-                    });
+                let on_glass = read.filter(|_| !switch_off).map(|r| r.rule).filter(|&r| {
+                    !self.chrome_owns_terminal_span(wid, row_off + r, col_off..col_off + pane_cols)
+                });
                 let rule = on_glass.and_then(|r| {
                     let frame_row = strip + row_off + r;
                     let (run, rule) = texts.rule_run(
@@ -5771,7 +5871,7 @@ impl App {
                 {
                     lists.bare.push((session, row_off + r));
                 }
-                let harness_on = view.wears_glass(supervised).is_some() && !agy_switch_off;
+                let harness_on = view.wears_glass(supervised).is_some() && !switch_off;
                 let click = self.claude_click_shown(session);
                 // Claude's running jobs, read past the ⬆️'s own need for them: its words name them
                 // for a move held by them, and the mode light's title for what a click's restart
@@ -5807,10 +5907,9 @@ impl App {
                 });
                 let unhosted_on = self.unhosted_glass(agent);
                 let theme = crate::autopilot::harness_theme(view, supervised, word, unhosted_on);
-                let border = theme.filter(|_| switch.is_some() && !agy_switch_off);
-                let gate = agent.is_some_and(|prog| {
-                    rewrites_mode_row(prog, border.is_some()) && !agy_switch_off
-                });
+                let border = theme.filter(|_| switch.is_some() && !switch_off);
+                let gate = agent
+                    .is_some_and(|prog| rewrites_mode_row(prog, border.is_some()) && !switch_off);
                 let top_rule = readings.reach.and_then(|r| r.rules()).map(|(top, _)| top);
                 if let Some(
                     prog @ (aterm_phase::Program::Claude
@@ -5840,8 +5939,8 @@ impl App {
                             pane,
                             blank,
                             switch,
+                            unhosted_off: self.unhosted_off(view, agent),
                             palette: border,
-                            held: true,
                             cell,
                         },
                     );
@@ -5872,7 +5971,7 @@ impl App {
                         prog,
                         aterm_phase::Program::Claude | aterm_phase::Program::Agy
                     ) && (prog == aterm_phase::Program::Claude || harness_on)
-                        && !agy_switch_off
+                        && !switch_off
                         && let Some(palette) = theme
                         && self.config.claude_footer_agents()
                         && let Some((_, bottom)) = readings.reach.and_then(|r| r.rules())
@@ -6277,16 +6376,6 @@ impl App {
                     .any(|at| at == (r.frame_row, r.col_off));
                 if !vendor {
                     claude_card.paint_marks(input_scratch, r.frame_row, r.col_off, &r.painted);
-                }
-            }
-            for m in lists.marks.drain(..) {
-                if claude_footer_undo.took(m.frame_row, m.edit_col) {
-                    claude_lights.mark_hits.push(crate::claude_lights::MarkHit {
-                        frame_row: m.frame_row,
-                        term_row: m.term_row,
-                        cols: m.cols,
-                        session: m.session,
-                    });
                 }
             }
             for r in &lists.rules {
@@ -8510,8 +8599,6 @@ struct TopKey {
     face: KeyFace,
     cell: (u16, u16),
     clip: aterm_core::render::PxRect,
-    mark_hover: bool,
-    title_gen: u64,
 }
 
 #[cfg(test)]
@@ -8630,42 +8717,21 @@ const fn rgb_of(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
-/// Compose the CLI's top line ([`top_line`]), laid from its right end: `──`, the label, the
-/// switch, `──`, Claude Code's label zone moved whole from `tail` (the grid's cells of it, as
-/// [`Tail`] read them, each ink floored to read as words do, [`relaid`]) or aterm's ghost, the
-/// arc rule with the agent's active `goal` on it ([`lay_goal`]), and the lockup.
-fn compose_top(
-    key: &TopKey,
-    top: &mut ComposedTop,
-    version: Option<&str>,
-    goal: Option<&str>,
-    tail: &[RenderCell],
-) {
-    compose_top_in(key, top, version, goal, tail, TITLE_LEAD);
-}
-
-/// The `─` the hover title leaves before the tail slot or the switch.
-const TITLE_LEAD: usize = 2;
-
 /// The ⬆️ of a newer build ([`TopUp`]), drawn with emoji presentation over two cells.
 pub(crate) const UP_ARROW: char = '\u{2b06}';
 
 /// A held move's arrow ([`UpState::Held`]): `↑`, one cell in the label's quiet ink.
 pub(crate) const HELD_ARROW: char = '\u{2191}';
 
-/// [`compose_top`] with the hover title leaving `title_lead` `─` before the tail slot.
+/// Compose the CLI's top line ([`top_line`]), laid from its right end: `──`, the label, the
+/// switch, `──`, Claude Code's label zone moved whole from `tail_cells` (the grid's cells of it, as
+/// [`Tail`] read them, each ink floored to read as words do, [`relaid`]) or aterm's ghost, the
+/// arc rule with the agent's active `goal` on it ([`lay_goal`]), and the lockup.
 #[expect(
     clippy::too_many_lines,
     reason = "one line's layout, right to left, read as one pass"
 )]
-fn compose_top_in(
-    key: &TopKey,
-    top: &mut ComposedTop,
-    version: Option<&str>,
-    goal: Option<&str>,
-    tail_cells: &[RenderCell],
-    title_lead: usize,
-) {
+fn compose_top(key: &TopKey, top: &mut ComposedTop, goal: Option<&str>, tail_cells: &[RenderCell]) {
     #[cfg(test)]
     crate::work_counts::footer_top_composed();
     top.cells.clear();
@@ -8846,7 +8912,7 @@ fn compose_top_in(
                 .map(|(l, tier)| (run.col + l.start..run.col + l.end, tier)),
         });
     }
-    let goal_at = goal.filter(|_| !key.mark_hover).and_then(|text| {
+    let goal_at = goal.and_then(|text| {
         let from = lockup_at
             .as_ref()
             .map_or(rung.lead, |r| r.end)
@@ -8917,59 +8983,15 @@ fn compose_top_in(
         if rung.lockup == Some(Lockup::Full) {
             let ground = crate::claude_card::pack(blank.bg);
             let name_at = at.start + aterm_effects::cli_marks::ICON_RUN;
-            let word = mark.name(build);
-            let word_len = word.chars().count();
-            let room = next.saturating_sub(name_at + 1 + title_lead);
-            // While the label shows the CLI's version the title names the product alone.
-            let says_cli = rung.label.is_some_and(label_says_cli)
-                && switch.is_some_and(|paint| paint.cli_core().is_some());
-            let title = key
-                .mark_hover
-                .then(|| hover_title(program.product(), version.filter(|_| !says_cli), room))
-                .flatten()
-                .filter(|t| t.len >= word_len);
-            match title {
-                Some(t) => {
-                    let end = name_at + t.len;
-                    if cells.len() <= end - lo {
-                        cells.resize(end + 1 - lo, rule_cell);
-                    }
-                    let letter = |k: usize| {
-                        if t.len <= 1 {
-                            0
-                        } else {
-                            (k * (word_len - 1) + (t.len - 1) / 2) / (t.len - 1)
-                        }
-                    };
-                    for (k, ch) in t.chars().enumerate() {
-                        cells[name_at + k - lo] = if ch == ' ' {
-                            pad
-                        } else {
-                            RenderCell {
-                                ch,
-                                fg: rgb_of(aterm_effects::cli_marks::name_fg(
-                                    mark,
-                                    letter(k),
-                                    ground,
-                                )),
-                                bold: true,
-                                ..blank
-                            }
-                        };
-                    }
-                    cells[end - lo] = pad;
-                    top.lockup.end = run.col + end + 1;
-                }
-                None => {
-                    for (k, ch) in word.chars().enumerate() {
-                        cells[name_at + k - lo] = RenderCell {
-                            ch,
-                            fg: rgb_of(aterm_effects::cli_marks::name_fg(mark, k, ground)),
-                            bold: true,
-                            ..blank
-                        };
-                    }
-                }
+            // The name is the CLI's own word at rest and under the pointer alike: a hover never
+            // swaps it for the product's name.
+            for (k, ch) in mark.name(build).chars().enumerate() {
+                cells[name_at + k - lo] = RenderCell {
+                    ch,
+                    fg: rgb_of(aterm_effects::cli_marks::name_fg(mark, k, ground)),
+                    bold: true,
+                    ..blank
+                };
             }
         }
     }
@@ -9192,48 +9214,6 @@ fn lay_goal(goal: &str, from: usize, to: usize) -> Option<LaidGoal> {
 /// The cache and repaint term of an active goal (0: none).
 pub(crate) fn goal_term(goal: Option<&str>) -> u64 {
     goal.map_or(0, |text| aterm_hash::fnv1a_64(text.as_bytes()) | 1)
-}
-
-/// The hover title's words ([`hover_title`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HoverTitle<'a> {
-    product: &'a str,
-    version: Option<&'a str>,
-    len: usize,
-}
-
-impl HoverTitle<'_> {
-    /// The title's glyphs.
-    fn chars(&self) -> impl Iterator<Item = char> + '_ {
-        self.product.chars().chain(
-            self.version
-                .into_iter()
-                .flat_map(|v| std::iter::once(' ').chain(v.chars())),
-        )
-    }
-}
-
-/// The widest hover title whose words fit `room` cells.
-fn hover_title<'a>(
-    product: &'a str,
-    version: Option<&'a str>,
-    room: usize,
-) -> Option<HoverTitle<'a>> {
-    let cells = product.chars().count();
-    version
-        .map(|v| HoverTitle {
-            product,
-            version: Some(v),
-            len: cells + 1 + v.chars().count(),
-        })
-        .filter(|t| t.len <= room)
-        .or_else(|| {
-            (cells <= room).then_some(HoverTitle {
-                product,
-                version: None,
-                len: cells,
-            })
-        })
 }
 
 /// The contents of the marks' sprites ([`aterm_effects::cli_marks::content`]).
@@ -11187,6 +11167,7 @@ pub(crate) mod rig {
             route: aterm_agent::harness::accounts::AuthRoute::Outside,
             unoffered: None,
             env_stamp: None,
+            first_seen: None,
         };
         let asks = Asks {
             files: |_| None,
@@ -12372,8 +12353,8 @@ mod tests {
         let rest = compose_rule_spans(&fit, None, rule, blank, (&plain, place), room, None);
         assert_eq!(
             text_of(&rest.cells),
-            " \u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 04:00   \
-             \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "
+            " \u{25C6} Opus 5.5 xhigh   \u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \
+             \u{2573} ~Thu 12 Nov 04:00   \u{2302} ~/aterm   \u{2387} main "
         );
         let unit = rest
             .spans
@@ -12487,8 +12468,8 @@ mod tests {
             .find(|span| span.kind == FactKind::Model)
             .expect("the model's span");
         assert!(
-            under.iter().all(|&c| c < at + usize::from(model.cells.0)),
-            "the model is not lit"
+            under.iter().all(|&c| c >= at + usize::from(model.cells.1)),
+            "the model, ahead of the unit, is not lit"
         );
     }
     #[test]
@@ -12557,8 +12538,9 @@ mod tests {
         let cells = compose_rule(&fit, None, rule, blank, palette, room).0;
         let text = text_of(&cells);
         assert!(
-            text.contains(" \u{29D7} until 3pm   \u{25C6}") && !text.contains("5h"),
-            "the wall leads, until when alone: {text:?}"
+            text.contains(" \u{25C6} Opus 5.5 xhigh   \u{29D7} until 3pm   ")
+                && !text.contains("5h"),
+            "the wall follows the model, until when alone: {text:?}"
         );
         let (glass, at) = (rule_glass(palette, rule, blank), rule_at_room(room));
         let col = |mark: char| cells.iter().position(|c| c.ch == mark).unwrap();
@@ -12703,6 +12685,7 @@ mod tests {
                     route: aterm_agent::harness::accounts::AuthRoute::Outside,
                     unoffered: None,
                     env_stamp: None,
+                    first_seen: None,
                 },
             );
             folds.insert(session, footer::FooterCache::default());
@@ -12819,15 +12802,36 @@ mod tests {
         assert_eq!(login_of_args(Some(&args_of(&[]))), None, "reads empty");
         let roster = two_accounts();
         let default = login_of_args(Some(&args_of(&["HOME=/home/someone"]))).expect("read");
-        assert_eq!(accounts::footer_label(&roster, &default), Some("main"));
+        assert_eq!(
+            accounts::footer_label(
+                &roster,
+                &default,
+                &aterm_agent::harness::observe::Observation::Unread
+            ),
+            Some("main")
+        );
         let named = login_under("/logins/work-2").expect("read");
-        assert_eq!(accounts::footer_label(&roster, &named), Some("work-2"));
+        assert_eq!(
+            accounts::footer_label(
+                &roster,
+                &named,
+                &aterm_agent::harness::observe::Observation::Unread
+            ),
+            Some("work-2")
+        );
         let own_home = login_of_args(Some(&args_of(&[
             "HOME=/home/someone",
             "CLAUDE_CONFIG_DIR=/elsewhere",
         ])))
         .expect("read");
-        assert_eq!(accounts::footer_label(&roster, &own_home), None);
+        assert_eq!(
+            accounts::footer_label(
+                &roster,
+                &own_home,
+                &aterm_agent::harness::observe::Observation::Unread
+            ),
+            None
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -13166,6 +13170,7 @@ mod tests {
             route: aterm_agent::harness::accounts::AuthRoute::Outside,
             unoffered: None,
             env_stamp: None,
+            first_seen: None,
         }
     }
 
@@ -16754,7 +16759,7 @@ mod tests {
         let strip = strip(&app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
         assert!(
-            bottom.contains("\u{2386} this login")
+            bottom.contains("\u{2386} redacted-user@example.test")
                 && !bottom.contains("71%")
                 && email_of(&app).as_deref() == Some("redacted-user@example.test"),
             "CONTROL: no card shown yet: {bottom:?}"
@@ -16783,7 +16788,7 @@ mod tests {
         );
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("\u{2386} this login 71%")
+            bottom.contains("\u{2386} redacted-user@example.test 71%")
                 && !bottom.contains("Muse Code Max Usage")
                 && !bottom.contains("unavailable"),
             "the usage card populates its weekly beside the account: {bottom:?}"
@@ -16810,7 +16815,7 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[account_only_bottom]);
         assert!(
-            bottom.contains("\u{2386} this login")
+            bottom.contains("\u{2386} redacted-user@example.test")
                 && email_of(&app).as_deref() == Some("redacted-user@example.test")
                 && plan_of(&app).as_deref() != Some("Muse Code Max Usage"),
             "a named status card cannot borrow another card's plan: {bottom:?}"
@@ -16821,7 +16826,7 @@ mod tests {
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
             plan_of(&app).as_deref() == Some("Muse Code Max Usage")
-                && bottom.contains("\u{2386} this login 71%"),
+                && bottom.contains("\u{2386} redacted-user@example.test 71%"),
             "usage-only bootstrap remains available before any switch: {bottom:?}"
         );
         let already_read = clock_reads.get();
@@ -16877,7 +16882,7 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("\u{2386} this login") && !bottom.contains("71%"),
+            bottom.contains("\u{2386} redacted-user@example.test") && !bottom.contains("71%"),
             "an unchanged expired card cannot graft its quota again: {bottom:?}"
         );
         assert_eq!(
@@ -16891,7 +16896,7 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("\u{2386} this login 71%"),
+            bottom.contains("\u{2386} redacted-user@example.test 71%"),
             "a new window is admitted: {bottom:?}"
         );
         {
@@ -16917,7 +16922,7 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("\u{2386} this login")
+            bottom.contains("\u{2386} second@example.test")
                 && email_of(&app).as_deref() == Some("second@example.test")
                 && plan_of(&app).as_deref() != Some("Muse Code Max Usage")
                 && !bottom.contains("71%"),
@@ -16936,7 +16941,7 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("\u{2386} this login")
+            bottom.contains("\u{2386} second@example.test")
                 && email_of(&app).as_deref() == Some("second@example.test")
                 && plan_of(&app).as_deref() != Some("Muse Code Max Usage")
                 && !bottom.contains("71%"),
@@ -16966,7 +16971,7 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[stale_bottom_row]);
         assert!(
-            bottom.contains("\u{2386} this login")
+            bottom.contains("\u{2386} second@example.test")
                 && email_of(&app).as_deref() == Some("second@example.test")
                 && !bottom.contains("redacted-user")
                 && !bottom.contains("71%"),
@@ -16983,7 +16988,7 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[stale_bottom_row]);
         assert!(
-            bottom.contains("\u{2386} this login")
+            bottom.contains("\u{2386} second@example.test")
                 && email_of(&app).as_deref() == Some("second@example.test")
                 && plan_of(&app).as_deref() == Some("Muse Code Pro")
                 && plan_of(&app).as_deref() != Some("Muse Code Max Usage")
@@ -17444,8 +17449,7 @@ mod tests {
             );
             if prog == "agy" {
                 assert!(
-                    bottom_on.contains("\u{2386} this login")
-                        && !bottom_on.contains("redacted-user")
+                    bottom_on.contains("\u{2386} redacted-user@example.test")
                         && !bottom_on.contains("Google AI Ultra"),
                     "agy: the launch card's account populates the standardized footer, its plan the hover: {bottom_on:?}"
                 );

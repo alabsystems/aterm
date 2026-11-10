@@ -53,14 +53,12 @@ fn key(program: aterm_phase::Program, len: usize, palette: Option<CardPalette>) 
         face: KeyFace::default(),
         cell: (7, 14),
         clip: aterm_core::render::PxRect::EVERYWHERE,
-        mark_hover: false,
-        title_gen: 0,
     }
 }
 
 fn composed(key: &TopKey, goal: Option<&str>) -> ComposedTop {
     let mut top = ComposedTop::default();
-    compose_top(key, &mut top, None, goal, &[]);
+    compose_top(key, &mut top, goal, &[]);
     top
 }
 
@@ -175,12 +173,13 @@ fn the_goal_sits_between_the_lockup_and_the_switch_and_moves_neither() {
 }
 
 #[test]
-fn the_hover_title_and_a_narrow_rule_take_the_room_from_the_goal() {
-    let hovered = TopKey {
-        mark_hover: true,
-        ..key(aterm_phase::Program::Claude, 120, None)
-    };
-    assert_eq!(composed(&hovered, Some(VISION)).goal_cols, None);
+fn a_narrow_rule_takes_the_room_from_the_goal() {
+    assert!(
+        composed(&key(aterm_phase::Program::Claude, 120, None), Some(VISION))
+            .goal_cols
+            .is_some(),
+        "CONTROL: a wide rule lays the goal"
+    );
     let narrow = key(aterm_phase::Program::Claude, 40, None);
     let top = composed(&narrow, Some(VISION));
     assert_eq!(

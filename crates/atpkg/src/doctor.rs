@@ -308,8 +308,8 @@ pub struct Probes {
     /// What the `[packages]` table's own spelling asks of its owner.
     pub config_notes: Vec<String>,
     /// The `aterm.toml` this process reads and the one the app launchd starts reads, when they
-    /// differ ([`crate::config_split`]); a fixture reads one.
-    pub config_split: Option<crate::config_split::Split>,
+    /// differ ([`crate::config_split`]), or why the app's configuration could not be read.
+    pub config_split: Result<Option<crate::config_split::Split>, String>,
     /// A `[packages] prefix` this shipped build does not use, naming another store.
     pub ignored_prefix: Option<PathBuf>,
     /// Retired environment opt-outs still exported to this process.
@@ -588,7 +588,7 @@ impl Default for Probes {
             automatic: true,
             excluded: Vec::new(),
             config_notes: Vec::new(),
-            config_split: None,
+            config_split: Ok(None),
             ignored_prefix: None,
             retired_env: Vec::new(),
             stub_env: crate::reroute::StubEnv::default(),
@@ -1679,7 +1679,7 @@ pub(crate) fn read(
             note.clone(),
         ));
     }
-    if let (Some(split), Some(home)) = (&probes.config_split, home) {
+    if let (Ok(Some(split)), Some(home)) = (&probes.config_split, home) {
         let remedy = match split.unify_command() {
             Some(command) => Remedy::Command(command),
             None => Remedy::Person {
@@ -1696,6 +1696,14 @@ pub(crate) fn read(
             split.said(home),
             "one aterm.toml for the app and the shell's aterm",
             remedy,
+        ));
+    }
+    if let Err(reason) = &probes.config_split {
+        f.push(Finding::unread(
+            c::of(c::CONFIG, "split"),
+            Class::Person,
+            "aterm.toml",
+            reason.clone(),
         ));
     }
     if let Some(ignored) = probes.ignored_prefix.as_deref() {

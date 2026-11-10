@@ -659,10 +659,32 @@ pub fn proved_running(exe: &Path) -> Result<Option<String>, String> {
         return Ok(None);
     };
     let record = PathBuf::from(record);
-    let cutter = proved_cutter(exe, &record)?;
     let repo = std::env::current_dir().map_err(|e| format!("name the release clone: {e}"))?;
-    clean_at(&repo, &cutter.commit)?;
-    Ok(Some(cutter.commit))
+    let args: Option<Vec<_>> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string().ok())
+        .collect();
+    proved_running_at(exe, &record, &repo, args.as_deref()).map(Some)
+}
+
+fn proved_running_at(
+    exe: &Path,
+    record: &Path,
+    repo: &Path,
+    args: Option<&[String]>,
+) -> Result<String, String> {
+    let cutter = proved_cutter(exe, record)?;
+    if !args.is_some_and(reads_candidate_elsewhere) {
+        clean_at(repo, &cutter.commit)?;
+    }
+    Ok(cutter.commit)
+}
+
+/// Only a parsed release preview can leave the caller's HEAD alone. Its frozen executable
+/// is still content-proved above; its readers use the owned candidate checkout instead.
+fn reads_candidate_elsewhere(args: &[String]) -> bool {
+    matches!(crate::cli::parse(args), Ok(crate::cli::Cmd::Release(opts))
+        if opts.dry_run && !opts.forget && opts.abandon.is_none() && !opts.prefreeze)
 }
 
 fn proved_cutter(exe: &Path, record: &Path) -> Result<Cutter, String> {
@@ -1024,6 +1046,64 @@ mod tests {
             adopt_cutter(&release, &next, &source, &observation)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn only_a_parsed_release_preview_can_start_away_from_its_frozen_commit() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        crate::ledger::testing::init(
+            &repo,
+            &[
+                ("user.name", "Fixture"),
+                ("user.email", "fixture@example.invalid"),
+            ],
+        );
+        let git = GitCli::new(&repo);
+        crate::ledger::git_ok(&git, &["commit", "--allow-empty", "-qm", "checkout"]).unwrap();
+        let candidate = "1".repeat(40);
+        let source = tool_source(temp.path(), "source", CUTTER_VERSION, 0);
+        let release = temp.path().join("release");
+        let cutter = stage_cutter(
+            &release,
+            &candidate,
+            &source,
+            &temp.path().join("log"),
+            None,
+        )
+        .unwrap();
+        publish_cutter(&release, &cutter).unwrap();
+        let read = |args: &[&str]| {
+            proved_running_at(
+                &cutter.tool.path,
+                &cutter_record_path(&release),
+                &repo,
+                Some(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()),
+            )
+        };
+        assert_eq!(
+            read(&["release", "--dry-run", "--mac-only"]).unwrap(),
+            candidate
+        );
+        // Negative controls: another dry verb, a real cut, an invalid preview and absent
+        // arguments all retain startup's clean/exact-checkout requirement.
+        for args in [
+            &["release", "--mac-only"][..],
+            &["cut", "--dry-run"],
+            &["release", "--dry-run", "--unknown"],
+            &["release", "--dry-run", "--forget"],
+        ] {
+            assert!(read(args).is_err(), "{args:?}");
+        }
+        assert!(
+            proved_running_at(
+                &cutter.tool.path,
+                &cutter_record_path(&release),
+                &repo,
+                None
+            )
+            .is_err()
         );
     }
 
