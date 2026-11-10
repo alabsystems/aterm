@@ -309,7 +309,17 @@ fn an_oversized_frame_ends_the_connection_unread() {
     .unwrap();
     let claimed = u32::try_from(aterm_uds::lan::wire::MAX_FRAME + 1).unwrap();
     raw.write_all(&claimed.to_be_bytes()).unwrap();
-    raw.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+    #[cfg(unix)]
+    {
+        let deadline = std::time::Instant::now() + MUST_HAPPEN;
+        while !aterm_uds::hangup::peer_closed(&raw) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the broker never closed"
+            );
+            aterm_uds::deadline::poll_yield();
+        }
+    }
     // The broker's hello, then its close: it read no body.
     let mut reader = aterm_uds::lan::wire::Reader::new(0);
     let deadline = Some(std::time::Instant::now() + MUST_HAPPEN);

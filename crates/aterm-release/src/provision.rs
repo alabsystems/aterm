@@ -3443,10 +3443,8 @@ mod tests {
 
     #[test]
     fn local_roster_state_that_cannot_be_proven_is_a_hard_stop_not_a_reseed() {
-        let dir = std::env::temp_dir().join(format!("provision-local-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("aterm-machines.toml");
+        let scratch = crate::test_scratch_dir("local");
+        let path = scratch.path().join("aterm-machines.toml");
 
         std::fs::write(&path, b"schema = 1\n").unwrap();
         assert!(read_local_candidate_with(&path, pins::PAPER_MASTER_PUBKEYS).is_err());
@@ -3457,8 +3455,6 @@ mod tests {
 
         std::fs::write(&path, b"schema = 1\n").unwrap();
         assert!(read_local_candidate_with(&path, pins::PAPER_MASTER_PUBKEYS).is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3502,7 +3498,7 @@ mod tests {
     fn an_explicit_profile_is_audited_without_replacing_the_default() {
         use crate::release_keychain::Leave;
         use std::os::unix::fs::PermissionsExt as _;
-        let scratch = aterm_tempfile::tempdir().unwrap();
+        let scratch = crate::test_scratch_dir("explicit");
         let home = scratch.path();
         let home_s = home.to_str().unwrap();
         let explicit = home.join("selected.toml");
@@ -3556,8 +3552,8 @@ mod tests {
     fn the_profile_audit_refuses_what_the_cut_refuses() {
         use crate::release_keychain::Leave;
         use std::os::unix::fs::PermissionsExt as _;
-        let home = std::env::temp_dir().join(format!("provision-profile-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
+        let scratch = crate::test_scratch_dir("profile");
+        let home = scratch.path();
         std::fs::create_dir_all(home.join(atpkg_keys::provision::RELEASE_RING_REL)).unwrap();
         let path = home.join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL);
         let home_s = home.to_str().unwrap().to_string();
@@ -3697,7 +3693,6 @@ mod tests {
             profile_check(&home_s, "m9", Some(&sha1), mine, &fake, Leave::Look),
             Check::Pass(_)
         ));
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -3721,8 +3716,8 @@ mod tests {
 
     #[test]
     fn the_authorized_generation_is_kept_outside_the_sweepable_checkout() {
-        let dir = std::env::temp_dir().join(format!("provision-keep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("keep");
+        let dir = scratch.path();
         let dist = dir.join("dist").join("aterm-machines.toml");
         let home = dir.join("home");
         let kept = kept_roster_path(home.to_str().unwrap());
@@ -3770,15 +3765,13 @@ mod tests {
 
         std::fs::remove_file(machines::RosterDocument::signature_path(&kept)).unwrap();
         assert!(newest_fixture_candidate(&[&dist, &kept], &[&master]).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_front_door_is_targo_and_trustc_answering_version_with_no_rustup() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("provision-front-door-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let bin = dir.join("store/trust/9192/bin");
+        let scratch = crate::test_scratch_dir("front");
+        let bin = scratch.path().join("store/trust/9192/bin");
         std::fs::create_dir_all(&bin).unwrap();
         for tool in ["targo", "trustc"] {
             std::fs::write(bin.join(tool), b"#!/bin/sh\nexit 0\n").unwrap();
@@ -3814,16 +3807,13 @@ mod tests {
             Check::Fail { .. } => {}
             other => panic!("a missing driver is a GAP: {other:?}"),
         }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_stage2_missing_its_verifiers_is_rebuilt_in_a_trust_checkout() {
-        let bin = std::env::temp_dir().join(format!("provision-verifiers-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&bin);
-        std::fs::create_dir_all(&bin).unwrap();
-        match verifiers_check(&bin) {
+        let scratch = crate::test_scratch_dir("verifier");
+        let bin = scratch.path();
+        match verifiers_check(bin) {
             Check::Fail { what, fix } => {
                 assert!(
                     what.starts_with("targo + tippy + ty + trustdoc missing"),
@@ -3835,14 +3825,13 @@ mod tests {
             }
             other => panic!("an empty bin is missing every verifier: {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&bin);
     }
 
     #[test]
     fn path_resolution_finds_only_a_real_executable_and_in_path_order() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("provision-path-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("path");
+        let dir = scratch.path();
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
@@ -3867,14 +3856,12 @@ mod tests {
             resolve_on_path("trustdoc", &joined),
             Some(a.join("trustdoc"))
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_farm_link_is_created_repairs_a_dangling_link_and_replaces_nothing_else() {
-        let dir = std::env::temp_dir().join(format!("provision-farm-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = crate::test_scratch_dir("farm");
+        let dir = scratch.path();
         let target = dir.join("stage2-trustdoc");
         std::fs::write(&target, b"#!/bin/sh\n").unwrap();
         let farm = dir.join("farm/bin/trustdoc");
@@ -3920,15 +3907,12 @@ mod tests {
         std::fs::write(&farm, b"not a link").unwrap();
         link_farm(&farm, &target).unwrap_err();
         assert_eq!(std::fs::read_to_string(&farm).unwrap(), "not a link");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_death_between_the_phase_one_pair_renames_recovers_forward() {
-        let dir =
-            std::env::temp_dir().join(format!("provision-phase1-crash-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let dist = dir.join("dist").join("aterm-machines.toml");
+        let scratch = crate::test_scratch_dir("phase1");
+        let dist = scratch.path().join("dist").join("aterm-machines.toml");
         let sig_path = machines::RosterDocument::signature_path(&dist);
 
         let (master, six, six_sig) = signed_candidate(6);
@@ -3992,6 +3976,5 @@ mod tests {
         assert_eq!(std::fs::read(&sig_path).unwrap(), eight_sig);
         assert!(!std::path::Path::new(&transaction).exists());
         drop(lock);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

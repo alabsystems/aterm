@@ -397,7 +397,11 @@ pub(crate) fn repo_fetch_main(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome
     }
     let gh = ctx.github()?;
     let (slug, named) = inv.repo(gh.router())?;
-    let out = gh.run_git(&GitRun::fetch_main(&slug, &dir, INTO).with_named(named))?;
+    let mut run = GitRun::fetch_main(&slug, &dir, INTO).with_named(named);
+    if inv.has("--blobless") {
+        run = run.without_blobs();
+    }
+    let out = gh.run_git(&run)?;
     let mut receipt = Receipt::for_repo(inv, &gh, &slug);
     receipt.as_ = None;
     receipt

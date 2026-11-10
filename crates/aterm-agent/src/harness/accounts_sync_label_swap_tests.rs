@@ -182,6 +182,8 @@ fn records(desk: &Desk) -> Vec<Option<Vec<u8>>> {
 fn a_sheet_that_swaps_the_default_logins_label_publishes_and_the_init_item_completes() {
     let desk = m3();
     let store = desk.store();
+    let legacy = desk.home.join(".secrets").join(FLEET_ROSTER_FILE);
+    let legacy_before = fs::read(&legacy).unwrap();
     assert!(!init_item_complete(&desk, NOW), "CONTROL: the item is open");
 
     sync(&desk, NOW).expect("a swap with rows not signed in here publishes");
@@ -231,7 +233,8 @@ fn a_sheet_that_swaps_the_default_logins_label_publishes_and_the_init_item_compl
         "the empty directory no row names is removed"
     );
     assert!(store.login_dir("m3-3").unwrap().is_dir());
-    assert!(!desk.home.join(".secrets").join(FLEET_ROSTER_FILE).exists());
+    assert_eq!(fs::read(legacy).unwrap(), legacy_before);
+    assert!(store.source_policy().unwrap().retired());
 
     assert!(init_item_complete(&desk, NOW + 1));
     let after = records(&desk);

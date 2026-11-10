@@ -69,7 +69,7 @@ impl TierB {
 pub const fn rank(name: WaitName) -> u8 {
     match name {
         WaitName::ProgramCheck | WaitName::Translating => 0,
-        WaitName::Memory => 1,
+        WaitName::Memory | WaitName::BuildAdmission => 1,
         WaitName::TtyPassword => 2,
         WaitName::TtyBuiltinRead => 3,
         WaitName::TtyRaw => 4,
@@ -93,6 +93,7 @@ pub const fn standing_of(name: WaitName) -> Standing {
         WaitName::ProgramCheck
         | WaitName::Translating
         | WaitName::Memory
+        | WaitName::BuildAdmission
         | WaitName::TtyPassword
         | WaitName::TtyBuiltinRead
         | WaitName::TtyRaw
@@ -159,20 +160,43 @@ pub fn name_job(
         .map_or((shell.0, shell.1.to_owned()), |(p, n)| (*p, n.clone()));
     let mut best: Option<Wait> = None;
     let mut own_wait = false;
+    let mut kernel = None;
+    let mut other_unproven = false;
+    let mut admission_blocked = false;
     for (pid, name) in leaves {
         let Some(w) = leaf_wait(scene, job.consumer, *pid, name, 0) else {
+            other_unproven = true;
             continue;
         };
+        if w.name == WaitName::Kernel {
+            kernel = Some(w.clone());
+        }
+        other_unproven |= w.name != WaitName::BuildAdmission && w.standing != Standing::Legit;
+        admission_blocked |= w.name == WaitName::BuildAdmission && w.standing != Standing::Legit;
         own_wait |=
             !(*pid == job.reader && w.name == WaitName::EventLoop && reads_terminal(scene, *pid));
         if best.as_ref().is_none_or(|b| rank(w.name) < rank(b.name)) {
             best = Some(w);
         }
     }
+    if let Some(w) = best.as_mut().filter(|w| w.name == WaitName::BuildAdmission) {
+        if let Some(kernel) = kernel {
+            return kernel;
+        }
+        // A queued leaf does not excuse another leaf whose dependency is unknown or stuck.
+        if other_unproven {
+            w.standing = Standing::Capped;
+        } else if admission_blocked && w.standing == Standing::Legit {
+            w.standing = Standing::Capable;
+        }
+    }
     if let Some(w) = best.as_ref().filter(|w| {
         matches!(
             w.name,
-            WaitName::ProgramCheck | WaitName::Translating | WaitName::Memory
+            WaitName::ProgramCheck
+                | WaitName::Translating
+                | WaitName::Memory
+                | WaitName::BuildAdmission
         )
     }) {
         // A held or translating leaf, and a front waiting for its claim, is not reading the
@@ -273,6 +297,32 @@ fn leaf_wait(
     // A build's front that runs no child waits for its claim, whatever its descriptors say (its
     // look at the ledger is a timer's; what it inherited is its caller's), unless the kernel holds
     // it.
+    if let Some(holders) = &p.build_admission {
+        if scene
+            .d_age
+            .get(&pid)
+            .is_some_and(|&ms| ms >= super::KERNEL_WAIT_MS)
+        {
+            return Some(mk(WaitName::Kernel));
+        }
+        let mut w = mk(WaitName::BuildAdmission);
+        // Unlike memory's best-holder heuristic, a known stuck holder must remain visible
+        // even when another slot holder is making progress.
+        w.standing = if holders
+            .iter()
+            .any(|pid| scene.elsewhere.get(pid) == Some(&Standing::Capped))
+        {
+            Standing::Capped
+        } else if holders
+            .iter()
+            .any(|pid| scene.elsewhere.get(pid) == Some(&Standing::Capable))
+        {
+            Standing::Capable
+        } else {
+            Standing::Legit
+        };
+        return Some(w);
+    }
     if let Some(ahead) = &p.claims_ahead {
         if scene
             .d_age

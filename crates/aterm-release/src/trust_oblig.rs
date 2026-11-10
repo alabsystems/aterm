@@ -1118,6 +1118,7 @@ pub fn write_record(args: &ReduceArgs) -> std::result::Result<Record, String> {
             fs::create_dir_all(dir)?;
             let stage = aterm_tempfile::Builder::new()
                 .prefix(".oblig-")
+                .suffix(".noindex")
                 .tempdir_in(dir)?;
             let staged = stage.path().join("record.tsv");
             crate::durable::open_create_new(&staged).and_then(|mut f| {

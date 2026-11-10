@@ -253,6 +253,7 @@ pub(crate) fn write_atomic_durable(path: &Path, bytes: &[u8], mode: u32) -> std:
     std::fs::create_dir_all(dir)?;
     let stage = aterm_tempfile::Builder::new()
         .prefix(".stage-")
+        .suffix(".noindex")
         .tempdir_in(dir)?;
     let staged = stage.path().join("data");
     let mut open = std::fs::OpenOptions::new();

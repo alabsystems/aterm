@@ -1032,6 +1032,44 @@ fn a_restored_in_flight_relaunch_stays_eligible_until_stale() {
     ));
 }
 
+/// A restored relaunch held on the native operation its ended host kept outlasts the attempt
+/// budget until stale, so the kept operation's deadline can pass and its replay lapse; so do the
+/// lapse itself and a fresh native relaunch's pending outcome. Any other wait keeps the budget.
+#[test]
+fn a_restored_native_wait_stays_eligible_until_stale() {
+    for step in [
+        "wait:native-unresolved-operation",
+        "wait:native-lapsed",
+        "wait:native-outcome",
+    ] {
+        let outcome = relaunch::outcome(step);
+        assert!(
+            restored_retry(
+                step,
+                &outcome,
+                RESTORED_TRIES,
+                Duration::from_secs(relaunch::STALE_S - 1)
+            ),
+            "{step}"
+        );
+        assert!(
+            !restored_retry(
+                step,
+                &outcome,
+                RESTORED_TRIES,
+                Duration::from_secs(relaunch::STALE_S)
+            ),
+            "{step}"
+        );
+    }
+    assert!(!restored_retry(
+        "wait:native-recovery",
+        &relaunch::outcome("wait:native-recovery"),
+        RESTORED_TRIES,
+        Duration::ZERO
+    ));
+}
+
 #[test]
 fn a_restored_retirement_hold_remains_eligible_after_the_attempt_budget() {
     for step in ["wait:native-retired-unissued", relaunch::WAIT_ACCOUNT] {
@@ -1252,6 +1290,7 @@ fn landing_attempt(tried: u32, landed: bool) -> RestoredAttempt {
         pause: RESTORED_FIRST_PAUSE,
         tried,
         resume_wait_since: None,
+        native_wait_since: None,
         acting: false,
         agent_seen: false,
         carried: false,
@@ -1271,6 +1310,7 @@ fn queued_attempt(agent: RestoredAgent, order: usize) -> RestoredAttempt {
         pause: RESTORED_FIRST_PAUSE,
         tried: 0,
         resume_wait_since: None,
+        native_wait_since: None,
         acting: false,
         agent_seen: false,
         carried: false,
@@ -23811,6 +23851,7 @@ fn closing_a_restored_queue_during_its_read_preserves_the_snapshot_and_debt() {
                 pause: RESTORED_FIRST_PAUSE,
                 tried: 1,
                 resume_wait_since: None,
+                native_wait_since: None,
                 acting: false,
                 agent_seen: false,
                 carried: false,

@@ -6,10 +6,48 @@
 
 use super::{Body, EpochAudience, Log, Record, RecordId, epoch_commitment};
 use crate::commons::binding::Binding;
-use crate::{Error, Result, age::Identity};
+use crate::{
+    Error, Result,
+    age::{Identity, Recipient},
+};
 use aterm_digest::Sha256;
 use std::cell::OnceCell;
+use std::collections::{BTreeMap, BTreeSet};
 use zeroize::Zeroizing;
+
+#[cfg(test)]
+thread_local! {
+    /// The epoch keys [`HistoryLease::unwrap_commons_epoch`] unwrapped on this thread, counted
+    /// (never timed).
+    pub(crate) static UNWRAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The epochs of one log's held records whose keys a device opened, by the device's recipient
+/// ([`HistoryLease::opened`]). It holds no key, only which epochs opened: whether a device's
+/// `Wrap` of an epoch opens and the log names the epoch's writers follows from the held records
+/// and the device alone, so the log keeps it until it holds another record, and its clones share
+/// it (`Log::hold`).
+#[derive(Debug, Default)]
+pub(crate) struct Opened(std::sync::Mutex<BTreeMap<Recipient, BTreeSet<RecordId>>>);
+
+impl Opened {
+    fn holds(&self, recipient: Recipient, epoch: &RecordId) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&recipient)
+            .is_some_and(|epochs| epochs.contains(epoch))
+    }
+
+    fn note(&self, recipient: Recipient, epoch: RecordId) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(recipient)
+            .or_default()
+            .insert(epoch);
+    }
+}
 
 /// Identity of the exact complete record bytes in their retained causal order.
 /// A peer-supplied label or a heads-only digest cannot substitute for it.
@@ -173,11 +211,38 @@ impl HistoryLease<'_> {
         identity: &Identity,
     ) -> Result<Option<Zeroizing<[u8; 32]>>> {
         self.check_record(epoch)?;
+        #[cfg(test)]
+        UNWRAPS.with(|unwraps| unwraps.set(unwraps.get() + 1));
         let log = self.view.log;
         if log.is_fold_epoch(epoch.record.id()) {
             return log.unwrap_fold_epoch(epoch.record.id(), identity);
         }
         log.unwrap_commons_epoch(epoch.record.id(), identity)
+    }
+
+    /// Whether `identity` opened `epoch`'s key under this history before: its `Wrap` of the
+    /// epoch opened and the log names the epoch's writers ([`HistoryLease::note_opened`]). A log
+    /// that holds another record answers afresh.
+    pub(crate) fn opened(&self, epoch: &RecordLease<'_>, identity: &Identity) -> Result<bool> {
+        self.check_record(epoch)?;
+        Ok(self
+            .view
+            .log
+            .opened
+            .holds(identity.recipient(), epoch.record.id()))
+    }
+
+    /// Note that `identity` opened `epoch`'s key under this history, its writers named
+    /// ([`HistoryLease::historical_commons_writers`]) and its key unwrapped
+    /// ([`HistoryLease::unwrap_commons_epoch`]), for each later lease of the same records
+    /// ([`HistoryLease::opened`]).
+    pub(crate) fn note_opened(&self, epoch: &RecordLease<'_>, identity: &Identity) -> Result<()> {
+        self.check_record(epoch)?;
+        self.view
+            .log
+            .opened
+            .note(identity.recipient(), *epoch.record.id());
+        Ok(())
     }
 
     /// Whether `key` is the key of the counting Commons epoch `epoch` (it matches the
@@ -351,6 +416,56 @@ mod tests {
         hold(&mut log, 5);
         assert_eq!(generation(&log), afresh(&log));
         assert_eq!(generation(&unasked), afresh(&unasked));
+    }
+
+    /// A log keeps which epochs each device opened for its held records: a lease of it, or of a
+    /// clone, answers an epoch noted as opened for that device and for no other, and once the log
+    /// holds another record its leases answer afresh, while the clone taken before keeps its own.
+    /// NEGATIVE CONTROL: `Log::hold` keeping `opened` gives the log's lease the epoch opened after
+    /// it holds another record.
+    #[test]
+    fn a_logs_opened_epochs_follow_its_held_records() {
+        let (mut log, seed, incarnation, actor) = fixture();
+        let identity = Identity::from_secret_bytes([19; 32]);
+        let other = Identity::from_secret_bytes([29; 32]);
+        let epoch = *log.network();
+        let opened = |log: &Log, identity: &Identity| {
+            let view = HistoryView::new(log);
+            let lease = view.lease_complete().unwrap();
+            let RecordState::Complete(epoch) = lease.record(&epoch).unwrap() else {
+                panic!("the genesis is held");
+            };
+            lease.opened(&epoch, identity).unwrap()
+        };
+        assert!(!opened(&log, &identity));
+        {
+            let view = HistoryView::new(&log);
+            let lease = view.lease_complete().unwrap();
+            let RecordState::Complete(held) = lease.record(&epoch).unwrap() else {
+                panic!("the genesis is held");
+            };
+            lease.note_opened(&held, &identity).unwrap();
+        }
+        let before = log.clone();
+        assert!(opened(&log, &identity));
+        assert!(opened(&before, &identity), "a clone shares what opened");
+        assert!(!opened(&log, &other), "another device opened nothing");
+        let next = log
+            .draft(
+                &actor,
+                2,
+                Body::Name {
+                    name: "next".into(),
+                },
+            )
+            .sign(&seed, incarnation)
+            .unwrap();
+        assert_eq!(log.insert(next).unwrap(), Inserted::Held);
+        assert!(
+            !opened(&log, &identity),
+            "a log that holds another record answers afresh"
+        );
+        assert!(opened(&before, &identity));
     }
 
     /// A lease answers each held record as the log holds it, whether it takes the log's own

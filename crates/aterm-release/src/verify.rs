@@ -1641,13 +1641,11 @@ mod yank_local_gate_tests {
 
     use super::*;
 
-    fn scratch_repo(label: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("aterm-yank-gates-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+    fn scratch_repo(label: &str) -> aterm_tempfile::TempDir {
+        let dir = crate::test_scratch_dir(label);
+        let root = dir.path();
         ledger::testing::init(
-            &root,
+            root,
             &[
                 ("user.name", "t"),
                 ("user.email", "t@example.invalid"),
@@ -1661,19 +1659,20 @@ mod yank_local_gate_tests {
         ] {
             let out = ledger::testing::git()
                 .arg("-C")
-                .arg(&root)
+                .arg(root)
                 .args(args)
                 .output()
                 .unwrap();
             assert!(out.status.success(), "git {args:?}");
         }
-        root
+        dir
     }
 
     #[test]
     fn a_detached_checkout_may_yank_and_a_dirty_one_may_not() {
-        let root = scratch_repo("detached");
-        let git = ledger::testing::Git::new(&root);
+        let scratch = scratch_repo("detached");
+        let root = scratch.path();
+        let git = ledger::testing::Git::new(root);
         ledger::git_ok(&git, &["checkout", "-q", "--detach", "HEAD~1"]).unwrap();
         let branch = ledger::git_ok(&git, &["rev-parse", "--abbrev-ref", "HEAD"])
             .unwrap()
@@ -1688,6 +1687,5 @@ mod yank_local_gate_tests {
         let stale = |_: &dyn ledger::GitRunner| -> Result<()> { Err(Error::new("stale cutter")) };
         assert!(yank_local_gates(&git, "o/r", &stale).is_err());
         assert!(yank_local_gates(&git, "someone/else", &ours).is_err());
-        let _ = fs::remove_dir_all(&root);
     }
 }

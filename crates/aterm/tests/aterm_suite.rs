@@ -142,8 +142,6 @@ mod window_server_census_live_headless;
 #[cfg(windows)]
 mod windows_console_image;
 #[cfg(unix)]
-mod worker_held_live_headless;
-#[cfg(unix)]
 mod worker_spawn_live_headless;
 
 /// Standalone runs overlap the private instances' event waits. The verifier always supplies

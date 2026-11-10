@@ -77,6 +77,8 @@ fn completed_predecessor_and_positive_noexec_survive_target_rotation_and_reload(
                 billing: ColdBilling::Keep,
             })),
         },
+        boot: None,
+        custody: None,
     };
     let mut prior = St {
         native_coordination: true,

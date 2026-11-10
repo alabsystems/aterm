@@ -35,6 +35,7 @@ impl Bed {
         advance_renewal_generations(&before, &mut logins, &events).unwrap();
         let plan = Plan {
             fleet: None,
+            source_policy: None,
             local_logins: false,
             wake: None,
             roster_path: Some(
@@ -190,12 +191,12 @@ fn scoped_state_publications_refuse_missing_witnessed_images() {
                 1 => bed
                     .store
                     .transact_roster_state_held(&held, NOW, &mut None, target(), edit),
-                2 => bed.store.transact_fleet_state_held(
+                2 => bed.store.transact_fleet_state_policy_held(
                     &held,
                     NOW,
                     &mut None,
                     (&bed.path, "account = []\n"),
-                    edit,
+                    (false, edit),
                 ),
                 _ => unreachable!(),
             };

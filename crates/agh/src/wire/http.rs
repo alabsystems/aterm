@@ -245,6 +245,16 @@ const fn phase_of(phase: aterm_http::Phase) -> Phase {
 
 impl crate::wire::Transport for HttpTransport {
     fn round_trip(&self, req: WireRequest<'_>) -> Result<WireResponse, WireError> {
+        self.round_trip_started(req, crate::fx::NativeRequestStart::now())
+    }
+}
+
+impl HttpTransport {
+    fn round_trip_started(
+        &self,
+        req: WireRequest<'_>,
+        started: crate::fx::NativeRequestStart,
+    ) -> Result<WireResponse, WireError> {
         if let Some(refusal) = guard(&req) {
             return Err(refusal);
         }
@@ -264,6 +274,19 @@ impl crate::wire::Transport for HttpTransport {
             atomic_refs: _,
             repo_create: _,
         } = req;
+        let remaining = |within| started.remaining(within);
+        let connect = remaining(deadlines.connect);
+        if connect.is_zero()
+            || deadlines
+                .backstop
+                .is_some_and(|within| remaining(within).is_zero())
+        {
+            return Err(WireError {
+                phase: Phase::NotSent,
+                kind: WireKind::Timeout,
+                detail: "request deadline expired before dispatch".into(),
+            });
+        }
         let mut builder = self.client.request(http_method(method), &url);
         for (name, value) in &headers {
             builder = builder.header(name, value);
@@ -275,9 +298,9 @@ impl crate::wire::Transport for HttpTransport {
         let mut builder = builder
             .limit(usize::try_from(limit).unwrap_or(usize::MAX))
             .idle(deadlines.idle)
-            .connect_within(deadlines.connect);
+            .connect_within(connect);
         builder = match deadlines.backstop {
-            Some(backstop) => builder.backstop(backstop),
+            Some(backstop) => builder.backstop(remaining(backstop)),
             None => builder.without_backstop(),
         };
         let body = match body {
@@ -307,6 +330,10 @@ impl crate::wire::Transport for HttpTransport {
 }
 
 impl super::sealed::Sealed for HttpTransport {}
+
+#[cfg(all(test, unix))]
+#[path = "native_wait_tests.rs"]
+mod native_wait_tests;
 
 #[cfg(test)]
 #[path = "permit_tests.rs"]

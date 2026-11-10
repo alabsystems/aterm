@@ -6,9 +6,11 @@ use aterm_spec::derive::Model;
 /// Every replay needs its own successful publication, and keeps the exact
 /// operation through failed writes and lost replies. This models two attempts;
 /// it assumes the writer's successful durability acknowledgement is truthful.
-/// A record that kept only its wire (`Bound = 0`) drops it on the host's positive
-/// unadmitted answer to a dispatched replay, and on nothing else; a record that
-/// holds its admission binding (`Bound = 1`) never meets that answer.
+/// A record drops its operation only on a positive answer to a dispatched replay of
+/// its exact prepare: the host's unadmitted answer, which a record that holds its
+/// admission binding (`Bound = 1`) never meets, or its lapsed answer (no exec grant
+/// was or can be issued), which a record meets bound or not. A private restart, the
+/// renewal's (`Private = 1`), never meets a lapsed answer.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_replay_publication_model() -> Model {
@@ -16,16 +18,18 @@ pub fn native_replay_publication_model() -> Model {
         NativeReplayPublication {
             const Buggy = 0;
             const Bound = 0;
+            const Private = 0;
             var barrier_failed = 0; var dry = 0; var held = 0;
             var attempts = 0; var sent = 0;
             var unpublished = 0; var dry_sent = 0; var held_sent = 0; var changed = 0;
-            var unadmitted = 0; var cleared = 0; var lost_cleared = 0;
+            var unadmitted = 0; var lapsed = 0; var cleared = 0; var lost_cleared = 0;
             action FailBarrier when (barrier_failed == 0 && attempts <= 1) { barrier_failed = 1; }
             action RepairBarrier when (barrier_failed == 1 && attempts <= 1) { barrier_failed = 0; }
             action DryRun when (dry == 0 && attempts <= 1) { dry = 1; }
             action LiveRun when (dry == 1 && attempts <= 1) { dry = 0; }
             action Hold when (held == 0 && attempts <= 1) { held = 1; }
             action Unadmit when (Bound == 0 && unadmitted == 0 && attempts <= 1) { unadmitted = 1; }
+            action Lapse when (Private == 0 && lapsed == 0 && attempts <= 1) { lapsed = 1; }
             action Attempt when (attempts <= 1) {
                 attempts = attempts + 1;
                 sent = sent + if cleared == 0 && (barrier_failed == 0 || Buggy == 1)
@@ -39,9 +43,11 @@ pub fn native_replay_publication_model() -> Model {
                 changed = if Buggy == 4 && barrier_failed == 1 && dry == 0 && held == 0
                     {1} else {changed};
                 cleared = if cleared == 1 || (dry == 0 && held == 0
-                    && ((barrier_failed == 0 && unadmitted == 1) || Buggy == 5)) {1} else {0};
+                    && ((barrier_failed == 0 && (unadmitted == 1 || lapsed == 1)) || Buggy == 5))
+                    {1} else {0};
                 lost_cleared = if Buggy == 5 && cleared == 0 && dry == 0 && held == 0
-                    && (barrier_failed == 1 || unadmitted == 0) {1} else {lost_cleared};
+                    && (barrier_failed == 1 || (unadmitted == 0 && lapsed == 0))
+                    {1} else {lost_cleared};
             }
             invariant PublicationBeforeDispatch: unpublished == 0;
             invariant DryRunIsInert: dry_sent == 0;
@@ -53,7 +59,8 @@ pub fn native_replay_publication_model() -> Model {
                 && 0 <= attempts && attempts <= 2 && 0 <= sent && sent <= 2
                 && 0 <= unpublished && unpublished <= 1 && 0 <= dry_sent && dry_sent <= 1
                 && 0 <= held_sent && held_sent <= 1 && 0 <= changed && changed <= 1
-                && 0 <= unadmitted && unadmitted <= 1 && 0 <= cleared && cleared <= 1
+                && 0 <= unadmitted && unadmitted <= 1 && 0 <= lapsed && lapsed <= 1
+                && 0 <= cleared && cleared <= 1
                 && 0 <= lost_cleared && lost_cleared <= 1;
         }
     }

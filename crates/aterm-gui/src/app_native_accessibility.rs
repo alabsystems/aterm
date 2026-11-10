@@ -2158,6 +2158,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "measures complete accessibility tree allocations; run alone"]
+    fn complete_terminal_tree_allocation_cost() {
+        for split in [false, true] {
+            let mut app = crate::scripted_redraw_fixture::scripted_app();
+            let wid = WindowId(0);
+            crate::scripted_redraw_fixture::feed(
+                &app,
+                "tree text 中 e\u{301}\r\nsecond row".as_bytes(),
+            );
+            if split {
+                app.split_active_stub_tab(wid);
+                app.split_active_stub_tab(wid);
+            }
+            let plan = app.active_visible_leaf_plan(wid).unwrap();
+            let control = app.grid_a11y_tree(wid, Some(&plan)).unwrap();
+            for sample in 0..3 {
+                let (tree, allocations) = aterm_heap_count::allocations_in(|| {
+                    app.grid_a11y_tree(wid, Some(&plan)).unwrap()
+                });
+                assert_eq!(tree, control);
+                let nodes = tree.nodes.len();
+                let (_, retained_bytes) = aterm_heap_count::bytes_freed_in(|| drop(tree));
+                println!(
+                    "split={split} sample={sample} nodes={nodes} allocations={allocations} retained_bytes={retained_bytes}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn shared_geometry_panes_match_independent_document_reads() {
         use aterm_core::selection::{SelectionSide, SelectionType};
         let mut app = crate::scripted_redraw_fixture::scripted_app();

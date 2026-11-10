@@ -6,6 +6,10 @@ use aterm_spec::derive::Model;
 /// The client's durable hold preserves debt; it is never authority for a successor.
 /// A record whose admission reply was lost keeps only its wire (`bound` 0); the host's
 /// positive unadmitted answer clears that wire alone, never a binding or a hold.
+/// The host's lapsed answer (no exec grant was or can be issued under the prepare, the
+/// `NativeHistoricalClosure` model) clears the wire and its binding, bound or not, but never
+/// a hold; the debt stays for the fresh plan that pays it. The host answers it only for a cold
+/// or typed asked restart, which the client checks again.
 /// A typed asked recipe has the same debt boundary; its passive history is not a new grant.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -37,6 +41,9 @@ pub fn native_retirement_debt_model() -> Model {
             action Unadmitted when (finished == 0) {
                 kept = if (bound == 0 && held == 0) || Buggy == 8 {0} else {kept};
                 held = if Buggy == 9 {0} else {held};
+            }
+            action Lapsed when ((observed == 0 || Buggy == 10) && finished == 0 && kept == 1) {
+                kept = 0; bound = 0;
             }
             invariant PositiveObservation: held == 0 || observed == 1;
             invariant NoRevival: observed == 0 || held == 1;

@@ -299,10 +299,9 @@ mod background_title_tests {
 }
 
 fn is_terminal_tab(tab: &crate::tab_model::Tab, views: &crate::tab_model::ViewStore) -> bool {
-    tab.root
-        .leaves()
-        .into_iter()
-        .all(|view| matches!(views.get(view), Some(crate::tab_model::View::Terminal(_))))
+    !tab.root.any_leaf(&mut |view| {
+        !matches!(views.get(*view), Some(crate::tab_model::View::Terminal(_)))
+    })
 }
 
 fn terminal_tab_id_at(
@@ -595,13 +594,22 @@ impl App {
             .iter()
             .enumerate()
             .find_map(|(canonical_index, tab)| {
-                let view = tab.root.leaves().into_iter().find(|view| {
-                    self.view_store
-                        .get(*view)
+                let mut found = None;
+                tab.root.any_leaf(&mut |&view| {
+                    if self
+                        .view_store
+                        .get(view)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
                         == Some(session)
-                })?;
+                    {
+                        found = Some(view);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                let view = found?;
                 Some(TerminalViewLocation {
                     tab_id: tab.id,
                     canonical_index,
@@ -843,35 +851,33 @@ impl App {
         tab_id: crate::tab_model::TabId,
     ) -> Option<crate::tab_model::TabIndicators> {
         let tab = self.windows.get(&wid)?.tab_set.get(tab_id)?;
-        Some(
-            tab.root
-                .leaves()
-                .into_iter()
-                .filter_map(|view| match self.view_store.get(view)? {
-                    crate::tab_model::View::Terminal(terminal) => {
-                        Some(self.session_status_indicators(terminal.session))
-                    }
-                    crate::tab_model::View::Native(native) => self
-                        .native_runtime
-                        .presentation(native.instance, view)
-                        .ok()
-                        .map(|presentation| crate::tab_model::TabIndicators {
-                            dirty: presentation.indicators.dirty,
-                            busy: presentation.indicators.busy,
-                            attention: presentation.indicators.attention
-                                || self.edit_view_attention(view),
-                            status_attention: false,
-                        }),
-                })
-                .fold(crate::tab_model::TabIndicators::default(), |acc, bits| {
-                    crate::tab_model::TabIndicators {
-                        dirty: acc.dirty || bits.dirty,
-                        busy: acc.busy || bits.busy,
-                        attention: acc.attention || bits.attention,
-                        status_attention: acc.status_attention || bits.status_attention,
-                    }
-                }),
-        )
+        let mut acc = crate::tab_model::TabIndicators::default();
+        tab.root.visit(&mut |&view| {
+            let Some(bits) = (match self.view_store.get(view) {
+                Some(crate::tab_model::View::Terminal(terminal)) => {
+                    Some(self.session_status_indicators(terminal.session))
+                }
+                Some(crate::tab_model::View::Native(native)) => self
+                    .native_runtime
+                    .presentation(native.instance, view)
+                    .ok()
+                    .map(|presentation| crate::tab_model::TabIndicators {
+                        dirty: presentation.indicators.dirty,
+                        busy: presentation.indicators.busy,
+                        attention: presentation.indicators.attention
+                            || self.edit_view_attention(view),
+                        status_attention: false,
+                    }),
+                None => None,
+            }) else {
+                return;
+            };
+            acc.dirty |= bits.dirty;
+            acc.busy |= bits.busy;
+            acc.attention |= bits.attention;
+            acc.status_attention |= bits.status_attention;
+        });
+        Some(acc)
     }
 
     /// Refresh the native owners' indicators and the terminal classifier's contribution together, preserving the composed title and tooltip.
@@ -943,15 +949,7 @@ impl App {
                     .iter()
                     .position(|tab| tab.id == tab_id)?;
                 let tab = window.tab_set.get(tab_id)?;
-                tab.root
-                    .leaves()
-                    .into_iter()
-                    .all(|view| {
-                        matches!(
-                            self.view_store.get(view),
-                            Some(crate::tab_model::View::Terminal(_))
-                        )
-                    })
+                is_terminal_tab(tab, &self.view_store)
                     .then(|| (tab.root.clone(), tab.focus, tab.zoomed, canonical_index))
             })
         else {
@@ -1078,14 +1076,24 @@ impl App {
     pub(crate) fn open_system_state_tab_in_window(&mut self, wid: WindowId) -> bool {
         let existing = self.windows.get(&wid).and_then(|window| {
             window.tab_set.tabs().iter().find_map(|tab| {
-                tab.root.leaves().into_iter().find_map(|view| {
-                    let crate::tab_model::View::Native(native) = self.view_store.get(view)? else {
-                        return None;
+                let mut found = None;
+                tab.root.any_leaf(&mut |&view| {
+                    let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view)
+                    else {
+                        return false;
                     };
-                    (self.native_runtime.app(native.instance)?.kind()
-                        == crate::native_app::AppKind::SystemState)
-                        .then_some((tab.id, view))
-                })
+                    if self
+                        .native_runtime
+                        .app(native.instance)
+                        .is_some_and(|app| app.kind() == crate::native_app::AppKind::SystemState)
+                    {
+                        found = Some((tab.id, view));
+                        true
+                    } else {
+                        false
+                    }
+                });
+                found
             })
         });
         let (tab, view) = match existing {
@@ -3647,14 +3655,22 @@ impl App {
                     .and_then(|window| {
                         let index = window.tab_set.active_index()?;
                         let tab = window.tab_set.active()?;
-                        let view = tab.root.leaves().into_iter().find(|view| {
-                            self.view_store
-                                .get(*view)
+                        let mut found = None;
+                        tab.root.any_leaf(&mut |&view| {
+                            if self
+                                .view_store
+                                .get(view)
                                 .copied()
                                 .and_then(crate::tab_model::View::terminal_session)
                                 == Some(session)
-                        })?;
-                        Some((wid, index, view))
+                            {
+                                found = Some(view);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        Some((wid, index, found?))
                     })
                     .or_else(|| {
                         self.terminal_view_location(wid, session)
@@ -4799,23 +4815,20 @@ impl App {
         crate::tab_model::ViewId,
         crate::tab_model::NativeViewRef,
     )> {
-        self.windows.get(&wid).map_or_else(Vec::new, |window| {
-            window
-                .tab_set
-                .tabs()
-                .iter()
-                .flat_map(|tab| {
-                    tab.root.leaves().into_iter().filter_map(|view| {
-                        let crate::tab_model::View::Native(native) =
-                            self.view_store.get(view).copied()?
-                        else {
-                            return None;
-                        };
-                        Some((tab.id, view, native))
-                    })
-                })
-                .collect()
-        })
+        let Some(window) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        let mut views = Vec::new();
+        for tab in window.tab_set.tabs() {
+            tab.root.visit(&mut |&view| {
+                if let Some(crate::tab_model::View::Native(native)) =
+                    self.view_store.get(view).copied()
+                {
+                    views.push((tab.id, view, native));
+                }
+            });
+        }
+        views
     }
 
     fn prepare_window_native_shutdown_with(
@@ -5043,10 +5056,10 @@ impl App {
     ) {
         let asks = self.windows.get(&wid).is_some_and(|state| {
             state.tab_set.get(tab).is_some_and(|target| {
-                target.root.leaves().into_iter().any(|view| {
+                target.root.any_leaf(&mut |view| {
                     state
                         .palette()
-                        .is_some_and(|palette| palette.is_native_close_recovery_for(wid, view))
+                        .is_some_and(|palette| palette.is_native_close_recovery_for(wid, *view))
                 })
             })
         });
@@ -5389,12 +5402,7 @@ impl App {
                 tab.root.clone(),
                 tab.focus,
                 tab.zoomed,
-                tab.root.leaves().into_iter().all(|view| {
-                    matches!(
-                        self.view_store.get(view),
-                        Some(crate::tab_model::View::Terminal(_))
-                    )
-                }),
+                is_terminal_tab(tab, &self.view_store),
             ))
         }) else {
             return;
@@ -5502,7 +5510,7 @@ impl App {
         let mut owners = Vec::new();
         for (&window, state) in &self.windows {
             for tab in state.tab_set.tabs() {
-                for view in tab.root.leaves() {
+                tab.root.visit(&mut |&view| {
                     if self
                         .view_store
                         .get(view)
@@ -5512,7 +5520,7 @@ impl App {
                     {
                         owners.push(window);
                     }
-                }
+                });
             }
         }
         let mut to_close = Vec::new();
@@ -6126,9 +6134,9 @@ impl App {
                 Some((
                     tab.id,
                     !is_terminal_tab(tab, &self.view_store),
-                    tab.root.leaves().into_iter().any(|view| {
+                    tab.root.any_leaf(&mut |view| {
                         matches!(
-                            self.view_store.get(view),
+                            self.view_store.get(*view),
                             Some(crate::tab_model::View::Terminal(_))
                         )
                     }),
@@ -6249,14 +6257,7 @@ impl App {
                 .tab_set
                 .tabs()
                 .iter()
-                .filter(|tab| {
-                    tab.root.leaves().into_iter().all(|view| {
-                        matches!(
-                            self.view_store.get(view),
-                            Some(crate::tab_model::View::Terminal(_))
-                        )
-                    })
-                })
+                .filter(|tab| is_terminal_tab(tab, &self.view_store))
                 .collect();
             let active_tab = ws.tab_set.active();
             let front_truth = match active_tab.and_then(|tab| {
@@ -6418,7 +6419,8 @@ impl App {
                 }
             }
             for tab in ws.tab_set.tabs() {
-                for view in tab.root.leaves() {
+                let mut invalid = None;
+                tab.root.any_leaf(&mut |&view| {
                     let owned = match self.view_store.get(view).copied() {
                         Some(crate::tab_model::View::Terminal(terminal)) => {
                             self.pool.get(terminal.session).is_some()
@@ -6430,13 +6432,19 @@ impl App {
                         None => false,
                     };
                     if !owned {
-                        return Some(format!(
+                        invalid = Some(format!(
                             "{wid:?}: tab {:?}'s leaf {view:?} ({:?}) is not owned by the session \
                              pool / native runtime",
                             tab.id,
                             self.view_store.get(view).copied(),
                         ));
+                        true
+                    } else {
+                        false
                     }
+                });
+                if let Some(err) = invalid {
+                    return Some(err);
                 }
             }
             None
@@ -6455,18 +6463,22 @@ impl App {
                 let closed_session = outcome.closed();
                 let closed_view = self.windows.get(&wid).and_then(|ws| {
                     let tab_id = terminal_tab_id_at(&ws.tab_set, &self.view_store, tab)?;
-                    ws.tab_set
-                        .get(tab_id)?
-                        .root
-                        .leaves()
-                        .into_iter()
-                        .find(|view| {
-                            self.view_store
-                                .get(*view)
-                                .copied()
-                                .and_then(crate::tab_model::View::terminal_session)
-                                == Some(closed_session)
-                        })
+                    let mut found = None;
+                    ws.tab_set.get(tab_id)?.root.any_leaf(&mut |&view| {
+                        if self
+                            .view_store
+                            .get(view)
+                            .copied()
+                            .and_then(crate::tab_model::View::terminal_session)
+                            == Some(closed_session)
+                        {
+                            found = Some(view);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    found
                 });
                 let synced = self.sync_tab_model_from_layout(wid, tab);
                 debug_assert!(synced);

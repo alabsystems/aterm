@@ -411,8 +411,8 @@ fn a_password_never_reaches_a_debug_line() {
 #[test]
 fn a_cut_without_a_notary_credential_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
-    let root = std::env::temp_dir().join(format!("aterm-apple-refusal-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let scratch = crate::test_scratch_dir("apple");
+    let root = scratch.path();
     let (home, repo) = (root.join("home"), root.join("repo"));
     std::fs::create_dir_all(home.join(atpkg_keys::provision::RELEASE_RING_REL)).unwrap();
     std::fs::create_dir_all(&repo).unwrap();
@@ -439,7 +439,6 @@ fn a_cut_without_a_notary_credential_is_refused() {
     assert_eq!(profile.profile(), Some(path.as_path()));
     sign::resolve_apple_tier(FAKE_TEAM, Some(&profile))
         .expect_err("a profile without notary_profile cannot notarize");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

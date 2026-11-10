@@ -58,6 +58,8 @@ fn prepare() -> Prepare {
             rollback: None,
             cold: None,
         },
+        boot: None,
+        custody: None,
     }
 }
 

@@ -4665,6 +4665,7 @@ fn write_floor_files(files: &[(&Path, Option<&str>)]) -> std::result::Result<(),
             .unwrap_or_else(|| Path::new("."));
         let scratch = aterm_tempfile::Builder::new()
             .prefix(".trust-floor-")
+            .suffix(".noindex")
             .tempdir_in(parent)
             .map_err(|e| format!("could not stage {}: {e}", path.display()))?;
         let file = scratch.path().join("data");
@@ -5812,13 +5813,8 @@ mod tests {
 
     #[test]
     fn the_lanes_budget_mark_is_read_into_the_facts() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-trust-facts-budget-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let scratch = crate::test_scratch_dir("budget");
+        let dir = scratch.path();
         for (spec, rc, mark) in [
             ("alpha@1.0.0", "137", Some("60\n")),
             ("beta@2.0.0", "1", Some("\n")),
@@ -5836,7 +5832,6 @@ mod tests {
         ))
         .unwrap();
         p.measure();
-        let _ = fs::remove_dir_all(&dir);
         let got: Vec<(String, bool)> = p
             .facts
             .crates
@@ -5910,32 +5905,20 @@ mod tests {
     }
 
     use crate::ledger::testing::Git;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
 
     struct World {
+        _dir: aterm_tempfile::TempDir,
         root: PathBuf,
-    }
-
-    impl Drop for World {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
     }
 
     const PROVER_COMMIT: &str = "321aaeda75478038420d97830f14724c33c8dc39";
 
     impl World {
         fn new(label: &str) -> World {
-            let root = std::env::temp_dir().join(format!(
-                "aterm-trust-facts-{label}-{}-{}",
-                std::process::id(),
-                SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = fs::remove_dir_all(&root);
+            let dir = crate::test_scratch_dir(label);
+            let root = dir.path().to_path_buf();
             fs::create_dir_all(root.join("work")).unwrap();
-            let w = World { root };
+            let w = World { _dir: dir, root };
             crate::ledger::testing::init(
                 &w.work(),
                 &[
@@ -6947,12 +6930,8 @@ mod tests {
         pace: Option<Pace>,
         record: bool,
     ) -> Facts {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-trust-facts-check-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let scratch = crate::test_scratch_dir("check");
+        let dir = scratch.path();
         let beside = |ext: &str| dir.join(format!("{spec}.log{ext}"));
         fs::write(beside(""), log).unwrap();
         fs::write(beside(".rc"), "1\n").unwrap();
@@ -6968,7 +6947,6 @@ mod tests {
         ))
         .unwrap();
         p.measure();
-        let _ = fs::remove_dir_all(&dir);
         p.facts.driver = "/store/trust/15698/bin/targo".into();
         p.facts.driver_id = DRV.into();
         p.facts

@@ -220,6 +220,7 @@ pub fn stage_cutter(
             let _phase = crate::cut_timing::Timer::start(log, "cutter-copy-sync");
             let stage = aterm_tempfile::Builder::new()
                 .prefix(".cutter-")
+                .suffix(".noindex")
                 .tempdir_in(&root)
                 .map_err(|e| e.to_string())?;
             copy_executable(source, &stage.path().join("aterm-release"))?;
@@ -438,6 +439,7 @@ pub fn stage(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let staged = aterm_tempfile::Builder::new()
                 .prefix(".tools-")
+                .suffix(".noindex")
                 .tempdir_in(&tools_dir)
                 .map_err(|e| format!("stage frozen tools in {}: {e}", tools_dir.display()))?;
             copy_executable(cutter, &staged.path().join("aterm-release"))?;

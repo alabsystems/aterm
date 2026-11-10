@@ -364,11 +364,13 @@ mod tests {
             assert!(event["self_cpu_s"].is_null());
             assert!(event["child_cpu"]["observed_s"].is_null());
         }
-        let serial = Timer::new("serial after join");
         assert!(
-            serial.cpu.is_some(),
-            "joined siblings no longer consume counters"
+            STACK.with_borrow(Vec::is_empty),
+            "joined siblings leave no concurrent frame"
         );
+        let serial = Timer::new("serial after join");
+        assert_eq!(serial.parent_id, None);
+        assert!(!serial.children.lock().unwrap().parallel);
     }
 
     #[test]

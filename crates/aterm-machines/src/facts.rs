@@ -1768,6 +1768,7 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
         assert!(parse_dscl_list("admin +501\n").is_empty());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_live_keyboard_list_parses_where_hidutil_answers() {
         let ran = match crate::port::Live::new().run(&hidutil_keyboards()) {

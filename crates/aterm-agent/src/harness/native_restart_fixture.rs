@@ -45,7 +45,70 @@ pub(in crate::harness) fn retain_bound_preparation(state: &mut St) {
             observation: None,
             cold: None,
         },
+        boot: None,
+        custody: None,
     })
     .encode()
     .expect("a canonical retained preparation");
+}
+
+/// Make the retained preparation a cold crash restart, one of the kinds a later host epoch can
+/// answer `lapsed`: the same id and recipe, a relaunch duty and an owned-helper cold intent.
+pub(in crate::harness) fn retain_cold(state: &mut St) {
+    let Some(Request::Prepare(mut prepare)) = Request::parse(&state.native_prepare) else {
+        panic!("the fixture keeps a preparation")
+    };
+    prepare.duty = Scope::Relaunch;
+    prepare.asked = None;
+    let NativePlan::Restart { cold, .. } = &mut prepare.plan else {
+        panic!("a restart plan")
+    };
+    *cold = Some(Box::new(native_act::ColdIntent {
+        login: None,
+        home: None,
+        auth_observed: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
+        conversation: None,
+        profile: None,
+        mode: crate::harness::accounts::Mode::Wall,
+        billing: native_act::ColdBilling::Keep,
+    }));
+    state.native_prepare = Request::prepare(*prepare)
+        .encode()
+        .expect("a canonical cold preparation");
+}
+
+/// Make the retained preparation a typed asked restart (`ask` `None`: an Upgrade; `Some`: a
+/// checked Memory relaunch with that ask word), the other kind a later host epoch can answer
+/// `lapsed`.
+pub(in crate::harness) fn retain_asked(state: &mut St, ask: Option<&str>) {
+    let Some(Request::Prepare(mut prepare)) = Request::parse(&state.native_prepare) else {
+        panic!("the fixture keeps a preparation")
+    };
+    let predecessor = "cd".repeat(16);
+    let NativePlan::Restart {
+        cold, observation, ..
+    } = &mut prepare.plan
+    else {
+        panic!("a restart plan")
+    };
+    *cold = None;
+    *observation = None;
+    (prepare.duty, prepare.asked) = match ask {
+        None => (
+            Scope::Upgrade,
+            Some(AskedIntent::Upgrade(AskedUpgradeIntent { predecessor })),
+        ),
+        Some(ask) => (
+            Scope::Relaunch,
+            Some(AskedIntent::Relaunch(native_act::AskedRelaunchIntent {
+                predecessor,
+                ask: ask.to_owned(),
+            })),
+        ),
+    };
+    assert!(prepare.asked_restart_shape(), "a supported asked shape");
+    state.native_prepare = Request::prepare(*prepare)
+        .encode()
+        .expect("a canonical asked preparation");
 }

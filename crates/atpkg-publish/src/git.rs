@@ -78,6 +78,22 @@ impl SourceRepo {
 
 static MAIN_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Admit local source reads and require that its origin names the requested repository.
+/// This checks local configuration only; fetching and authenticating the remote remain
+/// the selected host's responsibility.
+/// # Errors
+/// Local source admission, a missing origin or an origin for another repository.
+pub(crate) fn source_with_origin(repo: &Path, slug: &crate::host::Slug) -> Result<SourceRepo> {
+    let source = SourceRepo::open(repo)?;
+    let origin = source.query(&["remote", "get-url", "origin"])?;
+    if !crate::artifact::package::names_repo(origin.trim(), &slug.owner, &slug.repo) {
+        return Err(Error::refused(format!(
+            "the source origin does not name {slug}; its main cannot judge this cut"
+        )));
+    }
+    Ok(source)
+}
+
 /// Read a repository's owner-bound main through the selected host, preserving the checkout,
 /// origin/main and FETCH_HEAD. The native route never falls back to the publisher's raw
 /// network Git or ambient origin credentials.
@@ -86,13 +102,7 @@ pub(crate) fn main_of_record(
     repo: &Path,
     slug: &crate::host::Slug,
 ) -> Result<(SourceRepo, String)> {
-    let source = SourceRepo::open(repo)?;
-    let origin = source.query(&["remote", "get-url", "origin"])?;
-    if !crate::artifact::package::names_repo(origin.trim(), &slug.owner, &slug.repo) {
-        return Err(Error::refused(format!(
-            "the source origin does not name {slug}; its main cannot judge this cut"
-        )));
-    }
+    let source = source_with_origin(repo, slug)?;
     let reference = format!(
         "refs/agh/atpkg-publish/main-{}-{}",
         std::process::id(),

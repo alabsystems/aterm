@@ -1477,6 +1477,13 @@ pub struct Log {
     /// (2026-11-08), and the searches for its seats 4.2% (2026-11-09). `hold` lets it go; clones
     /// share it until one holds a record.
     historical: Arc<OnceLock<eval::Historical>>,
+    /// Which epochs of the held records each device opened the key of ([`history::Opened`]): a
+    /// quiet repair round asks whether this Mac holds each epoch of its history, sixteen a round
+    /// on each side (`aterm-db`'s `Session::history_needs`), and unwrapping each again took 7.7%
+    /// of such a round over a log of 9,605 records (2026-11-09). It holds no key. `hold` lets it
+    /// go; clones share it until one holds a record.
+    #[cfg(unix)]
+    opened: Arc<history::Opened>,
 }
 
 /// The Macs a log let back in after a removal, named as a roster names them: canonical `m<N>`
@@ -1569,6 +1576,8 @@ impl Log {
             #[cfg(unix)]
             generation: Arc::default(),
             historical: Arc::default(),
+            #[cfg(unix)]
+            opened: Arc::default(),
         })
     }
 
@@ -2334,6 +2343,7 @@ impl Log {
         #[cfg(unix)]
         {
             self.generation = Arc::default();
+            self.opened = Arc::default();
         }
         self.historical = Arc::default();
         #[cfg(test)]

@@ -25,7 +25,6 @@ pub(super) enum Selection {
     },
     Sheet {
         path: PathBuf,
-        displaced_copy: Option<PathBuf>,
     },
     Beside {
         path: PathBuf,
@@ -35,6 +34,26 @@ pub(super) enum Selection {
 }
 
 impl Selection {
+    /// Local discovery retires a slot only when it replaces an existing input.
+    /// A pool or explicit source establishes authority even before that input arrives.
+    pub(super) fn retires_legacy(&self, home: Option<&Path>, config: Option<&Path>) -> bool {
+        match self {
+            Self::Pool(_) | Self::Key(_) => true,
+            Self::Sheet { path } => sheet_names_this_machine(config, path),
+            Self::Beside { path, opt_in } => {
+                *opt_in == Some(OptIn::Named)
+                    && home.is_some_and(|home| {
+                        superseded_secrets_copy(
+                            home,
+                            &home.join(".secrets").join(FLEET_ROSTER_FILE),
+                            path,
+                        )
+                    })
+            }
+            Self::VaultFleet { .. } | Self::Absent => false,
+        }
+    }
+
     pub(super) fn source(&self) -> Option<String> {
         match self {
             Self::Key(source) => Some(source.clone()),
@@ -78,11 +97,12 @@ impl Selection {
         project = "aterm_agent::harness::accounts_sync::source_selection::tests::resolve"
     )
 )]
-pub(super) fn select(
+fn select_inner(
     home: Option<&Path>,
     config: Option<&Path>,
     roster: Option<&Path>,
     scope: Scope,
+    retired: bool,
 ) -> Selection {
     let beside = roster.and_then(fleet_file_beside);
     let beside_opt_in = beside.as_deref().and_then(fleet_file_opt_in);
@@ -113,9 +133,10 @@ pub(super) fn select(
                     .filter(|path| source_entry_present(path)),
             )
             .filter(|(home, vault)| {
-                !beside
-                    .as_deref()
-                    .is_some_and(|beside| superseded_secrets_copy(home, vault, beside))
+                !retired
+                    && !beside
+                        .as_deref()
+                        .is_some_and(|beside| superseded_secrets_copy(home, vault, beside))
             })
         {
             let own = beside
@@ -127,7 +148,6 @@ pub(super) fn select(
             {
                 return Selection::Sheet {
                     path: sheet.clone(),
-                    displaced_copy: Some(vault),
                 };
             }
             let local = read_local_source_text(&vault).ok().and_then(|text| {
@@ -155,10 +175,7 @@ pub(super) fn select(
             };
         }
         if let Some(path) = sheet {
-            return Selection::Sheet {
-                path,
-                displaced_copy: None,
-            };
+            return Selection::Sheet { path };
         }
     }
     if let Some(path) =
@@ -170,6 +187,68 @@ pub(super) fn select(
         };
     }
     Selection::Absent
+}
+
+pub(super) fn select_for(
+    store: &accounts::Store,
+    home: Option<&Path>,
+    config: Option<&Path>,
+    roster: Option<&Path>,
+    scope: Scope,
+) -> Result<Selection, String> {
+    select_observed(home, config, roster, scope, &store.source_policy()?)
+}
+
+pub(super) fn select_observed(
+    home: Option<&Path>,
+    config: Option<&Path>,
+    roster: Option<&Path>,
+    scope: Scope,
+    policy: &accounts::source_policy::Snapshot,
+) -> Result<Selection, String> {
+    let selected = select_inner(home, config, roster, scope, policy.retired());
+    if (policy.retired() || selected.retires_legacy(home, config))
+        && let Some(home) = home
+    {
+        let path = match &selected {
+            Selection::Pool(path)
+            | Selection::VaultFleet { path, .. }
+            | Selection::Sheet { path }
+            | Selection::Beside { path, .. } => Some(path.clone()),
+            Selection::Key(source)
+                if !source.starts_with("http://") && !source.starts_with("https://") =>
+            {
+                let path = if let Some(relative) = source.strip_prefix("~/") {
+                    source_path(home, Path::new(relative))?
+                } else {
+                    let base = config.and_then(Path::parent).unwrap_or(home);
+                    let base = std::path::absolute(base).map_err(|why| why.to_string())?;
+                    source_path(&base, Path::new(source))?
+                };
+                Some(path)
+            }
+            _ => None,
+        };
+        if let Some(path) = path
+            && accounts::source_policy::aliases(
+                &path,
+                &home.join(".secrets").join(FLEET_ROSTER_FILE),
+            )?
+        {
+            return Err("retired legacy source cannot be selected through another path".into());
+        }
+    }
+    Ok(selected)
+}
+
+#[cfg(test)]
+pub(super) fn select(
+    home: Option<&Path>,
+    config: Option<&Path>,
+    roster: Option<&Path>,
+    scope: Scope,
+) -> Selection {
+    select_inner(home, config, roster, scope, false)
 }
 
 #[cfg(test)]

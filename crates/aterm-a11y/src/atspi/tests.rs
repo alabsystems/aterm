@@ -3,6 +3,7 @@
 
 //! Tests for the AT-SPI publisher against recorded zbus bytes and scripted buses.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -1062,6 +1063,8 @@ struct TestBuses {
     refuse: usize,
     write_timeout: Option<Duration>,
     rejoin_first: Duration,
+    /// The lines this publisher's worker logs, and no other's ([`Captured`]).
+    log: Lines,
 }
 
 #[test]
@@ -1124,12 +1127,20 @@ impl TestBuses {
             refuse: 0,
             write_timeout: Some(super::WRITE),
             rejoin_first: super::publisher::REJOIN_FIRST,
+            log: Lines::default(),
         }
+    }
+
+    /// Sends what this thread logs to this publisher's own log: its worker's first call,
+    /// [`Buses::session`], comes before any line the worker logs.
+    fn log_here(&self) {
+        MINE.with(|mine| *mine.borrow_mut() = Some(Arc::clone(&self.log)));
     }
 }
 
 impl Buses for TestBuses {
     fn session(&mut self) -> aterm_dbus::Result<Connection> {
+        self.log_here();
         let stream = self.session.take().ok_or(aterm_dbus::Error::Closed)?;
         Connection::handshake_within(stream, 1000, None, HANG)
     }
@@ -1184,9 +1195,18 @@ impl DeactivationHandler for Window {
     }
 }
 
-struct Captured {
-    lines: Mutex<Vec<String>>,
+/// One publisher's log lines.
+type Lines = Arc<Mutex<Vec<String>>>;
+
+thread_local! {
+    /// The log of the publisher whose worker runs on this thread ([`TestBuses::log_here`]).
+    static MINE: RefCell<Option<Lines>> = const { RefCell::new(None) };
 }
+
+/// The process's logger in this test binary. The tests run at once and their publishers' workers
+/// log the same lines, so each line goes to the log of the publisher on the thread that wrote it,
+/// and a test reads only its own; a line from a thread with no publisher is dropped.
+struct Captured;
 
 impl aterm_log::Log for Captured {
     fn enabled(&self, _: &aterm_log::Metadata) -> bool {
@@ -1194,22 +1214,23 @@ impl aterm_log::Log for Captured {
     }
 
     fn log(&self, record: &aterm_log::Record<'_>) {
-        self.lines.lock().unwrap().push(record.args().to_string());
+        let _ = MINE.try_with(|mine| {
+            if let Some(lines) = &*mine.borrow() {
+                lines.lock().unwrap().push(record.args().to_string());
+            }
+        });
     }
 
     fn flush(&self) {}
 }
 
-fn captured() -> &'static Captured {
-    static LOG: OnceLock<&'static Captured> = OnceLock::new();
+/// Installs [`Captured`] as the process's logger, once.
+fn captured() {
+    static LOG: OnceLock<()> = OnceLock::new();
     LOG.get_or_init(|| {
-        let log: &'static Captured = Box::leak(Box::new(Captured {
-            lines: Mutex::new(Vec::new()),
-        }));
-        let _ = aterm_log::set_logger(log);
+        let _ = aterm_log::set_logger(&Captured);
         aterm_log::set_max_level(aterm_log::LevelFilter::Info);
-        log
-    })
+    });
 }
 
 fn heard(rx: &Receiver<Heard>) -> Heard {
@@ -1279,7 +1300,7 @@ fn child_path(reply: &Message) -> String {
 
 #[test]
 fn a_session_survives_losing_the_bus_and_rejoins() {
-    let log = captured();
+    captured();
     let (session_client, session_bus) = CtlStream::pair().unwrap();
     let (first_client, first_bus) = CtlStream::pair().unwrap();
     let (second_client, second_bus) = CtlStream::pair().unwrap();
@@ -1287,10 +1308,9 @@ fn a_session_survives_losing_the_bus_and_rejoins() {
     let first_peer = Peer::accept(first_bus, ":1.20");
     let second_peer = Peer::accept(second_bus, ":1.21");
     let (opened_tx, opened) = mpsc::channel();
-    let publisher = Publisher::start(
-        TestBuses::new(session_client, [first_client, second_client], opened_tx),
-        Some("aterm-test".into()),
-    );
+    let buses = TestBuses::new(session_client, [first_client, second_client], opened_tx);
+    let log = Arc::clone(&buses.log);
+    let publisher = Publisher::start(buses, Some("aterm-test".into()));
     let (tx, window_heard) = mpsc::channel();
     let mut adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
 
@@ -1358,8 +1378,7 @@ fn a_session_survives_losing_the_bus_and_rejoins() {
     let mut bus = second_peer.join().unwrap();
     embedded(&mut bus, ":1.21");
     assert!(
-        log.lines
-            .lock()
+        log.lock()
             .unwrap()
             .iter()
             .any(|l| l.contains("the AT-SPI bus failed")),
@@ -1395,7 +1414,7 @@ const ANNOUNCING: [&str; 4] = [
 ];
 
 fn first_announcement(focus_first: bool) -> Vec<(String, String)> {
-    let _log = captured();
+    captured();
     let (session_client, session_bus) = CtlStream::pair().unwrap();
     let (bus_client, bus_end) = CtlStream::pair().unwrap();
     let session_peer = Peer::accept(session_bus, ":1.10");
@@ -1485,7 +1504,7 @@ struct Rejoined {
 }
 
 fn rejoin_after_a_loss(queued: Queued) -> Rejoined {
-    let _log = captured();
+    captured();
     let (session_client, session_bus) = CtlStream::pair().unwrap();
     let (first_client, first_bus) = CtlStream::pair().unwrap();
     let (second_client, second_bus) = CtlStream::pair().unwrap();
@@ -1664,10 +1683,11 @@ struct Stalling {
     session: Peer,
     first: Peer,
     second: Option<std::thread::JoinHandle<Peer>>,
+    log: Lines,
 }
 
 fn stalling(write_timeout: Option<Duration>) -> Stalling {
-    let _log = captured();
+    captured();
     let (session_client, session_bus) = CtlStream::pair().unwrap();
     let (first_client, first_bus) = CtlStream::pair().unwrap();
     let session_peer = Peer::accept(session_bus, ":1.10");
@@ -1679,13 +1699,12 @@ fn stalling(write_timeout: Option<Duration>) -> Stalling {
         Peer::accept(second_bus, ":1.21")
     });
     let (opened_tx, _opened) = mpsc::channel();
-    let publisher = Publisher::start(
-        TestBuses {
-            write_timeout,
-            ..TestBuses::new(session_client, buses, opened_tx)
-        },
-        Some("aterm-test".into()),
-    );
+    let buses = TestBuses {
+        write_timeout,
+        ..TestBuses::new(session_client, buses, opened_tx)
+    };
+    let log = Arc::clone(&buses.log);
+    let publisher = Publisher::start(buses, Some("aterm-test".into()));
     let (tx, window_heard) = mpsc::channel();
     let mut adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
     let mut session = session_peer.join().unwrap();
@@ -1703,16 +1722,16 @@ fn stalling(write_timeout: Option<Duration>) -> Stalling {
         session,
         first,
         second,
+        log,
     }
 }
 
 #[test]
 fn a_bus_that_stops_reading_is_left_and_the_next_one_joined() {
-    let log = captured();
     let mut s = stalling(Some(STALL));
     keep_changing(&mut s.adapter, &s.window_heard, Some(Heard::Deactivated), 0);
     assert!(
-        log.lines
+        s.log
             .lock()
             .unwrap()
             .iter()
@@ -1781,19 +1800,18 @@ fn without_a_write_deadline_a_bus_that_stops_reading_holds_the_publisher() {
 
 #[test]
 fn a_join_that_fails_is_tried_again() {
-    let log = captured();
+    captured();
     let (session_client, session_bus) = CtlStream::pair().unwrap();
     let (bus_client, bus_end) = CtlStream::pair().unwrap();
     let session_peer = Peer::accept(session_bus, ":1.10");
     let bus_peer = Peer::accept(bus_end, ":1.30");
     let (opened_tx, opened) = mpsc::channel();
-    let publisher = Publisher::start(
-        TestBuses {
-            refuse: 1,
-            ..TestBuses::new(session_client, [bus_client], opened_tx)
-        },
-        Some("aterm-test".into()),
-    );
+    let buses = TestBuses {
+        refuse: 1,
+        ..TestBuses::new(session_client, [bus_client], opened_tx)
+    };
+    let log = Arc::clone(&buses.log);
+    let publisher = Publisher::start(buses, Some("aterm-test".into()));
     let (tx, window_heard) = mpsc::channel();
     let adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
     let mut session = session_peer.join().unwrap();
@@ -1805,8 +1823,7 @@ fn a_join_that_fails_is_tried_again() {
     embedded(&mut bus, ":1.30");
     assert_eq!(heard(&window_heard), Heard::Activated);
     assert!(
-        log.lines
-            .lock()
+        log.lock()
             .unwrap()
             .iter()
             .any(|l| l.contains("cannot join the AT-SPI bus") && l.contains("in 1 s")),
@@ -1814,6 +1831,43 @@ fn a_join_that_fails_is_tried_again() {
     );
     drop(adapter);
     drop(publisher);
+}
+
+/// The tests of this binary run at once, and every publisher's worker logs the same lines: a line
+/// another test's publisher logs is in that test's log, not this one's, so it cannot stand in
+/// for one this test's publisher never logged.
+#[test]
+fn a_line_another_publisher_logs_is_not_in_this_tests_log() {
+    captured();
+    let (opened_tx, _opened) = mpsc::channel();
+    let (mine_session, _mine_bus) = CtlStream::pair().unwrap();
+    let (theirs_session, _theirs_bus) = CtlStream::pair().unwrap();
+    let mine = TestBuses::new(mine_session, [], opened_tx.clone());
+    let theirs = TestBuses::new(theirs_session, [], opened_tx);
+    let theirs_log = Arc::clone(&theirs.log);
+    let (logged, wrote) = mpsc::channel();
+    std::thread::spawn(move || {
+        theirs.log_here();
+        aterm_log::warn!("accessibility: the AT-SPI bus failed (closed)");
+        let _ = logged.send(());
+    });
+    wrote
+        .recv_timeout(HANG)
+        .expect("the other publisher's thread logged");
+    let has = |log: &Lines| {
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("the AT-SPI bus failed"))
+    };
+    assert!(
+        has(&theirs_log),
+        "a publisher's line is in its own test's log"
+    );
+    assert!(
+        !has(&mine.log),
+        "another test's publisher's line is in this test's log"
+    );
 }
 
 #[test]

@@ -51,7 +51,7 @@ impl<'a> Network<'a> {
 impl GitRunner for Network<'_> {
     fn git(&self, args: &[&str]) -> crate::ledger::Result<crate::ledger::RunOut> {
         self.running().map_err(crate::ledger::Error::new)?;
-        let mut cmd = crate::ledger::object_git(&self.repo);
+        let mut cmd = crate::ledger::object_git(&self.repo)?;
         cmd.args(["-c", "protocol.allow=never"]).args(args);
         let out = aterm_uds::deadline::output_until_from_unless(
             &mut cmd,

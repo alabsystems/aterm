@@ -20,6 +20,9 @@ pub const SYSTEMD_SERVICE: &str = "aterm-auto-atpkg.service";
 /// The Linux lane's timer.
 pub const SYSTEMD_TIMER: &str = "aterm-auto-atpkg.timer";
 
+/// The explicit staged-only lane's filesystem event source.
+pub const SYSTEMD_PATH: &str = "aterm-auto-atpkg.path";
+
 /// The Apple lane's 6-hour start interval in seconds.
 pub const START_INTERVAL_SECS: u64 = 21_600;
 
@@ -42,6 +45,8 @@ pub struct UnitSpec {
     pub shim_bin: PathBuf,
     /// Which hosts the unit's runs build (`--host`, §16.1): `gh` until WP15.
     pub host: HostChoice,
+    /// Consume staging notifications instead of building missing programs.
+    pub staged_only: bool,
 }
 
 impl UnitSpec {
@@ -61,7 +66,7 @@ impl UnitSpec {
 
     /// `lane run <kind> --sha256 … --log …`.
     fn run_words(&self) -> Vec<String> {
-        vec![
+        let mut words = vec![
             "lane".into(),
             "run".into(),
             self.kind.as_str().into(),
@@ -72,7 +77,11 @@ impl UnitSpec {
                 .log
                 .display()
                 .to_string(),
-        ]
+        ];
+        if self.staged_only {
+            words.extend(["--staged-only".into(), "--queued".into(), "--json".into()]);
+        }
+        words
     }
 
     /// `XDG_STATE_HOME`, so the run resolves the state root the installer used.
@@ -109,7 +118,13 @@ pub struct Unit {
 pub fn render(spec: &UnitSpec) -> Vec<Unit> {
     match spec.kind {
         LaneKind::Alab => vec![launchd(spec)],
-        LaneKind::Linux => vec![systemd_service(spec), systemd_timer()],
+        LaneKind::Linux => {
+            let mut units = vec![systemd_service(spec), systemd_timer()];
+            if spec.staged_only {
+                units.push(systemd_ready_path(spec));
+            }
+            units
+        }
     }
 }
 
@@ -314,5 +329,23 @@ pub fn systemd_timer() -> Unit {
                [Install]\n\
                WantedBy=timers.target\n"
             .into(),
+    }
+}
+
+/// Wake the existing service when canonical staging changes its notification
+/// directory. The service still checks its installed hash and the fresh cohort.
+#[must_use]
+pub fn systemd_ready_path(spec: &UnitSpec) -> Unit {
+    let directory = super::state::LaneState::of(LaneKind::Linux, &spec.state_dir).ready_dir();
+    // PathChanged takes the entire literal RHS, not an ExecStart-style quoted word.
+    let path = directory.display().to_string().replace('%', "%%");
+    Unit {
+        name: SYSTEMD_PATH.into(),
+        text: format!(
+            "# Rendered by `atpkg-publish lane install linux --staged-only`.\n\
+             [Unit]\nDescription=publish qualified staged atpkg cohorts\n\n\
+             [Path]\nPathChanged={path}\nUnit={SYSTEMD_SERVICE}\n\n\
+             [Install]\nWantedBy=default.target\n"
+        ),
     }
 }

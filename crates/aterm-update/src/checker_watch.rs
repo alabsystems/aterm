@@ -129,6 +129,29 @@ const GEN_SHIFT: u32 = 48;
 const PHASE_SHIFT: u32 = 40;
 const SECS_MASK: u64 = (1 << PHASE_SHIFT) - 1;
 const PHASE_MASK: u64 = 0xff;
+const COUNT_MASK: u64 = (1 << GEN_SHIFT) - 1;
+#[cfg(any(target_os = "macos", test))]
+const DEADLINE_SECS_MASK: u64 = (1 << GEN_SHIFT) - 1;
+
+/// Keep a delayed retired writer from replacing a newer generation's count.
+fn publish_count(count: &AtomicU64, generation: u64, value: u64) {
+    if generation == 0 {
+        return;
+    }
+    let _ = count.try_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+        (generation_of(previous) <= generation)
+            .then_some((generation << GEN_SHIFT) | value.min(COUNT_MASK))
+    });
+}
+
+fn read_count(count: &AtomicU64, generation: u64) -> u64 {
+    let word = count.load(Ordering::Acquire);
+    if generation_of(word) == generation {
+        word & COUNT_MASK
+    } else {
+        0
+    }
+}
 
 #[inline]
 const fn pack(generation: u64, phase: CheckerPhase, secs: u64) -> u64 {
@@ -281,9 +304,14 @@ pub struct CheckerWatch {
     lane: AtomicU64,
     max_interval: AtomicU64,
     respawns: AtomicU64,
+    /// Generation-prefixed count, saturated to [`COUNT_MASK`].
     deferrals: AtomicU64,
+    /// Generation-prefixed count, saturated to [`COUNT_MASK`].
     settings_misses: AtomicU64,
     checks: AtomicU64,
+    /// Generation in the high bits, positive Unix seconds in the low bits.
+    #[cfg(any(target_os = "macos", test))]
+    next_check: AtomicU64,
     /// Optional host event-loop wake invoked on phase transitions.
     phase_wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
@@ -306,6 +334,8 @@ impl CheckerWatch {
             deferrals: AtomicU64::new(0),
             settings_misses: AtomicU64::new(0),
             checks: AtomicU64::new(0),
+            #[cfg(any(target_os = "macos", test))]
+            next_check: AtomicU64::new(0),
             phase_wake: OnceLock::new(),
         }
     }
@@ -368,6 +398,39 @@ impl CheckerWatch {
         generation_of(self.beat.load(Ordering::Acquire)) == generation
     }
 
+    /// Publish a live generation's wait. Its marker alone may clear this value.
+    /// Unrepresentable timestamps and a second wait of the same generation are refused.
+    #[must_use]
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn publish_next_check(
+        &self,
+        generation: u64,
+        unix_secs: u64,
+    ) -> Option<NextCheckMark<'_>> {
+        if generation == 0
+            || !self.is_current(generation)
+            || unix_secs == 0
+            || unix_secs > DEADLINE_SECS_MASK
+        {
+            return None;
+        }
+        let word = (generation << GEN_SHIFT) | unix_secs;
+        self.next_check
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                (previous == 0 || generation_of(previous) < generation).then_some(word)
+            })
+            .ok()?;
+        Some(NextCheckMark { watch: self, word })
+    }
+
+    /// The current generation's published deadline, never a retired wait's.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn next_check_unix(&self) -> Option<u64> {
+        let word = self.next_check.load(Ordering::Acquire);
+        let generation = generation_of(word);
+        (generation != 0 && self.is_current(generation)).then_some(word & DEADLINE_SECS_MASK)
+    }
+
     /// Publishes the loop's maximum wait interval between stamps (`Cadence::max_wait`).
     pub fn set_max_interval(&self, generation: u64, secs: u64) {
         if self.is_current(generation) {
@@ -378,14 +441,14 @@ impl CheckerWatch {
     /// Publish the consecutive count of `checker.lock` deferrals to a holder showing no progress.
     pub fn set_deferrals(&self, generation: u64, n: u64) {
         if self.is_current(generation) {
-            self.deferrals.store(n, Ordering::Relaxed);
+            publish_count(&self.deferrals, generation, n);
         }
     }
 
     /// Publish the consecutive settings-miss count.
     pub fn set_settings_misses(&self, generation: u64, n: u64) {
         if self.is_current(generation) {
-            self.settings_misses.store(n, Ordering::Relaxed);
+            publish_count(&self.settings_misses, generation, n);
         }
     }
 
@@ -421,8 +484,8 @@ impl CheckerWatch {
             at_secs: word & SECS_MASK,
             max_interval_secs: self.max_interval.load(Ordering::Relaxed),
             respawns: self.respawns.load(Ordering::Relaxed),
-            deferrals: self.deferrals.load(Ordering::Relaxed),
-            settings_misses: self.settings_misses.load(Ordering::Relaxed),
+            deferrals: read_count(&self.deferrals, generation),
+            settings_misses: read_count(&self.settings_misses, generation),
             lane: (generation_of(lane) != 0).then(|| LaneHolder {
                 generation: generation_of(lane),
                 phase: phase_of(lane),
@@ -451,8 +514,6 @@ impl CheckerWatch {
                 (generation_of(word) == stalled).then_some(last)
             });
         self.respawns.fetch_add(1, Ordering::AcqRel);
-        self.deferrals.store(0, Ordering::Relaxed);
-        self.settings_misses.store(0, Ordering::Relaxed);
         Some(next)
     }
 
@@ -476,6 +537,25 @@ impl CheckerWatch {
         if let Some(wake) = self.phase_wake.get() {
             wake();
         }
+    }
+}
+
+/// Ownership of one published wait deadline.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct NextCheckMark<'a> {
+    watch: &'a CheckerWatch,
+    word: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for NextCheckMark<'_> {
+    fn drop(&mut self) {
+        let _ = self.watch.next_check.compare_exchange(
+            self.word,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
@@ -675,6 +755,37 @@ mod tests {
     }
 
     #[test]
+    fn only_the_current_waiter_publishes_a_representable_deadline() {
+        let watch = CheckerWatch::new();
+        let old = watch.register(60);
+        assert!(watch.publish_next_check(old, 0).is_none());
+        assert!(
+            watch
+                .publish_next_check(old, DEADLINE_SECS_MASK + 1)
+                .is_none()
+        );
+        let old_mark = watch.publish_next_check(old, 100).unwrap();
+        assert!(
+            watch.publish_next_check(old, 200).is_none(),
+            "one live wait per generation"
+        );
+        assert_eq!(watch.next_check_unix(), Some(100));
+        let new = watch.supersede(old).unwrap();
+        assert_eq!(watch.next_check_unix(), None);
+        assert!(watch.publish_next_check(old, 200).is_none());
+        let new_mark = watch.publish_next_check(new, 100).unwrap();
+        drop(old_mark);
+        assert_eq!(watch.next_check_unix(), Some(100));
+        drop(new_mark);
+        assert_eq!(watch.next_check_unix(), None);
+        assert!(watch.publish_next_check(old, 300).is_none());
+        let next_mark = watch.publish_next_check(new, DEADLINE_SECS_MASK).unwrap();
+        assert_eq!(watch.next_check_unix(), Some(DEADLINE_SECS_MASK));
+        drop(next_mark);
+        assert_eq!(watch.next_check_unix(), None);
+    }
+
+    #[test]
     fn a_superseded_generation_cannot_beat_and_a_stall_is_replaced_once() {
         let watch = CheckerWatch::new();
         assert!(watch.snapshot().is_none(), "nothing registered yet");
@@ -708,6 +819,39 @@ mod tests {
         watch.unstarted(live);
         assert_eq!(watch.snapshot().unwrap().respawns, MAX_RESPAWNS - 1);
         assert!(watch.supersede(live).is_some(), "the slot is spent again");
+    }
+
+    #[test]
+    fn a_retired_publish_cannot_restore_old_failure_counts() {
+        let watch = CheckerWatch::new();
+        let old = watch.register(100);
+        watch.set_deferrals(old, 7);
+        watch.set_settings_misses(old, 9);
+        let new = watch.supersede(old).unwrap();
+        // The retired setters passed their current-generation check before
+        // retirement, then resumed at publication after the replacement began.
+        publish_count(&watch.deferrals, old, 7);
+        publish_count(&watch.settings_misses, old, 9);
+        let snapshot = watch.snapshot().unwrap();
+        assert_eq!(snapshot.deferrals, 0);
+        assert_eq!(snapshot.settings_misses, 0);
+        watch.set_deferrals(new, 2);
+        watch.set_settings_misses(new, 3);
+        publish_count(&watch.deferrals, old, 8);
+        publish_count(&watch.settings_misses, old, 10);
+        let snapshot = watch.snapshot().unwrap();
+        assert_eq!(snapshot.deferrals, 2);
+        assert_eq!(snapshot.settings_misses, 3);
+        watch.set_deferrals(new, u64::MAX);
+        watch.set_settings_misses(new, u64::MAX);
+        let snapshot = watch.snapshot().unwrap();
+        assert_eq!(snapshot.deferrals, COUNT_MASK);
+        assert_eq!(snapshot.settings_misses, COUNT_MASK);
+        let next = watch.supersede(new).unwrap();
+        let snapshot = watch.snapshot().unwrap();
+        assert_eq!(snapshot.generation, next);
+        assert_eq!(snapshot.deferrals, 0);
+        assert_eq!(snapshot.settings_misses, 0);
     }
 
     #[test]

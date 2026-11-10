@@ -3388,22 +3388,24 @@ fn wraps_met(shots: &[Shot], cols: u16) -> Vec<WrapMet> {
 ///
 /// But the wall's. At the margin the composer's rules over and under the line leave the cat at
 /// the wall no seat, so from the key whose letter meets its box it fades out where it stands
-/// (`OldPath::NoSeatHidesTheBody`, ATERM-KI-1107-4): no hide begins more than
-/// [`WRAP_HIDE_LEAD_MAX_MS`] before its wrap (the program's lines meet the box 37 to 67 ms before
-/// theirs, down to alpha 218 of 255; the hand's 86 to 112 ms). A wrap that takes the caret to the
-/// next row ends that hide at once, and the cat bounds as above. One that leaves the caret on its
-/// row (the composer at the screen's foot grows up, carrying the line up a row) leaves the cat to
-/// the wall, as an Enter or a wrap on a full page's last row does
+/// (`OldPath::NoSeatHidesTheBody`, ATERM-KI-1107-4), drawn off the glass within the wall's cut
+/// (`OldPath::LettersCutTheFade`, 64 ms) since its box lies on those letters: no hide begins more
+/// than [`WRAP_HIDE_LEAD_MAX_MS`] before its wrap (the program's lines meet the box 37 to 67 ms
+/// before theirs, drawn down to alpha 0 to 101 of 255 by then, 218 to 234 with the cut reverted;
+/// the hand's 86 to 112 ms). A wrap that takes the caret to the next row ends that hide at once,
+/// and the cat bounds as above, fading back in as it goes. One that leaves the caret on its row
+/// (the composer at the screen's foot grows up, carrying the line up a row) leaves the cat to the
+/// wall, as an Enter or a wrap on a full page's last row does
 /// (`companion_off_letters::a_last_row_that_holds_no_seat_hides_the_companion`): the hide holds
-/// to its fade's end, its alpha never rising, off the glass within the fade (0.45 s) and two
-/// frames of the frame it began, and back on glass within a second of the wrap, 12 cells or nearer
-/// the caret. The wall's wraps are the hand's, at 61.1 and 93.4 s, off the glass 318 to 353 ms
-/// past the wrap and back 16 to 85 ms later; with the harness on, the cat sits at the margin over
-/// the composer's lines before the one at 61.1 s, a seat off the line, and that one is a bound,
-/// as is every other wrap. At 120 columns of 15 px cells the wall's law read nothing before
-/// 2026-11-08 (the box's columns, `PetBrain::rest_box_cols`, fell a rounding past the grid's
-/// end), so every wrap here was a bound; on 16 px cells this take hid the cat at 61.1 s then too
-/// (Linux arm64, 2026-11-08).
+/// to its fade's end, its alpha never rising, off the glass within the cut and two frames of the
+/// frame it began (measured 17 to 69 ms), and back on glass within a second of the wrap, 12 cells
+/// or nearer the caret. The wall's wraps are the hand's, at 61.1 and 93.4 s, off the glass 19 to
+/// 69 ms before the wrap and back 360 to 405 ms past it, when the fade the cut drew off has run
+/// out; with the harness on, the cat sits at the margin over the composer's lines before the one
+/// at 61.1 s, a seat off the line, and that one is a bound, as is every other wrap. At 120
+/// columns of 15 px cells the wall's law read nothing before 2026-11-08 (the box's columns,
+/// `PetBrain::rest_box_cols`, fell a rounding past the grid's end), so every wrap here was a
+/// bound; on 16 px cells this take hid the cat at 61.1 s then too (Linux arm64, 2026-11-08).
 ///
 /// Why these schedules. A schedule moves which present shows the wrap and how many presents the
 /// flight spans, so it spreads a wrap's leave and its time aloft around the on-time cell's. Of
@@ -3429,7 +3431,11 @@ fn wraps_met(shots: &[Shot], cols: u16) -> Vec<WrapMet> {
 /// before a wrap, and each wrap the wall had is a bound again: the cat stands on the hand's last
 /// letters to the wrap and crosses. With `PetBrain::wall_seat` holding no seat wherever the head
 /// law seats the cat nowhere at the wall, a letter under its box or not (built to measure, not
-/// kept), a hide began 240 ms before the program's wrap at 30.7 s (Linux arm64, 2026-11-09).
+/// kept), a hide began 240 ms before the program's wrap at 30.7 s (Linux arm64, 2026-11-09). With
+/// `OldPath::LettersCutTheFade` reverted (the same runs), each wall's hide lies on the hand's
+/// letters for its whole fade, off the glass 272 ms or more after it began (two thirds of the
+/// shortest measured: 407 to 448 ms, 318 to 353 ms past the wrap, and back 16 to 85 ms later;
+/// Linux arm64, 2026-11-09).
 #[test]
 fn the_writings_wrap_is_a_brisk_bound() {
     let hosts = [
@@ -3498,17 +3504,19 @@ fn the_writings_wrap_is_a_brisk_bound() {
             ));
         }
     }
-    for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
-        runs.push((
-            0,
-            4,
-            Knobs {
-                frame_ms,
-                echo_ms,
-                reverted: Some(OldPath::NoSeatHidesTheBody),
-                ..Knobs::SHIPPED
-            },
-        ));
+    for law in [OldPath::NoSeatHidesTheBody, OldPath::LettersCutTheFade] {
+        for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+            runs.push((
+                0,
+                4,
+                Knobs {
+                    frame_ms,
+                    echo_ms,
+                    reverted: Some(law),
+                    ..Knobs::SHIPPED
+                },
+            ));
+        }
     }
     let seen = crate::common::par_map(&runs, |&(take, wraps_held, knobs)| {
         let crossings = wraps_met(replayed(take, knobs), TAKES[take].cols);
@@ -3566,15 +3574,17 @@ fn the_writings_wrap_is_a_brisk_bound() {
         // The wraps the wall's law leaves to the wall: the generating take's third and fourth
         // (the hand's, at 61.1 and 93.4 s), the third not with the harness on, which seats the
         // cat off the line before it. None with the law reverted (the negative control).
-        let walls: &[usize] = match (take, knobs.reverted, knobs.brand) {
-            (0, None, false) => &[2, 3],
-            (0, None, true) => &[3],
+        let seated = knobs.reverted == Some(OldPath::NoSeatHidesTheBody);
+        let walls: &[usize] = match (take, seated, knobs.brand) {
+            (0, false, false) => &[2, 3],
+            (0, false, true) => &[3],
             _ => &[],
         };
+        let cut = knobs.reverted != Some(OldPath::LettersCutTheFade);
         for (i, w) in crossings.iter().enumerate() {
             if let Some(hid) = w.hid {
                 assert!(
-                    knobs.reverted.is_none(),
+                    !seated,
                     "negative control, {label}: the cat faded before the wrap ({w:?})"
                 );
                 assert!(
@@ -3599,8 +3609,15 @@ fn the_writings_wrap_is_a_brisk_bound() {
             let gone = w.gone.unwrap_or_else(|| {
                 panic!("{label}: the wall's hide from {hid} ms never left the glass ({w:?})")
             });
+            // The wall's cut (`FADE_OFF_THE_LETTERS`, 64 ms) and two frames; with it reverted,
+            // the fade (0.45 s), the floor two thirds of the shortest measured (407 ms).
+            let timed = if cut {
+                gone <= hid + 64 + 32
+            } else {
+                gone >= hid + 272
+            };
             assert!(
-                w.rose == 0 && gone <= hid + 450 + 32,
+                w.rose == 0 && timed,
                 "{label}: the wall's hide from {hid} ms rose in {} frames or ran to {gone} ms \
                  ({w:?})",
                 w.rose

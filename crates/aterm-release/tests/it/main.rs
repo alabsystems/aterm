@@ -111,6 +111,8 @@ mod harness_versions;
 #[path = "../../src/hook.rs"]
 #[allow(dead_code)]
 mod hook;
+#[path = "../../src/input_record.rs"]
+mod input_record;
 #[path = "../../src/interrupt.rs"]
 #[allow(dead_code)]
 mod interrupt;
@@ -280,4 +282,17 @@ fn git_first_path() -> &'static str {
             Err(_) => exec,
         }
     })
+}
+
+/// Create a short `.noindex` temporary directory for integration and unit tests in this crate.
+pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let short = &tag[..tag.floor_char_boundary(8)];
+    let builder = aterm_tempfile::Builder::new()
+        .prefix(&format!("arl-{short}-"))
+        .suffix(".noindex");
+    #[cfg(unix)]
+    let made = builder.tempdir_in("/tmp");
+    #[cfg(not(unix))]
+    let made = builder.tempdir();
+    made.expect("test scratch dir")
 }

@@ -28,6 +28,18 @@ pub struct Input {
     pub paths: Vec<String>,
 }
 
+impl Input {
+    /// An empty cone needs neither a toolchain seal nor a source check.
+    pub fn no_work_note(&self) -> Option<String> {
+        self.paths.is_empty().then(|| {
+            format!(
+                "release input: {} unreceipted commits, no unchecked paths; 0 checks run",
+                self.commits.len(),
+            )
+        })
+    }
+}
+
 fn git(root: &Path, path: &OsStr, args: &[&str]) -> Result<String, String> {
     let mut command = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
     command
@@ -243,17 +255,15 @@ pub fn judge(
     root: &Path,
     base: &str,
     tip: &str,
+    checks: &[Check],
+    events: Option<crate::event_log::EventLog>,
     log: &mut (dyn std::io::Write + Send),
 ) -> Result<String, (bool, String)> {
     let began = std::time::Instant::now();
     let env = EnvSnapshot::capture();
     let input = discover(root, &env.path, base, tip).map_err(|why| (false, why))?;
-    if input.paths.is_empty() {
-        return Ok(format!(
-            "release input: {} unreceipted commits, no unchecked paths; 0 checks run ({:.3}s)",
-            input.commits.len(),
-            began.elapsed().as_secs_f64()
-        ));
+    if let Some(note) = input.no_work_note() {
+        return Ok(format!("{note} ({:.3}s)", began.elapsed().as_secs_f64()));
     }
     writeln!(
         log,
@@ -277,11 +287,13 @@ pub fn judge(
     )
     .with_quiet(Some(aterm_capacity::Admit::Now))
     .with_halt(crate::halt_of(false, true))
+    .with_events(events)
     .with_memory(crate::memory::Book::live());
     ctx.input_paths = Some(input.paths.clone());
     ctx.head_at_start = Some(tip.into());
     let mut unavailable = Vec::new();
-    for (check, name) in CHECKS.into_iter().zip(NAMES) {
+    for check in checks.iter().copied() {
+        let name = check.name();
         if (check == Check::Fmt && ctx.tools.trustfmt.is_none())
             || (check == Check::Lint && ctx.tools.tippy.is_none())
         {
@@ -300,6 +312,7 @@ pub fn judge(
             },
         )
         .map_err(|e| (false, e.to_string()))?;
+        log.write_all(&output).map_err(|e| (false, e.to_string()))?;
         if code == crate::exit::FAILED {
             return Err((
                 true,
@@ -323,9 +336,35 @@ pub fn judge(
 
 /// Standalone entry for measuring the same preflight the release runs at step one.
 pub fn run_cli(args: &[String], root: &Path) -> i32 {
-    if args.len() != 2 || args[0] != "--base" {
-        eprintln!("usage: verify release-input --base <last-release-commit>");
+    if args.len() < 2 || args[0] != "--base" {
+        eprintln!(
+            "usage: verify release-input --base <last-release-commit> [--checks NAMES] [--events PATH]"
+        );
         return crate::exit::USAGE;
+    }
+    let mut checks = CHECKS.to_vec();
+    let mut events = None;
+    for pair in args[2..].chunks(2) {
+        if pair.len() != 2 {
+            return crate::exit::USAGE;
+        }
+        match pair[0].as_str() {
+            "--checks" => {
+                let names: Vec<_> = pair[1].split(',').collect();
+                if names.iter().any(|name| !NAMES.contains(name)) {
+                    return crate::exit::USAGE;
+                }
+                checks.retain(|check| names.contains(&check.name()));
+            }
+            "--events" => match crate::event_log::EventLog::open(&root.join(&pair[1])) {
+                Ok(file) => events = Some(file),
+                Err(why) => {
+                    eprintln!("cannot open events: {why}");
+                    return crate::exit::COULD_NOT_RUN;
+                }
+            },
+            _ => return crate::exit::USAGE,
+        }
     }
     #[cfg(unix)]
     crate::exec::group::kill_on_interrupt();
@@ -340,7 +379,14 @@ pub fn run_cli(args: &[String], root: &Path) -> i32 {
             return crate::exit::COULD_NOT_RUN;
         }
     };
-    let code = match judge(root, &args[1], &tip, &mut std::io::stdout()) {
+    let code = match judge(
+        root,
+        &args[1],
+        &tip,
+        &checks,
+        events,
+        &mut std::io::stdout(),
+    ) {
         Ok(note) => {
             println!("{note}");
             crate::exit::PASS
@@ -423,6 +469,23 @@ mod tests {
             }
             .trailers()
         }
+    }
+
+    #[test]
+    fn empty_input_needs_no_workspace_or_check_tools() {
+        let repo = Repo::new();
+        let head = repo.git(&["rev-parse", "HEAD"]);
+        let mut log = Vec::new();
+        assert!(judge(repo.0.path(), &head, &head, &CHECKS, None, &mut log).is_ok());
+        assert!(log.is_empty(), "no source check was entered");
+        assert!(
+            Input {
+                commits: vec![head],
+                paths: vec!["seed".into()]
+            }
+            .no_work_note()
+            .is_none()
+        );
     }
 
     /// The very same tree is owed without its real landing trailer, and covered with it.

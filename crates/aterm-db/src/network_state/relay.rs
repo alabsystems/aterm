@@ -7,7 +7,7 @@
 use super::*;
 use aterm_uds::{CtlListener, CtlStream, listener, peer};
 use std::{
-    io::{self, Read, Write},
+    io::{self, Write},
     os::fd::AsFd,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     thread::{self, JoinHandle},
@@ -250,10 +250,7 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
 
 fn read_exact(stream: &mut CtlStream, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
     while !bytes.is_empty() {
-        stream
-            .set_read_timeout(Some(remaining(deadline)?))
-            .map_err(|error| context("read-timeout", error))?;
-        match stream.read(bytes) {
+        match aterm_uds::hangup::read_until(stream, bytes, deadline) {
             Ok(0) => return Err(refused()),
             Ok(n) => bytes = &mut bytes[n..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -607,6 +604,21 @@ mod history_conformance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_observer_keeps_its_queued_acknowledgement_readable() {
+        let (mut client, mut observer) = CtlStream::pair().unwrap();
+        observer.write_all(ACK).unwrap();
+        drop(observer);
+        let deadline = Instant::now() + EXCHANGE;
+        while !aterm_uds::hangup::peer_closed(&client) {
+            assert!(Instant::now() < deadline, "the observer never closed");
+            aterm_uds::deadline::poll_yield();
+        }
+        let mut ack = [0; ACK.len()];
+        read_exact(&mut client, &mut ack, deadline).unwrap();
+        assert_eq!(&ack, ACK);
+    }
 
     fn publish(handle: &ObservationHandle, state: NetworkObservation) {
         let mut publication = Publication::new(state, Instant::now());
@@ -984,6 +996,7 @@ mod tests {
     #[test]
     #[ignore = "child process fixture, invoked by cross_process_owner"]
     fn child_observer() {
+        use std::io::Read as _;
         let config =
             PathBuf::from(std::env::var_os("ATERM_TEST_OBSERVER_CONFIG").expect("fixture config"));
         let handle = ObservationHandle::default();

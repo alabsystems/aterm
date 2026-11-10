@@ -1479,13 +1479,10 @@ fn too_old(words: &str) -> Stop {
             MIN_GIT.1,
             words.trim()
         ),
-        // The release runs this one git by its path ([`ledger::GitCli`]), whatever PATH holds.
         format!(
-            "make {} a git ≥ {}.{} (on a Mac, newer Command Line Tools), then run the release \
-             again",
-            aterm_uds::os_path!("git"),
-            MIN_GIT.0,
-            MIN_GIT.1
+            "install or update managed Git with `aterm pkg install git` to git ≥ {}.{} \
+             (or update the OS Git when no managed Git is installed), then run the release again",
+            MIN_GIT.0, MIN_GIT.1
         ),
     )
 }

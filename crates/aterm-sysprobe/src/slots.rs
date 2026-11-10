@@ -86,6 +86,11 @@ impl Record {
         let Ok(v) = aterm_json::from_slice::<Value>(bytes) else {
             return RecordRead::Bad;
         };
+        Self::from_value(&v)
+    }
+
+    fn from_value(v: &aterm_json::Value) -> RecordRead {
+        use aterm_json::Value;
         if v.as_object().is_none() {
             return RecordRead::Bad;
         }
@@ -391,6 +396,27 @@ pub fn observe(dir: &Path, mono_ms: u64, now_us: u64) -> Result<Observation, Unr
     }
 }
 
+/// Observes a private legacy admission ticket through a fresh read-only `reader`, opened
+/// without following any path component's symlink. `facts` must predate that open. Metadata
+/// alone never establishes a waiter. Unsupported platforms return none.
+#[must_use]
+pub fn waiting_ticket(
+    path: &Path,
+    reader: &mut std::fs::File,
+    facts: &[crate::jobs::ProcFacts],
+    now_us: u64,
+) -> Option<Holder> {
+    #[cfg(target_os = "macos")]
+    {
+        live::waiting_ticket(path, reader, facts, now_us)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, reader, facts, now_us);
+        None
+    }
+}
+
 /// The index of a file named `slot-<digits>`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn slot_index(name: &str) -> Option<u32> {
@@ -491,6 +517,86 @@ mod live {
         RecordRead, Sight, SlotObs, Unread, adopted_in_window, birth_us, lock_checked, slot_index,
     };
     use crate::kproc;
+
+    pub(super) fn waiting_ticket(
+        path: &Path,
+        f: &mut std::fs::File,
+        facts: &[crate::jobs::ProcFacts],
+        now_us: u64,
+    ) -> Option<Holder> {
+        use crate::jobs::FdKind;
+        let original = std::fs::symlink_metadata(path).ok()?;
+        let private = |m: &std::fs::Metadata| {
+            m.is_file() && m.nlink() == 1 && m.mode() & 0o777 == 0o600
+                // SAFETY: geteuid has no preconditions.
+                && m.uid() == unsafe { libc::geteuid() }
+        };
+        if !private(&original) || original.len() > RECORD_CAP as u64 {
+            return None;
+        }
+        let file = identity(&original);
+        let opened = f.metadata().ok()?;
+        if !private(&opened) || identity(&opened) != file || locked(f) != Some(true) {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        (&mut *f)
+            .take(RECORD_CAP as u64 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() > RECORD_CAP {
+            return None;
+        }
+        // Slot records permit older optional fields; admission tickets require the canonical
+        // business record. These strings are validated, never interpreted as paths or argv.
+        let metadata: aterm_json::Value = aterm_json::from_slice(&bytes).ok()?;
+        if ["cmd", "cwd"].iter().any(|key| {
+            metadata
+                .get(key)
+                .and_then(aterm_json::Value::as_str)
+                .is_none()
+        }) {
+            return None;
+        }
+        let RecordRead::Rec(rec) = Record::from_value(&metadata) else {
+            return None;
+        };
+        let p = facts.iter().find(|p| p.pid == rec.pid)?;
+        let birth = p.start?;
+        if birth == 0
+            || birth > rec.started_us.saturating_add(BIRTH_SLACK_US)
+            || rec.started_us > now_us
+            || p.uid != Some(original.uid())
+            || !p.fds.as_ref()?.iter().any(|fd| {
+                matches!(fd.kind,
+                FdKind::File { regular: true, dev, ino, .. }
+                    if (dev as u32, ino) == file)
+            })
+        {
+            return None;
+        }
+        let native = kproc::record(rec.pid)?;
+        let after = std::fs::symlink_metadata(path).ok()?;
+        let unchanged = f.metadata().ok()?;
+        if native.zombie
+            || birth_us(&native) != birth
+            || native.uid != original.uid()
+            || !private(&after)
+            || identity(&after) != file
+            || unchanged.len() != opened.len()
+            || unchanged.mtime() != opened.mtime()
+            || unchanged.mtime_nsec() != opened.mtime_nsec()
+            || unchanged.ctime() != opened.ctime()
+            || unchanged.ctime_nsec() != opened.ctime_nsec()
+            || locked(f) != Some(true)
+        {
+            return None;
+        }
+        Some(Holder {
+            pid: rec.pid,
+            birth_us: birth,
+        })
+    }
 
     /// One slot's read: kept, vanished between the listing and the read, or
     /// refused to this user.

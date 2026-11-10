@@ -843,9 +843,9 @@ impl App {
                 }
                 let mut terminal_index = 0usize;
                 for tab in ws.tab_set.tabs() {
-                    let entry = if tab.root.leaves().into_iter().all(|view| {
-                        matches!(
-                            self.view_store.get(view),
+                    let entry = if !tab.root.any_leaf(&mut |view| {
+                        !matches!(
+                            self.view_store.get(*view),
                             Some(crate::tab_model::View::Terminal(_))
                         )
                     }) {
@@ -1982,9 +1982,9 @@ impl App {
             };
         let id = tab.id;
         let terminal = |view_store: &crate::tab_model::ViewStore, tab: &crate::tab_model::Tab| {
-            tab.root.leaves().into_iter().all(|view| {
-                matches!(
-                    view_store.get(view),
+            !tab.root.any_leaf(&mut |view| {
+                !matches!(
+                    view_store.get(*view),
                     Some(crate::tab_model::View::Terminal(_))
                 )
             })
@@ -3093,9 +3093,9 @@ impl App {
                     .tabs()
                     .iter()
                     .filter(|tab| {
-                        tab.root.leaves().into_iter().all(|view| {
-                            matches!(
-                                self.view_store.get(view),
+                        !tab.root.any_leaf(&mut |view| {
+                            !matches!(
+                                self.view_store.get(*view),
                                 Some(crate::tab_model::View::Terminal(_))
                             )
                         })
@@ -3131,19 +3131,19 @@ impl App {
         self.windows.get(&wid).is_none_or(|window| {
             let mut seen = Vec::new();
             window.tab_set.tabs().iter().all(|tab| {
-                tab.root.leaves().into_iter().all(|view| {
+                !tab.root.any_leaf(&mut |view| {
                     self.view_store
-                        .get(view)
+                        .get(*view)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
-                        .is_none_or(|session| {
-                            let fresh = !seen.contains(&session)
-                                || self
+                        .is_some_and(|session| {
+                            let duplicate = seen.contains(&session)
+                                && !self
                                     .pool
                                     .get(session)
                                     .is_some_and(|live| live.handoff_local_id.is_some());
                             seen.push(session);
-                            fresh
+                            duplicate
                         })
                 })
             })
@@ -3176,9 +3176,9 @@ impl App {
     fn window_holds_handed_off_shell(&self, wid: WindowId) -> bool {
         self.windows.get(&wid).is_some_and(|window| {
             window.tab_set.tabs().iter().any(|tab| {
-                tab.root.leaves().into_iter().any(|view| {
+                tab.root.any_leaf(&mut |view| {
                     self.view_store
-                        .get(view)
+                        .get(*view)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
                         .and_then(|session| self.pool.get(session))
@@ -4769,9 +4769,9 @@ impl App {
                 .iter()
                 .take(target)
                 .filter(|tab| {
-                    tab.root.leaves().into_iter().all(|view| {
-                        matches!(
-                            self.view_store.get(view),
+                    !tab.root.any_leaf(&mut |view| {
+                        !matches!(
+                            self.view_store.get(*view),
                             Some(crate::tab_model::View::Terminal(_))
                         )
                     })

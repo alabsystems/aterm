@@ -731,7 +731,7 @@ pub(crate) fn private_dir_in(base: &Path, prefix: &str) -> Result<PathBuf, Strin
     let mut last = String::from("no attempt");
     for _ in 0..64 {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = base.join(format!("{prefix}-{}-{n}", std::process::id()));
+        let path = base.join(format!("{prefix}-{}-{n}.noindex", std::process::id()));
         let mut b = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
@@ -798,6 +798,7 @@ fn reclaim_kept(base: &Path) {
             .and_then(|rest| rest.strip_prefix('-'))
             .and_then(|rest| rest.split_once('-'))
             .is_some_and(|(pid, n)| {
+                let n = n.strip_suffix(".noindex").unwrap_or(n);
                 [pid, n]
                     .iter()
                     .all(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
@@ -2334,7 +2335,7 @@ mod tests {
     /// directory named otherwise stay.
     #[test]
     fn a_kept_scratch_goes_once_its_hold_is_spent() {
-        let base = aterm_tempfile::tempdir().unwrap();
+        let base = crate::test_scratch_dir("site");
         let dir = |name: &str, stamp: Option<String>| {
             let path = base.path().join(name);
             std::fs::create_dir_all(path.join("clone/target")).unwrap();
@@ -2344,13 +2345,17 @@ mod tests {
             path
         };
         let spent = dir("aterm-site-41-0", Some(u64::MAX.to_string()));
+        let spent_noindex = dir("aterm-site-41-2.noindex", Some(u64::MAX.to_string()));
         let held = dir("aterm-site-41-1", None);
         aterm_uds::deadline::stamp_exec(&held);
-        let live = dir("aterm-site-42-0", None);
+        let held_noindex = dir("aterm-site-41-3.noindex", None);
+        aterm_uds::deadline::stamp_exec(&held_noindex);
+        let live = dir("aterm-site-42-0.noindex", None);
         let other = dir("aterm-site-sync-x", Some(u64::MAX.to_string()));
         reclaim_kept(base.path());
         assert!(!spent.exists());
-        for stays in [&held, &live, &other] {
+        assert!(!spent_noindex.exists());
+        for stays in [&held, &held_noindex, &live, &other] {
             assert!(stays.join("clone/target").is_dir(), "{}", stays.display());
         }
     }
@@ -2433,18 +2438,19 @@ mod tests {
 
     #[test]
     fn private_dirs_are_distinct_and_private() {
+        let base = crate::test_scratch_dir("priv");
         let made: Vec<PathBuf> = (0..8)
-            .map(|_| private_dir("aterm-site-t").unwrap())
+            .map(|_| private_dir_in(base.path(), "aterm-site-t").unwrap())
             .collect();
         let unique: std::collections::BTreeSet<&PathBuf> = made.iter().collect();
         assert_eq!(unique.len(), made.len());
-        #[cfg(unix)]
         for d in &made {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(d.metadata().unwrap().permissions().mode() & 0o777, 0o700);
-        }
-        for d in made {
-            std::fs::remove_dir(d).unwrap();
+            assert_eq!(d.extension().and_then(|e| e.to_str()), Some("noindex"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(d.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+            }
         }
     }
 }

@@ -3115,7 +3115,7 @@ fn run_checker(
     let wait = |schedule: &cadence::Cadence| -> cadence::Waited {
         match args.pause {
             Some(pause) => cadence::sleep_watching_for_wake(args.wake, wake_seen.get(), pause),
-            None => cadence::wait(schedule, args.wake, wake_seen.get()).1,
+            None => cadence::wait(schedule, args.wake, wake_seen.get(), watch, generation).1,
         }
     };
     let settle = |schedule: &mut cadence::Cadence,

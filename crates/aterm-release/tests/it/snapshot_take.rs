@@ -15,6 +15,7 @@ use crate::snapshot::{
 fn scratch() -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix("aterm-snapshot-")
+        .suffix(".noindex")
         .tempdir()
         .unwrap()
 }

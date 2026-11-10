@@ -377,11 +377,43 @@ fn read_public(
         })?;
         bind(&pkg, program, build, "the public", &tag)?;
         let mut complete = true;
-        for asset in release_assets(&pkg)
-            .into_iter()
-            .map(|(asset, _)| asset)
-            .chain(crate::artifact::bottle::reference::qualification::receipt_names(&bytes)?)
+        for artifact in pkg
+            .artifacts
+            .iter()
+            .filter(|a| a.protocol.is_empty() || a.protocol == "github-release")
         {
+            let asset = &artifact.asset;
+            match channel.probe_public(&public, &tag, asset) {
+                Probe::Present => {}
+                Probe::Absent => complete = false,
+                Probe::Unknown(_) => {
+                    // HEAD is only an availability shortcut. The ordinary anonymous
+                    // download policy can establish availability from the signed bytes.
+                    let path = pub_dir.join(asset);
+                    match channel.fetch_public(&public, &tag, asset, &path, artifact.size) {
+                        Probe::Absent => complete = false,
+                        Probe::Unknown(why) => return Err(unknown(asset, &why)),
+                        Probe::Present => {
+                            let meta = std::fs::symlink_metadata(&path)
+                                .map_err(|e| Error::io(asset, &e))?;
+                            let hash =
+                                atpkg::sha256_file(&path).map_err(|e| Error::io(asset, &e))?;
+                            if !meta.is_file()
+                                || meta.len() != artifact.size
+                                || hash != artifact.sha256
+                            {
+                                return Err(Error::refused(format!(
+                                    "{tag} public asset {asset} size or hash mismatch vs the signed manifest"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Reference receipts have their own qualification contract, not a signed
+        // artifact size and digest here. An inconclusive probe still refuses them.
+        for asset in crate::artifact::bottle::reference::qualification::receipt_names(&bytes)? {
             match channel.probe_public(&public, &tag, &asset) {
                 Probe::Present => {}
                 Probe::Absent => complete = false,

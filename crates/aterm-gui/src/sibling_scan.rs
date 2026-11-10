@@ -109,8 +109,11 @@ fn raise_on(sock: &str, sid: &str) -> Option<()> {
         .write_all(format!("AUTH {token}\nraise {sid}\n").as_bytes())
         .ok()?;
     (&stream).flush().ok()?;
-    let mut reader = BufReader::new(&stream);
-    let line = read_bounded_line(&stream, &mut reader, deadline)?;
+    let mut reader = BufReader::new(PeerRead {
+        stream: &stream,
+        deadline,
+    });
+    let line = read_bounded_line(&mut reader, deadline)?;
     line.starts_with("OK").then_some(())
 }
 
@@ -257,10 +260,9 @@ fn budget_left(deadline: Instant) -> Option<Duration> {
         .filter(|d| *d >= Duration::from_millis(1))
 }
 
-/// Re-arm the socket deadline with the budget remainder before one I/O step.
+/// Bound the request's writes before sending it.
 fn arm(stream: &aterm_uds::CtlStream, deadline: Instant) -> Option<()> {
     let left = budget_left(deadline)?;
-    stream.set_read_timeout(Some(left)).ok()?;
     stream.set_write_timeout(Some(left)).ok()?;
     Some(())
 }
@@ -281,8 +283,11 @@ fn summarize_peer_within(pid: u32, sock: &str, budget: Duration) -> Option<Sibli
         .write_all(format!("AUTH {token}\nsurvey facts\n").as_bytes())
         .ok()?;
     (&stream).flush().ok()?;
-    let mut reader = BufReader::new(&stream);
-    let header = read_bounded_line(&stream, &mut reader, deadline)?;
+    let mut reader = BufReader::new(PeerRead {
+        stream: &stream,
+        deadline,
+    });
+    let header = read_bounded_line(&mut reader, deadline)?;
     let count: usize = header
         .trim_end()
         .strip_prefix("OK ")
@@ -299,7 +304,7 @@ fn summarize_peer_within(pid: u32, sock: &str, budget: Duration) -> Option<Sibli
     let mut published = true;
     let mut bytes = 0usize;
     for _ in 0..count {
-        let line = read_bounded_line(&stream, &mut reader, deadline)?;
+        let line = read_bounded_line(&mut reader, deadline)?;
         bytes = bytes.checked_add(line.len())?;
         if bytes > MAX_REPLY_BYTES {
             return None;
@@ -325,15 +330,22 @@ fn summarize_peer_within(pid: u32, sock: &str, budget: Duration) -> Option<Sibli
     })
 }
 
-/// Read one `\n`-terminated line with the byte cap AND the peer budget
-/// re-armed first: `None` on EOF, error, exhausted budget, or an
-/// unterminated line at the cap (a flood, not a frame).
-fn read_bounded_line(
-    stream: &aterm_uds::CtlStream,
-    reader: &mut BufReader<&aterm_uds::CtlStream>,
+struct PeerRead<'a> {
+    stream: &'a aterm_uds::CtlStream,
     deadline: Instant,
-) -> Option<String> {
-    arm(stream, deadline)?;
+}
+
+impl Read for PeerRead<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        aterm_uds::hangup::read_until(self.stream, bytes, self.deadline)
+    }
+}
+
+/// Read one `\n`-terminated line with the byte cap and the peer budget:
+/// `None` on EOF, error, exhausted budget, or an
+/// unterminated line at the cap (a flood, not a frame).
+fn read_bounded_line(reader: &mut BufReader<PeerRead<'_>>, deadline: Instant) -> Option<String> {
+    budget_left(deadline)?;
     let mut buf = Vec::new();
     let mut limited = Read::by_ref(reader).take(MAX_LINE_BYTES);
     limited.read_until(b'\n', &mut buf).ok()?;
@@ -347,6 +359,31 @@ fn read_bounded_line(
 mod tests {
     use super::parse_session_row;
     use aterm_types::needs::NeedWord;
+
+    #[cfg(unix)]
+    #[test]
+    fn queued_survey_lines_survive_the_siblings_close() {
+        use super::*;
+        let (stream, mut peer) = aterm_uds::CtlStream::pair().unwrap();
+        peer.write_all(b"OK 1\nsession sid=s-peer needs=-\n")
+            .unwrap();
+        drop(peer);
+        aterm_spec::wait::until_peer_closed(&stream);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let mut reader = BufReader::new(PeerRead {
+            stream: &stream,
+            deadline,
+        });
+        assert_eq!(
+            read_bounded_line(&mut reader, deadline).as_deref(),
+            Some("OK 1\n")
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, deadline).as_deref(),
+            Some("session sid=s-peer needs=-\n")
+        );
+        assert_eq!(read_bounded_line(&mut reader, deadline), None);
+    }
 
     /// A `survey facts` row is read by key: its published need, its role
     /// (else its program) as the label, and the age of the fact it stands on

@@ -4613,13 +4613,13 @@ fn a_sibling_replaced_after_the_plan_is_sent_its_own_token() {
         probe
     });
     let (client_app, client_relay) = CtlStream::pair().expect("pair");
+    client_app
+        .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+        .expect("a hang detector on the reply");
     let forward = std::thread::spawn(move || {
         let hop = crate::proxy::connect_hop(&plan).map_err(|e| format!("no hop: {e:?}"))?;
         crate::proxy::relay_hop(hop, &line, &client_relay, &[]).map_err(|e| e.to_string())
     });
-    client_app
-        .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
-        .expect("a hang detector on the reply");
     let mut reply = String::new();
     let _ = BufReader::new(client_app.try_clone().expect("clone")).read_line(&mut reply);
     hang_up(client_app);
@@ -8054,20 +8054,30 @@ fn a_refused_handshake_is_recorded_by_kind_through_the_denials_it_is_given() {
 }
 
 fn read_until(s: &CtlStream, mut acc: String, pred: impl Fn(&str) -> bool) -> String {
-    use std::io::Read;
-    let mut s = s.try_clone().expect("clone client end");
-    s.set_read_timeout(Some(std::time::Duration::from_millis(200)))
-        .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut buf = [0u8; 8192];
     while !pred(&acc) && std::time::Instant::now() < deadline {
-        match s.read(&mut buf) {
+        match aterm_uds::hangup::read_until(s, &mut buf, deadline) {
             Ok(n) if n > 0 => acc.push_str(&String::from_utf8_lossy(&buf[..n])),
             Ok(_) => break, // EOF
-            Err(_) => {}    // timeout: loop until the deadline
+            Err(_) => break,
         }
     }
     acc
+}
+
+#[test]
+fn a_subscription_fixture_reads_the_final_push_after_its_peer_closed() {
+    use std::io::Write as _;
+    let (client, mut server) = CtlStream::pair().unwrap();
+    server.write_all(b"final push\n").unwrap();
+    drop(server);
+    #[cfg(unix)]
+    aterm_spec::wait::until_peer_closed(&client);
+    assert_eq!(
+        read_until(&client, String::new(), |s| s.ends_with('\n')),
+        "final push\n"
+    );
 }
 
 fn screen_frame_read_whole(text: &str) -> bool {

@@ -76,7 +76,10 @@ fn retired_unissued_recipe_survives_disk_reload_without_any_further_dispatch() {
         recover(&opts, "conversation", &mut client, SID, &mut loaded),
         Ok(Recovery::Held)
     );
-    assert!(!abort(&opts, "conversation", &mut client, SID, &mut loaded));
+    assert_eq!(
+        abort(&opts, "conversation", &mut client, SID, &mut loaded),
+        None
+    );
     assert!(!complete(
         &opts,
         "conversation",
@@ -261,7 +264,10 @@ fn every_prepare_replay_waits_for_its_state_barrier() {
             recover(&opts, "conversation", &mut client, SID, &mut st),
             Err("native-unsaved")
         );
-        assert!(!abort(&opts, "conversation", &mut client, SID, &mut st));
+        assert_eq!(
+            abort(&opts, "conversation", &mut client, SID, &mut st),
+            None
+        );
         assert!(!retire(&opts, "conversation", &mut client, SID, &mut st));
         assert_eq!(st, original);
     }
@@ -726,7 +732,10 @@ fn a_loaded_binding_cannot_reconcile_before_its_own_durability_barrier() {
         loaded.native, st.native,
         "rename was visible before its barrier"
     );
-    let expected = Request::Reconcile(st.native.clone().unwrap());
+    // The kept prepare replays first; its admission reconciles the binding.
+    let replay = Request::parse(&st.native_prepare).unwrap();
+    let binding = st.native.clone().unwrap();
+    let expected = Request::Reconcile(binding.clone());
     let allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let at_server = std::sync::Arc::clone(&allowed);
     let (mut client, worker) = endpoint(move |line| {
@@ -734,7 +743,14 @@ fn a_loaded_binding_cannot_reconcile_before_its_own_durability_barrier() {
             at_server.load(std::sync::atomic::Ordering::Acquire),
             "retirement reached the wire before the directory barrier was repaired"
         );
-        assert_eq!(request(line), expected);
+        let request = request(line);
+        if request == replay {
+            return Some(format!(
+                "OK native-act state=admitted id={} cap={}\n",
+                binding.id, binding.capability
+            ));
+        }
+        assert_eq!(request, expected);
         None
     });
     let mut dry = opts.clone();
@@ -760,8 +776,8 @@ fn a_loaded_binding_cannot_reconcile_before_its_own_durability_barrier() {
     drop(client);
     assert_eq!(
         worker.join().unwrap().len(),
-        1,
-        "only the durable attempt leaves"
+        2,
+        "only the durable attempt leaves: its replay and its reconciliation"
     );
 }
 
@@ -1056,6 +1072,8 @@ fn a_cold_completion_keeps_the_selected_intent_and_the_original_seed_with_or_wit
                 billing: ColdBilling::Keep,
             })),
         },
+        boot: None,
+        custody: None,
     };
     let intent = super::super::accounts_pool::ExecutionIntent::Stored {
         namespace: "11".repeat(32),
@@ -1407,7 +1425,10 @@ fn queued_prepare_safe_receipt_restores_unsent() {
         Err("native-predecessors")
     );
     assert!(!st.native_prepare.is_empty());
-    assert!(abort(&opts, "conversation", &mut client, SID, &mut st));
+    assert_eq!(
+        abort(&opts, "conversation", &mut client, SID, &mut st),
+        Some(Recovery::Cancelled)
+    );
     st.unsent(back);
     assert_eq!(st.phase, Phase::Announced { at_s: 1, asks: 1 });
     assert!(st.native.is_none() && st.native_prepare.is_empty());
@@ -1464,7 +1485,10 @@ fn an_unadmitted_answer_drops_only_its_own_prepare_and_the_next_begin_plans_afre
         recover(&opts, "conversation", &mut client, SID, &mut st),
         Err("native-unknown")
     );
-    assert!(!abort(&opts, "conversation", &mut client, SID, &mut st));
+    assert_eq!(
+        abort(&opts, "conversation", &mut client, SID, &mut st),
+        None
+    );
     assert_eq!(st, lost);
     drop(client);
     assert_eq!(worker.join().unwrap().len(), 2);
@@ -1480,7 +1504,7 @@ fn an_unadmitted_answer_drops_only_its_own_prepare_and_the_next_begin_plans_afre
         let ended = if retiring {
             retire(&opts, "conversation", &mut client, SID, &mut st)
         } else {
-            abort(&opts, "conversation", &mut client, SID, &mut st)
+            abort(&opts, "conversation", &mut client, SID, &mut st) == Some(Recovery::Unadmitted)
         };
         drop(client);
         let seen = worker.join().unwrap();
@@ -1554,6 +1578,218 @@ fn an_unadmitted_answer_drops_only_its_own_prepare_and_the_next_begin_plans_afre
         .collect::<Vec<_>>();
     assert_eq!(ids.len(), 2);
     assert_ne!(ids[0], ids[1], "a fresh plan has a fresh id");
+}
+
+/// `lost_prepare`'s record with its kept prepare made a kind a later host epoch can answer
+/// `lapsed` (a typed asked upgrade, or a cold crash restart), saved as this writer's own.
+fn lost_lapsable(opts: &Opts, command: &PlannedCommand, asked: bool) -> St {
+    let mut st = lost_prepare(opts, command);
+    if asked {
+        super::fixture::retain_asked(&mut st, None);
+    } else {
+        super::fixture::retain_cold(&mut st);
+    }
+    upgrade_drive::save_checked(opts, "conversation", &st).unwrap();
+    st
+}
+
+fn prepared_ids(seen: &[String]) -> Vec<String> {
+    seen.iter()
+        .filter_map(|line| match actual_request(line) {
+            Some(Request::Prepare(plan)) => Some(plan.id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_kept_operation_replays_before_any_new_plan_and_its_answer_is_saved_without_minting() {
+    let command = planned();
+    for asked in [false, true] {
+        for lapse in [true, false] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let opts = opts(dir.path());
+            let mut st = lost_lapsable(&opts, &command, asked);
+            let id = retained_prepare(&st).unwrap().id;
+            let (mut client, worker) = endpoint(move |line| {
+                common(line).or_else(|| match request(line) {
+                    Request::Prepare(plan) if lapse => native_act::lapsed_reply(&plan.id),
+                    Request::Prepare(plan) => Some(format!(
+                        "OK native-act state=admitted id={} cap={}\n",
+                        plan.id,
+                        binding().capability
+                    )),
+                    other => panic!("only the kept prepare replays: {other:?}"),
+                })
+            });
+            // An asked upgrade is the Upgrade lane's own begin; a cold crash's is the Relaunch
+            // lane's, whose replay comes before any constructor gate.
+            let duty = if asked {
+                Scope::Upgrade
+            } else {
+                Scope::Relaunch
+            };
+            let admission = begin(
+                &opts,
+                &mut client,
+                &mut st,
+                "conversation",
+                duty,
+                &command.target,
+                Some(&command),
+                Some(&command),
+            );
+            drop(client);
+            assert_eq!(
+                prepared_ids(&worker.join().unwrap()),
+                std::slice::from_ref(&id),
+                "asked={asked} lapse={lapse}: the kept id replays and nothing new is minted"
+            );
+            let saved = upgrade_drive::load(&opts, "conversation").unwrap();
+            if lapse {
+                assert_eq!(admission, Ok(Recovery::Lapsed));
+                assert!(st.native_prepare.is_empty() && st.native.is_none());
+                assert!(saved.native_prepare.is_empty() && saved.native.is_none());
+            } else {
+                assert_eq!(admission, Err("native-unresolved-operation"));
+                let recovered = Some(Binding {
+                    id: id.clone(),
+                    capability: binding().capability,
+                });
+                assert_eq!(st.native, recovered);
+                assert_eq!(saved.native, recovered, "the recovered binding is saved");
+                assert_eq!(saved.native_prepare, st.native_prepare);
+            }
+        }
+    }
+}
+
+/// A minted prepare carries this boot and its issuer journal's custody, the stamps a later host
+/// epoch's `lapsed` answer reads; a home whose journal holds no record yet stamps no custody.
+#[test]
+fn a_new_prepare_is_stamped_with_this_boot_and_its_issuer_journals_custody() {
+    use super::super::native_receipts::{self, testing};
+    let command = planned();
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(dir.path());
+    let mint = |session: &str| {
+        let (mut st, _) = state(&command);
+        let (mut client, worker) = endpoint(|line| {
+            common(line).or_else(|| match request(line) {
+                Request::Prepare(plan) => Some(format!(
+                    "OK native-act state=admitted id={} cap={}\n",
+                    plan.id,
+                    binding().capability
+                )),
+                other => panic!("only the new prepare is dispatched: {other:?}"),
+            })
+        });
+        let admission = begin(
+            &opts,
+            &mut client,
+            &mut st,
+            session,
+            Scope::Relaunch,
+            &command.target,
+            Some(&command),
+            Some(&command),
+        );
+        drop(client);
+        assert_eq!(admission, Ok(Recovery::Admitted));
+        let mut minted = worker
+            .join()
+            .unwrap()
+            .iter()
+            .filter_map(|line| match actual_request(line) {
+                Some(Request::Prepare(plan)) => Some(*plan),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(minted.len(), 1);
+        assert_eq!(*retained_prepare(&st).unwrap(), minted[0], "the saved wire");
+        minted.remove(0)
+    };
+    let first = mint("conversation");
+    assert!(first.boot.is_some(), "this machine's boot reads");
+    assert_eq!(first.boot, native_act::BootStamp::current());
+    assert_eq!(first.custody, None);
+    // Its admission recorded as the host records it: the next prepare names that journal.
+    testing::Journal::new(&opts.home)
+        .record(
+            &first,
+            &Binding {
+                id: first.id.clone(),
+                capability: binding().capability,
+            },
+            testing::Append::Prepare,
+        )
+        .unwrap();
+    let custody = native_receipts::custody_for_home(&opts.home).unwrap();
+    assert!(custody.is_some());
+    let next = mint("next-conversation");
+    assert_eq!(next.boot, first.boot);
+    assert_eq!(next.custody, custody);
+}
+
+#[test]
+fn a_lapsed_answer_naming_another_operation_changes_nothing() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(dir.path());
+    let lost = lost_lapsable(&opts, &planned(), false);
+    let id = retained_prepare(&lost).unwrap().id;
+    let elsewhere = format!(
+        "{}{}",
+        if id.starts_with('f') { '0' } else { 'f' },
+        &id[1..]
+    );
+    let mut st = lost.clone();
+    let (mut client, worker) = endpoint(move |line| match request(line) {
+        Request::Prepare(_) => native_act::lapsed_reply(&elsewhere),
+        other => panic!("only the saved prepare replays: {other:?}"),
+    });
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut st),
+        Err("native-unknown")
+    );
+    assert_eq!(
+        abort(&opts, "conversation", &mut client, SID, &mut st),
+        None
+    );
+    assert!(!retire(&opts, "conversation", &mut client, SID, &mut st));
+    assert_eq!(st, lost);
+    drop(client);
+    assert_eq!(worker.join().unwrap().len(), 3);
+}
+
+#[test]
+fn a_bound_record_replays_its_prepare_and_a_lapse_ends_its_retirement_or_abort() {
+    for retiring in [false, true] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let opts = opts(dir.path());
+        let mut st = lost_lapsable(&opts, &planned(), false);
+        st.native = Some(Binding {
+            id: retained_prepare(&st).unwrap().id,
+            capability: binding().capability,
+        });
+        upgrade_drive::save_checked(&opts, "conversation", &st).unwrap();
+        let mut expected = st.clone();
+        expected.native = None;
+        expected.native_prepare.clear();
+        expected.native_rollback = false;
+        let (mut client, worker) = endpoint(|line| match request(line) {
+            Request::Prepare(plan) => native_act::lapsed_reply(&plan.id),
+            other => panic!("a lapse needs nothing more: {other:?}"),
+        });
+        let ended = if retiring {
+            retire(&opts, "conversation", &mut client, SID, &mut st)
+        } else {
+            abort(&opts, "conversation", &mut client, SID, &mut st) == Some(Recovery::Lapsed)
+        };
+        drop(client);
+        assert_eq!(worker.join().unwrap().len(), 1, "retiring={retiring}");
+        assert!(ended, "retiring={retiring}");
+        assert_eq!(st, expected, "retiring={retiring}");
+    }
 }
 
 #[test]
@@ -1687,20 +1923,26 @@ fn completed_forward_receipt_can_only_prepare_its_fixed_old_slot_as_a_distinct_c
     }
     let mut active = st.clone();
     active.native_prepare = Request::prepare(original.clone()).encode().unwrap();
+    // The replay saves the kept operation's admission, so it keeps a record of its own.
     assert_eq!(
-        begin_completed_rollback(&opts, &mut client, &mut active, "conversation"),
+        begin_completed_rollback(&opts, &mut client, &mut active, "kept-operation"),
         Err("native-unresolved-operation")
     );
     assert_eq!(
-        plans.lock().unwrap().len(),
-        1,
-        "negative controls send no new prepare"
+        plans
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|plan| plan.id.as_str())
+            .collect::<Vec<_>>(),
+        [original.id.as_str(); 2],
+        "negative controls send no new prepare: a kept one only replays"
     );
     assert_eq!(
         begin_completed_rollback(&opts, &mut client, &mut st, "conversation"),
         Ok(Recovery::Admitted)
     );
-    let next = plans.lock().unwrap()[1].clone();
+    let next = plans.lock().unwrap()[2].clone();
     assert_ne!(next.id, original.id);
     assert_eq!(st.native_completed_prepare.as_deref(), Some(&original));
     assert_eq!(

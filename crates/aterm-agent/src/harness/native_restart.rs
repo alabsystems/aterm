@@ -37,11 +37,18 @@ pub(super) enum Recovery {
     Held,
     /// The host proved it never admitted the saved prepare, which is dropped: nothing ran.
     Unadmitted,
+    /// The host proved no exec grant was or can be issued under the saved restart prepare
+    /// (`state=lapsed`), which is dropped with its binding. Unlike [`Self::Unadmitted`] it
+    /// claims nothing about the operation's other effects: it may have signalled the old agent
+    /// or typed its launcher line, so its lane ends and a later pass plans afresh.
+    Lapsed,
 }
 
 pub(super) const WAIT_RETIRED_UNISSUED: &str = "wait:native-retired-unissued";
 /// The wait of a lane whose saved prepare the host proved never admitted ([`Recovery::Unadmitted`]).
 pub(super) const WAIT_UNADMITTED: &str = "wait:native-unadmitted";
+/// The wait of a lane whose saved prepare the host proved can grant no exec ([`Recovery::Lapsed`]).
+pub(super) const WAIT_LAPSED: &str = "wait:native-lapsed";
 
 /// The wait word of a [`begin`] that admitted nothing: its refusal, or the answer that dropped
 /// its prepare. A cancellation is `begin`'s own refusal word.
@@ -49,6 +56,7 @@ pub(super) const fn refusal_word(admission: Result<Recovery, &'static str>) -> &
     match admission {
         Err(why) => why,
         Ok(Recovery::Unadmitted) => "native-unadmitted",
+        Ok(Recovery::Lapsed) => "native-lapsed",
         Ok(_) => "native-cancelled",
     }
 }
@@ -272,8 +280,46 @@ fn recover_reply(st: &mut St, reply: Reply) -> Result<Recovery, &'static str> {
         }
         Reply::Pending(_) => Err("native-predecessors"),
         Reply::Unadmitted(id) => unadmitted(st, &id),
+        Reply::Lapsed(id) => lapsed(st, &id),
         _ => Err("native-unknown"),
     }
+}
+
+/// Drop the saved restart prepare, and its binding, under which the host proved no exec grant
+/// was or can be issued. Only the exact retained prepare of a cold or typed asked restart may:
+/// the host answers no other, a private restart's renewal included, and a terminal record of the
+/// same id is a completion or a positive no-grant. A binding may go too, since the retained
+/// prepare already names its operation ([`retained_prepare`]). [`terminal_reply`]'s hold for a
+/// retired-unissued record answers first. Nothing is recorded completed, and nothing says the
+/// operation's other effects did not happen: its lane ends instead of restoring what came before.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeRetirementDebt",
+        action = "Lapsed",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+    )
+)]
+fn lapsed(st: &mut St, id: &str) -> Result<Recovery, &'static str> {
+    let prepare = retained_prepare(st).map_err(|_| "native-unknown")?;
+    if prepare.id != id
+        || !matches!(prepare.plan, NativePlan::Restart { .. })
+        || !matches!(
+            prepare.constructor(),
+            Constructor::ColdRestart | Constructor::AskedUpgrade | Constructor::AskedRelaunch
+        )
+        || (prepare.asked.is_some() && !prepare.asked_restart_shape())
+        || [&st.native_noexec_prepare, &st.native_completed_prepare]
+            .into_iter()
+            .flatten()
+            .any(|done| done.id == id)
+    {
+        return Err("native-unknown");
+    }
+    st.native = None;
+    st.native_prepare.clear();
+    st.native_rollback = false;
+    Ok(Recovery::Lapsed)
 }
 
 /// Drop the saved prepare the host proved it never admitted. Only a record that kept that exact
@@ -326,12 +372,13 @@ pub(super) fn begin(
     rollback: Option<&super::relaunch::PlannedCommand>,
 ) -> Result<Recovery, &'static str> {
     let asked = if duty == Scope::Upgrade && coordinated(st) {
-        if st.native.is_some()
-            || !st.native_prepare.is_empty()
-            || st.native_rollback
-            || st.native_retired_unissued
-            || st.native_account_candidate.is_some()
-        {
+        if st.native_retired_unissued || st.native_account_candidate.is_some() {
+            return Err("native-unresolved-operation");
+        }
+        if st.native.is_some() || !st.native_prepare.is_empty() {
+            return replay_retained(opts, client, st, session);
+        }
+        if st.native_rollback {
             return Err("native-unresolved-operation");
         }
         let previous = st
@@ -463,16 +510,18 @@ pub(super) fn begin_crash(
     if st.native_retired_unissued {
         return Ok(Recovery::Held);
     }
+    // A kept operation is answered by its own replay, whatever this pass's plan would need: an
+    // earlier host's restore plans no cold intent, and production enables no private restart,
+    // so a constructor gate here would hold the record for good ([`replay_retained`]).
+    if st.native.is_some() || !st.native_prepare.is_empty() {
+        return replay_retained(opts, client, st, session);
+    }
     if cold.is_some() {
         require_cold_constructor(opts, client, st)?;
     } else if legacy_before_prepare(opts, client, st)? {
         return Ok(Recovery::Legacy);
     }
-    let observed = if st.native_prepare.is_empty() {
-        Some(observation::captured(opts, snap).ok_or("native-crash-observation")?)
-    } else {
-        None
-    };
+    let observed = Some(observation::captured(opts, snap).ok_or("native-crash-observation")?);
     let target = command.ok_or("native-command")?.target.clone();
     begin_plan(
         opts,
@@ -634,6 +683,12 @@ fn begin_plan(
     if st.native_retired_unissued {
         return Ok(Recovery::Held);
     }
+    // The kept operation's replay comes before every gate of the plan this call would mint: its
+    // answer does not depend on the constructor the new plan would need, and the host judges
+    // the replay by its own policy.
+    if st.native.is_some() || !st.native_prepare.is_empty() {
+        return replay_retained(opts, client, st, session);
+    }
     // CLI/operator constructors preserve their independent legacy authority. Only the real
     // private host opts contain this token; holder/as=person words never select this branch.
     if asked.is_some() || checked.is_some() {
@@ -660,139 +715,135 @@ fn begin_plan(
     } else if legacy_before_prepare(opts, client, st)? {
         return Ok(Recovery::Legacy);
     }
-    if st.native.is_some() || !st.native_prepare.is_empty() {
-        return Err("native-unresolved-operation");
+    let supported = client
+        .help_counted("native-act")
+        .is_ok_and(|(head, _)| crate::is_ok_reply(&head));
+    if !supported {
+        return Err("native-act-unavailable");
     }
-    if st.native_prepare.is_empty() {
-        let supported = client
-            .help_counted("native-act")
-            .is_ok_and(|(head, _)| crate::is_ok_reply(&head));
-        if !supported {
-            return Err("native-act-unavailable");
-        }
-        let status = upgrade_drive::status_line(client, &st.tab).ok_or("native-status")?;
-        if super::relaunch::line_held_by_status(
-            Some(&status),
-            st.line_grace_s.unwrap_or(opts.human_grace_s),
-            &upgrade_drive::hand_name(),
-        )
-        .is_some()
-        {
-            return Err("native-person-or-hand");
-        }
-        let expected_human_seq = human_seq(&status).ok_or("native-person-unread")?;
-        let revision = status
-            .split_ascii_whitespace()
-            .find_map(|w| w.strip_prefix("supervisor_revision="))
-            .and_then(|n| n.parse::<u64>().ok())
-            .ok_or("native-revision")?;
-        let process = match observed.as_ref() {
-            Some((registration, _)) if registration.vendor.pid == st.pid => {
-                registration.vendor.clone()
+    let status = upgrade_drive::status_line(client, &st.tab).ok_or("native-status")?;
+    if super::relaunch::line_held_by_status(
+        Some(&status),
+        st.line_grace_s.unwrap_or(opts.human_grace_s),
+        &upgrade_drive::hand_name(),
+    )
+    .is_some()
+    {
+        return Err("native-person-or-hand");
+    }
+    let expected_human_seq = human_seq(&status).ok_or("native-person-unread")?;
+    let revision = status
+        .split_ascii_whitespace()
+        .find_map(|w| w.strip_prefix("supervisor_revision="))
+        .and_then(|n| n.parse::<u64>().ok())
+        .ok_or("native-revision")?;
+    let process = match observed.as_ref() {
+        Some((registration, _)) if registration.vendor.pid == st.pid => registration.vendor.clone(),
+        Some(_) => return Err("native-crash-observation"),
+        None => Process::observe(st.pid).ok_or("native-process")?,
+    };
+    let shell = Process::observe(st.shell).ok_or("native-shell")?;
+    if observed
+        .as_ref()
+        .is_some_and(|(registration, _)| registration.shell != shell)
+    {
+        return Err("native-shell-changed");
+    }
+    let target = Image::at(target).ok_or("native-target")?;
+    let forward = command
+        .and_then(|command| {
+            if asked.is_some() || checked.is_some() {
+                command.capture_native()
+            } else {
+                command.capture()
             }
-            Some(_) => return Err("native-crash-observation"),
-            None => Process::observe(st.pid).ok_or("native-process")?,
-        };
-        let shell = Process::observe(st.shell).ok_or("native-shell")?;
-        if observed
+        })
+        .ok_or("native-command")?;
+    if forward.image != target || forward.legacy_line().as_deref() != Some(st.line.as_str()) {
+        return Err("native-command-changed");
+    }
+    let rollback = match rollback {
+        None if st.back_line.is_empty() => None,
+        Some(command) => {
+            let command = command.capture().ok_or("native-rollback-command")?;
+            if command.image != process.image
+                || command.legacy_line().as_deref() != Some(st.back_line.as_str())
+            {
+                return Err("native-rollback-changed");
+            }
+            Some(command)
+        }
+        None => return Err("native-rollback-command"),
+    };
+    let launcher = std::env::current_exe()
+        .ok()
+        .and_then(|path| Image::at(&path))
+        .ok_or("native-launcher")?;
+    let socket = opts.sock.clone().ok_or("native-endpoint")?;
+    let Reply::Info {
+        epoch: host_epoch, ..
+    } = native_act::exchange(client, &st.tab, &Request::Info).map_err(|_| "native-host-epoch")?
+    else {
+        return Err("native-host-epoch");
+    };
+    let rejection_domain = match native_act::exchange(client, &st.tab, &Request::RejectionDomain) {
+        Ok(Reply::RejectionDomain(domain)) => Some(domain),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && error.to_string().starts_with("ERR usage: native-act ") =>
+        {
+            None
+        }
+        _ => return Err("native-rejection-domain-unavailable"),
+    };
+    let deadline_us = native_act::monotonic_us()
+        .and_then(|now| now.checked_add(120_000_000))
+        .ok_or("native-clock")?;
+    let mut prepare = Prepare {
+        rejection_domain,
+        asked: asked.cloned(),
+        id: native_act::operation_id().map_err(|_| "native-entropy")?,
+        host_epoch,
+        holder: upgrade_drive::hand_name(),
+        revision,
+        expected_human_seq: Some(expected_human_seq),
+        deadline_us,
+        duty,
+        plan: NativePlan::Restart {
+            process,
+            observation: observed.map(|(_, binding)| binding),
+            shell,
+            launcher,
+            socket,
+            forward: Box::new(forward),
+            cold: cold.cloned().map(Box::new),
+            rollback: rollback.map(Box::new),
+        },
+        // What a later host epoch reads to answer `lapsed` for this prepare. The host admits
+        // a stamp only when it is its own machine, boot and issuer custody, so a stamp read
+        // wrongly here costs this admission, never a grant.
+        boot: native_act::BootStamp::current(),
+        custody: custody_stamp(&opts.home),
+    };
+    if let Some((source, _)) = checked {
+        if !source.agrees(&prepare) {
+            return Err("native-checked-source-changed");
+        }
+        let predecessor = st
+            .native_completed_prepare
             .as_ref()
-            .is_some_and(|(registration, _)| registration.shell != shell)
-        {
-            return Err("native-shell-changed");
-        }
-        let target = Image::at(target).ok_or("native-target")?;
-        let forward = command
-            .and_then(|command| {
-                if asked.is_some() || checked.is_some() {
-                    command.capture_native()
-                } else {
-                    command.capture()
-                }
-            })
-            .ok_or("native-command")?;
-        if forward.image != target || forward.legacy_line().as_deref() != Some(st.line.as_str()) {
-            return Err("native-command-changed");
-        }
-        let rollback = match rollback {
-            None if st.back_line.is_empty() => None,
-            Some(command) => {
-                let command = command.capture().ok_or("native-rollback-command")?;
-                if command.image != process.image
-                    || command.legacy_line().as_deref() != Some(st.back_line.as_str())
-                {
-                    return Err("native-rollback-changed");
-                }
-                Some(command)
-            }
-            None => return Err("native-rollback-command"),
-        };
-        let launcher = std::env::current_exe()
-            .ok()
-            .and_then(|path| Image::at(&path))
-            .ok_or("native-launcher")?;
-        let socket = opts.sock.clone().ok_or("native-endpoint")?;
-        let Reply::Info {
-            epoch: host_epoch, ..
-        } = native_act::exchange(client, &st.tab, &Request::Info)
-            .map_err(|_| "native-host-epoch")?
-        else {
-            return Err("native-host-epoch");
-        };
-        let rejection_domain =
-            match native_act::exchange(client, &st.tab, &Request::RejectionDomain) {
-                Ok(Reply::RejectionDomain(domain)) => Some(domain),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::PermissionDenied
-                        && error.to_string().starts_with("ERR usage: native-act ") =>
-                {
-                    None
-                }
-                _ => return Err("native-rejection-domain-unavailable"),
-            };
-        let deadline_us = native_act::monotonic_us()
-            .and_then(|now| now.checked_add(120_000_000))
-            .ok_or("native-clock")?;
-        let mut prepare = Prepare {
-            rejection_domain,
-            asked: asked.cloned(),
-            id: native_act::operation_id().map_err(|_| "native-entropy")?,
-            host_epoch,
-            holder: upgrade_drive::hand_name(),
-            revision,
-            expected_human_seq: Some(expected_human_seq),
-            deadline_us,
-            duty,
-            plan: NativePlan::Restart {
-                process,
-                observation: observed.map(|(_, binding)| binding),
-                shell,
-                launcher,
-                socket,
-                forward: Box::new(forward),
-                cold: cold.cloned().map(Box::new),
-                rollback: rollback.map(Box::new),
-            },
-        };
-        if let Some((source, _)) = checked {
-            if !source.agrees(&prepare) {
-                return Err("native-checked-source-changed");
-            }
-            let predecessor = st
-                .native_completed_prepare
-                .as_ref()
-                .ok_or("native-asked-predecessor-unproven")?
-                .id
-                .clone();
-            prepare.asked = Some(AskedIntent::Relaunch(native_act::AskedRelaunchIntent {
-                predecessor,
-                ask: source.ask().to_owned(),
-            }));
-        }
-        let request = Request::prepare(prepare);
-        st.native_prepare = request.encode().ok_or("native-plan")?;
-        st.native_noexec_prepare = None;
-        st.native_coordination = true;
+            .ok_or("native-asked-predecessor-unproven")?
+            .id
+            .clone();
+        prepare.asked = Some(AskedIntent::Relaunch(native_act::AskedRelaunchIntent {
+            predecessor,
+            ask: source.ask().to_owned(),
+        }));
     }
+    let request = Request::prepare(prepare);
+    st.native_prepare = request.encode().ok_or("native-plan")?;
+    st.native_noexec_prepare = None;
+    st.native_coordination = true;
     let _checked_authorization = if let Some((source, host)) = checked {
         // The producer can authorize only a recipe whose actual durability barrier succeeded.
         upgrade_drive::save_checked(opts, session, st).map_err(|_| "native-unsaved")?;
@@ -813,6 +864,86 @@ fn begin_plan(
         Err("native-cancelled")
     } else {
         Ok(recovered)
+    }
+}
+
+/// Replay the retained prepare or binding a new plan would otherwise replace, and save what the
+/// answer changed. It runs before any gate of that new plan (a constructor, a cold intent, an
+/// owned launcher): the answer is the kept operation's own, and the host judges the replay by
+/// its own policy. No call that finds one mints a plan: its caller fixed what it judged before
+/// this ran (an exit lane its fresh-start judgement), so a new plan waits for the next pass,
+/// which sees the record as this leaves it.
+///
+/// The host's proof that it never admitted the prepare, or that no exec grant was or can be
+/// issued under it, is returned, as is a terminal answer: each caller's arm for it saves its own
+/// end, and a save lost here only replays the same answer. A cancellation is the refusal `begin`
+/// gives its own; an admission, a pending or unknown answer and an unreadable record keep the
+/// refusal, with a recovered binding saved.
+fn replay_retained(
+    opts: &Opts,
+    client: &mut Client,
+    st: &mut St,
+    session: &str,
+) -> Result<Recovery, &'static str> {
+    let tab = st.tab.clone();
+    replay_retained_at(opts, client, st, session, &tab)
+}
+
+/// [`replay_retained`] addressed to `tab`, the tab its host holds now, for a caller that
+/// replays before it rewrites the record it hands in (the exit lane's, whose tab may have
+/// been reopened under another id).
+pub(super) fn replay_retained_at(
+    opts: &Opts,
+    client: &mut Client,
+    st: &mut St,
+    session: &str,
+    tab: &str,
+) -> Result<Recovery, &'static str> {
+    let recovered = recover(opts, session, client, tab, st);
+    let _saved = upgrade_drive::save_checked(opts, session, st);
+    match recovered {
+        Ok(
+            outcome @ (Recovery::Lapsed
+            | Recovery::Unadmitted
+            | Recovery::Completed
+            | Recovery::Retired
+            | Recovery::Held),
+        ) => Ok(outcome),
+        Ok(Recovery::Cancelled) => Err("native-cancelled"),
+        Ok(Recovery::Admitted | Recovery::Legacy) | Err(_) => Err("native-unresolved-operation"),
+    }
+}
+
+/// End a lane whose kept operation lapsed ([`Recovery::Lapsed`]) as its record stands: no exec
+/// grant was or can be issued under it, but it may have signalled the agent or typed its
+/// launcher line, so the record is never restored as unsent; a later pass plans afresh from what
+/// it then observes.
+pub(super) fn end_lapsed(
+    opts: &Opts,
+    r: &upgrade_drive::Report,
+    st: &mut St,
+    session: &str,
+) -> upgrade_drive::Report {
+    st.stop("native-lapsed", upgrade_drive::now_s());
+    upgrade_drive::save(opts, session, st);
+    upgrade_drive::said(r.clone(), WAIT_LAPSED)
+}
+
+/// The issuer custody a new prepare names, read without a lock from the vault under this
+/// harness's own home ([`super::native_receipts::custody_for_home`]); `None` when none is
+/// established or it does not read, which leaves the prepare's absence from the journal
+/// unprovable and changes nothing else.
+fn custody_stamp(home: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        super::native_receipts::custody_for_home(home)
+            .ok()
+            .flatten()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = home;
+        None
     }
 }
 
@@ -866,6 +997,14 @@ fn begin_plan(
 )]
 #[cfg_attr(
     any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeReplayPublication",
+        action = "Lapse",
+        reason = "The host's issuer journal proves no exec grant was or can be issued under a cold or typed asked restart prepare"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "NativeReplayPublication",
         action = "Attempt",
@@ -903,7 +1042,7 @@ pub(super) fn recover(
         },
     )?;
     if matches!(&reply, Reply::Admitted(binding) | Reply::Pending(binding) if binding.id != expected_id)
-        || matches!(&reply, Reply::Unadmitted(id) if *id != expected_id)
+        || matches!(&reply, Reply::Unadmitted(id) | Reply::Lapsed(id) if *id != expected_id)
     {
         return Err("native-unknown");
     }
@@ -966,26 +1105,31 @@ fn completed_inactive(st: &St) -> bool {
         )
 }
 
+/// End the retained operation before any signal of it: what ended it, or `None` when it stays.
+/// The host's proof that it never admitted the prepare, that no exec grant was or can be issued
+/// under it ([`Recovery::Lapsed`]), or a safe cancellation, answering the replay or an Abort.
+/// A lapse proves nothing about the operation's other effects, so a caller ends its record as
+/// it stands after one ([`end_lapsed`]) and restores it as unsent only after either other end.
 pub(super) fn abort(
     opts: &Opts,
     session: &str,
     client: &mut Client,
     tab: &str,
     st: &mut St,
-) -> bool {
+) -> Option<Recovery> {
     match recover(opts, session, client, tab, st) {
-        Ok(Recovery::Cancelled | Recovery::Unadmitted) => return true,
+        Ok(outcome @ (Recovery::Cancelled | Recovery::Unadmitted | Recovery::Lapsed)) => {
+            return Some(outcome);
+        }
         Ok(Recovery::Completed | Recovery::Retired | Recovery::Held | Recovery::Legacy)
-        | Err(_) => return false,
+        | Err(_) => return None,
         Ok(Recovery::Admitted) => {}
     }
-    let Some(binding) = st.native.as_ref() else {
-        return false;
-    };
+    let binding = st.native.as_ref()?;
     native_act::exchange(client, tab, &Request::Abort(binding.clone()))
         .ok()
         .and_then(|reply| terminal_reply(st, &reply))
-        == Some(Recovery::Cancelled)
+        .filter(|outcome| *outcome == Recovery::Cancelled)
 }
 
 pub(super) fn signal(client: &mut Client, tab: &str, binding: &Binding) -> Terminated {
@@ -1192,14 +1336,21 @@ pub(super) fn retire(
     if opts.dry_run {
         return false;
     }
-    if st.native.is_none() && !st.native_prepare.is_empty() {
+    if !st.native_prepare.is_empty() {
         // A lost Prepare reply can leave only the saved exact request. Replay
         // that request to recover its binding before reconciling; never mint a
-        // replacement id or signal/resume a command merely to close it.
+        // replacement id or signal/resume a command merely to close it. A kept
+        // binding replays it too: only that replay can hear that no exec grant
+        // was or can be issued under it, which a later host epoch answers to
+        // the prepare alone. An admission, or a replay that answers nothing,
+        // reconciles the kept binding as before.
         match recover(opts, session, client, tab, st) {
             Ok(Recovery::Admitted) => {}
-            Ok(Recovery::Retired | Recovery::Cancelled | Recovery::Unadmitted) => return true,
-            _ => return false,
+            Ok(
+                Recovery::Retired | Recovery::Cancelled | Recovery::Unadmitted | Recovery::Lapsed,
+            ) => return true,
+            Err(_) if st.native.is_some() => {}
+            Ok(Recovery::Completed | Recovery::Held | Recovery::Legacy) | Err(_) => return false,
         }
     }
     let Some(binding) = st.native.clone() else {

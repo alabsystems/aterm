@@ -111,7 +111,7 @@ fn supersession_reads_private_staging_with_its_routed_identity() {
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
-    let mut cmd = object_git(repo);
+    let mut cmd = object_git(repo).unwrap();
     cmd.args(args)
         .env("GIT_AUTHOR_NAME", "fixture")
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
@@ -926,7 +926,7 @@ fn a_baseline_imports_only_the_first_advertised_preference_and_proves_its_commit
         Some(("v1".into(), first.clone()))
     );
     // NEGATIVE CONTROL: importing the whole catalog also transfers this object.
-    let mut absent = object_git(&target);
+    let mut absent = object_git(&target).unwrap();
     absent.args(["cat-file", "-e", &later]);
     assert!(
         !absent.status().unwrap().success(),

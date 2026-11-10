@@ -55,6 +55,62 @@ pub enum Lock {
 }
 
 impl LaneState {
+    /// The directory watched by an explicitly installed staged-only dispatcher.
+    #[must_use]
+    pub fn ready_dir(&self) -> PathBuf {
+        self.root.join("publish-ready")
+    }
+
+    /// Wake the staged-only dispatcher after a persisted stage. The stager also
+    /// repeats this atomic hint after unlocking; it grants no publication authority.
+    /// # Errors
+    /// An unsafe queue directory or a failed atomic write.
+    pub fn notify_ready(&self) -> Result<()> {
+        let directory = self.ready_dir();
+        aterm_types::fs_restricted::ensure_private_dir(&directory)
+            .map_err(|e| Error::io("create the ready notification directory", &e))?;
+        aterm_uds::atomic_file::write(&directory.join("pending"), b"staged\n", 0o600)
+            .map_err(|e| Error::io("record staged work notification", &e))
+    }
+
+    /// Read only whether staged work requested a pass, never whether it qualifies.
+    /// The caller holds the same lock as the staging writer.
+    /// # Errors
+    /// A non-directory notification root or malformed/nonregular notification.
+    pub fn ready_pending(&self) -> Result<bool> {
+        let directory = self.ready_dir();
+        match std::fs::symlink_metadata(&directory) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            Ok(_) => return Err(Error::refused("unsafe ready notification directory")),
+            Err(e) => return Err(Error::io("inspect ready notification directory", &e)),
+        }
+        let pending = directory.join("pending");
+        match std::fs::symlink_metadata(&pending) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {}
+            Ok(_) => return Err(Error::refused("unsafe ready notification file")),
+            Err(e) => return Err(Error::io("inspect ready notification", &e)),
+        }
+        match crate::identity::read_regular_bytes(&pending, 16) {
+            Ok(bytes) if bytes == b"staged\n" => Ok(true),
+            Ok(_) => Err(Error::refused("malformed ready notification")),
+            Err(e) => Err(Error::io("read ready notification", &e)),
+        }
+    }
+
+    /// Retire a notification only after a completed pass, while still holding the
+    /// lane lock. Failed and covered passes leave it for a later attempt.
+    /// # Errors
+    /// Removing the notification failed.
+    pub fn clear_ready(&self) -> Result<()> {
+        match std::fs::remove_file(self.ready_dir().join("pending")) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::io("retire staged work notification", &e)),
+        }
+    }
+
     /// The state of lane `kind` under `root`.
     #[must_use]
     pub fn of(kind: LaneKind, root: &Path) -> Self {
@@ -99,11 +155,23 @@ impl LaneState {
     /// # Errors
     /// A could-not-run when the lock file cannot be opened.
     pub fn try_lock(&self) -> Result<Lock> {
+        self.lock_within(Duration::ZERO)
+    }
+
+    /// Give a staging writer time to release the same lock after emitting its
+    /// notification. Longer contention remains covered by the existing timer.
+    /// # Errors
+    /// A could-not-run when the lock file cannot be opened.
+    pub fn queued_lock(&self) -> Result<Lock> {
+        self.lock_within(Duration::from_secs(30))
+    }
+
+    fn lock_within(&self, timeout: Duration) -> Result<Lock> {
         if let Some(parent) = self.lock.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::io(format!("mkdir {}", parent.display()), &e))?;
         }
-        match FileLock::acquire_within(&self.lock, Duration::ZERO) {
+        match FileLock::acquire_within(&self.lock, timeout) {
             Ok(guard) => Ok(Lock::Held(guard)),
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(Lock::Busy),
             Err(e) => Err(Error::io(format!("lock {}", self.lock.display()), &e)),

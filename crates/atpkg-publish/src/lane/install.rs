@@ -37,6 +37,8 @@ pub struct InstallFlags {
     pub allow_dirty: bool,
     /// Snapshot and render, keeping the live link and armed units as they are.
     pub no_arm: bool,
+    /// Install an event-driven Linux publisher for existing qualified stages only.
+    pub staged_only: bool,
     /// A Linux builder with no machine key: it stages for a rostered machine.
     pub keyless: bool,
     /// Which hosts the installed unit's runs build (`--host`, recorded in its command line and
@@ -61,6 +63,10 @@ impl InstallFlags {
                     f.no_arm = true;
                     continue;
                 }
+                "--staged-only" => {
+                    f.staged_only = true;
+                    continue;
+                }
                 "--keyless" => {
                     f.keyless = true;
                     continue;
@@ -69,7 +75,7 @@ impl InstallFlags {
                     Some(value) => value,
                     None => {
                         return Err(Error::usage(format!(
-                            "`lane install` does not take `{other}` (--allow-dirty, --no-arm, \
+                            "`lane install` does not take `{other}` (--allow-dirty, --no-arm, --staged-only, \
                              --keyless, --host gh|agh-staging|agh)"
                         )));
                     }
@@ -276,6 +282,9 @@ pub fn install_with(
     tx: &Transcript,
 ) -> Result<Installed> {
     machine.check_os(kind)?;
+    if flags.staged_only && kind != LaneKind::Linux {
+        return Err(Error::usage("lane install --staged-only is Linux-only"));
+    }
     let keyless_ok = kind == LaneKind::Linux && flags.keyless;
     let identity = [
         ("machine key", &ctx.identity.key),
@@ -372,6 +381,10 @@ pub fn install_with(
     }
     let state = LaneState::of(kind, &ctx.state_dir);
     state.ensure()?;
+    if flags.staged_only {
+        aterm_types::fs_restricted::ensure_private_dir(&state.ready_dir())
+            .map_err(|e| Error::io("prepare the staged-only notification directory", &e))?;
+    }
     let _guard = match state.try_lock()? {
         Lock::Held(g) => g,
         Lock::Busy => {
@@ -459,6 +472,9 @@ pub fn install_with(
         // The choice, after the `sha256` line the self-check reads (`lane::self_check`).
         installed_from.push_str(&format!("host {}\n", flags.host.as_str()));
     }
+    if flags.staged_only {
+        installed_from.push_str("mode staged-only\n");
+    }
     super::report::write_atomic(&snapshot.join("INSTALLED-FROM"), &installed_from)?;
     let snapshot = snapshot_dir.keep();
 
@@ -484,6 +500,7 @@ pub fn install_with(
         xdg_config_home: machine.config_home.clone(),
         shim_bin: ctx.pkg_prefix.join("bin"),
         host: flags.host,
+        staged_only: flags.staged_only,
     };
     let unit_files = units::render(&spec);
     let rendered_dir = ctx.state_dir.join("units");
@@ -1263,7 +1280,22 @@ impl ServiceManager for Systemd {
         lint_systemd(paths)
     }
 
-    fn arm(&self, _kind: LaneKind, _paths: &[PathBuf]) -> Result<Retirement> {
+    fn arm(&self, _kind: LaneKind, paths: &[PathBuf]) -> Result<Retirement> {
+        let ready_path = paths.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == units::SYSTEMD_PATH)
+        });
+        if !ready_path && self.unit_dir.join(units::SYSTEMD_PATH).exists() {
+            let stopped = run_tool(
+                "systemctl",
+                &["--user", "disable", "--now", units::SYSTEMD_PATH],
+            )?;
+            if !stopped.status.success() {
+                return Err(Error::refused("could not retire the staged-only path unit"));
+            }
+            std::fs::remove_file(self.unit_dir.join(units::SYSTEMD_PATH))
+                .map_err(|e| Error::io("remove the retired staged-only path unit", &e))?;
+        }
         for args in [
             &["--user", "daemon-reload"][..],
             &["--user", "enable", "--now", units::SYSTEMD_TIMER][..],
@@ -1277,15 +1309,47 @@ impl ServiceManager for Systemd {
                 )));
             }
         }
+        if ready_path {
+            let out = run_tool(
+                "systemctl",
+                &["--user", "enable", "--now", units::SYSTEMD_PATH],
+            )?;
+            if !out.status.success() {
+                return Err(Error::refused(format!(
+                    "systemctl enable staged-only path failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            // PathChanged observes future changes. Drain a notification that
+            // predates installation too, without making install wait for a release.
+            let out = run_tool(
+                "systemctl",
+                &["--user", "start", "--no-block", units::SYSTEMD_SERVICE],
+            )?;
+            if !out.status.success() {
+                return Err(Error::refused(format!(
+                    "systemctl start staged-only service failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
         Ok(Retirement::Confirmed)
     }
 
     fn disarm(&self, _kind: LaneKind) -> Result<()> {
         let _ = run_tool(
             "systemctl",
+            &["--user", "disable", "--now", units::SYSTEMD_PATH],
+        );
+        let _ = run_tool(
+            "systemctl",
             &["--user", "disable", "--now", units::SYSTEMD_TIMER],
         );
-        for n in [units::SYSTEMD_SERVICE, units::SYSTEMD_TIMER] {
+        for n in [
+            units::SYSTEMD_SERVICE,
+            units::SYSTEMD_TIMER,
+            units::SYSTEMD_PATH,
+        ] {
             let _ = std::fs::remove_file(self.unit_dir.join(n));
         }
         let _ = run_tool("systemctl", &["--user", "daemon-reload"]);

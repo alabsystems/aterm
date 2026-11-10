@@ -366,13 +366,21 @@ pub fn pack_build(ctx: &Ctx, program: &str, dir: &Path, compiler_moved: bool) ->
     }
 }
 
-/// Collect every refusal, and what the publish would do.
+/// Check local source identity first, then collect the seal and publication refusals.
+/// An invalid native source origin returns before any compiler probe or payload scan.
 #[must_use]
 pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight {
     let mut pf = Preflight {
         have_key: ctx.identity.key.is_file(),
         ..Preflight::default()
     };
+    if !gh_serves(ctx, HostRole::Staging)
+        && let Err(why) =
+            crate::git::source_with_origin(&req.trust_repo, &ctx.staging_slug("trust"))
+    {
+        pf.problems.push(why.to_string());
+        return pf;
+    }
     let seal = &req.seal;
     let upload = req.mode == Mode::StageUpload;
 
@@ -894,15 +902,14 @@ pub fn publish_group(
             ctx.shown(&out.join(program))
         ));
     }
-    log.say(format!(
-        "  3. index {next} over the verified channel head: the four builds as a {triple} \
-         overlay (other targets keep their selections){}",
-        if upload {
-            "; the packs are made public first"
-        } else {
-            ""
-        }
-    ));
+    if upload {
+        log.say("  3. record staged builds; leave the public packages and channel index unchanged");
+    } else {
+        log.say(format!(
+            "  3. index {next} over the verified channel head: the four builds as a {triple} \
+             overlay (other targets keep their selections)"
+        ));
+    }
     if req.mode == Mode::DryRun {
         log.say("dry run — nothing executed");
         return Ok(GroupOutcome {

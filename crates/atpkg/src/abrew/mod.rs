@@ -453,6 +453,62 @@ fn canonical_help_command(cmd: &str) -> &str {
 /// known command prints its path; a tap's `cmd/brew-<name>`
 /// file prints its own path; anything else is brew's
 /// unknown-command error (earlier paths already printed).
+/// Brew `Commands.path` external legs: `<cmd>.rb` in tap cmd
+/// directories, then `brew-<cmd>.rb`/`brew-<cmd>` on PATH and
+/// in tap cmd directories. Only trusted commands resolve.
+fn external_command_path(prefix: &Prefix, name: &str) -> Option<std::path::PathBuf> {
+    let mut tap_cmd_dirs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if let Ok(users) = std::fs::read_dir(prefix.taps_dir()) {
+        for user in users.flatten() {
+            let Ok(repos) = std::fs::read_dir(user.path()) else {
+                continue;
+            };
+            for repo in repos.flatten() {
+                let repo_name = repo.file_name().to_string_lossy().into_owned();
+                let tap_name = format!(
+                    "{}/{}",
+                    user.file_name().to_string_lossy(),
+                    repo_name.strip_prefix("homebrew-").unwrap_or(&repo_name)
+                );
+                tap_cmd_dirs.push((tap_name, repo.path().join("cmd")));
+            }
+        }
+    }
+    let trusted_in = |dirs: &[(String, std::path::PathBuf)], file: &str| {
+        for (tap_name, dir) in dirs {
+            let candidate = dir.join(file);
+            if candidate.is_file()
+                && commands::is_executable(&candidate)
+                && trust::trusted(
+                    prefix,
+                    trust::TrustType::Command,
+                    &format!("{tap_name}/{name}"),
+                )
+            {
+                return Some(candidate);
+            }
+        }
+        None
+    };
+    if let Some(path) = trusted_in(&tap_cmd_dirs, &format!("{name}.rb")) {
+        return Some(path);
+    }
+    for file in [format!("brew-{name}.rb"), format!("brew-{name}")] {
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                let candidate = dir.join(&file);
+                if candidate.is_file() && commands::is_executable(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        if let Some(path) = trusted_in(&tap_cmd_dirs, &file) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn cmd_command_path(prefix: &Prefix, rest: &[String]) -> ExitCode {
     for name in operands(rest) {
         let canonical = canonical_help_command(&name);
@@ -465,23 +521,7 @@ fn cmd_command_path(prefix: &Prefix, rest: &[String]) -> ExitCode {
             }
             continue;
         }
-        let mut found: Option<std::path::PathBuf> = None;
-        for tap in tap::list(prefix) {
-            for file in [
-                format!("brew-{name}.rb"),
-                format!("brew-{name}.sh"),
-                format!("brew-{name}"),
-            ] {
-                let candidate = tap.path.join("cmd").join(file);
-                if candidate.is_file() {
-                    found = Some(candidate);
-                    break;
-                }
-            }
-            if found.is_some() {
-                break;
-            }
-        }
+        let found = external_command_path(prefix, &name);
         match found {
             Some(path) => println!("{}", path.display()),
             None => {
@@ -1877,7 +1917,12 @@ fn native_args(
         "zap" => (&["--force", "-f", "--cask", "--casks"], 1, usize::MAX, true),
         "postinstall" => (&[], 1, usize::MAX, false),
         "which-formula" => (&["--explain"], 0, usize::MAX, true),
-        "cleanup" => (&["--dry-run", "-n", "-s", "--scrub"], 0, usize::MAX, true),
+        "cleanup" => (
+            &["--dry-run", "-n", "-s", "--scrub", "--prune-prefix"],
+            0,
+            usize::MAX,
+            true,
+        ),
         "autoremove" => (&["--dry-run", "-n"], 0, 0, true),
         // Brew's docs declares no named args but ignores any given.
         "docs" => (&[], 0, usize::MAX, false),
@@ -2524,16 +2569,64 @@ fn native_args(
         // Dash-leading operands only arise after `--`; brew
         // tries to resolve them and fails with its own error,
         // so they pass admission to reach it.
+        // Read-only lookups resolve core-qualified references
+        // like brew; mutating commands keep the delegated
+        // posture for qualified names.
+        let read_only = matches!(
+            cmd,
+            "info"
+                | "outdated"
+                | "cat"
+                | "home"
+                | "homepage"
+                | "deps"
+                | "uses"
+                | "dependents"
+                | "missing"
+                | "log"
+                | "options"
+                | "--cache"
+        );
         s.starts_with('-')
             || valid_component(s)
-            || ((want_formula || matches!(cmd, "--prefix" | "--cellar"))
+            || ((want_formula || matches!(cmd, "--prefix" | "--cellar") || read_only)
                 && s.strip_prefix("homebrew/core/")
                     .is_some_and(valid_component))
-            || ((want_cask || cmd == "--caskroom")
+            || ((want_cask || cmd == "--caskroom" || read_only)
                 && s.strip_prefix("homebrew/cask/")
                     .is_some_and(valid_component))
+            // Foreign tap-qualified references reach these
+            // commands' resolvers, which answer with brew's own
+            // tap/trust errors when they cannot resolve them.
+            || (matches!(
+                cmd,
+                "info" | "outdated" | "deps" | "uses" | "home" | "homepage" | "missing" | "fetch"
+            )
+                && {
+                    let parts: Vec<&str> = s.split('/').collect();
+                    (2..=3).contains(&parts.len()) && parts.iter().all(|p| valid_component(p))
+                })
     };
-    if names && !ops.iter().all(valid_package_name) {
+    // Qualified names go through brew's factory in list and
+    // fail there (racks are bare names); path operands delegate.
+    if matches!(cmd, "list" | "ls") {
+        for op in &ops {
+            if op.contains('/') && !op.starts_with(['.', '/']) {
+                // Two-segment shorthands fail by leaf name.
+                let shown = if op.matches('/').count() == 1 {
+                    op.rsplit('/').next().unwrap_or(op)
+                } else {
+                    op
+                };
+                return Err(InstallError::Failed(format!(
+                    "Error: No available formula or cask with the name \"{shown}\"."
+                )));
+            }
+        }
+    }
+    // desc bare mode validates operands at its own gate below
+    // (tap-qualified names and brew's Invalid-tap errors).
+    if names && cmd != "desc" && !ops.iter().all(valid_package_name) {
         return Err(unsupported());
     }
     if cmd == "tab"
@@ -2750,7 +2843,40 @@ fn native_args(
     } else {
         0
     };
-    if desc_modes > 1 || (cmd == "desc" && desc_modes == 0 && !ops.iter().all(valid_package_name)) {
+    if cmd == "desc" && desc_modes == 0 {
+        // Bare desc operands may be tap-qualified names; brew's
+        // tap parser rejects malformed ones by name.
+        for op in &ops {
+            if !op.contains('/') {
+                continue;
+            }
+            // Ruby's split drops trailing empty segments.
+            let mut parts: Vec<&str> = op.split('/').collect();
+            while parts.last().is_some_and(|part| part.is_empty()) {
+                parts.pop();
+            }
+            let invalid = |shown: &str| {
+                Err(InstallError::Failed(format!(
+                    "Error: Invalid tap name: '{shown}'"
+                )))
+            };
+            let shown = parts[..parts.len().min(2)].join("/");
+            if parts.len() >= 3 && parts[1].is_empty() {
+                return invalid(&shown);
+            }
+            if parts.len() == 2 && parts[0].is_empty() && !valid_component(parts[1]) {
+                return invalid(&shown);
+            }
+        }
+    }
+    let desc_name_ok = |s: &String| {
+        valid_package_name(s)
+            || (s.contains('/')
+                && s.split('/').all(|part| {
+                    part.is_empty() || valid_component(part) || part == ".." || part == "."
+                }))
+    };
+    if desc_modes > 1 || (cmd == "desc" && desc_modes == 0 && !ops.iter().all(desc_name_ok)) {
         return Err(unsupported());
     }
     if (matches!(cmd, "search" | "-S") || desc_modes == 1)
@@ -3137,6 +3263,12 @@ fn prelock_admission(
     let mut any = false;
     for name in rest.iter().filter(|s| !s.starts_with('-')) {
         any = true;
+        // Foreign tap-qualified names are resolved (or refused
+        // with brew's factory errors) by the commands that admit
+        // them; the install planner never sees them.
+        if commands::foreign_qualified(name) {
+            continue;
+        }
         // Upgrading a name that is not installed is the command's
         // own error, not a plan to admit or delegate.
         if opts.upgrade {
@@ -3263,6 +3395,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "post_install" => "postinstall",
         other => other,
     };
+    let raw_rest = rest;
     let canonical = canonical_kind_switches(rest);
     let rest: &[String] = &canonical;
     if via_reroute() {
@@ -3333,6 +3466,19 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             print!("{}", help_for(cmd));
             return ExitCode::SUCCESS;
         }
+    }
+    // A tap's external command exists but abrew never executes
+    // it: refuse as not native rather than "Unknown command".
+    if !command_names(true).contains(&cmd)
+        && commands::external_commands(prefix)
+            .iter()
+            .any(|name| name == cmd)
+    {
+        return from_install(
+            prefix,
+            args,
+            Err(InstallError::Unsupported(format!("'{cmd}' is not native"))),
+        );
     }
     let (prepared, admitted) = match native_args(cmd, rest) {
         Ok(pair) => pair,
@@ -3550,7 +3696,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "search" | "-S" => cmd_search(prefix, &api, rest),
         "info" => cmd_info(prefix, &api, args, rest),
         "desc" => cmd_desc(prefix, &api, rest),
-        "home" | "homepage" => cmd_home(&api, rest),
+        "home" | "homepage" => cmd_home(prefix, &api, rest),
         "docs" => cmd_docs(),
         "source" => cmd_source(&api, rest),
         "cat" => cmd_cat(prefix, &api, rest),
@@ -3563,24 +3709,42 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
                 );
                 return ExitCode::from(1);
             }
+            let external = commands::external_commands(prefix);
             if has_flag(rest, "--quiet", "-q") {
-                let names: Vec<String> = command_names(has_flag(rest, "--include-aliases", ""))
+                let mut names: Vec<String> = command_names(has_flag(rest, "--include-aliases", ""))
                     .into_iter()
                     .map(str::to_string)
                     .collect();
+                names.extend(external);
+                names.sort();
                 commands::print_columns_pub(&names);
             } else {
+                let mut sections: Vec<(&str, Vec<String>)> = vec![
+                    (
+                        "Built-in commands",
+                        BREW_BUILTIN_COMMANDS
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    ),
+                    (
+                        "Built-in developer commands",
+                        BREW_DEVELOPER_COMMANDS
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    ),
+                ];
+                if !external.is_empty() {
+                    sections.push(("External commands", external));
+                }
                 let mut first = true;
-                for (title, names) in [
-                    ("Built-in commands", BREW_BUILTIN_COMMANDS),
-                    ("Built-in developer commands", BREW_DEVELOPER_COMMANDS),
-                ] {
+                for (title, names) in sections {
                     if !first {
                         println!();
                     }
                     first = false;
                     println!("{}", tty::ohai(title));
-                    let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
                     commands::print_columns_pub(&names);
                 }
             }
@@ -3588,7 +3752,9 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         }
         "completions" => commands::cmd_completions(prefix, rest),
         "config" => cmd_config(prefix),
-        "shellenv" => cmd_shellenv(prefix, rest),
+        // brew.sh reads the shellenv shell name raw, before
+        // any option parsing (so `-zsh` survives unbundling).
+        "shellenv" => cmd_shellenv(prefix, raw_rest),
         "doctor" | "dr" => cmd_doctor(prefix, &api, rest),
         "analytics" => commands::cmd_analytics(),
         "developer" => commands::cmd_developer(prefix, rest),
@@ -4095,7 +4261,6 @@ const BREW_BUILTIN_COMMANDS: &[&str] = &[
     "which-formula",
 ];
 const BREW_DEVELOPER_COMMANDS: &[&str] = &[
-    "aspell-dictionaries",
     "audit",
     "benchmark",
     "bottle",
@@ -4106,12 +4271,9 @@ const BREW_DEVELOPER_COMMANDS: &[&str] = &[
     "bump-unversioned-casks",
     "bump",
     "cat",
-    "check-bottle-modification",
-    "check-ci-status",
     "contributions",
     "create",
     "debugger",
-    "determine-rebottle-runners",
     "edit",
     "extract",
     "find-appcast",
@@ -5517,6 +5679,38 @@ mod admission_tests {
             native_args("list", &argv(&["--json"])),
             Err(InstallError::Failed(m)) if m
                 == "Error: Invalid usage: `brew list --json` requires `--versions`."
+        ));
+        // r316: desc/list qualified-name handling; core-qualified
+        // read-only lookups admit, mutating commands delegate.
+        assert!(matches!(
+            native_args("desc", &argv(&["/^jq$/"])),
+            Err(InstallError::Failed(m)) if m == "Error: Invalid tap name: '/^jq$'"
+        ));
+        assert!(matches!(
+            native_args("desc", &argv(&["a//b"])),
+            Err(InstallError::Failed(m)) if m == "Error: Invalid tap name: 'a/'"
+        ));
+        assert!(native_args("desc", &argv(&["homebrew/core/jq"])).is_ok());
+        assert!(native_args("desc", &argv(&["foo/bar"])).is_ok());
+        assert!(native_args("info", &argv(&["homebrew/core/jq"])).is_ok());
+        assert!(native_args("info", &argv(&["homebrew/cask/caffeine"])).is_ok());
+        assert!(native_args("info", &argv(&["foo/bar"])).is_ok());
+        assert!(native_args("outdated", &argv(&["a/b/c"])).is_ok());
+        assert!(native_args("deps", &argv(&["foo/bar"])).is_ok());
+        assert!(native_args("uses", &argv(&["a/b/c"])).is_ok());
+        assert!(matches!(
+            native_args("log", &argv(&["foo/bar"])),
+            Err(InstallError::Unsupported(_))
+        ));
+        assert!(native_args("outdated", &argv(&["homebrew/core/jq"])).is_ok());
+        assert!(matches!(
+            native_args("list", &argv(&["homebrew/core/jq"])),
+            Err(InstallError::Failed(m)) if m
+                == "Error: No available formula or cask with the name \"homebrew/core/jq\"."
+        ));
+        assert!(matches!(
+            native_args("install", &argv(&["homebrew/core/jq"])),
+            Err(InstallError::Unsupported(_))
         ));
         assert!(msg(&["audit"]).contains("'audit' is not native"));
     }

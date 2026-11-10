@@ -22,6 +22,7 @@
 use aterm_uds::spawnfd::{Command, command};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::changelog;
 
@@ -63,6 +64,135 @@ impl From<String> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Resolve once and hold that exact installed build until every local Git child
+/// has finished. A broken managed installation is not permission to use another Git.
+struct SelectedGit {
+    program: PathBuf,
+    env: atpkg::shim_env::ShimEnv,
+    _lease: Option<atpkg::lease::Lease>,
+}
+
+impl SelectedGit {
+    fn command(&self) -> Command {
+        let mut cmd = command(&self.program);
+        cmd.envs(self.env.entries().iter().map(|(key, value)| (key, value)));
+        cmd
+    }
+
+    fn object_command(&self, repo: &Path) -> Command {
+        let mut cmd = command(&self.program);
+        for (key, _) in std::env::vars_os() {
+            if key.as_encoded_bytes().starts_with(b"GIT_") {
+                cmd.env_remove(&key);
+            }
+        }
+        // Reapply only the selected package's declared environment after removing
+        // ambient Git overrides (notably its own GIT_EXEC_PATH, when declared).
+        cmd.envs(self.env.entries().iter().map(|(key, value)| (key, value)))
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .arg("-C")
+            .arg(repo)
+            .stdin(aterm_uds::spawnfd::Stdio::null());
+        crate::credential_wait::ask_no_one(&mut cmd);
+        cmd
+    }
+}
+
+fn managed_git(layout: &atpkg::Layout) -> std::result::Result<SelectedGit, String> {
+    let present = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cannot inspect managed Git {}: {error}",
+            path.display()
+        )),
+    };
+    let tool = atpkg::store::ToolName::new("git").ok_or("invalid Git tool name")?;
+    let shim = layout.shim(&tool);
+    if !present(&shim)? && !present(&layout.program_current("git"))? {
+        return Ok(SelectedGit {
+            program: PathBuf::from(aterm_uds::os_path!("git")),
+            env: atpkg::shim_env::ShimEnv::NONE,
+            _lease: None,
+        });
+    }
+    let selected = atpkg::ops::managed(layout, "git").ok_or(
+        "managed Git is present but its executable cannot be resolved; run `aterm pkg repair`",
+    )?;
+    let (owner, build) = atpkg::ops::store_build_of(&layout.prefix, &selected.target)
+        .filter(|(owner, _)| owner == "git")
+        .ok_or("managed Git does not name an installed Git build")?;
+    let root = layout.build_dir(&owner, build);
+    let lease = atpkg::lease::take_for_dir(&layout.prefix, &root, "aterm-release local Git")
+        .map_err(|error| format!("cannot hold managed Git build {build}: {error}"))?
+        .ok_or("managed Git build has no package lease")?;
+    if !atpkg::store::build_is_complete(&root) {
+        return Err(format!(
+            "managed Git build {build} is incomplete; run `aterm pkg repair`"
+        ));
+    }
+    let physical_root = root
+        .canonicalize()
+        .map_err(|error| format!("resolve managed Git build: {error}"))?;
+    let program = selected
+        .target
+        .canonicalize()
+        .map_err(|error| format!("resolve managed Git executable: {error}"))?;
+    if !program.starts_with(&physical_root) || !aterm_toolchain::is_executable_file(&program) {
+        return Err("managed Git executable is not a runnable file in its selected build".into());
+    }
+    let verified = atpkg::verify::verify_program(layout, "git");
+    if verified != (atpkg::verify::VerifyOutcome::Match { build }) {
+        return Err(format!(
+            "managed Git build {build} failed signed-tree verification: {verified:?}"
+        ));
+    }
+    if atpkg::ops::managed(layout, "git").as_ref() != Some(&selected) {
+        return Err(
+            "managed Git selection changed while it was being verified; retry the release".into(),
+        );
+    }
+    Ok(SelectedGit {
+        program,
+        env: selected.env,
+        _lease: Some(lease),
+    })
+}
+
+fn selected_git() -> Result<&'static SelectedGit> {
+    static SELECTED: OnceLock<std::result::Result<SelectedGit, String>> = OnceLock::new();
+    SELECTED
+        .get_or_init(|| {
+            let home = aterm_uds::host::tool_home()
+                .ok_or("cannot locate the installed Git package home")?;
+            // The verifier records this prefix before replacing HOME with its private
+            // test home. Normal release processes use the configured package prefix.
+            let configured = std::env::var_os("ATERM_TEST_PACKAGE_PREFIX")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    aterm_toolchain::atpkg_prefix(
+                        &home,
+                        std::env::var_os("XDG_CONFIG_HOME")
+                            .as_deref()
+                            .map(Path::new),
+                    )
+                });
+            managed_git(&atpkg::Layout {
+                prefix: atpkg::store::vet_prefix(Some(&configured), &home),
+            })
+        })
+        .as_ref()
+        .map_err(|why| Error::new(why.clone()))
+}
+
+pub(crate) fn git_command() -> Result<Command> {
+    Ok(selected_git()?.command())
+}
 
 /// Captured output of one runner invocation.
 pub struct RunOut {
@@ -282,7 +412,7 @@ impl GitRunner for GitCli {
 
     fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<RunOut> {
         use aterm_uds::spawnfd::Stdio;
-        let mut git = command(aterm_uds::os_path!("git"));
+        let mut git = git_command()?;
         let child = crate::credential_wait::ask_no_one(&mut git)
             .arg("-C")
             .arg(&self.repo)
@@ -306,7 +436,7 @@ impl GitRunner for GitCli {
     }
 
     fn git_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
-        let mut cmd = command(aterm_uds::os_path!("git"));
+        let mut cmd = git_command()?;
         crate::credential_wait::ask_no_one(&mut cmd)
             .arg("-C")
             .arg(&self.repo);
@@ -325,23 +455,8 @@ pub(crate) const BYTE_EXACT: [&str; 6] = [
 ];
 
 /// `git -C <repo>` that answers for that repository's objects as recorded and nothing else: every inherited `GIT_*` variable is removed (`GIT_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_GRAFT_FILE` … would answer for another repository or rewrite this one), no system or global config is read, replace refs are ignored, nothing is fetched lazily or prompts, no optional lock is taken, and stdin is empty.
-pub fn object_git(repo: &Path) -> Command {
-    let mut cmd = command(aterm_uds::os_path!("git"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"GIT_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
-        .arg(repo)
-        .stdin(aterm_uds::spawnfd::Stdio::null());
-    crate::credential_wait::ask_no_one(&mut cmd);
-    cmd
+pub fn object_git(repo: &Path) -> Result<Command> {
+    Ok(selected_git()?.object_command(repo))
 }
 
 /// Run a git command and require success; the error carries the argv and git's trimmed stderr.
@@ -1008,5 +1123,159 @@ pub(crate) mod testing {
             }
         }
         fs::write(&file, text).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod managed_git_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    struct Store {
+        _temp: aterm_tempfile::TempDir,
+        layout: atpkg::Layout,
+    }
+
+    impl Store {
+        fn new() -> Self {
+            let temp = aterm_tempfile::tempdir().unwrap();
+            let layout = atpkg::Layout {
+                prefix: temp.path().canonicalize().unwrap().join("pkg"),
+            };
+            std::fs::create_dir_all(&layout.prefix).unwrap();
+            Self {
+                _temp: temp,
+                layout,
+            }
+        }
+
+        fn install(&self, build: u64) -> PathBuf {
+            let root = self.layout.build_dir("git", build);
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            let program = root.join("bin/git");
+            std::fs::write(&program, format!(
+                "#!/bin/sh\nprintf 'git version 2.{build}.0\\n'\nprintf 'exec=%s\\n' \"$GIT_EXEC_PATH\"\n"
+            )).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let env =
+                atpkg::shim_env::ShimEnv::admit(&["GIT_EXEC_PATH=managed-exec".into()]).unwrap();
+            atpkg::activate::install_shims_env(
+                &self.layout,
+                &root,
+                &["git".into()],
+                atpkg::activate::Aliases::Off,
+                &env,
+            )
+            .unwrap();
+            atpkg::activate::activate_build(&self.layout, &root).unwrap();
+            atpkg::store::mark_build_ready(&root).unwrap();
+            let mut status = atpkg::status::Status::default();
+            status.programs.insert(
+                "git".into(),
+                atpkg::status::ProgramStatus {
+                    installed_build: Some(build),
+                    state: "fixture signed root".into(),
+                    tree_root: atpkg::tree::tree_root(&root).unwrap(),
+                },
+            );
+            atpkg::status::write(&self.layout, &status).unwrap();
+            program
+        }
+    }
+
+    #[test]
+    fn absent_managed_git_keeps_the_os_fallback() {
+        let store = Store::new();
+        let selected = managed_git(&store.layout).unwrap();
+        assert_eq!(selected.program, Path::new(aterm_uds::os_path!("git")));
+        assert!(selected._lease.is_none());
+    }
+
+    #[test]
+    fn managed_git_uses_the_signed_payload_and_its_environment_for_object_reads() {
+        let store = Store::new();
+        let program = store.install(56);
+        let selected = managed_git(&store.layout).unwrap();
+        assert_eq!(selected.program, program);
+        for mut cmd in [
+            selected.command(),
+            selected.object_command(&store.layout.prefix),
+        ] {
+            let output = cmd.arg("version").output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                "git version 2.56.0\nexec=managed-exec\n"
+            );
+        }
+        let subject = atpkg::lease::Subject::Build {
+            program: "git".into(),
+            build: 56,
+        };
+        assert!(matches!(
+            atpkg::lease::holders(&store.layout.prefix, &subject),
+            atpkg::lease::Holders::Held(_)
+        ));
+    }
+
+    #[test]
+    fn broken_managed_git_never_falls_back_to_another_executable() {
+        for failure in ["incomplete", "unsigned", "changed", "foreign"] {
+            let store = Store::new();
+            let program = store.install(56);
+            match failure {
+                "incomplete" => std::fs::remove_file(
+                    atpkg::store::ready_marker_path(&store.layout.build_dir("git", 56)).unwrap(),
+                )
+                .unwrap(),
+                "unsigned" => {
+                    atpkg::status::write(&store.layout, &atpkg::status::Status::default()).unwrap()
+                }
+                "changed" => std::fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap(),
+                "foreign" => {
+                    std::fs::remove_file(&program).unwrap();
+                    symlink(aterm_uds::os_path!("git"), &program).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(managed_git(&store.layout).is_err(), "{failure}");
+        }
+        let store = Store::new();
+        std::fs::create_dir_all(store.layout.bin_dir()).unwrap();
+        symlink(
+            store.layout.prefix.join("missing"),
+            store.layout.bin_dir().join("git"),
+        )
+        .unwrap();
+        assert!(
+            managed_git(&store.layout).is_err(),
+            "a dangling managed shim is not absence"
+        );
+    }
+
+    #[test]
+    fn an_update_does_not_retarget_a_running_release_or_drop_its_lease() {
+        let store = Store::new();
+        let program = store.install(56);
+        let selected = managed_git(&store.layout).unwrap();
+        store.install(57);
+        assert_eq!(selected.program, program);
+        let output = selected.command().arg("version").output().unwrap();
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .starts_with("git version 2.56.0\n")
+        );
+        let lease = selected._lease.unwrap();
+        let subject = lease.subject().clone();
+        assert!(matches!(
+            atpkg::lease::holders(&store.layout.prefix, &subject),
+            atpkg::lease::Holders::Held(_)
+        ));
+        lease.release();
+        assert_eq!(
+            atpkg::lease::holders(&store.layout.prefix, &subject),
+            atpkg::lease::Holders::Free
+        );
     }
 }

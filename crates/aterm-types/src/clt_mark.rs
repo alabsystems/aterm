@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn a_scheduled_record_writer_does_not_spend_the_automatic_ask() {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("clt-mark");
         let path = dir.path().join(FILE);
         let started = std::time::Instant::now() - std::time::Duration::from_secs(3);
         drop(lock_started(&path, started).unwrap());
@@ -389,7 +389,7 @@ mod tests {
     /// remain held and unchanged.
     #[test]
     fn a_password_episode_survives_updates_and_only_its_owner_can_release_it() {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("clt-mark");
         let path = dir.path().join(FILE);
         let text = || std::fs::read_to_string(&path).unwrap();
         assert!(!spent(&Live, &path));
@@ -466,7 +466,7 @@ mod tests {
     /// such change with `AlreadyExists`, the line it should add or take back left as it was.
     #[test]
     fn a_staged_copy_a_dead_process_of_this_pid_left_holds_no_change() {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("clt-mark");
         let path = dir.path().join(FILE);
         let staged = dir
             .path()
@@ -495,7 +495,7 @@ mod tests {
     /// Valid historical records and unreadable records both hold, with distinct diagnostics.
     #[test]
     fn the_reading_distinguishes_spent_available_and_unread() {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("clt-mark");
         let path = dir.path().join(FILE);
         assert!(matches!(reading(&Live, &path), Asked::Available));
         for record in ["opened\n", "opened dev\n"] {
@@ -520,7 +520,7 @@ mod tests {
     /// NEGATIVE CONTROL: with no other asker, the same claim adds the line (`true`).
     #[test]
     fn of_two_builds_claiming_one_episode_only_one_asks() {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("clt-mark");
         let path = dir.path().join(FILE);
         let other = std::rc::Rc::new(std::cell::RefCell::new(Some(Live.lock(&path).unwrap())));
         let waited = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn a_first_record_makes_its_folder() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("clt-mark");
         let path = dir.path().join("state").join("aterm").join(FILE);
         assert!(claim(&Live, &path, "release").unwrap());
         assert!(spent(&Live, &path));
@@ -602,7 +602,7 @@ mod tests {
             );
             return;
         }
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("clt-mark");
         let state = dir.path().join("state");
         let xdg = dir.path().join("xdg");
         let test = format!(

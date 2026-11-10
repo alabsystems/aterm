@@ -273,6 +273,7 @@ fn a_real_dev_link_is_admitted_and_duplicate_exec_hints_are_not() {
         pid: "4242".into(),
         entry: fixture.entry.clone(),
         target: target.clone(),
+        legacy_store: false,
     };
     std::fs::remove_file(&fixture.entry).unwrap();
     assert!(hints.admits(4242, &target, &fixture.entry));
@@ -302,6 +303,120 @@ fn a_real_dev_link_is_admitted_and_duplicate_exec_hints_are_not() {
         ],
     };
     assert!(Hints::capture(&fixture.layout, &args).is_some());
+    args.env.push("ATPKG_MANAGED_LAUNCH_TARGET".into());
+    assert!(Hints::capture_for_pid(&fixture.layout, &args, 4242).is_none());
+    args.env.pop();
     args.env.push("ATPKG_MANAGED_LAUNCH_PID=4242".into());
     assert!(Hints::capture(&fixture.layout, &args).is_none());
+}
+
+#[test]
+fn legacy_kernel_exec_requires_exact_store_image_and_independent_current_producer() {
+    let fixture = Fixture::new();
+    let args = ProcArgs {
+        exec_path: fixture.target.to_string_lossy().into_owned(),
+        argv: vec![
+            fixture.entry.to_string_lossy().into_owned(),
+            "resume".into(),
+        ],
+        env: vec![],
+    };
+    let hints = Hints::capture_for_pid(&fixture.layout, &args, 4242).unwrap();
+    let newer = package(&fixture.layout.build_dir("codex", 2_026_101_602), "B");
+    select(&fixture.layout, &newer);
+    assert!(hints.admits(4242, &fixture.target, &fixture.entry));
+    assert!(!hints.admits(4243, &fixture.target, &fixture.entry));
+    assert!(!hints.admits(4242, &newer, &fixture.entry));
+    assert!(!hints.admits(4242, &fixture.target, &fixture.target));
+    for pid in [0, 1] {
+        assert!(Hints::capture_for_pid(&fixture.layout, &args, pid).is_none());
+    }
+    for argv0 in [
+        fixture.target.clone(),
+        fixture.layout.prefix.join("exec/codex"),
+    ] {
+        let mut wrong = args.clone();
+        wrong.argv[0] = argv0.to_string_lossy().into_owned();
+        assert!(Hints::capture_for_pid(&fixture.layout, &wrong, 4242).is_none());
+    }
+    let mut alias = args.clone();
+    alias.exec_path = format!(
+        "{}/../bin/codex",
+        fixture.target.parent().unwrap().display()
+    );
+    assert!(Hints::capture_for_pid(&fixture.layout, &alias, 4242).is_none());
+    let alias_dir = fixture.layout.prefix.join("alias");
+    std::os::unix::fs::symlink(fixture.target.parent().unwrap(), &alias_dir).unwrap();
+    alias.exec_path = alias_dir.join("codex").to_string_lossy().into_owned();
+    assert!(Hints::capture_for_pid(&fixture.layout, &alias, 4242).is_none());
+    for target in [
+        package(
+            &fixture.layout.prefix.join("foreign/store/codex/2026101601"),
+            "F",
+        ),
+        package(&fixture.layout.prefix.join("retained-dev"), "D"),
+    ] {
+        let mut wrong = args.clone();
+        wrong.exec_path = target.to_string_lossy().into_owned();
+        assert!(Hints::capture_for_pid(&fixture.layout, &wrong, 4242).is_none());
+    }
+    let root = fixture.target.parent().unwrap().parent().unwrap();
+    let marker = crate::store::ready_marker_path(root).unwrap();
+    let ready = std::fs::read(&marker).unwrap();
+    std::fs::remove_file(&marker).unwrap();
+    assert!(Hints::capture_for_pid(&fixture.layout, &args, 4242).is_none());
+    assert!(!hints.admits(4242, &fixture.target, &fixture.entry));
+    std::fs::write(&marker, ready).unwrap();
+    let shim = fixture.layout.bin_dir().join("codex");
+    let old = std::fs::read(&shim).unwrap();
+    std::fs::write(&shim, b"#!/bin/sh\nexit 0\n").unwrap();
+    assert!(!hints.admits(4242, &fixture.target, &fixture.entry));
+    std::fs::write(&shim, old).unwrap();
+    std::fs::write(
+        fixture
+            .target
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(crate::alab::ALAB_BUILD_JSON),
+        "not-json",
+    )
+    .unwrap();
+    assert!(!hints.admits(4242, &fixture.target, &fixture.entry));
+}
+
+#[test]
+fn legacy_admission_never_recovers_partial_or_malformed_modern_hints() {
+    let fixture = Fixture::new();
+    let mut args = ProcArgs {
+        exec_path: fixture.target.to_string_lossy().into_owned(),
+        argv: vec![fixture.entry.to_string_lossy().into_owned()],
+        env: vec![],
+    };
+    for field in [
+        "ATPKG_MANAGED_LAUNCH_PID",
+        "ATPKG_MANAGED_LAUNCH_PID=",
+        "ATPKG_MANAGED_LAUNCH_PID=4242",
+        "ATPKG_MANAGED_LAUNCH_PATH=",
+        "ATPKG_MANAGED_LAUNCH_TARGET=",
+    ] {
+        args.env = vec![field.into()];
+        assert!(
+            Hints::capture_for_pid(&fixture.layout, &args, 4242).is_none(),
+            "{field}"
+        );
+    }
+    args.env = vec![
+        "ATPKG_MANAGED_LAUNCH_PID=04242".into(),
+        format!("ATPKG_MANAGED_LAUNCH_PATH={}", fixture.entry.display()),
+        format!("ATPKG_MANAGED_LAUNCH_TARGET={}", fixture.target.display()),
+    ];
+    let malformed = Hints::capture_for_pid(&fixture.layout, &args, 4242).unwrap();
+    assert!(!malformed.admits(4242, &fixture.target, &fixture.entry));
+    args.env.push("ATPKG_MANAGED_LAUNCH_TARGET".into());
+    assert!(Hints::capture_for_pid(&fixture.layout, &args, 4242).is_none());
+    args.env.pop();
+    args.env.push("ATPKG_MANAGED_LAUNCH_PID=4242".into());
+    assert!(Hints::capture_for_pid(&fixture.layout, &args, 4242).is_none());
 }

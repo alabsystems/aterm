@@ -15,6 +15,7 @@ pub struct Hints {
     pid: String,
     entry: PathBuf,
     target: PathBuf,
+    legacy_store: bool,
 }
 
 impl Hints {
@@ -32,7 +33,57 @@ impl Hints {
             pid: value("ATPKG_MANAGED_LAUNCH_PID")?,
             entry: value("ATPKG_MANAGED_LAUNCH_PATH")?.into(),
             target: value("ATPKG_MANAGED_LAUNCH_TARGET")?.into(),
+            legacy_store: false,
         })
+    }
+
+    /// Capture a kernel snapshot from a known process, including old managed execs.
+    /// Legacy admission requires all producer fields absent, the exact stable argv0,
+    /// and an independently admitted immutable store image. Current producer validation
+    /// remains mandatory in `admits`; argv0 alone grants no route authority.
+    #[must_use]
+    pub fn capture_for_pid(layout: &Layout, args: &ProcArgs, pid: u32) -> Option<Self> {
+        const NAMES: [&str; 3] = [
+            "ATPKG_MANAGED_LAUNCH_PID",
+            "ATPKG_MANAGED_LAUNCH_PATH",
+            "ATPKG_MANAGED_LAUNCH_TARGET",
+        ];
+        if args.env.iter().any(|field| NAMES.contains(&field.as_str())) {
+            return None;
+        }
+        if args.env.iter().any(|field| {
+            NAMES.iter().any(|name| {
+                field == name
+                    || field
+                        .strip_prefix(name)
+                        .is_some_and(|tail| tail.starts_with('='))
+            })
+        }) {
+            return Self::capture(layout, args);
+        }
+        #[cfg(unix)]
+        {
+            let entry = crate::activate::exec_dir(layout, "codex").join("codex");
+            let target = PathBuf::from(&args.exec_path);
+            if pid <= 1
+                || args.argv.first().map(String::as_str) != entry.to_str()
+                || !legacy_store_package(layout, &target)
+            {
+                return None;
+            }
+            Some(Self {
+                prefix: layout.prefix.clone(),
+                pid: pid.to_string(),
+                entry,
+                target,
+                legacy_store: true,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            None
+        }
     }
 
     /// Whether this exact exec's physical image belongs to the independently produced
@@ -49,7 +100,11 @@ impl Hints {
                 && launch.as_os_str() == self.entry.as_os_str()
                 && normalized(&self.target)
                 && std::fs::canonicalize(&self.target).ok().as_deref() == Some(image)
-                && running_package(&layout, &self.target)
+                && if self.legacy_store {
+                    legacy_store_package(&layout, &self.target)
+                } else {
+                    running_package(&layout, &self.target)
+                }
                 && producer_target(&layout, launch).is_some()
         }
         #[cfg(not(unix))]
@@ -114,6 +169,20 @@ fn package_root(target: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(root)
+}
+
+/// Legacy argv0 has no producer fields: require a positively readable complete store
+/// admission as well as the declared package entrypoint, never retained dev bytes.
+#[cfg(unix)]
+fn legacy_store_package(layout: &Layout, target: &Path) -> bool {
+    let Some(Origin::Store(build)) = package_origin(layout, target) else {
+        return false;
+    };
+    let root = layout.build_dir("codex", build);
+    crate::store::ready_marker_path(&root).is_some_and(|marker| {
+        crate::metadata_io::read_bounded_regular_utf8(&marker, 4 * 1024 * 1024).is_ok()
+            && crate::store::build_is_complete(&root)
+    })
 }
 
 // A captured dev image can outlive its link marker; `producer_target` confers route authority.

@@ -297,11 +297,7 @@ fn admitting_nothing_at(
         .unwrap();
         match told {
             Some(frame) => {
-                use std::io::Read as _;
-                wire::send(&stream, &frame).unwrap();
-                stream.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
-                let mut hello = Vec::new();
-                (&stream).read_to_end(&mut hello).unwrap();
+                refuse_and_drain(&stream, &frame, || {}).unwrap();
             }
             None => {
                 let hello = Reader::new(0)
@@ -311,6 +307,67 @@ fn admitting_nothing_at(
             }
         }
     })
+}
+
+fn refuse_and_drain(
+    stream: &CtlStream,
+    frame: &Frame,
+    after_send: impl FnOnce(),
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    // A client can close immediately on the verdict. On macOS setsockopt then
+    // returns EINVAL, even with its hello still queued for this reader.
+    stream.set_read_timeout(Some(MUST_HAPPEN))?;
+    wire::send(stream, frame)?;
+    after_send();
+    let mut hello = Vec::new();
+    (&*stream).read_to_end(&mut hello)?;
+    Ok(hello)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_verdict_can_close_the_peer_before_the_fixture_drains_its_hello() {
+    use std::io::{Read as _, Write as _};
+    for old_order in [true, false] {
+        let (server, mut client) = CtlStream::pair().unwrap();
+        let (closed, closure) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            client.write_all(b"queued hello").unwrap();
+            let verdict = Reader::new(0)
+                .frame(&client, Some(Instant::now() + MUST_HAPPEN))
+                .unwrap();
+            assert!(matches!(verdict, Some(Frame::Unchecked { .. })));
+            drop(client);
+            closed.send(()).unwrap();
+        });
+        let frame = Frame::Unchecked {
+            words: "not judged".into(),
+        };
+        let wait_for_close = || {
+            closure.recv_timeout(MUST_HAPPEN).unwrap();
+            aterm_spec::wait::until_peer_closed(&server);
+        };
+        let hello = if old_order {
+            wire::send(&server, &frame).unwrap();
+            wait_for_close();
+            let error = server.set_read_timeout(Some(MUST_HAPPEN)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+            let error = server.set_write_timeout(Some(MUST_HAPPEN)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+            // Nonblocking is fcntl, not setsockopt; changing it after closure
+            // still works and must not be policed as the same operation.
+            server.set_nonblocking(true).unwrap();
+            server.set_nonblocking(false).unwrap();
+            let mut hello = Vec::new();
+            (&server).read_to_end(&mut hello).unwrap();
+            hello
+        } else {
+            refuse_and_drain(&server, &frame, wait_for_close).unwrap()
+        };
+        assert_eq!(hello, b"queued hello");
+        peer.join().unwrap();
+    }
 }
 
 /// The seam that points this thread's client at `path`.

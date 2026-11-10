@@ -666,9 +666,10 @@ fn the_default_login_takes_its_lab_label_and_an_unknown_one_none() {
     );
     let bare = Bed::new(Some("zed"));
     bare.sync(&lab).expect("an empty lab roster is no error");
+    assert!(bare.store.source_policy().unwrap().retired());
     assert!(
         !bare.roster.exists(),
-        "an empty lab roster stays empty: the sync writes nothing"
+        "an empty lab roster stays empty while its source retirement is retained"
     );
 }
 
@@ -860,12 +861,19 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     let digests = || {
         (
             sync_inputs(&home, &state_dir, &roster_path, NOW),
-            cli_sync_inputs(Cli::Kimi, &home, &toml),
+            cli_sync_inputs(Cli::Kimi, &home, &state_dir, &toml),
         )
     };
     edit("email,computer,claude,kimi\none@example.com,m22,1,global\n");
+    let store = accounts::Store::at(&state_dir);
+    let held = store.acquire().unwrap();
+    store.retire_source_held(&held, NOW).unwrap();
+    drop(held);
     let (claude, kimi) = alab_roster::with_lab(lab.clone(), || {
-        assert!(!has_fleet_source(&home.join(".secrets")), "no fleet source");
+        assert!(
+            !has_fleet_source(&home.join(".secrets"), &store),
+            "no fleet source"
+        );
         assert!(!sheet_names_this_machine(Some(&toml), &sheet));
         assert!(
             !init_sync_needed(&home, &state_dir, &roster_path, NOW, true),
@@ -882,10 +890,10 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     let (moved_claude, moved_kimi) = digests();
     assert_ne!(moved_claude, bare_claude, "with no lab the sheet is read");
     assert_ne!(moved_kimi, bare_kimi);
-    assert!(has_fleet_source(&home.join(".secrets")));
+    assert!(has_fleet_source(&home.join(".secrets"), &store));
     let pending_kimi = alab_roster::while_pending(|| {
         assert!(
-            !has_fleet_source(&home.join(".secrets")),
+            !has_fleet_source(&home.join(".secrets"), &store),
             "a lab not read yet reads no sheet"
         );
         digests().1

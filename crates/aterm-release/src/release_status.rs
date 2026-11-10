@@ -1003,6 +1003,7 @@ mod tests {
                 kind: "aterm_gui test".to_owned(),
             },
             queued_at_unix_ms: Some(1),
+            codegen_requested: Some(true),
             started_at_unix_ms: 2,
             ended_at_unix_ms: 3,
             cpu_s: 1.0,

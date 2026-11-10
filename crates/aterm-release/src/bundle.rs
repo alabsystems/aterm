@@ -572,14 +572,10 @@ mod staging_tests {
 
     use super::*;
 
-    fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-release-staging-{label}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dist");
-        std::fs::canonicalize(&dir).expect("canonical scratch dist")
+    fn scratch(label: &str) -> (aterm_tempfile::TempDir, PathBuf) {
+        let dir = crate::test_scratch_dir(label);
+        let canon = std::fs::canonicalize(dir.path()).expect("canonical scratch dist");
+        (dir, canon)
     }
 
     fn bundle_in(dist: &Path, name: &str) -> PathBuf {
@@ -669,7 +665,7 @@ mod staging_tests {
 
     #[test]
     fn pruning_removes_only_what_is_provably_unused() {
-        let dist = scratch("prune");
+        let (_guard, dist) = scratch("prune");
         let keep = bundle_in(&dist, &staging_dir_name(3));
         let legacy = bundle_in(&dist, "cut-app");
         let old = bundle_in(&dist, &staging_dir_name(1));
@@ -701,14 +697,13 @@ mod staging_tests {
         assert!(!proven.exists(), "one whose copy ran is pruned: {lines:?}");
         assert!(keep.is_dir(), "this claim's own directory is never pruned");
         assert!(dist.join("cut-state.toml").is_file() && dev.is_dir());
-        let _ = std::fs::remove_dir_all(&dist);
     }
 
     /// A finished cut removes its own staging directory, but never from under a live
     /// process, on a process list it could not read, or while its copy never showed it ran.
     #[test]
     fn a_finished_cut_discards_its_staging_bundle_only_when_provably_unused() {
-        let dist = scratch("discard");
+        let (_guard, dist) = scratch("discard");
         let own = bundle_in(&dist, &staging_dir_name(7));
         let other = bundle_in(&dist, &staging_dir_name(6));
         let exe = format!("{}/aterm.app/Contents/MacOS/aterm", own.display());
@@ -740,7 +735,6 @@ mod staging_tests {
             Ok(()),
             "nothing left to discard is not a failure"
         );
-        let _ = std::fs::remove_dir_all(&dist);
     }
 }
 
@@ -755,7 +749,7 @@ mod exe_mode_tests {
     /// holding it still deletes whole, as the updater and `ship dev-app` delete bundles.
     #[test]
     fn a_copy_through_a_link_to_the_bundle_executable_never_rewrites_it() {
-        let scratch = aterm_tempfile::TempDir::new().expect("owned bundle scratch");
+        let scratch = crate::test_scratch_dir("bundle");
         let dir = scratch.path();
         let macos = dir.join("aterm.app/Contents/MacOS");
         std::fs::create_dir_all(&macos).expect("create bundle");

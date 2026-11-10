@@ -80,6 +80,8 @@ pub enum GitOp {
         dir: PathBuf,
         /// The ref main is fetched into.
         into: String,
+        /// Omit blob bodies while retaining complete commit/tree ancestry.
+        blobless: bool,
     },
     /// Fetch one full ref or object id into agh's private local namespace, without
     /// changing FETCH_HEAD, branches, tags or remote-tracking refs.
@@ -278,8 +280,19 @@ impl GitRun {
             GitOp::FetchMain {
                 dir: dir.to_path_buf(),
                 into: into.to_string(),
+                blobless: false,
             },
         )
+    }
+
+    /// Omit blob bodies from a main fetch. Other operations are unchanged.
+    /// Consumers must not interpret missing blobs as complete source snapshots.
+    #[must_use]
+    pub fn without_blobs(mut self) -> GitRun {
+        if let GitOp::FetchMain { blobless, .. } = &mut self.op {
+            *blobless = true;
+        }
+        self
     }
 
     /// Fetch exactly `reference` into `refs/agh/…`. Anonymous reads never get a
@@ -880,7 +893,105 @@ mod unix {
         error.with_side_effect(SideEffect::None)
     }
 
+    fn certificate_default(out: &ChildOut) -> Result<Option<PathBuf>> {
+        if out.code == Some(1) && out.stdout.is_empty() {
+            return Ok(None);
+        }
+        if out.code != Some(0) || out.stdout.len() > 8192 {
+            return Err(Error::local(
+                "cannot read the selected Git's certificate default",
+            ));
+        }
+        let path = std::str::from_utf8(&out.stdout)
+            .ok()
+            .and_then(|text| text.strip_suffix('\0'))
+            .filter(|text| !text.is_empty() && !text.contains(['\0', '\n', '\r']))
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| Error::local("the selected Git returned an invalid certificate path"))?;
+        Ok(Some(path))
+    }
+
+    #[cfg(test)]
+    mod certificate_tests {
+        use super::*;
+
+        #[test]
+        fn certificate_default_keeps_only_one_absolute_path() {
+            let output = |code, bytes: &[u8]| ChildOut {
+                code: Some(code),
+                stdout: bytes.to_vec(),
+                stderr: Vec::new(),
+            };
+            assert_eq!(certificate_default(&output(1, b"")).unwrap(), None);
+            assert_eq!(
+                certificate_default(&output(0, b"/moved store/share/cacert.pem\0")).unwrap(),
+                Some(PathBuf::from("/moved store/share/cacert.pem")),
+            );
+            for (code, raw) in [
+                (128, b"".as_slice()),
+                (0, b""),
+                (0, b"relative.pem\0"),
+                (0, b"/first\0/second\0"),
+                (0, b"/line\nbreak\0"),
+                (1, b"/unexpected\0"),
+                (0, b"/unterminated"),
+            ] {
+                assert!(
+                    certificate_default(&output(code, raw)).is_err(),
+                    "{code}: {raw:?}"
+                );
+            }
+            assert!(certificate_default(&output(0, &vec![b'x'; 8193])).is_err());
+        }
+    }
+
     impl Children<'_> {
+        /// Keep the selected Git's certificate default while still suppressing every
+        /// other system/global setting. In particular, a relocated managed Git stores
+        /// its CA path in its own system config, which GIT_CONFIG_NOSYSTEM hides.
+        fn retain_certificate_default(&mut self, slug: &Slug) -> Result<()> {
+            let out = self
+                .git(
+                    &[
+                        os("config"),
+                        os("--system"),
+                        os("--no-includes"),
+                        os("--null"),
+                        os("--path"),
+                        os("--get"),
+                        os("http.sslCAInfo"),
+                    ],
+                    None,
+                    format!("git certificate-default {slug}").as_bytes(),
+                )
+                .map_err(unsent)?;
+            let Some(path) = certificate_default(&out)? else {
+                return Ok(());
+            };
+            if self.gh.fx().mode().replays() {
+                return Ok(());
+            }
+            let count = self
+                .env
+                .iter_mut()
+                .find(|(name, _)| name == "GIT_CONFIG_COUNT")
+                .ok_or_else(|| Error::local("isolated Git config count is absent"))?;
+            let index = count
+                .1
+                .to_str()
+                .and_then(|n| n.parse::<usize>().ok())
+                .ok_or_else(|| Error::local("isolated Git config count is invalid"))?;
+            count.1 = os((index + 1).to_string());
+            self.env
+                .push((os(format!("GIT_CONFIG_KEY_{index}")), os("http.sslCAInfo")));
+            self.env.push((
+                os(format!("GIT_CONFIG_VALUE_{index}")),
+                path.into_os_string(),
+            ));
+            Ok(())
+        }
+
         /// One child through `Fx::git`: `args`, in `cwd` (or the work directory), its request
         /// named `canonical`. An error keeps `Fx::git`'s side effect unless the run only reads.
         fn git(&self, args: &[OsString], cwd: Option<&Path>, canonical: &[u8]) -> Result<ChildOut> {
@@ -1869,7 +1980,7 @@ mod unix {
         };
         let remote = Remote::of(gh, slug)?;
         if gh.fx().mode().replays() {
-            let children = Children {
+            let mut children = Children {
                 gh,
                 git: PathBuf::from("git"),
                 env: Vec::new(),
@@ -1881,6 +1992,9 @@ mod unix {
                 anonymous_read,
                 clone_stage: None,
             };
+            if matches!(remote, Remote::Github(_)) && !matches!(run.op, GitOp::CheckLocal { .. }) {
+                children.retain_certificate_default(slug)?;
+            }
             let routed = profile.clone();
             return finish(&children, run, &remote, profile, None)
                 .map_err(|error| name_routed_authentication(error, routed.as_deref()));
@@ -1943,7 +2057,7 @@ mod unix {
             env.push((os("GIT_OPTIONAL_LOCKS"), os("0")));
         }
         let clone_stage = CloneStage::for_op(&run.op)?;
-        let children = Children {
+        let mut children = Children {
             gh,
             git,
             env,
@@ -1951,7 +2065,10 @@ mod unix {
             scratch_git: (push
                 || matches!(
                     run.op,
-                    GitOp::FetchRef { .. } | GitOp::FetchBatch { .. } | GitOp::CommitRead { .. }
+                    GitOp::FetchRef { .. }
+                        | GitOp::FetchBatch { .. }
+                        | GitOp::CommitRead { .. }
+                        | GitOp::FetchMain { blobless: true, .. }
                 ))
             .then(|| root.join("scratch.git")),
             budget: run.budget,
@@ -1960,6 +2077,9 @@ mod unix {
             anonymous_read,
             clone_stage: clone_stage.as_ref().map(|stage| stage.path().to_path_buf()),
         };
+        if matches!(remote, Remote::Github(_)) && !matches!(run.op, GitOp::CheckLocal { .. }) {
+            children.retain_certificate_default(slug)?;
+        }
         let nonce = guard.as_ref().map(|g| g.grant.nonce.clone());
         let routed = profile.clone();
         let result = finish(&children, run, &remote, profile, nonce)
@@ -2288,6 +2408,135 @@ mod unix {
             None,
         )?;
         check_parents()?;
+        step(
+            "update",
+            vec![
+                os("-C"),
+                dir.into_os_string(),
+                os("update-ref"),
+                os("--no-deref"),
+                os("--create-reflog"),
+                os(into),
+                os(oid),
+            ],
+            None,
+        )
+    }
+
+    /// Keep promisor configuration private. Import only a newly generated metadata pack;
+    /// the caller receives neither a remote nor authority to lazily fetch missing blobs.
+    fn fetch_main_blobless(
+        children: &Children<'_>,
+        run: &GitRun,
+        remote: &Remote,
+        dir: &Path,
+        into: &str,
+    ) -> Result<ChildOut> {
+        let dir = screened(children, run, dir)?;
+        let canonical = crate::fx::canon::git_request(run);
+        let scratch = children.scratch_git.as_deref();
+        let step = |name: &str, args: Vec<OsString>, cwd: Option<&Path>| -> Result<ChildOut> {
+            let key = [canonical.as_slice(), b"\nstep ", name.as_bytes()].concat();
+            let out = if name == "fetch" {
+                children.remote_read(run, &args, cwd, &key, None)
+            } else {
+                children.git(&args, cwd, &key)
+            }
+            .map_err(unsent)?;
+            if out.code != Some(0) {
+                return Err(
+                    failed(&run.op, &out, children.gh.redactor(), &run.slug, false)
+                        .with_next(format!("metadata step: {name}")),
+                );
+            }
+            Ok(out)
+        };
+        let view = step("common-dir", source_view_args(&dir), None)?;
+        let (common, _) = source_view(&view.stdout)?;
+        cache_parents(Path::new(common), into)?;
+        let mut init = vec![os("init"), os("--quiet"), os("--bare")];
+        if let Some(path) = scratch {
+            init.push(path.as_os_str().to_owned());
+        }
+        step("init", init, None)?;
+        step(
+            "fetch",
+            vec![
+                os("fetch"),
+                os("--quiet"),
+                os("--no-tags"),
+                os("--no-write-fetch-head"),
+                os("--recurse-submodules=no"),
+                os("--filter=blob:none"),
+                os(remote.url()),
+                os("+refs/heads/main:refs/agh/source"),
+            ],
+            scratch,
+        )?;
+        let oid = step(
+            "oid",
+            vec![
+                os("rev-parse"),
+                os("--verify"),
+                os("refs/agh/source^{commit}"),
+            ],
+            scratch,
+        )?;
+        let oid = std::str::from_utf8(&oid.stdout)
+            .ok()
+            .and_then(|s| s.strip_suffix('\n'))
+            .filter(|s| crate::path::is_sha(s))
+            .ok_or_else(|| Error::protocol("invalid metadata commit"))?;
+        let prefix = Path::new(common).join("objects/pack/pack");
+        let key = [canonical.as_slice(), b"\nstep metadata-pack"].concat();
+        let packed = children
+            .git_input(
+                &[
+                    os("-c"),
+                    os("protocol.allow=never"),
+                    os("pack-objects"),
+                    os("--quiet"),
+                    os("--threads=1"),
+                    os("--revs"),
+                    os("--filter=blob:none"),
+                    prefix.as_os_str().to_owned(),
+                ],
+                scratch,
+                &key,
+                format!("{oid}\n").as_bytes(),
+            )
+            .map_err(unsent)?;
+        if packed.code != Some(0) {
+            return Err(failed(
+                &run.op,
+                &packed,
+                children.gh.redactor(),
+                &run.slug,
+                false,
+            ));
+        }
+        let hash = std::str::from_utf8(&packed.stdout)
+            .ok()
+            .and_then(|s| s.strip_suffix('\n'))
+            .filter(|s| crate::path::is_sha(s))
+            .ok_or_else(|| Error::protocol("invalid metadata pack"))?;
+        // Verify every packed byte/object ID against its generated index. Link
+        // completeness is intentionally not asserted: blob bodies were excluded.
+        // No promisor marker/config is installed in the receiving repository.
+        step(
+            "verify",
+            vec![
+                os("-c"),
+                os("protocol.allow=never"),
+                os("index-pack"),
+                os("--verify"),
+                prefix
+                    .with_file_name(format!("pack-{hash}.pack"))
+                    .into_os_string(),
+            ],
+            scratch,
+        )?;
+        cache_parents(Path::new(common), into)?;
         step(
             "update",
             vec![
@@ -3530,9 +3779,22 @@ mod unix {
                 ];
                 (args, None)
             }
-            GitOp::FetchMain { dir, into } => {
+            GitOp::FetchMain {
+                dir,
+                into,
+                blobless,
+            } => {
+                if *blobless {
+                    let out = fetch_main_blobless(children, run, remote, dir, into)?;
+                    return Ok(GitOut {
+                        stdout: kept(&out.stdout, redactor),
+                        stderr: kept(&out.stderr, redactor),
+                        as_: profile,
+                        grant,
+                    });
+                }
                 let dir = screened(children, run, dir)?;
-                let args = vec![
+                let mut args = vec![
                     os("-C"),
                     dir.into_os_string(),
                     os("-c"),
@@ -3542,9 +3804,8 @@ mod unix {
                     os("--no-tags"),
                     os("--no-write-fetch-head"),
                     os("--recurse-submodules=no"),
-                    url,
-                    os(format!("+refs/heads/main:{into}")),
                 ];
+                args.extend([url, os(format!("+refs/heads/main:{into}"))]);
                 (args, None)
             }
             GitOp::FetchRef {

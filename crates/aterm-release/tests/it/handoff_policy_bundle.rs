@@ -46,12 +46,8 @@ fn the_cutter_seals_the_handoff_policy_into_the_bundle_before_it_signs() {
 
     aterm_uds::deadline::require_trust_service();
     let repo = repo_root();
-    let scratch = std::env::temp_dir().join(format!(
-        "aterm-release-policy-bundle-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch).expect("scratch");
+    let scratch_dir = crate::test_scratch_dir("policy");
+    let scratch = scratch_dir.path();
     let exe = scratch.join("aterm-bin");
     std::fs::copy("/usr/bin/true", &exe).expect("a Mach-O to bundle");
     let spec = bundle::BundleSpec {
@@ -89,16 +85,12 @@ fn the_cutter_seals_the_handoff_policy_into_the_bundle_before_it_signs() {
         broken.contains("sealed resource"),
         "codesign names the sealed resource: {broken}"
     );
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
 fn the_bundle_step_refuses_a_policy_no_producer_could_follow() {
-    let scratch = std::env::temp_dir().join(format!(
-        "aterm-release-policy-refused-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&scratch);
+    let scratch_dir = crate::test_scratch_dir("refused");
+    let scratch = scratch_dir.path();
     std::fs::create_dir_all(scratch.join("publish")).expect("scratch repo");
     std::fs::create_dir_all(scratch.join("aterm.app/Contents/Resources")).expect("scratch app");
     std::fs::write(
@@ -106,7 +98,7 @@ fn the_bundle_step_refuses_a_policy_no_producer_could_follow() {
         "schema = 1\ncary = \"repaint\"\n",
     )
     .expect("write");
-    bundle::place_handoff_policy(&scratch, &scratch.join("aterm.app"))
+    bundle::place_handoff_policy(scratch, &scratch.join("aterm.app"))
         .expect_err("a typo'd key refuses");
     assert!(
         !scratch
@@ -115,5 +107,4 @@ fn the_bundle_step_refuses_a_policy_no_producer_could_follow() {
             .exists(),
         "nothing is written into the bundle"
     );
-    let _ = std::fs::remove_dir_all(&scratch);
 }

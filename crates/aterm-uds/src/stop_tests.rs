@@ -67,8 +67,9 @@ fn an_unset_stop_sleeps_its_time_out() {
 /// thread can be caught blocked on its way to its wait (a page fault, an allocator's lock), so each
 /// place is the one a thread is seen in three reads running, and the stop's sleeper is read until
 /// it waits where the plain waiter does (a sleeper that never does fails at the hang detector's
-/// minute). And it stays in that wait: while the poller wakes eight times, the stop's sleeper wakes
-/// at most once (a spurious wakeup), which a stop that polled its condition variable would not.
+/// minute). Notifications that leave the predicate false make the sleeper recheck it. While the
+/// poller wakes eight times, no stop wait expires: spurious wakeups are allowed, timer polling is
+/// not.
 /// NEGATIVE CONTROL: the poller, which sleeps where the stop's sleeper does not.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
@@ -157,16 +158,36 @@ fn a_sleeper_waits_in_one_condvar_wait_not_between_timer_sleeps() {
         poll_sleeps, condvar_sleeps,
         "the poller sleeps in a timer's call, which this test must tell apart"
     );
+    // Notifications need not change the predicate. A correct stop rechecks it and keeps
+    // waiting, however often that happens; spurious wakeups have the same effect.
+    for _ in 0..3 {
+        let before = {
+            let _guard = stop.set.lock().unwrap();
+            let before = stop.wakes();
+            stop.rung.notify_all();
+            before
+        };
+        let until = std::time::Instant::now() + HANG;
+        while stop.wakes() <= before {
+            assert!(
+                std::time::Instant::now() < until,
+                "the stop's sleeper did not recheck its predicate"
+            );
+            crate::deadline::poll_yield();
+        }
+    }
+    assert!(!stop.is_set());
+
     let from = rounds.load(Ordering::Acquire);
     let until = std::time::Instant::now() + HANG;
     while rounds.load(Ordering::Acquire) < from + 8 {
         assert!(std::time::Instant::now() < until, "the poller never woke");
         crate::deadline::poll_yield();
     }
-    assert!(
-        stop.wakes() <= 1,
-        "the stop's sleeper woke {} times while the poller woke eight",
-        stop.wakes()
+    assert_eq!(
+        stop.expired(),
+        0,
+        "a stop wait expired while the poller woke eight times"
     );
 
     stop.set();

@@ -9378,6 +9378,77 @@ fn a_build_front_waiting_for_its_claim_reads_as_its_build_waiting_for_memory() {
     );
 }
 
+#[test]
+fn wrapped_legacy_admission_survives_polling_history_then_resumes() {
+    for registered in [false, true] {
+        let mut w = World::new();
+        let mut parent = sleeper(1000, "targo");
+        parent.syscalls_per_s = 40;
+        w.run_fg(1, 7, "targo --unverified verify land", parent);
+        let mut wrapper = world::Proc::new(1001, 1000, "sh");
+        wrapper.pgid = 1000;
+        wrapper.sid = w.p(1000).sid;
+        w.add(wrapper);
+        let mut waiter = world::Proc::new(1002, 1001, "python3");
+        waiter.pgid = 1000;
+        waiter.sid = w.p(1000).sid;
+        waiter.syscalls_per_s = 40;
+        w.add(waiter);
+        let before = run_to(&mut w, 28 * 60_000, |_, _| {});
+        let root = before.row("b7").unwrap().leader;
+        assert_eq!(
+            before.row("b7").unwrap().verdict,
+            Verdict::Stuck,
+            "the prior polling episode really escalated"
+        );
+        w.p(1002).build_admission = registered.then(Vec::new);
+        if registered {
+            let first = w.tick(TICK_MS);
+            let row = first.row("b7").unwrap();
+            assert_eq!(row.class, Class::Waiting);
+            assert_eq!(row.phi_milli, Some(0), "no old polling history survives");
+            assert_eq!(row.leader, root, "the block retains its original root");
+            assert_eq!(row.wait.as_ref().map(|w| w.leaf), Some(1002));
+        }
+        let view = run_to(&mut w, 28 * 60_000, |_, _| {});
+        let row = view.row("b7").unwrap();
+        if !registered {
+            assert_eq!(
+                row.verdict,
+                Verdict::Stuck,
+                "negative control: {}",
+                row.wire()
+            );
+            continue;
+        }
+        assert_eq!(row.class, Class::Waiting, "{}", row.wire());
+        assert_eq!(
+            row.wait.as_ref().map(|w| w.name),
+            Some(WaitName::BuildAdmission)
+        );
+        assert_eq!(row.verdict, Verdict::Fine);
+        assert_eq!(row.phi_milli, Some(0));
+        w.p(1002).build_admission = None;
+        w.p(1002).cpu_per_s = 1_000_000_000;
+        let first = w.tick(TICK_MS);
+        assert_ne!(
+            first.row("b7").unwrap().wait.as_ref().map(|w| w.name),
+            Some(WaitName::BuildAdmission),
+            "ticket removal has no debounce"
+        );
+        let resumed = run_to(&mut w, 20_000, |_, _| {});
+        let row = resumed.row("b7").unwrap();
+        assert_ne!(
+            row.wait.as_ref().map(|w| w.name),
+            Some(WaitName::BuildAdmission)
+        );
+        assert_ne!(row.verdict, Verdict::Stuck);
+        w.p(1002).cpu_per_s = 0;
+        let stalled = run_to(&mut w, 28 * 60_000, |_, _| {});
+        assert_eq!(stalled.row("b7").unwrap().verdict, Verdict::Stuck);
+    }
+}
+
 /// The front of a `targo` typed in tab 1 (pid 1000, waking 40 times a second to look at its
 /// ledger), its claim behind the one claim held by `ahead`, and tab 2's `targo build` (pid 5120)
 /// compiling, or stopped outside job control (a `kill -STOP` while it holds its terminal), read

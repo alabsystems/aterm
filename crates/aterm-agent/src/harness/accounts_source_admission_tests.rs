@@ -6,6 +6,45 @@ use crate::harness::alab_roster::{Lab, TestSourceOverride, test_machine};
 use aterm_spec::interp::State;
 
 #[test]
+fn policy_and_source_precedence_are_rechecked_after_capture() {
+    let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
+    for retire in [false, true] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path();
+        let config = home.join("aterm.toml");
+        let env = quiet_env(home, &home.join("state"), &config, 1);
+        let roster = home.join("accounts.toml");
+        let store = env.accounts_store();
+        let policy = store.source_policy().unwrap();
+        let selected = source_selection::select_observed(
+            Some(home),
+            Some(&config),
+            Some(&roster),
+            SourceScope::Init,
+            &policy,
+        )
+        .unwrap();
+        let captured = AutomaticSource::capture(&config)
+            .unwrap()
+            .with_policy(policy, false)
+            .with_selection(&env, &roster, SourceScope::Init, selected);
+        if retire {
+            let held = store.acquire().unwrap();
+            store.retire_source_held(&held, 1).unwrap();
+        } else {
+            std::fs::create_dir(home.join(".secrets")).unwrap();
+            std::fs::write(
+                home.join(".secrets")
+                    .join(crate::harness::ai_pool::AI_POOL_FILE),
+                "account=[]\n",
+            )
+            .unwrap();
+        }
+        assert!(captured.validate().is_err());
+    }
+}
+
+#[test]
 fn invalid_configuration_cannot_admit_a_fallback_source() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let config = scratch.path().join("aterm.toml");

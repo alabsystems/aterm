@@ -224,10 +224,21 @@ pub(crate) fn entropy_byte() -> u8 {
 
 /// Wait one jittered `cadence` interval while watching `signal` and wall-clock jumps.
 #[cfg(target_os = "macos")]
-pub(crate) fn wait(cadence: &Cadence, signal: &WakeSignal, seen: u64) -> (Duration, Waited) {
-    wait_with(cadence, entropy_byte(), |delay| {
-        sleep_watching_for_wake(signal, seen, delay)
-    })
+pub(crate) fn wait(
+    cadence: &Cadence,
+    signal: &WakeSignal,
+    seen: u64,
+    watch: &crate::checker_watch::CheckerWatch,
+    generation: u64,
+) -> (Duration, Waited) {
+    wait_with(
+        cadence,
+        entropy_byte(),
+        watch,
+        generation,
+        SystemTime::now(),
+        |delay| sleep_watching_for_wake(signal, seen, delay),
+    )
 }
 
 /// [`wait`] over an injected sleep. The next check is published only while the wait
@@ -235,31 +246,24 @@ pub(crate) fn wait(cadence: &Cadence, signal: &WakeSignal, seen: u64) -> (Durati
 fn wait_with(
     cadence: &Cadence,
     entropy: u8,
+    watch: &crate::checker_watch::CheckerWatch,
+    generation: u64,
+    now: SystemTime,
     sleep: impl FnOnce(Duration) -> Waited,
 ) -> (Duration, Waited) {
     let delay = cadence.delay(entropy);
-    note_next_check(SystemTime::now(), delay);
-    let waited = sleep(delay);
-    NEXT_CHECK_UNIX.store(0, std::sync::atomic::Ordering::Relaxed);
-    (delay, waited)
-}
-
-/// When this process's check loop looks next, as Unix seconds (`0`: no wait under way),
-/// set and cleared by [`wait`], read by `crate::next_check_at` for `aterm ctl update
-/// status`'s `next_check=`.
-static NEXT_CHECK_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Record that the loop's next check is `delay` after `now`.
-fn note_next_check(now: SystemTime, delay: Duration) {
     let at = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.saturating_add(delay).as_secs());
-    NEXT_CHECK_UNIX.store(at, std::sync::atomic::Ordering::Relaxed);
+    let _published = watch.publish_next_check(generation, at);
+    let waited = sleep(delay);
+    (delay, waited)
 }
 
 /// Unix timestamp of the next scheduled check, or `None` when not waiting.
+#[cfg(target_os = "macos")]
 pub(crate) fn next_check_unix() -> Option<u64> {
-    Some(NEXT_CHECK_UNIX.load(std::sync::atomic::Ordering::Relaxed)).filter(|at| *at > 0)
+    crate::checker_watch::WATCH.next_check_unix()
 }
 
 /// Log action chosen for an update-check result.
@@ -761,27 +765,79 @@ mod tests {
     /// `next_check=` is now plus the wait about to start, published only while it runs.
     #[test]
     fn the_loop_publishes_its_next_check() {
+        let watch = crate::checker_watch::CheckerWatch::new();
+        let generation = watch.register(60);
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_280_801);
-        note_next_check(at, Duration::from_secs(600));
-        assert_eq!(next_check_unix(), Some(1_790_281_401));
-
         let base = Duration::from_secs(INTERVAL_SECS);
         for waited in [Waited::Elapsed, Waited::Woke(Duration::from_secs(3600))] {
             let mut during = None;
-            let before = aterm_time::unix_secs().unwrap();
-            let (delay, outcome) = wait_with(&Cadence::new(base), 0, |delay| {
-                during = next_check_unix();
-                assert_eq!(delay, jitter(base, 0));
-                waited
-            });
+            let (delay, outcome) =
+                wait_with(&Cadence::new(base), 0, &watch, generation, at, |delay| {
+                    during = watch.next_check_unix();
+                    assert_eq!(delay, jitter(base, 0));
+                    waited
+                });
             assert_eq!(outcome, waited);
-            let during = during.expect("published while the wait runs");
-            assert!(
-                (before + delay.as_secs()..=before + delay.as_secs() + 2).contains(&during),
-                "{during} vs {before} + {delay:?}"
+            assert_eq!(
+                during,
+                Some(1_790_280_801 + delay.as_secs()),
+                "published while the wait runs"
             );
-            assert_eq!(next_check_unix(), None, "cleared once the wait is over");
+            assert_eq!(
+                watch.next_check_unix(),
+                None,
+                "cleared once the wait is over"
+            );
         }
+    }
+
+    #[test]
+    fn a_retired_wait_preserves_the_replacements_equal_deadline() {
+        let watch = crate::checker_watch::CheckerWatch::new();
+        let old = watch.register(60);
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_280_801);
+        let cadence = Cadence::new(Duration::from_secs(INTERVAL_SECS));
+        let mut replacement_mark = None;
+        let mut replacement_deadline = None;
+        let _ = wait_with(&cadence, 0, &watch, old, at, |_| {
+            let until = watch.next_check_unix().expect("old wait published");
+            let replacement = watch.supersede(old).expect("replace the old waiter");
+            assert_eq!(
+                watch.next_check_unix(),
+                None,
+                "retirement hides its deadline"
+            );
+            replacement_mark = watch.publish_next_check(replacement, until);
+            assert!(replacement_mark.is_some());
+            replacement_deadline = Some(until);
+            Waited::Elapsed
+        });
+        assert_eq!(
+            watch.next_check_unix(),
+            replacement_deadline,
+            "the old wait cannot clear the replacement, even at the same timestamp"
+        );
+        drop(replacement_mark);
+        assert_eq!(watch.next_check_unix(), None);
+    }
+
+    #[test]
+    fn a_wait_that_panics_clears_its_deadline() {
+        let watch = crate::checker_watch::CheckerWatch::new();
+        let generation = watch.register(60);
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_280_801);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_with(
+                &Cadence::new(Duration::from_secs(INTERVAL_SECS)),
+                0,
+                &watch,
+                generation,
+                at,
+                |_| panic!("injected sleep panic"),
+            )
+        }));
+        assert!(result.is_err());
+        assert_eq!(watch.next_check_unix(), None);
     }
 
     #[test]

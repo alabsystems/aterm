@@ -135,6 +135,62 @@ pub(super) fn cask_unavailable(name: &str) -> String {
     format!("Cask '{name}' is unavailable: No Cask with this name exists.")
 }
 
+/// A name qualified by a non-core tap (not `homebrew/core/` or
+/// `homebrew/cask/`); brew resolves these in their tap only.
+pub(super) fn foreign_qualified(name: &str) -> bool {
+    name.contains('/') && !name.starts_with("homebrew/core/") && !name.starts_with("homebrew/cask/")
+}
+
+/// The tap record for a foreign-qualified formula reference:
+/// two-segment shorthands name the `user/homebrew-user` tap.
+pub(super) fn foreign_formula(prefix: &Prefix, name: &str) -> Option<Formula> {
+    let parts: Vec<&str> = name.split('/').collect();
+    match parts.len() {
+        3 => super::tap::lookup(prefix, name),
+        2 => super::tap::lookup(prefix, &format!("{}/{}/{}", parts[0], parts[0], parts[1])),
+        _ => None,
+    }
+}
+
+/// Brew's factory failure for an unresolvable foreign-qualified
+/// reference (without the `Error: ` prefix).
+pub(super) fn foreign_unavailable(
+    prefix: &Prefix,
+    api: &Api,
+    name: &str,
+    cask_only: bool,
+    formula_only: bool,
+) -> String {
+    if cask_only {
+        return format!("Cask '{name}' is unavailable: Invalid cask name.");
+    }
+    let parts: Vec<&str> = name.split('/').collect();
+    if parts.len() == 3 {
+        let noun = if formula_only {
+            "formula"
+        } else {
+            "formula or cask"
+        };
+        let tap_dir = prefix
+            .taps_dir()
+            .join(parts[0])
+            .join(format!("homebrew-{}", parts[1]));
+        if tap_dir.is_dir() {
+            format!("No available {noun} with the name \"{name}\".")
+        } else {
+            format!(
+                "No available {noun} with the name \"{name}\".\n\
+                 This command requires the tap {}/{}.\n\
+                 If you trust this tap, tap it explicitly and then try again:\n  \
+                 brew tap {}/{}",
+                parts[0], parts[1], parts[0], parts[1]
+            )
+        }
+    } else {
+        formula_unavailable(api, parts.last().copied().unwrap_or(name))
+    }
+}
+
 fn no_such_keg(prefix: &Prefix, short: &str) -> String {
     format!("No such keg: {}", prefix.cellar().join(short).display())
 }
@@ -4406,6 +4462,34 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
         return info_analytics(prefix, api, args, rest);
     }
     let names = operands(rest);
+    // Foreign-qualified names resolve in their tap only; the
+    // JSON / sizes / github shapes share the factory failure.
+    if rest.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--json" | "--json=v1" | "--json=v2" | "--sizes" | "--github"
+        )
+    }) {
+        for name in &names {
+            if foreign_qualified(name) {
+                if foreign_formula(prefix, name).is_some() {
+                    return not_native(prefix, args, "info (tap-qualified name)");
+                }
+                return failed(&format!(
+                    "Error: {}",
+                    foreign_unavailable(
+                        prefix,
+                        api,
+                        name,
+                        has_flag(rest, "--cask", ""),
+                        rest.iter()
+                            .any(|a| matches!(a.as_str(), "--json" | "--json=v1"))
+                            || has_flag(rest, "--formula", ""),
+                    )
+                ));
+            }
+        }
+    }
     if has_flag(rest, "--sizes", "") {
         return info_sizes(prefix, api, rest, &names);
     }
@@ -4449,6 +4533,35 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
     for (idx, name) in names.iter().enumerate() {
         if idx > 0 {
             println!();
+        }
+        if foreign_qualified(name) {
+            let cask_only = has_flag(rest, "--cask", "");
+            match foreign_formula(prefix, name) {
+                Some(f) if !cask_only => {
+                    if quiet {
+                        for line in formula_quiet_lines(prefix, &f) {
+                            println!("{line}");
+                        }
+                    } else {
+                        print_formula_info(prefix, api, &f, verbose);
+                    }
+                    printed = true;
+                }
+                _ => {
+                    super::tty::onoe!(
+                        "Error: {}",
+                        foreign_unavailable(
+                            prefix,
+                            api,
+                            name,
+                            cask_only,
+                            has_flag(rest, "--formula", "")
+                        )
+                    );
+                    failures += 1;
+                }
+            }
+            continue;
         }
         if has_flag(rest, "--cask", "") {
             match api.cask(name) {
@@ -4497,7 +4610,7 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                         failures += 1;
                         continue;
                     }
-                    if name.contains('/') {
+                    if name.contains('/') && !name.starts_with("homebrew/cask/") {
                         if !printed {
                             return not_native(prefix, args, "info (unresolved name)");
                         }
@@ -4505,7 +4618,7 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                         failures += 1;
                         continue;
                     }
-                    match api.cask(name) {
+                    match api.cask(Formula::short_name(name)) {
                         Ok(c) => {
                             if quiet {
                                 for line in cask_quiet_lines(prefix, &c) {
@@ -4924,8 +5037,28 @@ pub(super) fn cmd_desc(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
     let mut lines: Vec<(String, String)> = Vec::new();
     for name in operands(rest) {
         let short = Formula::short_name(&name);
+        // Tap-qualified references resolve in their tap; the
+        // two-segment shorthand (homebrew/jq) names a tap, and a
+        // miss is reported by leaf name.
+        let foreign = name.contains('/')
+            && !name.starts_with("homebrew/core/")
+            && !name.starts_with("homebrew/cask/");
+        let leaf = name
+            .split('/')
+            .rfind(|part| !part.is_empty())
+            .unwrap_or(&name);
+        let err_name: &str = if foreign && name.matches('/').count() == 1 {
+            leaf
+        } else {
+            &name
+        };
         if !want_cask {
-            if let Ok(f) = api.formula(&name) {
+            let hit = if foreign {
+                super::tap::lookup(prefix, &name)
+            } else {
+                api.formula(&name).ok()
+            };
+            if let Some(f) = hit {
                 let shown = super::tty::pretty_install_status(
                     &f.name,
                     prefix.installed_one(Kind::Formula, &f.name).is_some(),
@@ -4941,11 +5074,12 @@ pub(super) fn cmd_desc(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
                 continue;
             }
             if want_formula {
-                return failed(&format!("Error: {}", formula_unavailable(api, &name)));
+                return failed(&format!("Error: {}", formula_unavailable(api, err_name)));
             }
         }
         if !want_formula {
-            if let Ok(c) = api.cask(short) {
+            let cask_hit = if foreign { None } else { api.cask(short).ok() };
+            if let Some(c) = cask_hit {
                 let shown = super::tty::pretty_install_status(
                     &c.token,
                     prefix.installed_one(Kind::Cask, &c.token).is_some(),
@@ -4971,7 +5105,7 @@ pub(super) fn cmd_desc(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
                 return failed(&format!("Error: {}", cask_unavailable(short)));
             }
         }
-        return failed(&format!("Error: {}", formula_unavailable(api, &name)));
+        return failed(&format!("Error: {}", formula_unavailable(api, err_name)));
     }
     lines.sort_by(|a, b| a.0.cmp(&b.0));
     lines.dedup_by(|a, b| a.0 == b.0);
@@ -5149,7 +5283,7 @@ pub(super) fn cmd_docs() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-pub(super) fn cmd_home(api: &Api, rest: &[String]) -> ExitCode {
+pub(super) fn cmd_home(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     // Admission delegates the --formula/--cask conflict, as for
     // every other command; both cannot reach here together.
     let want_formula = has_flag(rest, "--formula", "") || has_flag(rest, "--formulae", "");
@@ -5162,6 +5296,21 @@ pub(super) fn cmd_home(api: &Api, rest: &[String]) -> ExitCode {
     let mut urls = Vec::new();
     for name in &names {
         let short = Formula::short_name(name);
+        if foreign_qualified(name) {
+            match foreign_formula(prefix, name) {
+                Some(f) if !want_cask => {
+                    println!("Opening homepage for Formula {}", f.name);
+                    urls.push(f.homepage);
+                    continue;
+                }
+                _ => {
+                    return failed(&format!(
+                        "Error: {}",
+                        foreign_unavailable(prefix, api, name, want_cask, want_formula)
+                    ));
+                }
+            }
+        }
         let resolved = if want_cask {
             api.cask(short)
                 .map(|c| (format!("Cask {}", c.token), c.homepage))
@@ -5948,10 +6097,10 @@ fn brew_shellenv(root: &str, shell: &str) -> String {
             .replace('`', "\\`")
     };
     let root = dq(root);
-    let base = shell.rsplit('/').next().unwrap_or(shell);
-    let base = base.strip_prefix('-').unwrap_or(base);
-    match base {
-        "fish" => format!(
+    // brew.sh matches the raw shell name (no basename): an
+    // explicit `/bin/zsh` is not zsh, `-zsh` is.
+    match shell {
+        "fish" | "-fish" => format!(
             "set --global --export HOMEBREW_PREFIX \"{root}\";\n\
              set --global --export HOMEBREW_CELLAR \"{root}/Cellar\";\n\
              set --global --export HOMEBREW_REPOSITORY \"{root}\";\n\
@@ -5961,7 +6110,7 @@ fn brew_shellenv(root: &str, shell: &str) -> String {
              if not set --query INFOPATH; set INFOPATH ''; end; \
              set --global --export INFOPATH \"{root}/share/info\" $INFOPATH;\n"
         ),
-        "csh" | "tcsh" => format!(
+        "csh" | "-csh" | "tcsh" | "-tcsh" => format!(
             "setenv HOMEBREW_PREFIX {root};\n\
              setenv HOMEBREW_CELLAR {root}/Cellar;\n\
              setenv HOMEBREW_REPOSITORY {root};\n\
@@ -5971,7 +6120,7 @@ fn brew_shellenv(root: &str, shell: &str) -> String {
              test ${{?INFOPATH}} -eq 1 || setenv INFOPATH '';\n\
              setenv INFOPATH \"{root}/share/info:${{INFOPATH}}\";\n"
         ),
-        "pwsh" => {
+        "pwsh" | "-pwsh" | "pwsh-preview" | "-pwsh-preview" => {
             let root = root.replace('\'', "''");
             format!(
                 "[System.Environment]::SetEnvironmentVariable('HOMEBREW_PREFIX','{root}',[System.EnvironmentVariableTarget]::Process)\n\
@@ -5986,9 +6135,16 @@ fn brew_shellenv(root: &str, shell: &str) -> String {
             let mut out = format!(
                 "export HOMEBREW_PREFIX=\"{root}\";\n\
                  export HOMEBREW_CELLAR=\"{root}/Cellar\";\n\
-                 export HOMEBREW_REPOSITORY=\"{root}\";\n\
-                 export PATH=\"{root}/bin:{root}/sbin${{PATH+:$PATH}}\";\n"
+                 export HOMEBREW_REPOSITORY=\"{root}\";\n"
             );
+            if matches!(shell, "zsh" | "-zsh") {
+                out.push_str(&format!(
+                    "fpath[1,0]=\"{root}/share/zsh/site-functions\";\nexport FPATH;\n"
+                ));
+            }
+            out.push_str(&format!(
+                "export PATH=\"{root}/bin:{root}/sbin${{PATH+:$PATH}}\";\n"
+            ));
             out.push_str(
                 "[ -z \"${MANPATH-}\" ] || { export MANPATH=\"${MANPATH%\"${MANPATH##*[!:]}\"}\"; \
                  export MANPATH=\":${MANPATH#\"${MANPATH%%[!:]*}\"}\"; };\n",
@@ -9994,6 +10150,30 @@ const fn outdated_failed(any: bool, named: bool) -> bool {
 }
 
 pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+    for op in operands_without_flag_values(rest, &["--minimum-version", "--min-version"]) {
+        if foreign_qualified(&op) {
+            let cask_only = has_flag(rest, "--cask", "") && !has_flag(rest, "--formula", "");
+            if foreign_formula(prefix, &op).is_some() && !cask_only {
+                return not_native(prefix, rest, "outdated (tap-qualified name)");
+            }
+            return failed(&format!(
+                "Error: {}",
+                if cask_only {
+                    // Outdated's cask resolution shorts the name
+                    // before the factory ever sees it.
+                    cask_unavailable(Formula::short_name(&op))
+                } else {
+                    foreign_unavailable(
+                        prefix,
+                        api,
+                        &op,
+                        false,
+                        has_flag(rest, "--formula", "") && !has_flag(rest, "--cask", ""),
+                    )
+                }
+            ));
+        }
+    }
     let scope: Vec<String> =
         operands_without_flag_values(rest, &["--minimum-version", "--min-version"])
             .iter()
@@ -12233,10 +12413,13 @@ fn prune_prefix_links(prefix: &Prefix, dry: bool, out: &mut Vec<String>) {
     let mut links = 0usize;
     let mut dirs_removed = 0usize;
     let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+    // Paths already (would-be) removed, so dry-run emptiness
+    // propagates to parent directories like brew's counts.
+    let mut gone: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     for anchor in ANCHORS {
         let root = prefix.root.join(anchor);
         if root.is_dir() {
-            walk_prune_links(&root, dry, &mut links, &mut subdirs, out);
+            walk_prune_links(&root, dry, &mut links, &mut subdirs, &mut gone, out);
         }
     }
     let caskroom = prefix.caskroom();
@@ -12254,12 +12437,14 @@ fn prune_prefix_links(prefix: &Prefix, dry: bool, out: &mut Vec<String>) {
     }
     subdirs.sort();
     for dir in subdirs.iter().rev() {
-        let empty = std::fs::read_dir(dir).is_ok_and(|mut it| it.next().is_none());
+        let empty = std::fs::read_dir(dir)
+            .is_ok_and(|entries| entries.flatten().all(|e| gone.contains(&e.path())));
         if !empty {
             continue;
         }
         if dry {
             out.push(format!("Would remove (empty directory): {}", dir.display()));
+            gone.insert(dir.clone());
         } else if std::fs::remove_dir(dir).is_ok() {
             dirs_removed += 1;
         }
@@ -12284,6 +12469,7 @@ fn walk_prune_links(
     dry: bool,
     links: &mut usize,
     subdirs: &mut Vec<std::path::PathBuf>,
+    gone: &mut std::collections::HashSet<std::path::PathBuf>,
     out: &mut Vec<String>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -12296,13 +12482,14 @@ fn walk_prune_links(
             if !path.exists() {
                 if dry {
                     out.push(format!("Would remove (broken link): {}", path.display()));
+                    gone.insert(path.clone());
                 } else if std::fs::remove_file(&path).is_ok() {
                     *links += 1;
                 }
             }
         } else if ft.is_dir() {
             subdirs.push(path.clone());
-            walk_prune_links(&path, dry, links, subdirs, out);
+            walk_prune_links(&path, dry, links, subdirs, gone, out);
         }
     }
 }
@@ -13018,6 +13205,17 @@ pub(super) fn cmd_which_formula(prefix: &Prefix, api: &Api, rest: &[String]) -> 
 }
 
 pub(super) fn cmd_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+    // `--prune-prefix` runs only the broken-link/empty-dir
+    // pass and returns (brew ignores any named arguments).
+    if has_flag(rest, "--prune-prefix", "") {
+        let dry = has_flag(rest, "--dry-run", "-n");
+        let mut out: Vec<String> = Vec::new();
+        prune_prefix_links(prefix, dry, &mut out);
+        for line in out {
+            println!("{line}");
+        }
+        return ExitCode::SUCCESS;
+    }
     // cleanup_max_age validates --prune and collapses scrub
     // into its result; the download mode is then derived
     // brew's way: an explicit --prune sets the age (and
@@ -14296,6 +14494,29 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
     }
     let mut jobs = Vec::new();
     for name in &names {
+        if foreign_qualified(name) {
+            let cask_only = has_flag(rest, "--cask", "");
+            match foreign_formula(prefix, name) {
+                Some(f) if !cask_only => {
+                    if has_flag(rest, "--deps", "") {
+                        return not_native(prefix, args, "fetch --deps (tap-qualified name)");
+                    }
+                    jobs.push(FetchJob::Formula(f, Vec::new()));
+                    continue;
+                }
+                _ => {
+                    return failed(&format!(
+                        "Error: {}",
+                        if cask_only {
+                            // Fetch's cask loading shorts first.
+                            cask_unavailable(Formula::short_name(name))
+                        } else {
+                            foreign_unavailable(prefix, api, name, false, false)
+                        }
+                    ));
+                }
+            }
+        }
         // Without a kind flag brew resolves a core formula
         // first and falls back to the cask token.
         let mut formula_error = None;
@@ -14637,6 +14858,9 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
         })
     };
     let formula_row = |name: &str| -> Option<super::api::DepRow> {
+        if foreign_qualified(name) {
+            return foreign_formula(prefix, name).map(|f| dep_row_of_formula_sourced(&f, true));
+        }
         api.formula_on(name, machine)
             .ok()
             .map(|f| dep_row_of_formula(&f))
@@ -14696,6 +14920,8 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
                         "Error: {}",
                         if only_cask {
                             cask_unavailable(Formula::short_name(name))
+                        } else if foreign_qualified(name) {
+                            foreign_unavailable(prefix, api, name, false, only_formula)
                         } else {
                             formula_unavailable(api, name)
                         }
@@ -15512,7 +15738,17 @@ pub(super) fn cmd_uses(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
     // Brew warns (and continues with a placeholder) for a name no
     // formula answers to; dependents of such a name are then an error.
     let mut unknown = false;
-    for t in &targets {
+    for (name, t) in names.iter().zip(&targets) {
+        if foreign_qualified(name) {
+            if foreign_formula(prefix, name).is_none() {
+                super::tty::opoo!(
+                    "Warning: {}",
+                    foreign_unavailable(prefix, api, name, false, true)
+                );
+                unknown = true;
+            }
+            continue;
+        }
         if !installed_f.contains(t) && api.formula(t).is_err() {
             super::tty::opoo!("Warning: {}", formula_unavailable(api, t));
             unknown = true;
@@ -15801,7 +16037,13 @@ pub(super) fn cmd_zap(prefix: &Prefix, api: &Api, args: &[String], rest: &[Strin
 pub(super) fn cmd_missing(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     let scope: Vec<String> = operands_without_flag_values(rest, &["--hide"])
         .iter()
-        .map(|n| Formula::short_name(n).to_string())
+        .map(|n| {
+            if foreign_qualified(n) {
+                n.clone()
+            } else {
+                Formula::short_name(n).to_string()
+            }
+        })
         .collect();
     // Brew's comma-array `--hide`: `=` and space forms, repeated.
     let mut hidden: Vec<String> = Vec::new();
@@ -15848,6 +16090,29 @@ pub(super) fn cmd_missing(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
         }
     } else {
         for name in &scope {
+            if foreign_qualified(name) {
+                match foreign_formula(prefix, name) {
+                    Some(f) if !has_flag(rest, "--cask", "") => {
+                        let dir = prefix
+                            .installed_one(Kind::Formula, &f.name)
+                            .map(|i| prefix.keg(&i.name, &i.version));
+                        formulae.push((f.name.clone(), dir));
+                        continue;
+                    }
+                    _ => {
+                        return failed(&format!(
+                            "Error: {}",
+                            foreign_unavailable(
+                                prefix,
+                                api,
+                                name,
+                                has_flag(rest, "--cask", ""),
+                                false
+                            )
+                        ));
+                    }
+                }
+            }
             if !has_flag(rest, "--cask", "")
                 && let Ok(f) = api.formula(name).or_else(|_| {
                     tap::lookup(prefix, name).ok_or_else(|| format!("abrew: no formula {name}"))
@@ -17176,6 +17441,83 @@ fn tap_formula_names(tap: &tap::Tap) -> Vec<String> {
 
 fn tap_cask_tokens(tap: &tap::Tap) -> Vec<String> {
     rb_stems(&tap.path.join("Casks"))
+}
+
+/// Brew `Commands.external_commands`: executable files in tap
+/// `cmd/` directories, extension and `brew-` prefix stripped,
+/// filtered to trusted taps/commands, sorted.
+pub(super) fn external_commands(prefix: &Prefix) -> Vec<String> {
+    // Brew globs `Library/Taps/*/*/cmd` directly (no git or
+    // custody requirements); this is a read-only listing and
+    // abrew never executes external commands.
+    let mut names: Vec<String> = Vec::new();
+    let Ok(users) = std::fs::read_dir(prefix.taps_dir()) else {
+        return names;
+    };
+    let mut cmd_dirs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for user in users.flatten() {
+        let Ok(repos) = std::fs::read_dir(user.path()) else {
+            continue;
+        };
+        for repo in repos.flatten() {
+            let repo_name = repo.file_name().to_string_lossy().into_owned();
+            let tap_name = format!(
+                "{}/{}",
+                user.file_name().to_string_lossy(),
+                repo_name.strip_prefix("homebrew-").unwrap_or(&repo_name)
+            );
+            cmd_dirs.push((tap_name, repo.path().join("cmd")));
+        }
+    }
+    for (tap_name, cmd_dir) in cmd_dirs {
+        let Ok(entries) = std::fs::read_dir(&cmd_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_file = entry
+                .file_type()
+                .map(|ft| ft.is_file() || (ft.is_symlink() && path.is_file()))
+                .unwrap_or(false);
+            if !is_file || !is_executable(&path) {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(stem) = std::path::Path::new(&file_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+            else {
+                continue;
+            };
+            let name = stem
+                .strip_prefix("brew-")
+                .unwrap_or(stem)
+                .trim()
+                .to_string();
+            if super::trust::trusted(
+                prefix,
+                super::trust::TrustType::Command,
+                &format!("{tap_name}/{name}"),
+            ) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+#[cfg(unix)]
+pub(super) fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+pub(super) fn is_executable(_path: &std::path::Path) -> bool {
+    true
 }
 
 fn tap_command_names(tap: &tap::Tap) -> Vec<String> {
@@ -18705,6 +19047,88 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn foreign_qualified_resolution_and_errors() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let api = Api::read_only(p.clone());
+        assert!(foreign_qualified("foo/bar"));
+        assert!(foreign_qualified("a/b/c"));
+        assert!(!foreign_qualified("homebrew/core/jq"));
+        assert!(!foreign_qualified("jq"));
+        // Untapped three-segment: tap-trust error.
+        let text = foreign_unavailable(&p, &api, "a/b/c", false, false);
+        assert!(
+            text.starts_with("No available formula or cask with the name \"a/b/c\".\nThis command requires the tap a/b."),
+            "{text}"
+        );
+        let text = foreign_unavailable(&p, &api, "a/b/c", false, true);
+        assert!(
+            text.starts_with("No available formula with the name \"a/b/c\"."),
+            "{text}"
+        );
+        assert_eq!(
+            foreign_unavailable(&p, &api, "foo/bar", true, false),
+            "Cask 'foo/bar' is unavailable: Invalid cask name."
+        );
+        // Tapped three-segment: plain unavailable, no trust block.
+        let tap_dir = p.taps_dir().join("a/homebrew-b");
+        std::fs::create_dir_all(tap_dir.join("Formula")).unwrap();
+        std::fs::create_dir_all(tap_dir.join(".git")).unwrap();
+        let text = foreign_unavailable(&p, &api, "a/b/c", false, false);
+        assert_eq!(
+            text,
+            "No available formula or cask with the name \"a/b/c\"."
+        );
+        // Resolvable once the tap formula file exists.
+        std::fs::write(
+            tap_dir.join("Formula/c.rb"),
+            "class C < Formula\n  desc \"cee\"\n  homepage \"https://example.com\"\n  url \"https://example.com/c-1.0.tar.gz\"\n  sha256 \"00\"\nend\n",
+        )
+        .unwrap();
+        assert!(foreign_formula(&p, "a/b/c").is_some());
+        assert!(foreign_formula(&p, "a/c").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_commands_glob_tap_cmd_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&temp.path().join("prefix"));
+        let make = |tap: &str, file: &str, mode: u32| {
+            let dir = prefix.taps_dir().join(tap).join("cmd");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(file);
+            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        make("homebrew/homebrew-core", "aspell-dictionaries.rb", 0o755);
+        make("homebrew/homebrew-core", "brew-xtra", 0o755);
+        make("homebrew/homebrew-core", "not-exec.rb", 0o644);
+        make("someone/homebrew-thing", "sneaky.rb", 0o755);
+        assert_eq!(
+            external_commands(&prefix),
+            vec!["aspell-dictionaries".to_string(), "xtra".to_string()]
+        );
+    }
+
+    #[test]
+    fn brew_shellenv_zsh_carries_fpath_block() {
+        let zsh = brew_shellenv("/opt/homebrew", "zsh");
+        assert!(zsh.contains(
+            "export HOMEBREW_REPOSITORY=\"/opt/homebrew\";\n\
+             fpath[1,0]=\"/opt/homebrew/share/zsh/site-functions\";\n\
+             export FPATH;\n\
+             export PATH="
+        ));
+        assert!(brew_shellenv("/opt/homebrew", "-zsh").contains("fpath[1,0]="));
+        assert!(!brew_shellenv("/opt/homebrew", "/bin/zsh").contains("fpath"));
+        assert!(brew_shellenv("/opt/homebrew", "-fish").starts_with("set --global"));
+        assert!(!brew_shellenv("/opt/homebrew", "bash").contains("fpath"));
+    }
 
     #[test]
     fn unpack_destdir_expands_like_ruby_expand_path() {
@@ -20435,6 +20859,43 @@ mod tests {
             "It was migrated from me/mine to homebrew/cask/newthing.\n\
              You can access it again by running:\n  brew tap homebrew/cask\n\
              And then you can install it by running:\n  brew install --cask newthing\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_dry_run_propagates_emptiness() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let nested = p.root.join("share/empty/nested");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        let onlylink = p.root.join("share/onlylink");
+        std::fs::create_dir_all(&onlylink).expect("mkdir");
+        std::os::unix::fs::symlink("/nonexistent/abrew-r319", onlylink.join("dead"))
+            .expect("symlink");
+        let mut lines: Vec<String> = Vec::new();
+        prune_prefix_links(&p, true, &mut lines);
+        let text = lines.join("\n");
+        assert!(text.contains("Would remove (broken link):"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "Would remove (empty directory): {}",
+                onlylink.display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "Would remove (empty directory): {}",
+                p.root.join("share/empty").display()
+            )),
+            "{text}"
+        );
+        // Dry run removed nothing.
+        assert!(
+            nested.is_dir()
+                && std::fs::symlink_metadata(onlylink.join("dead")).is_ok_and(|m| m.is_symlink())
         );
     }
 

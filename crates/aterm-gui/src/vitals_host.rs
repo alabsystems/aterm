@@ -4902,32 +4902,34 @@ impl crate::App {
             ..crate::disk_where::Ask::default()
         };
         for ws in self.windows.values() {
-            for view in ws.tab_set.tabs().iter().flat_map(|tab| tab.root.leaves()) {
-                let Some(crate::tab_model::View::Terminal(view)) =
-                    self.view_store.get(view).copied()
-                else {
-                    continue;
-                };
-                let Some(s) = self.pool.get(view.session) else {
-                    continue;
-                };
-                if let Ok(pid) = u32::try_from(s.pid)
-                    && pid > 0
-                {
-                    ask.shells.push(pid);
-                }
-                let tl = s
-                    .ctx
-                    .timeline
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let agent = tl.agent();
-                if agent.reader.is_some()
-                    && let Ok(leader) = u32::try_from(agent.program_pgid)
-                    && leader > 0
-                {
-                    ask.agents.push(leader);
-                }
+            for tab in ws.tab_set.tabs() {
+                tab.root.visit(&mut |&view| {
+                    let Some(crate::tab_model::View::Terminal(view)) =
+                        self.view_store.get(view).copied()
+                    else {
+                        return;
+                    };
+                    let Some(s) = self.pool.get(view.session) else {
+                        return;
+                    };
+                    if let Ok(pid) = u32::try_from(s.pid)
+                        && pid > 0
+                    {
+                        ask.shells.push(pid);
+                    }
+                    let tl = s
+                        .ctx
+                        .timeline
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let agent = tl.agent();
+                    if agent.reader.is_some()
+                        && let Ok(leader) = u32::try_from(agent.program_pgid)
+                        && leader > 0
+                    {
+                        ask.agents.push(leader);
+                    }
+                });
             }
         }
         crate::disk_where::start(
@@ -5256,20 +5258,30 @@ impl crate::App {
     /// The terminal sessions of `tab`, its focused pane first, then the rest
     /// in layout order: the panes the vitals request sends as one tab.
     fn tab_sessions(&self, tab: &crate::tab_model::Tab) -> Vec<u64> {
-        std::iter::once(tab.focus)
-            .chain(tab.root.leaves().into_iter().filter(|v| *v != tab.focus))
-            .filter_map(|view| self.terminal_session(view))
-            .collect()
+        let mut sessions = Vec::with_capacity(tab.root.len());
+        if let Some(focused) = self.terminal_session(tab.focus) {
+            sessions.push(focused);
+        }
+        tab.root.visit(&mut |&view| {
+            if view != tab.focus
+                && let Some(session) = self.terminal_session(view)
+            {
+                sessions.push(session);
+            }
+        });
+        sessions
     }
 
     /// The terminal sessions of `tab` in layout order, whichever has the focus:
     /// the disk walker's panes, numbered `pane=` in that order by `sys disk`.
     pub(crate) fn tab_layout_sessions(&self, tab: &crate::tab_model::Tab) -> Vec<u64> {
-        tab.root
-            .leaves()
-            .into_iter()
-            .filter_map(|view| self.terminal_session(view))
-            .collect()
+        let mut sessions = Vec::with_capacity(tab.root.len());
+        tab.root.visit(&mut |&view| {
+            if let Some(session) = self.terminal_session(view) {
+                sessions.push(session);
+            }
+        });
+        sessions
     }
 
     fn terminal_session(&self, view: crate::tab_model::ViewId) -> Option<u64> {

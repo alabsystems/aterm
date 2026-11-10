@@ -36,6 +36,7 @@ impl Fixture {
         static BUILT: crate::template::Template<()> = crate::template::Template::new();
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("aterm-ledger-race-{name}-"))
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let root = dir.path();

@@ -3,9 +3,9 @@
 
 //! One interrupt in a timed stage's wait for the quiet machine ends the whole run as COULD NOT
 //! RUN (`docs/DESIGN-adaptive-build-2026-10-24.md`, WAIT-INTERRUPT): a stand-in run in a process
-//! of its own (`lint` and `appkit`: a tippy stage beside two timed stages in one lane), its
+//! of its own (`libc` and `appkit`: a compiler stage beside two timed stages in one lane), its
 //! stages stand-ins and its quiet claim in a scratch ledger behind this test's, is signalled
-//! once while its first timed stage waits and its tippy stage's child runs.
+//! once while its first timed stage waits and its compiler stage's child runs.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -111,12 +111,12 @@ fn admit_in_scratch(need: Need, mode: Admit) -> Result<Claim, Error> {
     )
 }
 
-/// The stand-in run's stages: tippy runs [`standin_stage_child`] as a stage child, which naps
+/// The stand-in run's stages: libc runs [`standin_stage_child`] as a stage child, which naps
 /// until the run's end ends it; a timed stage notes in `ran` that it ran.
 fn stage(ctx: &Ctx, spec: &StageSpec) -> Report {
     let dir = PathBuf::from(std::env::var_os(STANDIN).expect("the stand-in's directory"));
     let mut r = Report::new(spec.title.clone());
-    if spec.id == StageId::Tippy {
+    if spec.id == StageId::LibcOracle {
         let mut cmd = Cmd::new(std::env::current_exe().expect("test binary"));
         cmd.args = [
             "--exact",
@@ -148,7 +148,7 @@ fn standin_stage_child() {
 }
 
 /// Run by [`one_interrupt_in_a_timed_stages_wait_ends_the_run`] in a process of its own: a
-/// verify run of `lint` and `appkit` under `--admit wait`, its interrupt handling verify's own,
+/// verify run of `libc` and `appkit` under `--admit wait`, its interrupt handling verify's own,
 /// that exits as verify does.
 #[test]
 fn standin_run_waits_for_the_quiet_machine() {
@@ -164,7 +164,7 @@ fn standin_run_waits_for_the_quiet_machine() {
         EnvSnapshot::default(),
         scratch,
     )
-    .with_checks(&[Check::Lint, Check::Appkit])
+    .with_checks(&[Check::Libc, Check::Appkit])
     .with_quiet(Some(Admit::Wait));
     let mut out = std::io::stdout();
     let code = crate::run_with(
@@ -197,7 +197,7 @@ impl Drop for Standin {
 }
 
 /// One SIGTERM, or one SIGINT, sent while the run's first timed stage waits for the quiet
-/// machine and its tippy stage's child runs, ends the run well inside the one-minute hang
+/// machine and its compiler stage's child runs, ends the run well inside the one-minute hang
 /// detector (the time is reported): exit 3, COULD NOT RUN, and no FAIL: the stage child the
 /// run's end killed decided nothing, and the second timed stage neither ran nor began a wait of
 /// its own (one admission was asked for). Only this test's claim is left in the ledger, and the
@@ -237,7 +237,7 @@ fn one_interrupt_in_a_timed_stages_wait_ends_the_run() {
         );
         let stage_child: i32 = until_within(
             MUST_HAPPEN,
-            "the run's quiet wait, its tippy stage's child running",
+            "the run's quiet wait, its compiler stage's child running",
             || {
                 std::fs::metadata(dir.path().join("waiting")).ok()?;
                 std::fs::read_to_string(dir.path().join("child"))

@@ -34,6 +34,39 @@ fn each_lane_keeps_its_floors_where_its_shell_lane_did() {
 }
 
 #[test]
+fn ready_notification_handoff_waits_for_the_stager_and_rejects_malformed_state() {
+    let tmp = scratch("ready-handoff");
+    let state = LaneState::of(LaneKind::Linux, tmp.path());
+    state.ensure().unwrap();
+    let Lock::Held(guard) = state.try_lock().unwrap() else {
+        panic!("own lock")
+    };
+    state.notify_ready().unwrap();
+    let waiter = state.clone();
+    let thread = std::thread::spawn(move || {
+        let Lock::Held(_guard) = waiter.queued_lock().unwrap() else {
+            panic!("staging handoff")
+        };
+        assert!(waiter.ready_pending().unwrap());
+        waiter.clear_ready().unwrap();
+    });
+    assert!(matches!(state.try_lock().unwrap(), Lock::Busy));
+    drop(guard);
+    thread.join().unwrap();
+    assert!(!state.ready_pending().unwrap());
+    state.notify_ready().unwrap();
+    std::fs::write(state.ready_dir().join("pending"), b"not a queue\n").unwrap();
+    assert!(state.ready_pending().is_err());
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(state.ready_dir().join("pending")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("absent"), state.ready_dir().join("pending"))
+            .unwrap();
+        assert!(state.ready_pending().is_err());
+    }
+}
+
+#[test]
 fn a_floor_that_cannot_be_read_is_never_read_as_zero() {
     let tmp = scratch("state-floor");
     let s = LaneState::of(LaneKind::Alab, tmp.path());

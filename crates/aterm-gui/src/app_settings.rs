@@ -561,7 +561,7 @@ impl App {
                 && window
                     .tab_set
                     .active()
-                    .is_some_and(|tab| tab.root.leaves().contains(&view))
+                    .is_some_and(|tab| tab.root.contains(view))
         })
     }
 
@@ -1360,18 +1360,15 @@ impl App {
             (usize::from(ws.rows), usize::from(ws.cols))
         };
         let panes = &reads.panes;
-        let (snap, selection) = match &reads.front {
-            Some(document) => (document.snap.clone(), document.selection),
-            None => (
-                crate::accessibility::AccessibleSnapshot {
-                    text: String::new(),
-                    rows: if panes.is_empty() { 0 } else { rows },
-                    cols,
-                    cursor: None,
-                },
-                None,
-            ),
+        let empty = crate::accessibility::AccessibleSnapshot {
+            text: String::new(),
+            rows: if panes.is_empty() { 0 } else { rows },
+            cols,
+            cursor: None,
         };
+        let (snap, selection) = reads.front.as_ref().map_or((&empty, None), |document| {
+            (&document.snap, document.selection)
+        });
         let geometry = self.grid_a11y_geometry(wid);
         let tabs = self.grid_a11y_tabs(wid);
         let messages = self.grid_a11y_messages(wid);
@@ -1383,7 +1380,7 @@ impl App {
             .map(|ws| ws.current_title.as_str())
             .unwrap_or_default();
         Some(crate::a11y_tree::grid_tree(
-            &snap,
+            snap,
             geometry,
             &crate::a11y_tree::GridFrame {
                 tabs: &tabs,

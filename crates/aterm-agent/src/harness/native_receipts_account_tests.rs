@@ -467,6 +467,31 @@ fn fences_exclude_every_writer_but_leave_a_different_candidate_available() {
 }
 
 #[test]
+fn the_closure_reader_reads_account_claims_and_fences_as_other_records() {
+    let w = World::closed(ImagePhase::Rollback);
+    assert_eq!(
+        observe_closure_at(&w.paths, &w.parent).unwrap(),
+        Closure::Exact(Recorded::NoExec)
+    );
+    let claimed = w.candidate(2);
+    account::claim_at(
+        &w.paths,
+        w.relation(&claimed),
+        &candidate_binding(&claimed),
+        LIMITS,
+    )
+    .unwrap();
+    let fenced = w.candidate(3);
+    account::fence_at(&w.paths, w.relation(&fenced), LIMITS).unwrap();
+    for candidate in [&claimed, &fenced] {
+        assert_eq!(
+            observe_closure_at(&w.paths, candidate).unwrap(),
+            Closure::Other
+        );
+    }
+}
+
+#[test]
 fn an_already_claimed_parent_can_fence_a_rival_without_releasing_its_claim() {
     let w = World::closed(ImagePhase::Forward);
     let first = w.candidate(2);

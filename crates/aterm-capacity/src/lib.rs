@@ -81,6 +81,7 @@ use std::time::Duration;
 
 pub mod admit;
 pub mod book;
+pub mod build_slot_wait;
 pub mod cache_work;
 #[cfg(unix)]
 pub mod canonical_ingress;

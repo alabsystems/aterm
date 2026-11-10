@@ -79,6 +79,49 @@ pub fn hang_up(stream: &(impl Halves + ?Sized)) -> bool {
 /// parked reads, so there this is the plain read.
 pub struct Awake<'a>(pub &'a CtlStream);
 
+/// Read under an absolute deadline, including queued bytes after the peer closes.
+/// The caller exclusively owns this stream's I/O for the call: Unix descriptor
+/// flags are shared with duplicates and temporarily made nonblocking.
+///
+/// # Errors
+/// The deadline expires, descriptor flags or readiness fail, or the read fails.
+pub fn read_until(
+    stream: &CtlStream,
+    bytes: &mut [u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<usize> {
+    use std::io::{self, Read as _};
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd as _;
+        crate::ready::with_nonblocking(stream.as_fd(), || {
+            loop {
+                crate::ready::until(stream.as_fd(), crate::ready::Interest::Read, deadline)?;
+                match (&*stream).read(bytes) {
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                        ) => {}
+                    result => return result,
+                }
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let left = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or(io::ErrorKind::TimedOut)?;
+        stream.set_read_timeout(Some(left))?;
+        (&*stream).read(bytes)
+    }
+}
+
 impl std::io::Read for Awake<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         #[cfg(unix)]
@@ -206,6 +249,25 @@ fn fd_peek(fd: std::os::fd::RawFd) -> Result<usize, std::io::ErrorKind> {
 mod tests {
     use super::{Awake, PeerState, hang_up, peer_closed, peer_state};
     use std::io::{ErrorKind, Read, Write};
+
+    #[test]
+    fn deadline_reads_drain_a_closed_peer_and_keep_the_absolute_bound() {
+        let (near, mut far) = crate::CtlStream::pair().unwrap();
+        far.write_all(b"queued").unwrap();
+        drop(far);
+        aterm_spec::wait::until_peer_closed(&near);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut bytes = [0; 6];
+        assert_eq!(super::read_until(&near, &mut bytes, deadline).unwrap(), 6);
+        assert_eq!(&bytes, b"queued");
+        assert_eq!(super::read_until(&near, &mut bytes, deadline).unwrap(), 0);
+        assert_eq!(
+            super::read_until(&near, &mut bytes, std::time::Instant::now())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::TimedOut
+        );
+    }
 
     /// What one non-blocking read of `stream` finds: `Ok(0)` is its
     /// end-of-file, `Err(WouldBlock)` an open socket with nothing to read.

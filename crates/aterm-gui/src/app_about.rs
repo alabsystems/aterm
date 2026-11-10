@@ -16,13 +16,23 @@ impl App {
     pub(crate) fn open_about_tab_in_window(&mut self, wid: WindowId) -> bool {
         let existing = self.windows.get(&wid).and_then(|window| {
             window.tab_set.tabs().iter().find_map(|tab| {
-                tab.root.leaves().into_iter().find_map(|view| {
-                    let View::Native(native) = self.view_store.get(view)? else {
-                        return None;
+                let mut found = None;
+                tab.root.any_leaf(&mut |&view| {
+                    let Some(View::Native(native)) = self.view_store.get(view) else {
+                        return false;
                     };
-                    (self.native_runtime.app(native.instance)?.kind() == AppKind::About)
-                        .then_some((tab.id, view))
-                })
+                    if self
+                        .native_runtime
+                        .app(native.instance)
+                        .is_some_and(|app| app.kind() == AppKind::About)
+                    {
+                        found = Some((tab.id, view));
+                        true
+                    } else {
+                        false
+                    }
+                });
+                found
             })
         });
         let (tab, view) = match existing {
@@ -103,7 +113,7 @@ impl App {
         let mut targets = Vec::new();
         for (&wid, window) in &self.windows {
             for tab in window.tab_set.tabs() {
-                for view in tab.root.leaves() {
+                tab.root.visit(&mut |&view| {
                     if let Some(View::Native(native)) = self.view_store.get(view)
                         && self
                             .native_runtime
@@ -112,7 +122,7 @@ impl App {
                     {
                         targets.push((wid, tab.id, view));
                     }
-                }
+                });
             }
         }
         for (wid, tab, view) in targets {

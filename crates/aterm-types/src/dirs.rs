@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn aterm_toml_reader_holds_the_opened_targets_ownership_rule() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("dirs");
         let path = dir.path().join("managed.toml");
         let link = dir.path().join("aterm.toml");
         let text = "[harness]\nenabled = false\n";
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn aterm_toml_is_read_through_a_link_and_a_dangling_one_is_no_absence() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("dirs");
         let real = dir.path().join("dotfiles-aterm.toml");
         std::fs::write(&real, "shell = \"fish\"\n").unwrap();
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -710,7 +710,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_accounts_own_shell_is_its_home_not_root_and_no_private_root() {
-        let scratch = aterm_tempfile::tempdir().unwrap();
+        let scratch = crate::test_scratch_dir("dirs");
         let dir = scratch.path();
         let home = dir.join("home");
         std::fs::create_dir(&home).unwrap();
@@ -742,7 +742,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn same_directory_is_one_directory_under_every_spelling() {
-        let scratch = aterm_tempfile::tempdir().unwrap();
+        let scratch = crate::test_scratch_dir("dirs");
         let home = std::fs::canonicalize(scratch.path()).unwrap().join("home");
         let other = home.with_file_name("other");
         std::fs::create_dir(&home).unwrap();

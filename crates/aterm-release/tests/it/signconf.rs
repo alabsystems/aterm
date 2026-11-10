@@ -14,7 +14,6 @@ fn a_profile_yields_the_derived_public_identity() {
     assert_eq!(creds.pubkey(), pubkey, "identity is derived from the key");
     let sig = creds.sign(b"manifest bytes").expect("signs in-process");
     assert_eq!(sig.len(), 64, "a detached Ed25519 signature is 64 bytes");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -28,7 +27,6 @@ fn a_group_or_other_readable_profile_is_refused() {
         err.contains("private key"),
         "the refusal must say why: {err}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -50,7 +48,6 @@ fn a_raw_binary_key_is_refused_by_name() {
         err.contains("base64"),
         "the refusal must name the encoding: {err}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -59,7 +56,6 @@ fn a_profile_without_a_signing_key_is_refused() {
     let path = write_profile(&dir, "# nothing here\n", 0o600);
     let err = sign::ReleaseCredentials::load(&path, None).expect_err("no key must be refused");
     assert!(err.contains("signing_key"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -78,14 +74,20 @@ fn the_private_key_never_reaches_a_debug_line() {
         !rendered.contains(&pkcs8),
         "the private key must never render"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn tempdir(label: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("aterm-signconf-{label}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+struct TestDir(aterm_tempfile::TempDir);
+
+impl std::ops::Deref for TestDir {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+fn tempdir(label: &str) -> TestDir {
+    TestDir(crate::test_scratch_dir(label))
 }
 
 fn write_profile(dir: &std::path::Path, body: &str, mode: u32) -> std::path::PathBuf {
@@ -213,8 +215,6 @@ fn resolution_prefers_the_flag_then_machine_state_then_none() {
         flag_pub,
         "an explicit --release-credentials outranks ambient machine state"
     );
-    let _ = std::fs::remove_dir_all(&home);
-    let _ = std::fs::remove_dir_all(&repo);
 }
 
 #[test]
@@ -235,6 +235,4 @@ fn a_present_but_unsafe_machine_key_is_an_error_not_a_fallthrough() {
         err.contains("machine.key"),
         "the refusal names the offending file: {err}"
     );
-    let _ = std::fs::remove_dir_all(&home);
-    let _ = std::fs::remove_dir_all(&repo);
 }

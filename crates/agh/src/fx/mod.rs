@@ -16,6 +16,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Native deadline bookkeeping inside the atomically recorded GitHub round trip.
+/// Replaying that effect does not enter the native transport or read this clock.
+pub(crate) struct NativeRequestStart(std::time::Instant);
+
+impl NativeRequestStart {
+    pub(crate) fn now() -> Self {
+        Self(std::time::Instant::now())
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) const fn from_started(started: std::time::Instant) -> Self {
+        Self(started)
+    }
+
+    pub(crate) fn remaining(&self, within: Duration) -> Duration {
+        within.saturating_sub(self.0.elapsed())
+    }
+}
+
 use aterm_types::{MutexExt, http_retry::Retry};
 
 /// A real elapsed native validation phase, observed only on a simulated client.

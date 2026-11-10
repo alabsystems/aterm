@@ -106,14 +106,14 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
 
     let h = host();
     let (client_app, client_relay) = CtlStream::pair().expect("pair");
+    client_app
+        .set_read_timeout(Some(PATIENCE))
+        .expect("bound the reply read");
     let sock = h.sock.clone();
     let forward_thread = std::thread::spawn(move || match connect_hop(&sock) {
         Ok(hop) => relay_hop(hop, LINE, &client_relay, &[]).is_err(),
         Err(_) => true,
     });
-    client_app
-        .set_read_timeout(Some(PATIENCE))
-        .expect("bound the reply read");
     let mut reply = String::new();
     BufReader::new(client_app.try_clone().unwrap())
         .read_line(&mut reply)

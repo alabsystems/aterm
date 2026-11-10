@@ -319,11 +319,15 @@ fn an_expired_restart_prepare_the_host_never_held_is_answered_unadmitted_without
 }
 
 #[test]
-fn an_admitted_restart_keeps_the_deadline_refusal_after_completion_and_reclaim() {
+fn an_admitted_restart_is_never_unadmitted_after_completion_and_reclaim() {
     let model = aterm_models_harness::native_unadmitted_prepare_model();
     for sealed in [false, true] {
         let mut state = model.init_state();
         let mut host = Host::new(7961 + u64::from(sealed), |_| {});
+        if sealed {
+            // A sealed cold restart's history answers `lapsed`; a private one's has no answer.
+            cold_restart(&mut host.request);
+        }
         host.approach();
         fire(&model, &mut state, &["Approach"]);
         let binding = admitted_binding(&host.send(&model));
@@ -373,14 +377,16 @@ fn an_admitted_restart_keeps_the_deadline_refusal_after_completion_and_reclaim()
         host.reclaim();
         fire(&model, &mut state, &["Reclaim"]);
         assert_eq!(host.probe(&model), state, "sealed={sealed}");
-        // The table forgot the id; its issuer record keeps the refusal. A positive NoExec
-        // receipt is still served as one.
+        // The table forgot the id; its issuer record keeps `unadmitted` away. A positive
+        // NoExec receipt is still served as one, and a seal that never recorded possible
+        // execution as `lapsed`, which is no unadmitted Answer.
         assert!(!model.action_enabled("Answer", &state));
-        assert_eq!(
-            host.send(&model),
-            if sealed { DEADLINE } else { NOEXEC },
-            "sealed={sealed}"
-        );
+        let expected = if sealed {
+            aterm_agent::harness::native_act::lapsed_reply(&host.request.id).unwrap()
+        } else {
+            NOEXEC.to_string()
+        };
+        assert_eq!(host.send(&model), expected, "sealed={sealed}");
         assert_eq!(host.probe(&model), state);
         // Negative control: with the issuer record gone, the same host answers `unadmitted`
         // for an operation it admitted, which the projection refuses.
@@ -575,6 +581,8 @@ fn the_answer_is_only_for_a_readable_builtin_restart_on_this_host_epoch() {
         send(&other_epoch, &host.actor),
         "ERR native host epoch changed\n"
     );
+    // A private restart has no historical answer; another epoch's stamped cold restart
+    // lapses past its deadline (`native_lapsed_tests.rs`).
     host.facts.receipt_readable.store(false, Ordering::SeqCst);
     assert_eq!(send(&host.request, &host.actor), DEADLINE);
     host.facts.receipt_readable.store(true, Ordering::SeqCst);

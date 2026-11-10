@@ -163,7 +163,13 @@ fn project(state: &State, action: &str, cli: Cli, variant: &str, cold: bool) -> 
     ));
     if cli == Cli::Claude {
         assert_eq!(
-            fleet_origin(Some(&bed.home), Some(&bed.aterm_toml()), &bed.roster(cli)).source(),
+            fleet_origin(
+                &accounts::Store::at(&bed.state),
+                Some(&bed.home),
+                Some(&bed.aterm_toml()),
+                &bed.roster(cli)
+            )
+            .source(),
             Some(
                 if case == 1 || case == 3 {
                     &primary

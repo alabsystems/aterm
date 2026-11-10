@@ -2005,6 +2005,13 @@ fn relaunch_held(
                 save(opts, session, st);
                 return said(r, super::native_restart::WAIT_UNADMITTED);
             }
+            Ok(super::native_restart::Recovery::Lapsed) => {
+                // The replay of an operation the record still kept lapsed, not the rollback
+                // (a private restart, which no lapse answers): still Exiting, as after an
+                // unadmitted one, the next pass mints the rollback afresh.
+                save(opts, session, st);
+                return said(r, super::native_restart::WAIT_LAPSED);
+            }
             Err(why) => return said(r, format!("wait:{why}")),
         }
     }
@@ -2040,6 +2047,14 @@ fn relaunch_held(
                 save(opts, session, st);
                 return said(r, super::native_restart::WAIT_UNADMITTED);
             }
+            Ok(super::native_restart::Recovery::Lapsed) => {
+                // No exec grant was or can be issued under it (never a rollback: a private
+                // restart, which no lapse answers). The crash's record ends, and the next pass
+                // plans that exit afresh.
+                st.stop("native-lapsed", now_s());
+                save(opts, session, st);
+                return said(r, super::native_restart::WAIT_LAPSED);
+            }
             Ok(
                 super::native_restart::Recovery::Admitted | super::native_restart::Recovery::Legacy,
             ) => {}
@@ -2069,10 +2084,18 @@ fn relaunch_held(
         // A prepare/signal reply may have been lost before mutation. Prove an explicit
         // pre-mutation abort before returning to a fresh at-rest constructor; never signal
         // later from this recovery/observation lane using an old screen observation.
-        if super::native_restart::abort(opts, session, c, &tab, st) {
-            st.stop("native-aborted-before-signal", now_s());
-            save(opts, session, st);
-            return said(r, "wait:native-aborted-before-signal");
+        match super::native_restart::abort(opts, session, c, &tab, st) {
+            Some(super::native_restart::Recovery::Lapsed) => {
+                st.stop("native-lapsed", now_s());
+                save(opts, session, st);
+                return said(r, super::native_restart::WAIT_LAPSED);
+            }
+            Some(_) => {
+                st.stop("native-aborted-before-signal", now_s());
+                save(opts, session, st);
+                return said(r, "wait:native-aborted-before-signal");
+            }
+            None => {}
         }
         if st.native_retired_unissued {
             save(opts, session, st);
@@ -5774,11 +5797,23 @@ fn restart_locked(
                     super::native_restart::WAIT_RETIRED_UNISSUED,
                 ));
             }
+            Ok(super::native_restart::Recovery::Lapsed) => {
+                break 'signal Some(super::native_restart::end_lapsed(
+                    opts, &r, &mut st, &session,
+                ));
+            }
             Ok(super::native_restart::Recovery::Unadmitted) | Err(_) => {
                 let why = super::native_restart::refusal_word(admission);
-                if st.native_prepare.is_empty()
-                    || super::native_restart::abort(opts, &session, &mut c, &tab, &mut st)
-                {
+                let ended = st.native_prepare.is_empty()
+                    || match super::native_restart::abort(opts, &session, &mut c, &tab, &mut st) {
+                        Some(super::native_restart::Recovery::Lapsed) => {
+                            break 'signal Some(super::native_restart::end_lapsed(
+                                opts, &r, &mut st, &session,
+                            ));
+                        }
+                        ended => ended.is_some(),
+                    };
+                if ended {
                     if super::native_restart::coordinated(&st) {
                         let _ = super::native_record::restore_inactive(
                             opts,
@@ -5818,7 +5853,13 @@ fn restart_locked(
             )
         };
         if signal_check.is_err() {
-            if super::native_restart::abort(opts, &session, &mut c, &tab, &mut st) {
+            let ended = super::native_restart::abort(opts, &session, &mut c, &tab, &mut st);
+            if ended == Some(super::native_restart::Recovery::Lapsed) {
+                break 'signal Some(super::native_restart::end_lapsed(
+                    opts, &r, &mut st, &session,
+                ));
+            }
+            if ended.is_some() {
                 let _ =
                     super::native_record::restore_inactive(opts, &session, &mut st, prior.as_ref());
             } else {
@@ -6077,10 +6118,16 @@ fn cancel_checked_before_effect(
     state: (&mut St, Option<&St>),
 ) {
     let (st, prior) = state;
-    if super::native_restart::abort(opts, session, client, tab, st) {
-        let _ = super::native_record::restore_inactive(opts, session, st, prior);
-    } else {
-        save(opts, session, st);
+    match super::native_restart::abort(opts, session, client, tab, st) {
+        // A lapse proves no grant, not the absence of every effect: the record ends as it stands.
+        Some(super::native_restart::Recovery::Lapsed) => {
+            st.stop("native-lapsed", now_s());
+            save(opts, session, st);
+        }
+        Some(_) => {
+            let _ = super::native_record::restore_inactive(opts, session, st, prior);
+        }
+        None => save(opts, session, st),
     }
 }
 
@@ -6145,6 +6192,9 @@ fn retry_checked_relaunch(
             save(opts, session, &st);
             return Some(said(r, native_restart::WAIT_UNADMITTED));
         }
+        native_restart::RelaunchObservation::Terminal(Recovery::Lapsed) => {
+            return Some(native_restart::end_lapsed(opts, &r, &mut st, session));
+        }
         native_restart::RelaunchObservation::Terminal(Recovery::Legacy | Recovery::Admitted)
         | native_restart::RelaunchObservation::Pending => {}
     }
@@ -6196,6 +6246,9 @@ fn retry_checked_relaunch(
                 st.stop("native-unadmitted", now_s());
                 save(opts, session, &st);
                 return stopped(said(r, native_restart::WAIT_UNADMITTED));
+            }
+            Ok(Recovery::Lapsed) => {
+                return stopped(native_restart::end_lapsed(opts, &r, &mut st, session));
             }
             Ok(Recovery::Legacy) | Err(_) => {
                 save(opts, session, &st);
@@ -7918,6 +7971,36 @@ fn launch_after_exit(
         ..
     } = plan;
     let session = r.session.clone();
+    // A kept operation answers first, on the record as it stands: its replay saves the record it
+    // is handed, so the rewrite below made first would turn a held record back into a relaunch
+    // in flight, rebound to this exit's agent and line with a new exit clock, on every pass that
+    // meets it. The replay goes to this exit's tab, where its host is now.
+    if !st.native_retired_unissued && (st.native.is_some() || !st.native_prepare.is_empty()) {
+        match super::native_restart::replay_retained_at(opts, &mut c, &mut st, &session, &snap.tab)
+        {
+            Ok(super::native_restart::Recovery::Completed) => return said(r, "wait:relaunched"),
+            Ok(super::native_restart::Recovery::Retired) => {
+                return said(r, "failed:native-cohort-retired");
+            }
+            Ok(super::native_restart::Recovery::Held) => {
+                return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+            }
+            Ok(super::native_restart::Recovery::Unadmitted) => {
+                st.stop("native-unadmitted", now_s());
+                save(opts, &session, &st);
+                return said(r, super::native_restart::WAIT_UNADMITTED);
+            }
+            Ok(super::native_restart::Recovery::Lapsed) => {
+                return super::native_restart::end_lapsed(opts, &r, &mut st, &session);
+            }
+            Ok(
+                super::native_restart::Recovery::Admitted
+                | super::native_restart::Recovery::Legacy
+                | super::native_restart::Recovery::Cancelled,
+            ) => return said(r, "wait:native-unresolved-operation"),
+            Err(why) => return said(r, format!("wait:{why}")),
+        }
+    }
     // The agent this relaunch waits on, by its pid and kernel start: a prior record's exit
     // stamp, kept by a restart that carried it, spoke of another agent and goes ([`St::bind`]).
     st.bind(snap.pid, &snap.start);
@@ -7961,6 +8044,11 @@ fn launch_after_exit(
                 st.stop("native-unadmitted", now_s());
                 save(opts, &session, &st);
                 return said(r, super::native_restart::WAIT_UNADMITTED);
+            }
+            // The record kept an operation no exec grant was or can be issued under. It ends
+            // here; the next pass judges a fresh start without it ([`host_ended_fresh`]).
+            Ok(super::native_restart::Recovery::Lapsed) => {
+                return super::native_restart::end_lapsed(opts, &r, &mut st, &session);
             }
             Err(why) => return said(r, format!("wait:{why}")),
         }

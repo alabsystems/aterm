@@ -87,6 +87,27 @@ struct Take {
     _scratch: Scratch,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RssScene {
+    Idle,
+    Busy,
+}
+
+/// Idle RSS reads at its quiet fence; busy RSS retains its post-drain delay. Callbacks let the
+/// test hold the quiet fence and advance a logical clock without a timing-dependent test.
+fn sample_settled<T>(
+    scene: RssScene,
+    quiet: impl FnOnce() -> Result<(), CouldNotRun>,
+    pause: impl FnOnce(std::time::Duration),
+    read: impl FnOnce() -> Result<T, CouldNotRun>,
+) -> Result<T, CouldNotRun> {
+    quiet()?;
+    if scene == RssScene::Busy {
+        pause(std::time::Duration::from_secs(2));
+    }
+    read()
+}
+
 impl Take {
     fn launch(rig: &Rig, record: bool, budget: Budget) -> Result<Self, CouldNotRun> {
         let (take, recording) =
@@ -198,16 +219,38 @@ impl Take {
 
     /// The instance's resident size in bytes, once its panes are quiet.
     fn settled_rss(&self) -> Result<u64, CouldNotRun> {
-        Ok(self.settled()?.rss)
+        Ok(self.settled(RssScene::Busy)?.rss)
     }
 
     /// The instance's resident size and app memory, once its panes are quiet.
-    fn settled(&self) -> Result<Settled, CouldNotRun> {
-        self.inst
-            .ctl
-            .ok(&["await", "idle", "2000", "timeout=120000"])?;
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        Settled::read(self.inst.pid(), self.inst.ctl.budget())
+    fn settled(&self, scene: RssScene) -> Result<Settled, CouldNotRun> {
+        let started = std::time::Instant::now();
+        let quiet_s = std::cell::Cell::new(0.0);
+        let delay_s = std::cell::Cell::new(0.0);
+        let result = sample_settled(
+            scene,
+            || {
+                self.inst
+                    .ctl
+                    .ok(&["await", "idle", "2000", "timeout=120000"])?;
+                quiet_s.set(started.elapsed().as_secs_f64());
+                Ok(())
+            },
+            |duration| {
+                let started = std::time::Instant::now();
+                std::thread::sleep(duration);
+                delay_s.set(started.elapsed().as_secs_f64());
+            },
+            || Settled::read(self.inst.pid(), self.inst.ctl.budget()),
+        );
+        if scene == RssScene::Idle {
+            eprintln!(
+                "measure setup: idle_rss quiet_s={:.6} post_quiet_s={:.6}",
+                quiet_s.get(),
+                delay_s.get()
+            );
+        }
+        result
     }
 }
 
@@ -713,7 +756,13 @@ fn measure_with_control(
             let (mut off_app, mut on_app) = (Vec::new(), Vec::new());
             for _ in 0..pairs {
                 for record in [false, true, true, false] {
-                    let took = Take::launch(rig, record, budget)?.settled()?;
+                    let started = std::time::Instant::now();
+                    let take = Take::launch(rig, record, budget)?;
+                    eprintln!(
+                        "measure setup: idle_rss record={record} launch_s={:.6}",
+                        started.elapsed().as_secs_f64()
+                    );
+                    let took = take.settled(RssScene::Idle)?;
                     if record { &mut on } else { &mut off }.push(took.rss);
                     if record { &mut on_app } else { &mut off_app }.push(took.app);
                 }
@@ -868,6 +917,36 @@ const fn verdict(pass: bool) -> ShapeVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_rss_reads_at_the_quiet_fence_and_busy_rss_keeps_its_delay() {
+        let observed = |scene| {
+            let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+            sample_settled(
+                scene,
+                || {
+                    clock.set(std::time::Duration::from_secs(2));
+                    Ok(())
+                },
+                |delay| clock.set(clock.get() + delay),
+                || Ok(clock.get()),
+            )
+            .unwrap()
+        };
+        assert_eq!(observed(RssScene::Idle), std::time::Duration::from_secs(2));
+        assert_eq!(
+            observed(RssScene::Busy),
+            std::time::Duration::from_secs(4),
+            "negative control: restoring the busy delay to idle must fail the idle assertion"
+        );
+        let unready = sample_settled::<()>(
+            RssScene::Idle,
+            || could_not_run("the quiet fence did not complete"),
+            |_| panic!("a refused quiet fence must not pause"),
+            || panic!("a refused quiet fence must not produce a memory sample"),
+        );
+        assert!(unready.is_err());
+    }
 
     #[test]
     fn the_portable_resident_probe_obeys_the_take_budget() {

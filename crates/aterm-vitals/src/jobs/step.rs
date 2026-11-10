@@ -381,12 +381,13 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     }
 
     // A build's front wakes to look at the ledger (its nap slices) while its claim waits: that
-    // waking is its wait for memory, not polling with no progress, and none of it carries into the
-    // build it execs. A program that has not started (held at macOS's program check, translated
+    // waking is its admission wait, not polling with no progress, and none of it carries into the
+    // build it execs. A native held legacy build-slot ticket names that same admission phase.
+    // A program that has not started (held at macOS's program check, translated
     // by Rosetta) runs nothing at all: what the job did before it is none of its wait's, and
     // carries into neither that wait nor what the program does once it starts.
-    let memory_wait = ev.wait.name == WaitName::Memory;
-    let in_line = memory_wait || starts(ev.wait.name);
+    let admission_wait = matches!(ev.wait.name, WaitName::Memory | WaitName::BuildAdmission);
+    let in_line = admission_wait || starts(ev.wait.name);
     if in_line {
         t.busy = Band::default();
         t.polling = Band::default();
@@ -432,7 +433,7 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     } else if holds_fg && ev.gate.word == GateWord::Pending {
         Class::UnreadInput
     } else if in_line {
-        // The front names its memory wait, or the leaf its start's, now; earlier rate bands
+        // The leaf names its admission or start wait now; earlier rate bands
         // cannot hide that state.
         Class::Waiting
     } else if t.thrash.on {
@@ -457,8 +458,9 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     // ends. Each shows and counts at the reading that names it, and the wait after it shows at
     // the reading that ends it, with neither debounce below.
     let held = class == Class::Waiting && starts(ev.wait.name);
-    let memory = class == Class::Waiting && memory_wait;
-    let at_once = |n: WaitName| starts(n) || n == WaitName::Memory;
+    let admission = class == Class::Waiting && admission_wait;
+    let at_once =
+        |n: WaitName| starts(n) || matches!(n, WaitName::Memory | WaitName::BuildAdmission);
     if class == Class::Waiting {
         let cand = ev.wait.clone();
         match &t.shown {
@@ -556,7 +558,7 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     let was_suspect = matches!(t.effective, Some(Effective::Capable | Effective::Capped));
     let eff = if raw == Effective::Legit {
         t.legit_streak += 1;
-        if was_suspect && t.legit_streak < 2 && !held && !memory {
+        if was_suspect && t.legit_streak < 2 && !held && !admission {
             if t.capable {
                 Effective::Capable
             } else {

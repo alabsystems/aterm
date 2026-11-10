@@ -571,7 +571,13 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
             None => format!("git clone {slug}"),
         },
         GitOp::Fetch { .. } => format!("git fetch {slug}"),
-        GitOp::FetchMain { into, .. } => format!("git fetch-main {slug}\ninto {into}"),
+        GitOp::FetchMain { into, blobless, .. } => {
+            let mut text = format!("git fetch-main {slug}\ninto {into}");
+            if *blobless {
+                text.push_str("\nfilter blob:none");
+            }
+            text
+        }
         GitOp::FetchRef {
             reference,
             into,

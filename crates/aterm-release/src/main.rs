@@ -15,6 +15,7 @@ mod changelog;
 mod check_content;
 mod check_record;
 mod checkout_bin;
+mod input_record;
 mod postlink;
 
 mod channel;
@@ -155,4 +156,18 @@ fn main() -> std::process::ExitCode {
         };
     }
     std::process::exit(cli::run());
+}
+
+/// Create a short `.noindex` temporary directory for unit tests in this crate.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let short = &tag[..tag.floor_char_boundary(8)];
+    let builder = aterm_tempfile::Builder::new()
+        .prefix(&format!("arl-{short}-"))
+        .suffix(".noindex");
+    #[cfg(unix)]
+    let made = builder.tempdir_in("/tmp");
+    #[cfg(not(unix))]
+    let made = builder.tempdir();
+    made.expect("test scratch dir")
 }

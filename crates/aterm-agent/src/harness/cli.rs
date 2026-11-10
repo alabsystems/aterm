@@ -12591,7 +12591,12 @@ fn write_accounts_report_snapshot(
     let enrolled = reported_enrolled(cli, &roster, env);
     let read = (&state, &logins);
     let origin = (cli == Cli::Claude && !own).then(|| {
-        super::accounts_sync::fleet_origin(env.home.as_deref(), env.config.as_deref(), path)
+        super::accounts_sync::fleet_origin(
+            &env.accounts_store(),
+            env.home.as_deref(),
+            env.config.as_deref(),
+            path,
+        )
     });
     let (policy, rotation) = rotation_beside(cli, env, path);
     // Each row's readings series, read once and cut as it is read to what the outlook's pace and
@@ -13056,10 +13061,15 @@ fn fleet_rows_for_write(
     if cli != Cli::Claude {
         return Ok(Vec::new());
     }
-    let origin = fleet_origin(env.home.as_deref(), env.config.as_deref(), path);
+    let origin = fleet_origin(
+        &env.accounts_store(),
+        env.home.as_deref(),
+        env.config.as_deref(),
+        path,
+    );
     let from = match &origin {
         FleetOrigin::Roster | FleetOrigin::Alab => return Ok(Vec::new()),
-        FleetOrigin::AlabPending(why) => return Err(why.clone()),
+        FleetOrigin::AlabPending(why) | FleetOrigin::SourcePending(why) => return Err(why.clone()),
         FleetOrigin::Local { files, .. } => return list_in_local_fleet(env, files, asked),
         FleetOrigin::Key(_) => "list the account there",
         FleetOrigin::Vault(_) => {

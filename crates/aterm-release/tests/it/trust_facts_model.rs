@@ -57,6 +57,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 struct Harness {
+    _dir: aterm_tempfile::TempDir,
     root: PathBuf,
     work: PathBuf,
     provers: [Prover; 2],
@@ -68,19 +69,10 @@ struct Harness {
     word: &'static str,
 }
 
-impl Drop for Harness {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
 impl Harness {
     fn new(label: &str) -> Harness {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-trust-facts-model-{label}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let dir = crate::test_scratch_dir(label);
+        let root = dir.path().to_path_buf();
         let work = root.join("work");
         fs::create_dir_all(&work).unwrap();
         crate::ledger::testing::init(
@@ -102,6 +94,7 @@ impl Harness {
         let model = trust_facts_reuse_model();
         let state = model.init_state();
         let mut h = Harness {
+            _dir: dir,
             root,
             work,
             provers,

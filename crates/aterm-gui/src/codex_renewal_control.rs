@@ -411,6 +411,8 @@ fn make_prepare(
             forward: Box::new(forward),
             rollback: Some(Box::new(rollback)),
         },
+        boot: None,
+        custody: None,
     })
 }
 
@@ -1442,6 +1444,8 @@ mod tests {
                 forward: Box::new(command),
                 rollback: None,
             },
+            boot: None,
+            custody: None,
         };
         let receipt = Receipt {
             destination: None,

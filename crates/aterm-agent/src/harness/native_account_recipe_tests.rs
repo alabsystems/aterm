@@ -79,6 +79,8 @@ fn pair() -> (Prepare, Prepare) {
             cold: None,
             rollback: Some(Box::new(command)),
         },
+        boot: None,
+        custody: None,
     };
     let mut next = old.clone();
     next.id = "ef".repeat(16);

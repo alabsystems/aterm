@@ -416,14 +416,14 @@ impl Deadlines {
     /// The JSON request's whole-request wall bound.
     pub(crate) const JSON_BACKSTOP: Duration = Duration::from_secs(60);
 
-    /// A JSON call: connect 10 s, idle 60 s, backstop 60 s.
+    /// A required JSON call: minute connect, idle and whole-request hang detectors.
     pub const JSON: Deadlines = Deadlines {
-        connect: Duration::from_secs(10),
+        connect: Duration::from_secs(60),
         idle: Duration::from_secs(60),
         backstop: Some(Self::JSON_BACKSTOP),
     };
 
-    /// A transfer: connect 10 s and at most 60 s without a byte, with no wall-time deadline.
+    /// A transfer: minute connect and idle detectors, with no whole-transfer wall bound.
     /// File readers impose a progress-earned resume bound instead.
     #[must_use]
     pub const fn for_transfer(_bytes: u64) -> Deadlines {

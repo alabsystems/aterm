@@ -19,48 +19,10 @@ use crate::retry::Idempotency;
 use crate::wire::Method;
 use crate::write::{Deleted, Effect, Ensured, WriteOp};
 
-/// The deadlines of `me_once`: connect 5 s, idle 10 s, the whole request 10 s (`--timeout`
-/// replaces the backstop, as it does on every call).
+/// Required identity learning uses the same native hang detectors as a JSON call.
 #[cfg(unix)]
-const LEARN_DEADLINES: crate::wire::Deadlines = crate::wire::Deadlines {
-    connect: std::time::Duration::from_secs(5),
-    idle: std::time::Duration::from_secs(10),
-    backstop: Some(std::time::Duration::from_secs(10)),
-};
-
-/// The bound a test set on each of `LEARN_DEADLINES`, in milliseconds (0: none set).
-#[cfg(all(unix, any(test, debug_assertions)))]
-static LEARN_DEADLINES_FOR_TEST_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Bound `me_once`'s connect, idle and whole request by `bound` instead of `LEARN_DEADLINES`,
-/// for this process.
-///
-/// A test whose loopback GitHub must answer `GET /user` sets the hang detector here: a loaded
-/// machine that outlasts the product's 10 s would otherwise read the fake as unreachable.
-#[cfg(all(unix, any(test, debug_assertions)))]
-#[doc(hidden)]
-pub fn set_learn_deadlines_for_test(bound: std::time::Duration) {
-    let ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX).max(1);
-    LEARN_DEADLINES_FOR_TEST_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// `LEARN_DEADLINES`, or the bound a test set with [`set_learn_deadlines_for_test`].
-#[cfg(unix)]
-fn learn_deadlines() -> crate::wire::Deadlines {
-    #[cfg(any(test, debug_assertions))]
-    match LEARN_DEADLINES_FOR_TEST_MS.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => {}
-        ms => {
-            let bound = std::time::Duration::from_millis(ms);
-            return crate::wire::Deadlines {
-                connect: bound,
-                idle: bound,
-                backstop: Some(bound),
-            };
-        }
-    }
-    LEARN_DEADLINES
+pub(crate) fn learn_deadlines() -> crate::wire::Deadlines {
+    crate::wire::Deadlines::JSON
 }
 
 /// Users and the rate limit.

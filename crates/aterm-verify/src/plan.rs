@@ -331,6 +331,21 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         .map(|b| (b.records(), b.plain_records()));
     let mut planned = Vec::with_capacity(v.len());
     for mut s in v {
+        // Source guards and the all-target lint expose errors before test code generation.
+        // Keep these dependencies explicit: an unmanaged run may use parallel target lanes.
+        for prerequisite in [
+            StageId::Formatting,
+            StageId::Census,
+            StageId::ExportScan,
+            StageId::Tippy,
+        ] {
+            if s.id == prerequisite {
+                break;
+            }
+            if !s.after_stages.contains(&prerequisite) {
+                s.after_stages.push(prerequisite);
+            }
+        }
         s.after_stages.retain(|id| present.contains(id));
         if measures && matches!(s.id, StageId::RedrawConformance | StageId::ObjcDrives) {
             s.exclusive = true;
@@ -438,25 +453,6 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
     let label = scope.label();
     vec![
         spec(
-            StageId::TestCompile,
-            format!("test compile ({label})"),
-            Lane::MainTarget,
-        ),
-        spec(StageId::Test, format!("test ({label})"), Lane::MainTarget),
-        StageSpec {
-            after_stages: vec![StageId::TestCompile],
-            ..spec(
-                StageId::Doctests,
-                format!("doctests ({label})"),
-                Lane::AfterCompile,
-            )
-        },
-        spec(
-            StageId::Tippy,
-            format!("tippy lint ({})", scope.lint_label()),
-            Lane::TippyTarget,
-        ),
-        spec(
             StageId::Formatting,
             "formatting (trustfmt over every tracked or cargo-built .rs, at its crate's edition)",
             Lane::Pure,
@@ -471,6 +467,25 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
             "export scan (the publication engine's content guards)",
             Lane::Pure,
         ),
+        spec(
+            StageId::Tippy,
+            format!("tippy lint ({})", scope.lint_label()),
+            Lane::TippyTarget,
+        ),
+        spec(
+            StageId::TestCompile,
+            format!("test compile ({label})"),
+            Lane::MainTarget,
+        ),
+        spec(StageId::Test, format!("test ({label})"), Lane::MainTarget),
+        StageSpec {
+            after_stages: vec![StageId::TestCompile],
+            ..spec(
+                StageId::Doctests,
+                format!("doctests ({label})"),
+                Lane::AfterCompile,
+            )
+        },
         StageSpec {
             after_stages: vec![StageId::TestCompile],
             ..spec(
@@ -1020,11 +1035,11 @@ mod tests {
         assert_eq!(
             claims(&ctx(&checks, scope.clone()).with_memory(book)),
             [
+                (StageId::Formatting, 0),
+                (StageId::Tippy, 12 * GIB),
                 (StageId::TestCompile, 12 * GIB),
                 // The dispatch claims its plan's peak; the stage must not claim it again.
                 (StageId::Test, 0),
-                (StageId::Tippy, 12 * GIB),
-                (StageId::Formatting, 0),
             ]
         );
         assert!(
@@ -1288,9 +1303,9 @@ mod tests {
         assert_eq!(
             claims(&empty),
             [
-                (StageId::Doctests, 0),
+                (StageId::Formatting, 0),
                 (StageId::Tippy, 0),
-                (StageId::Formatting, 0)
+                (StageId::Doctests, 0),
             ]
         );
         assert!(!has_compiler_stage(&empty));
@@ -1350,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn the_test_run_follows_its_compile_and_waits_for_nothing_else() {
+    fn source_and_type_preflight_finish_before_test_codegen() {
         use crate::sched::{awaited, ready};
         let c = ctx(&RELEASE, Scope::workspace());
         let p = plan(&c);
@@ -1364,19 +1379,32 @@ mod tests {
             lane_dir(&c, Lane::AfterCompile),
             lane_dir(&c, Lane::MainTarget)
         );
-        assert_eq!(awaited(&p, doc).collect::<Vec<_>>(), [compile]);
+        let preflight: Vec<_> = [
+            StageId::Formatting,
+            StageId::Census,
+            StageId::ExportScan,
+            StageId::Tippy,
+        ]
+        .into_iter()
+        .filter_map(|id| p.iter().position(|s| s.id == id))
+        .collect();
+        let mut doc_waits = preflight.clone();
+        doc_waits.push(compile);
+        assert_eq!(awaited(&p, doc).collect::<Vec<_>>(), doc_waits);
         let none = vec![false; p.len()];
         assert!(!ready(&p, &none, &none, 0, doc, u64::MAX));
-        assert!(
-            ready(&p, &none, &none, 0, compile, u64::MAX),
-            "the compile starts at t0"
-        );
-        assert!(p[compile].after_stages.is_empty() && p[test].after_stages.is_empty());
+        assert!(!ready(&p, &none, &none, 0, compile, u64::MAX));
         assert!(
             !ready(&p, &none, &none, 0, test, u64::MAX),
             "the test run follows its compile"
         );
         let mut done = none.clone();
+        for i in preflight {
+            assert!(!ready(&p, &done, &done, 0, compile, u64::MAX));
+            assert!(ready(&p, &done, &done, 0, i, u64::MAX));
+            done[i] = true;
+        }
+        assert!(ready(&p, &done, &done, 0, compile, u64::MAX));
         done[compile] = true;
         let mut started = done.clone();
         assert!(ready(&p, &started, &done, 0, test, u64::MAX));

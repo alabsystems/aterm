@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use aterm_core::render::RenderInput;
 use aterm_core::selection::{SelectionSide, SelectionType, TextSelection};
 use aterm_core::terminal::Terminal;
-use aterm_effects::kitty_pet::{PetAction, PetBrain, PetFrame, PetInputKind, PetSense, head_law};
+use aterm_effects::kitty_pet::{
+    OldPath, PetAction, PetBrain, PetFrame, PetInputKind, PetSense, head_law,
+};
 use aterm_effects::pet_world::{PetPane, PetRect, PetWorld, PetWorldFacts};
 use aterm_models_effects::console_cursor_home_model;
 use aterm_spec::derive::Model;
@@ -75,6 +77,8 @@ struct Scene {
     now: Instant,
     reduced: bool,
     hidden_caret_travels: bool,
+    /// Each tick a windowless still's ([`PetBrain::tick_static_capture`]).
+    still: bool,
     painted: (u16, u16),
     seen: Option<Seen>,
 }
@@ -95,6 +99,7 @@ impl Scene {
             now: Instant::now(),
             reduced,
             hidden_caret_travels: false,
+            still: false,
             painted,
             seen: None,
         }
@@ -121,7 +126,7 @@ impl Scene {
         if input.cursor_visible {
             self.painted = cell;
         }
-        let frame = self.brain.tick(PetSense {
+        let sense = PetSense {
             caret_drawn: input.cursor_visible || !self.hidden_caret_travels,
             now: self.now,
             caret: ((input.cursor_visible || self.hidden_caret_travels)
@@ -135,7 +140,12 @@ impl Scene {
             reduced_motion: self.reduced,
             output_burst: false,
             pointer: None,
-        });
+        };
+        let frame = if self.still {
+            self.brain.tick_static_capture(sense)
+        } else {
+            self.brain.tick(sense)
+        };
         if let Some(rect) = body(frame) {
             assert!(
                 world.under_text_clearance_past_caret(rect, 0.0) == Some(true),
@@ -404,31 +414,314 @@ fn ordinary_typing_keeps_the_full_body_visible_between_keys() {
     });
 }
 
+/// Typed along the dense page's prompt row (row 55 of 57, [`at_the_last_columns`]) to the grid's
+/// end and over it, a key every 4 frames: the body is on glass at every key until the wall holds
+/// it no seat (`OldPath::NoSeatHidesTheBody`, ATERM-KI-1107-4), from no sooner than the 25th key
+/// (measured: the 27th, the caret at the grid's second-last column), and its box lying on the
+/// row's letters there, the wall's cut (`OldPath::LettersCutTheFade`) draws it off the glass
+/// within 3 frames of the hide (measured 3, at alphas 184, 118 and 57). From the wrap it is on
+/// glass in every frame (it fades back in from off the glass, measured at full alpha from the 19th
+/// frame on, against the 8th with the cut reverted, which brought it back from its fade's 146), no
+/// frame drawn more than [`FADE_BACK_STEP`] over the one before (measured 19 at most, 14
+/// reverted), and it ends at home.
+/// Negative control (the cut reverted): its fade is on glass in 8 or more of the frames from the
+/// hide to the wrap, two thirds of those measured (12 of 12, down to alpha 146). Negative control
+/// by hand of the step (the cut snapped whole at the wrap, not lifted over the fade-in): the body
+/// went from off the glass to 159 in the wrap's first frame (Linux arm64, 2026-11-09).
 #[test]
 fn wall_side_changes_and_line_wrap_keep_the_body_visible() {
+    for cut in [true, false] {
+        let mut s = Scene::dense(false);
+        s.brain.set_old_path(OldPath::LettersCutTheFade, !cut);
+        s.term.process(b"\x1b[55;123H");
+        for _ in 0..100 {
+            s.tick(16);
+        }
+        let mut hid = None;
+        let mut drawn_in_the_hide = 0;
+        let mut last = u8::MAX;
+        for key in 0..34 {
+            s.brain.note_console_input(s.now, PetInputKind::Text);
+            s.term.process(b"a");
+            for beat in 0..4 {
+                let frame = s.tick(16);
+                let before = core::mem::replace(&mut last, frame.alpha);
+                if hid.is_none() && frame.alpha < u8::MAX {
+                    hid = Some(key);
+                }
+                if hid.is_some() && s.term.cursor().row == 54 {
+                    drawn_in_the_hide += usize::from(frame.alpha > 0);
+                    continue;
+                }
+                assert!(
+                    frame.alpha.saturating_sub(before) <= FADE_BACK_STEP,
+                    "(cut {cut}) key{key} beat{beat}: the body came back at {} from {before}",
+                    frame.alpha
+                );
+                assert!(
+                    frame.alpha > 0,
+                    "typing at margin key{key} beat{beat} (cut {cut}) hid full body: {}; \
+                     caret={:?}; frame={frame:?}",
+                    s.brain.console_reason(),
+                    s.term.cursor()
+                );
+            }
+        }
+        let hid = hid.unwrap_or_else(|| panic!("fixture (cut {cut}): the wall never hid the body"));
+        assert!(
+            hid >= 24,
+            "(cut {cut}) the wall hid the body from key{hid}, before the line reached it"
+        );
+        if cut {
+            assert!(
+                drawn_in_the_hide <= 3,
+                "from the wall's hide to the wrap the body lay on the letters in \
+                 {drawn_in_the_hide} frames"
+            );
+        } else {
+            assert!(
+                drawn_in_the_hide >= 8,
+                "negative control: the cut reverted, from the wall's hide to the wrap its fade \
+                 was on glass in only {drawn_in_the_hide} frames"
+            );
+        }
+        let mut frame = s.tick(16);
+        for _ in 0..150 {
+            frame = s.tick(16);
+        }
+        s.at_home(frame);
+    }
+}
+
+/// The most a frame of the body coming back from the wall's cut is drawn over the one before: twice
+/// the fade-in's own step at 60 Hz (255 x 16 ms / 300 ms, 13.6), since the cut's lift and the
+/// fade's run together and multiply (`OldPath::LettersCutTheFade`).
+const FADE_BACK_STEP: u8 = 28;
+
+/// The dense page's prompt row with its caret at row 55 of 57, column 123 (1-based), settled:
+/// typed on a key every 4 frames ([`type_along`]), its line reaches the grid's end and the wall
+/// holds the body no seat on its last letters
+/// ([`wall_side_changes_and_line_wrap_keep_the_body_visible`]). It is not the grid's last row:
+/// rows 56 and 57 under it are full of letters, and a wrap takes the caret down to row 56, which
+/// ends the wall's hide at once; on a last row a wrap scrolls the page and leaves the caret on its
+/// row (`PetBrain::unseated_sense`).
+fn at_the_last_columns(cut: bool) -> Scene {
     let mut s = Scene::dense(false);
+    s.brain.set_old_path(OldPath::LettersCutTheFade, !cut);
     s.term.process(b"\x1b[55;123H");
     for _ in 0..100 {
         s.tick(16);
     }
-    for key in 0..34 {
+    s
+}
+
+/// Types `a` along the row a key every 4 frames, up to `keys` keys, handing `seen` each frame;
+/// stops at the first frame it answers `true` for, and says whether one did.
+fn type_along(s: &mut Scene, keys: usize, mut seen: impl FnMut(&Scene, PetFrame) -> bool) -> bool {
+    for _ in 0..keys {
         s.brain.note_console_input(s.now, PetInputKind::Text);
         s.term.process(b"a");
-        for beat in 0..4 {
+        for _ in 0..4 {
+            let frame = s.tick(16);
+            if seen(s, frame) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The program hides its cursor (`ESC[?25l`) six frames into the wall's hide of the body on the
+/// last letters of the dense page's prompt row (row 55 of 57, [`at_the_last_columns`]), its cut
+/// having drawn the body off the glass (`OldPath::LettersCutTheFade`): the hidden cursor's hold
+/// (`cursor-hidden-home`) does not take a body the cut takes off the letters, whose last seat is
+/// the one on them. It stays off the glass in every frame of the cursor's hide, and the brain asks
+/// for no frames once its fade has run out (`FADE_OUT`, 450 ms: measured none from the 23rd frame
+/// of the cursor's hide; bound, none from the 28th). Shown again on that row, the cursor leaves it
+/// out (the wall still holds it no seat), and the line typed on over the grid's end brings it back
+/// from the wrap (on glass in every frame from the wrap's 2nd).
+/// Negative control (the cut reverted): the hold takes the body at its fade's alpha and brings it
+/// back on those letters, on glass in every frame of the cursor's hide (measured 214, 227, 241,
+/// then 255). Negative control by hand (the hold taking the cut body as well): it drew the body
+/// back on the letters at 11 to 245 in the cursor's hide's first 18 frames and at full from its
+/// 19th (Linux arm64, 2026-11-09).
+#[test]
+fn a_cursor_hide_in_the_walls_cut_keeps_the_body_off_the_letters() {
+    for cut in [true, false] {
+        let mut s = at_the_last_columns(cut);
+        let mut into = 0;
+        assert!(
+            type_along(&mut s, 34, |_, frame| {
+                into += usize::from(into > 0 || frame.alpha < u8::MAX);
+                into == 6
+            }),
+            "fixture (cut {cut}): the wall never hid the body"
+        );
+        assert_eq!(
+            s.term.cursor().row,
+            54,
+            "fixture (cut {cut}): the line wrapped"
+        );
+        s.term.process(b"\x1b[?25l");
+        let mut drawn = 0;
+        let mut asked = 0;
+        for k in 1..=60 {
+            let frame = s.tick(16);
+            drawn += usize::from(frame.alpha > 0);
+            if s.brain.needs_frames() {
+                asked = k;
+            }
+        }
+        if !cut {
+            assert_eq!(
+                drawn, 60,
+                "negative control: the cut reverted, the hidden cursor's hold drew the body in \
+                 only {drawn} of the cursor's hide's 60 frames"
+            );
+            continue;
+        }
+        assert_eq!(
+            drawn,
+            0,
+            "the hidden cursor's hold drew the body the wall's cut took off the letters in \
+             {drawn} frames: {}",
+            s.brain.console_reason()
+        );
+        assert!(
+            asked < 28 && !s.brain.is_active(),
+            "the body off the glass, the brain asked for frames to frame {asked} of the cursor's hide"
+        );
+        s.term.process(b"\x1b[?25h");
+        for _ in 0..30 {
+            let frame = s.tick(16);
+            assert_eq!(
+                frame.alpha, 0,
+                "the cursor shown at the wall, the body came back"
+            );
+        }
+        let mut past = 0;
+        let wrapped = type_along(&mut s, 8, |s, frame| {
+            if s.term.cursor().row == 54 {
+                return false;
+            }
+            past += 1;
+            assert!(
+                past < 2 || frame.alpha > 0,
+                "the line wrapped, the body was off the glass in the wrap's frame {past}"
+            );
+            past == 20
+        });
+        assert!(wrapped, "fixture: the line never wrapped");
+    }
+}
+
+/// The program hides its cursor one or three frames past the wrap that ends the wall's hide on the
+/// dense page's prompt row (row 55 of 57, [`at_the_last_columns`]: the wrap takes the caret down
+/// to row 56), the body coming back from the wall's cut (which lifts over the fade-in,
+/// `OldPath::LettersCutTheFade`), the typing stopped: the hidden cursor's hold lifts the cut on,
+/// and the brain asks for frames until the body is whole and for none once it is (a host that
+/// draws only the frames asked for leaves no body drawn short of full). Measured: full from the
+/// 19th frame from the wrap at either (bound, the fade-in's 19 frames and two), no frame asked for
+/// from there.
+/// Negative controls by hand (Linux arm64, 2026-11-09): with the hold's frames not lifting the
+/// cut, the body stayed at 14 or 41 of 255 and the brain asked for every frame; with the brain not
+/// asking for the cut's lift, it asked for none from 109 or 150.
+#[test]
+fn a_cursor_hide_as_the_body_comes_back_from_the_cut_brings_it_back_whole() {
+    for hide in [1, 3] {
+        let mut s = at_the_last_columns(true);
+        let mut hid = false;
+        assert!(
+            type_along(&mut s, 34, |s, frame| {
+                hid |= frame.alpha < u8::MAX;
+                hid && s.term.cursor().row != 54
+            }),
+            "fixture: the line never wrapped"
+        );
+        let mut full = None;
+        for k in 2..=60 {
+            if k == hide + 1 {
+                s.term.process(b"\x1b[?25l");
+            }
+            let frame = s.tick(16);
+            if full.is_none() && frame.alpha == u8::MAX {
+                full = Some(k);
+            }
+            assert!(
+                s.brain.needs_frames() || frame.alpha == u8::MAX,
+                "(hidden {hide} past the wrap) the brain asked for no frame past frame {k} from \
+                 the wrap, the body drawn at {}",
+                frame.alpha
+            );
+        }
+        assert!(
+            full.is_some_and(|k| k <= 21),
+            "(hidden {hide} past the wrap) the body came back whole from frame {full:?} from the \
+             wrap"
+        );
+        assert!(
+            !s.brain.needs_frames(),
+            "(hidden {hide} past the wrap) the hidden cursor's hold went on asking for frames"
+        );
+    }
+}
+
+/// Windowless stills (`PetBrain::tick_static_capture`) through the wall's hide of the body on the
+/// last letters of the dense page's prompt row (row 55 of 57, [`at_the_last_columns`]), the line
+/// resting at the wall, as live frames: a still does not force a body the wall's cut has taken off
+/// the glass back to full (`OldPath::LettersCutTheFade`), so its fade runs out under the cut as in
+/// live frames. The body is off the glass from the hide's 4th frame, the brain asks for no frames
+/// from its fade's end (`FADE_OUT`, 450 ms: measured none from the 29th frame; bound, none from
+/// the 31st), and six Backspaces that leave the body its seat bring it back on glass within 3
+/// frames (measured the 2nd; a still at full in the 1st).
+/// Negative control by hand (stills forcing the body back over the cut; Linux arm64,
+/// 2026-11-09): its fade started over in every still, the brain asked for frames in every one,
+/// and the body stayed off the glass past the Backspaces.
+#[test]
+fn a_still_capture_lets_the_walls_cut_run_out() {
+    for still in [false, true] {
+        let mut s = at_the_last_columns(true);
+        s.still = still;
+        assert!(
+            type_along(&mut s, 34, |_, frame| frame.alpha < u8::MAX),
+            "fixture (still {still}): the wall never hid the body"
+        );
+        let mut asked = 1;
+        for k in 2..=60 {
             let frame = s.tick(16);
             assert!(
-                frame.alpha > 0,
-                "typing at margin key{key} beat{beat} hid full body: {}; caret={:?}; frame={frame:?}",
-                s.brain.console_reason(),
-                s.term.cursor()
+                k < 4 || frame.alpha == 0,
+                "(still {still}) the body was drawn at {} in the hide's frame {k}",
+                frame.alpha
+            );
+            if s.brain.needs_frames() {
+                asked = k;
+            }
+        }
+        assert!(
+            asked < 31,
+            "(still {still}) the body off the glass, the brain asked for frames to frame \
+             {asked} of the hide"
+        );
+        for _ in 0..6 {
+            s.term.process(b"\x08\x1b[K");
+        }
+        let back = (1..=3).find_map(|k| {
+            let alpha = s.tick(16).alpha;
+            (alpha > 0).then_some((k, alpha))
+        });
+        assert!(
+            back.is_some(),
+            "(still {still}) six Backspaces left the body its seat, and it stayed off the glass"
+        );
+        if still {
+            assert_eq!(
+                back,
+                Some((1, u8::MAX)),
+                "a still shows the body back at full"
             );
         }
     }
-    let mut frame = s.tick(16);
-    for _ in 0..150 {
-        frame = s.tick(16);
-    }
-    s.at_home(frame);
 }
 
 #[test]

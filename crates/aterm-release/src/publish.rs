@@ -3615,7 +3615,7 @@ fn private_release_asset_temp(parent: &Path) -> Result<PrivateTempDir> {
         .unwrap_or(0);
     let sequence = RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     PrivateTempDir::create(parent.join(format!(
-        "aterm-release-asset-{}-{nonce}-{sequence}",
+        "aterm-release-asset-{}-{nonce}-{sequence}.noindex",
         std::process::id()
     )))
 }
@@ -10222,13 +10222,8 @@ mod release_body_post_tests {
 
     use super::*;
 
-    fn notes_file(label: &str, contents: &str) -> (PrivateTempDir, PathBuf) {
-        let sequence = RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
-            "aterm-release-notes-{label}-{}-{sequence}",
-            std::process::id()
-        )))
-        .expect("create release-notes test directory");
+    fn notes_file(label: &str, contents: &str) -> (aterm_tempfile::TempDir, PathBuf) {
+        let dir = crate::test_scratch_dir(label);
         let path = dir.path().join("notes-0.87.0.md");
         fs::write(&path, contents).expect("write release-notes fixture");
         (dir, path)
@@ -10310,12 +10305,7 @@ mod transport_body_tests {
 
     #[test]
     fn an_asset_upload_streams_off_disk_and_never_buffers() {
-        let dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
-            "aterm-release-oneshot-{}-{}",
-            std::process::id(),
-            RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        )))
-        .expect("scratch");
+        let dir = crate::test_scratch_dir("oneshot");
         let dmg = dir.path().join("aterm-0.33.0.dmg");
         fs::write(&dmg, b"dmg").expect("the asset");
         let args = prepared(|| {
@@ -10879,9 +10869,8 @@ mod roster_wiring_tests {
 
     #[test]
     fn the_ratchet_reads_both_generations_out_of_manifest_bytes() {
-        let dir = std::env::temp_dir().join(format!("aterm-ratchet-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let scratch = crate::test_scratch_dir("ratchet");
+        let dir = scratch.path();
 
         let mut manifest = manifest_out::build(&manifest_out::ManifestInputs {
             version: "0.5.0",
@@ -10939,7 +10928,7 @@ mod roster_wiring_tests {
         assert_eq!(cut_roster_seq(&fresh).unwrap(), Some(7));
 
         let mut resumed = ctx(Some("m3"));
-        resumed.dist = dir.clone();
+        resumed.dist = dir.to_path_buf();
         fs::write(dir.join(manifest_out::MANIFEST_ASSET), &attributed).unwrap();
         assert_eq!(
             cut_roster_seq(&resumed).unwrap(),
@@ -10950,8 +10939,6 @@ mod roster_wiring_tests {
         let mut lost = ctx(Some("m3"));
         lost.dist = dir.join("gone");
         assert!(cut_roster_seq(&lost).is_err());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -11002,29 +10989,25 @@ mod roster_wiring_tests {
 
     #[test]
     fn recovery_refuses_to_overwrite_a_newer_local_roster() {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-roster-downgrade-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = crate::test_scratch_dir("downgrad");
+        let dir = scratch.path();
 
-        assert!(refuse_roster_downgrade(&dir, 1).is_ok());
+        assert!(refuse_roster_downgrade(dir, 1).is_ok());
 
         let bytes = aterm_codec::base64::decode_strict(ROSTER_SEQ2.concat().as_bytes()).unwrap();
         let sig = aterm_codec::base64::decode_strict(ROSTER_SEQ2_SIG.as_bytes()).unwrap();
         std::fs::write(dir.join(roster::ROSTER_ASSET), &bytes).unwrap();
         std::fs::write(dir.join(roster::ROSTER_SIG_ASSET), &sig).unwrap();
 
-        let err = refuse_roster_downgrade(&dir, 1).unwrap_err();
+        let err = refuse_roster_downgrade(dir, 1).unwrap_err();
         assert!(err.0.contains("NEWER"), "{}", err.0);
         assert!(err.0.contains(roster::ROSTER_ASSET), "{}", err.0);
 
-        assert!(refuse_roster_downgrade(&dir, 2).is_ok());
-        assert!(refuse_roster_downgrade(&dir, 3).is_ok());
+        assert!(refuse_roster_downgrade(dir, 2).is_ok());
+        assert!(refuse_roster_downgrade(dir, 3).is_ok());
 
         std::fs::write(dir.join(roster::ROSTER_SIG_ASSET), [0u8; 64]).unwrap();
-        assert!(refuse_roster_downgrade(&dir, 1).is_ok());
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(refuse_roster_downgrade(dir, 1).is_ok());
     }
 
     #[test]
@@ -11049,10 +11032,8 @@ sha256 = \"aa\"\ndmg = \"aterm-0.20.0.dmg\"\n";
      {
         use ring::signature::{Ed25519KeyPair, KeyPair};
 
-        let dir =
-            std::env::temp_dir().join(format!("aterm-prove-roster-on-disk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = crate::test_scratch_dir("prove");
+        let dir = scratch.path();
 
         let master_kp = Ed25519KeyPair::from_seed_unchecked(&[0x51; 32]).unwrap();
         let master_pk = aterm_codec::base64::encode(master_kp.public_key().as_ref()).unwrap();
@@ -11109,7 +11090,7 @@ sha256 = \"aa\"\ndmg = \"aterm-0.20.0.dmg\"\n";
         );
 
         let mut rostered_ctx = ctx(Some("m3"));
-        rostered_ctx.dist = dir.clone();
+        rostered_ctx.dist = dir.to_path_buf();
         rostered_ctx.signature_pubkey = Some(m3_pk.clone());
         let now_ok = 1_790_000_000;
         let masters = [master_pk.as_str()];
@@ -11153,8 +11134,6 @@ sha256 = \"aa\"\ndmg = \"aterm-0.20.0.dmg\"\n";
             "{}",
             unrostered_err.0
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     const ROSTER_SEQ2: &[&str] = &[
@@ -11187,13 +11166,8 @@ mod lean_dmg_ceiling_tests {
         assert!(err.to_string().contains("aterm-0.95.0.dmg"), "{err}");
     }
 
-    fn sparse_dmg(label: &str, size: u64) -> (PrivateTempDir, PathBuf) {
-        let sequence = RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
-            "aterm-lean-dmg-{label}-{}-{sequence}",
-            std::process::id()
-        )))
-        .expect("create lean-DMG test directory");
+    fn sparse_dmg(label: &str, size: u64) -> (aterm_tempfile::TempDir, PathBuf) {
+        let dir = crate::test_scratch_dir(label);
         let path = dir.path().join("aterm-test.dmg");
         let file = fs::OpenOptions::new()
             .create_new(true)
@@ -11221,12 +11195,7 @@ mod lean_dmg_ceiling_tests {
 
     #[test]
     fn an_oversized_recovered_dmg_is_refused_before_publish() {
-        let sequence = RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
-            "aterm-lean-dmg-recovery-{}-{sequence}",
-            std::process::id()
-        )))
-        .expect("create recovered-DMG test directory");
+        let dir = crate::test_scratch_dir("recovery");
         let path = dir.path().join("aterm-recovered.dmg");
         recover_lean_dmg_to(&path, |destination| {
             let file = fs::OpenOptions::new()

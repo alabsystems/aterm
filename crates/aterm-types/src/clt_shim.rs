@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn xcode_bundle_roots_and_aliases_expose_their_developer_tools() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::test_scratch_dir("clt-shim");
         let bundle = root.path().join("Developer Suite");
         let developer = bundle.join("Contents/Developer");
         let git = developer.join("usr/bin/git");
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn invalid_developer_tools_do_not_hide_a_later_executable_and_links_still_work() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::test_scratch_dir("clt-shim");
         let partial = root.path().join("partial");
         let complete = root.path().join("complete");
         let empty = partial.join("usr/bin/git");

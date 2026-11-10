@@ -15,11 +15,18 @@ use headless_boot::{Instance, boot_session, ctl, ctl_ok, field, status, type_lin
 
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
+/// Replace a clock file atomically so a concurrent `Clock::read` never observes `O_TRUNC` empty bytes.
+pub(crate) fn write_clock(path: &std::path::Path, tick: &str) {
+    let staged = path.with_extension("next");
+    std::fs::write(&staged, tick).expect("stage the echo clock");
+    std::fs::rename(&staged, path).expect("advance the echo clock");
+}
+
 /// Advance the isolated server's echo clock and wait for a decision that still waits for input.
 pub(crate) fn past_echo_cap(inst: &Instance, sid: &str) {
     let path = inst.tmp.join("echo-clock").join(sid);
     let tick = (TURN_ECHO_CAP_MS + 1_000).to_string();
-    std::fs::write(&path, &tick).expect("advance the echo clock");
+    write_clock(&path, &tick);
     aterm_spec::wait::until_within(HANG, "the advanced echo still waits", || {
         std::fs::read_to_string(path.with_extension("seen"))
             .is_ok_and(|seen| seen == tick)
@@ -392,8 +399,7 @@ fn a_line_read_before_any_look_is_pressed_once_its_composer_shows_it() {
         aterm_spec::wait::until_within(HANG, "the program reads before the first look", || {
             script.with_extension("sh.read").exists().then_some(())
         });
-        std::fs::write(&clock, (TURN_ECHO_CAP_MS + 1_000).to_string())
-            .expect("advance past the original echo cap");
+        write_clock(&clock, &(TURN_ECHO_CAP_MS + 1_000).to_string());
         std::fs::remove_file(clock.with_extension("hold")).expect("allow the first look");
         past_echo_cap(&inst, &late);
         std::fs::remove_file(script.with_extension("sh.draw")).expect("draw the late echo");

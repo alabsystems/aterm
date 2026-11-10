@@ -149,6 +149,8 @@ pub struct EnvSnapshot {
     pub trust_stage2_bin: Option<PathBuf>,
     /// `XDG_CONFIG_HOME`.
     pub xdg_config_home: Option<PathBuf>,
+    /// Linux's login runtime directory, checked before it enters a test child.
+    pub xdg_runtime_dir: Option<PathBuf>,
     /// `RUSTUP_HOME`, raw ([`toolchain::rustup_home`]).
     pub rustup_home: Option<OsString>,
     /// `SSH_CONNECTION`.
@@ -216,6 +218,7 @@ impl EnvSnapshot {
                 .or_else(|| atpkg::store::resolve_configured().map(|layout| layout.prefix)),
             trust_stage2_bin: var_path("TRUST_STAGE2_BIN"),
             xdg_config_home: var_path("XDG_CONFIG_HOME").filter(|p| !p.as_os_str().is_empty()),
+            xdg_runtime_dir: var_path("XDG_RUNTIME_DIR"),
             rustup_home: std::env::var_os("RUSTUP_HOME"),
             ssh_connection: std::env::var("SSH_CONNECTION").ok(),
             cargo_build_jobs: std::env::var_os("CARGO_BUILD_JOBS"),
@@ -1505,8 +1508,9 @@ const fn stopping() -> bool {
     false
 }
 
-/// What the run's first proven red ends ([`Ctx::halt`]): a release, and a `--fail-fast` run, whose
-/// red stops every child the run started ([`exec::group::halt`]); a bare run, nothing.
+/// What a proven red ends ([`Ctx::halt`]): every red for a release or `--fail-fast`,
+/// and only source/type preflight failures for an ordinary run. Test failures retain the
+/// complete sweep required by `verify land`'s inheritance rule.
 fn halt_of(release: bool, fail_fast: bool) -> sched::Halt {
     #[cfg(unix)]
     let end: fn(&str) = exec::group::halt;
@@ -1517,7 +1521,7 @@ fn halt_of(release: bool, fail_fast: bool) -> sched::Halt {
     } else if fail_fast {
         sched::Halt::at_first_red("the run", end)
     } else {
-        sched::Halt::off()
+        sched::Halt::after_preflight(end)
     }
 }
 
@@ -4833,18 +4837,26 @@ mod tests {
             .filter(|s| matches!(s.id, plan::StageId::TestCompile | plan::StageId::Tippy))
             .map(|s| plan::StageSpec { mem: 12 * GIB, ..s })
             .collect();
+        let test_compile = stages
+            .iter()
+            .position(|s| s.id == plan::StageId::TestCompile)
+            .expect("test compile");
+        let tippy = stages
+            .iter()
+            .position(|s| s.id == plan::StageId::Tippy)
+            .expect("tippy");
         let held = sched::Held {
             waited: Duration::from_millis(41_250),
-            behind: vec![0],
+            behind: vec![test_compile],
         };
-        let note = held_note(&stages, 1, &held, 43 * GIB / 2).expect("held");
+        let note = held_note(&stages, tippy, &held, 43 * GIB / 2).expect("held");
         assert_eq!(
             note,
             "memory: held 41.2s for room behind test compile (-p aterm-gui): it claims 12 GiB of \
              the run's 21.5 GiB"
         );
         assert_eq!(
-            held_note(&stages, 1, &sched::Held::default(), 43 * GIB / 2),
+            held_note(&stages, tippy, &sched::Held::default(), 43 * GIB / 2),
             None
         );
     }

@@ -277,7 +277,8 @@ impl Overlap {
 }
 
 /// `verify-event: {"schema":1,"event":"compile-unit-timed",…}` for each span of call `call`:
-/// its unit by the name the memory book keys it by, its wait and its compile dated, its CPU and
+/// its unit by the name the memory book keys it by, its explicit backend output request
+/// (`codegen_requested`, null when unread), its wait and its compile dated, its CPU and
 /// its peak, and the reads' period, so a reader knows the dates' grain.
 #[must_use]
 pub fn span_events(call: &str, spans: &[crate::memory::UnitSpan]) -> Vec<String> {
@@ -289,6 +290,7 @@ pub fn span_events(call: &str, spans: &[crate::memory::UnitSpan]) -> Vec<String>
                 aterm_json::json!({
                     "schema": 1, "event": "compile-unit-timed", "call": call,
                     "package": s.unit.package, "unit": s.unit.kind,
+                    "codegen_requested": s.codegen_requested,
                     "queued_at_unix_ms": s.queued_at_unix_ms,
                     "started_at_unix_ms": s.started_at_unix_ms,
                     "ended_at_unix_ms": s.ended_at_unix_ms,

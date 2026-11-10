@@ -801,9 +801,9 @@ fn failed_terminal_persistence_withholds_success_and_retry_keeps_the_exact_compl
             assert_eq!(operation.lock().unwrap().completed_observation, observation);
         }
         assert_eq!(facts.sealed_history.lock().unwrap().len(), 1);
-        assert_eq!(
+        assert!(matches!(
             facts.journal.lock().unwrap()[&binding.id].state,
-            JournalState::Sealed
-        );
+            JournalState::Sealed { .. }
+        ));
     }
 }

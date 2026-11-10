@@ -1163,7 +1163,7 @@ mod tests {
         use std::io::Write as _;
         use std::os::unix::process::ExitStatusExt as _;
         let mut kept =
-            aterm_uds::deadline::KeptUntilRan::new(aterm_tempfile::tempdir().unwrap().keep());
+            aterm_uds::deadline::KeptUntilRan::new(crate::test_scratch_dir("interrupt").keep());
         let trustd = kept.path().join("trustd");
         let shell = if cfg!(target_vendor = "apple") {
             "/bin/dash"

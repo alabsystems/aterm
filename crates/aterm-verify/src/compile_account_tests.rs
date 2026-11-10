@@ -264,6 +264,7 @@ fn span(kind: &str, queued: Option<u64>, started: u64, ended: u64) -> crate::mem
             kind: kind.to_owned(),
         },
         queued_at_unix_ms: queued,
+        codegen_requested: None,
         started_at_unix_ms: started,
         ended_at_unix_ms: ended,
         cpu_s: 1.5,
@@ -342,4 +343,27 @@ fn each_span_is_one_timed_unit_event() {
     assert_eq!(a["read_every_ms"].as_u64(), Some(500));
     assert!(b["queued_at_unix_ms"].is_null(), "{b}");
     assert_eq!(b["unit"].as_str(), Some("b test"));
+}
+
+/// Output evidence survives the wire without treating an unread selection as metadata-only.
+#[test]
+fn timed_unit_events_preserve_codegen_requests_and_unknowns() {
+    let spans: Vec<_> = [Some(false), Some(true), None]
+        .into_iter()
+        .map(|requested| {
+            let mut s = span("dep lib", None, 10, 20);
+            s.codegen_requested = requested;
+            s
+        })
+        .collect();
+    let events = super::span_events("lint", &spans);
+    let values: Vec<aterm_json::Value> = events
+        .iter()
+        .map(|line| {
+            aterm_json::from_str(line.strip_prefix("verify-event: ").expect("event")).expect("json")
+        })
+        .collect();
+    assert_eq!(values[0]["codegen_requested"].as_bool(), Some(false));
+    assert_eq!(values[1]["codegen_requested"].as_bool(), Some(true));
+    assert!(values[2]["codegen_requested"].is_null());
 }

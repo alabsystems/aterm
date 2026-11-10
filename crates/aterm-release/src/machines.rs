@@ -532,9 +532,8 @@ mod tests {
 
     #[test]
     fn a_missing_identity_is_none_and_a_broken_one_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("aterm-machine-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = crate::test_scratch_dir("machine");
+        let dir = scratch.path();
         let path = dir.join("machine.toml");
         assert_eq!(MachineIdentity::read(&path).unwrap(), None);
 
@@ -551,7 +550,6 @@ mod tests {
 
         std::fs::write(&path, "this is not toml = = =").unwrap();
         assert!(MachineIdentity::read(&path).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Release attribution reads `~/.aterm/release-ring/machine.toml` and ignores the host's own
@@ -560,8 +558,8 @@ mod tests {
     /// `Some("m99")` when the release ring is absent).
     #[test]
     fn release_ring_identity_path_ignores_host_machine_toml() {
-        let home = std::env::temp_dir().join(format!("aterm-ring-id-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
+        let scratch = crate::test_scratch_dir("ring-id");
+        let home = scratch.path();
         std::fs::create_dir_all(home.join(".aterm")).unwrap();
         std::fs::write(
             home.join(".aterm/machine.toml"),
@@ -569,7 +567,7 @@ mod tests {
         )
         .unwrap();
 
-        let ring_record = identity_path_in(&home);
+        let ring_record = identity_path_in(home);
         assert_eq!(
             declared_machine_id(None, Some(&ring_record)).unwrap(),
             None,
@@ -583,7 +581,6 @@ mod tests {
             Some("m22".to_string()),
             "release-ring/machine.toml wins over ~/.aterm/machine.toml"
         );
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[cfg(unix)]

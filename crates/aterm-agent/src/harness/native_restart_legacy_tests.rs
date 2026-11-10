@@ -9,6 +9,9 @@ pub(super) fn old_prepare(seed: &St, stored: bool) -> (Request, String) {
     let Request::Prepare(mut prepare) = Request::parse(&seed.native_prepare).unwrap() else {
         unreachable!();
     };
+    // An older harness's prepare carries neither stamp.
+    prepare.boot = None;
+    prepare.custody = None;
     let NativePlan::Restart { cold, .. } = &mut prepare.plan else {
         unreachable!();
     };

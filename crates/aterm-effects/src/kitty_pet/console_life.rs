@@ -2794,6 +2794,15 @@ impl PetBrain {
     /// New interests use the resident's position, distance-driven gait and authored poses.
     /// `dt` is the tick's capped span, and `move_dt` the part of it the body and the clocks of
     /// what is drawn spend: none on a tick that ends a sleep ([`PetBrain::tick`]).
+    ///
+    /// A program's cursor hide holds the body at its last seat (`cursor-hidden-home`), but not a
+    /// body the wall's cut takes off the line's letters ([`PetBrain::cut_on_the_letters`]): that
+    /// seat is the one whose box met them, and the hold brought the body back there, lifting the
+    /// cut over [`FADE_IN`] (on `console_cursor_home`'s dense page, its prompt on row 55 of 57,
+    /// a cursor hide six frames into the wall's, the body off the glass from that hide's 4th,
+    /// drew it back onto the same letters at 11 to 245 in the cursor hide's first 18 frames and
+    /// at full from its 19th, Linux arm64, 2026-11-09). Its fade runs out under the hidden caret
+    /// as under the wall's hide, and the body comes back as any faded-out one does.
     #[inline]
     pub(super) fn tick_console_resident(
         &mut self,
@@ -2805,6 +2814,7 @@ impl PetBrain {
             && sense.caret.is_none()
             && self.console.cursor_home.is_some()
             && self.alpha > 0.0
+            && !self.wall_cut_falls
             && !self.console_legacy_motion_pending();
         if holding {
             if let Some((col, row)) = self.console.last_seat {
@@ -2973,6 +2983,7 @@ impl PetBrain {
             self.land_t = 0.0;
             self.retired_flight_lift = None;
             self.drop_room_cue();
+            self.lift_the_wall_cut(move_dt);
             return Some(self.emit(sense, width));
         };
         let destination = if target == body {
@@ -3280,6 +3291,7 @@ impl PetBrain {
                 self.facing_left = trip.to.0 < trip.from.0;
             }
         }
+        self.lift_the_wall_cut(move_dt);
         Some(self.emit(sense, width))
     }
 

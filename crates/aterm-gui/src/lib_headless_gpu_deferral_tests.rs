@@ -19,7 +19,10 @@ fn a_headless_boot_claims_no_first_frame_warm() {
     }
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
     crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
-        let warm = super::warm_config(true, crate::app_config::CarriedZoom::default());
+        let warm = super::warm_config(
+            super::WarmLaunch::Headless,
+            crate::app_config::CarriedZoom::default(),
+        );
         let _ = warm.backend_handle.join().expect("the backend worker");
     });
     assert!(

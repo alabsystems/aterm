@@ -925,7 +925,79 @@ fn a_pending_epoch_cannot_hit_cached_historical_absence() {
             .historical_from_lease(&identity, *epoch.id(), &pending.lease_complete().unwrap())
             .is_err()
     );
+    assert!(
+        access
+            .opens_from_lease(&identity, *epoch.id(), &pending.lease_complete().unwrap())
+            .is_err(),
+        "an ask whether it opens is refused as the key's is"
+    );
     assert!(log.get(parent.id()).is_none(), "the parent has not arrived");
+}
+
+/// A batch asks whether this device holds each basis as [`Bootstrap::historicals`] answers it, in
+/// order, and takes no key to answer: it asks nothing of the kept keys, a basis the log opens is
+/// noted as opened in the log the vault's memo keeps, and the next ask unwraps no key again.
+///
+/// NEGATIVE CONTROLS: `Bootstrap::holds_histories` answering through `historicals` fails the kept
+/// keys' assertion; `Access::opens_from_lease` without its `HistoryLease::opened` lookup fails the
+/// second ask's (one unwrap); `holds_histories` answering in reverse order fails the first.
+#[test]
+fn a_batch_asks_whether_it_holds_each_basis_as_its_historicals_answer() {
+    use crate::membership_log::history::{HistoryView, RecordState, UNWRAPS};
+    use std::cell::Cell;
+
+    let vault = Vault::new();
+    let identity = client::machine_identity(&vault.paths).unwrap();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    let basis = *access.basis();
+    let bases = [basis, [7; 32]];
+    let asks = KEY_CACHE_ASKS.with(Cell::get);
+    let held = vault
+        .bootstrap
+        .holds_histories(&vault.journal, &access, &bases);
+    assert_eq!(held, [true, false]);
+    assert_eq!(
+        KEY_CACHE_ASKS.with(Cell::get),
+        asks,
+        "an ask whether it holds takes no kept key"
+    );
+    let (log, _) = client::trusted_commons_log_now(&vault.paths, vault.bootstrap.trust())
+        .unwrap()
+        .unwrap();
+    let view = HistoryView::new(&log);
+    let lease = view.lease_complete().unwrap();
+    let RecordState::Complete(epoch) = lease.record(&basis).unwrap() else {
+        panic!("CONTROL: the log holds the vault's own epoch");
+    };
+    assert!(
+        lease.opened(&epoch, &identity).unwrap(),
+        "the ask noted what opened in the log the memo keeps"
+    );
+    let unwraps = UNWRAPS.with(Cell::get);
+    assert_eq!(
+        vault
+            .bootstrap
+            .holds_histories(&vault.journal, &access, &bases),
+        held
+    );
+    assert_eq!(
+        UNWRAPS.with(Cell::get),
+        unwraps,
+        "an epoch that opened is answered without its key unwrapped again"
+    );
+    let answers: Vec<bool> = vault
+        .bootstrap
+        .historicals(&vault.journal, &access, &bases)
+        .iter()
+        .map(Result::is_ok)
+        .collect();
+    assert_eq!(held, answers);
+    assert!(
+        vault
+            .bootstrap
+            .holds_histories(&vault.journal, &access, &[])
+            .is_empty()
+    );
 }
 
 /// A batch answers each basis as it alone would, in order: one the log opens, and one it does not

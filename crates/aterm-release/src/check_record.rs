@@ -191,7 +191,8 @@ pub struct CheckRecord {
     pub tree: String,
     /// The commit whose release ran it.
     pub commit: String,
-    /// The run's build-inputs identity ([`crate::build_inputs::current`]).
+    /// The run's build-inputs identity ([`crate::build_inputs::current`]); a release-input
+    /// namespace additionally binds its selection and finalized execution context.
     pub seal: String,
     /// The separately declared content this check read.  The authoritative key above remains
     /// tree-local; this evidence can only seed the immediately following line hop.
@@ -313,6 +314,40 @@ fn answers(
     executable: Option<&str>,
 ) -> bool {
     record.key == key(check, tree, seal, executable)
+}
+
+/// Why a preflight selection cannot run: a standing failure or unreadable evidence.
+#[derive(Debug)]
+pub enum InputError {
+    Failed(String),
+    Unavailable(String),
+}
+
+/// Missing preflight rows, or the distinction between a recorded red and unreadable evidence.
+pub fn input_missing(root: &Path, tree: &str, seal: &str) -> Result<Vec<String>, InputError> {
+    let mut missing = Vec::new();
+    for name in std::iter::once(RUN_LEVEL).chain(
+        aterm_verify::release_input::CHECKS
+            .into_iter()
+            .map(Check::name),
+    ) {
+        match read(&path(root, tree, seal, name, None)).map_err(InputError::Unavailable)? {
+            Read::Record(record) if answers(&record, name, tree, seal, None) => {
+                if [FAIL, BEGAN].contains(&record.outcome.as_str()) {
+                    return Err(InputError::Failed(format!(
+                        "{name}: {} (recorded in {})",
+                        record.outcome, record.log
+                    )));
+                }
+                if name != RUN_LEVEL && record.outcome != OK {
+                    missing.push(name.to_owned());
+                }
+            }
+            _ if name != RUN_LEVEL => missing.push(name.to_owned()),
+            _ => {}
+        }
+    }
+    Ok(missing)
 }
 
 /// The records of bundle check `check` in `seal_dir`, one per executable: each U and
@@ -1711,7 +1746,11 @@ pub fn write_run(
             else {
                 continue;
             };
-            let Some(check) = RELEASE.into_iter().find(|c| c.name() == name) else {
+            let Some(check) = RELEASE
+                .into_iter()
+                .chain(aterm_verify::release_input::CHECKS)
+                .find(|c| c.name() == name)
+            else {
                 continue;
             };
             if !facts.asked.iter().any(|a| a == name)
@@ -2046,6 +2085,72 @@ mod tests {
             finished: release_names().iter().map(|c| finished(c, OK)).collect(),
             ..RunEvents::default()
         }
+    }
+
+    #[test]
+    fn input_records_resume_only_missing_and_never_reroll_red() {
+        let f = Fixture::new();
+        let asked: Vec<_> = aterm_verify::release_input::CHECKS
+            .into_iter()
+            .map(|check| check.name().to_owned())
+            .collect();
+        let mut facts = f.facts("input-cone-seal", "");
+        facts.executable = None;
+        facts.asked = &asked;
+        assert_eq!(input_missing(&f.root, TREE, facts.seal).unwrap(), asked);
+        begin_run(&f.root, &facts).unwrap();
+        assert!(input_missing(&f.root, TREE, facts.seal).is_err());
+        let events = RunEvents {
+            finished: asked.iter().map(|name| finished(name, OK)).collect(),
+            ..RunEvents::default()
+        };
+        write_run(
+            &f.root,
+            &facts,
+            RunEnd {
+                exit: 0,
+                log_sha256: "",
+                events: Ok(&events),
+            },
+        )
+        .unwrap();
+        assert!(input_missing(&f.root, TREE, facts.seal).unwrap().is_empty());
+        assert_eq!(
+            input_missing(&f.root, TREE, "changed-cone-seal").unwrap(),
+            asked
+        );
+        assert_eq!(
+            input_missing(&f.root, "changed-tree", facts.seal).unwrap(),
+            asked
+        );
+        // A real red is retained even if a later run supplies all-green events.
+        begin_run(&f.root, &facts).unwrap();
+        let red = RunEvents {
+            finished: vec![finished("lint", FAIL)],
+            ..RunEvents::default()
+        };
+        write_run(
+            &f.root,
+            &facts,
+            RunEnd {
+                exit: 1,
+                log_sha256: "",
+                events: Ok(&red),
+            },
+        )
+        .unwrap();
+        assert!(input_missing(&f.root, TREE, facts.seal).is_err());
+        write_run(
+            &f.root,
+            &facts,
+            RunEnd {
+                exit: 0,
+                log_sha256: "",
+                events: Ok(&events),
+            },
+        )
+        .unwrap();
+        assert!(input_missing(&f.root, TREE, facts.seal).is_err());
     }
 
     /// Compilation may uplift the verifier path. Both halves use their captured running

@@ -34,6 +34,7 @@ impl<T: Clone> Template<T> {
         let (from, tree, value) = self.built.get_or_init(|| {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("aterm-release-template-")
+                .suffix(".noindex")
                 .tempdir()
                 .unwrap();
             let from = dir.path().to_path_buf();

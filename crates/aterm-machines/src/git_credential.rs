@@ -2826,6 +2826,7 @@ mod tests {
     /// someone else's is in effect and not the block, and the file stays as it is. Only on a
     /// Mac: no `aterm init` ran gh elsewhere, so off a Mac those sections are a person's own,
     /// as the settings tests above hold.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_block_gh_setup_git_wrote_gives_way_to_atermss_route() {
         let live = Live::new();

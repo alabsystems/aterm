@@ -34,15 +34,15 @@ impl Bed {
     fn publish(&self, cut: Option<usize>) -> Result<bool, String> {
         let held = self.store.acquire().unwrap();
         CUT.with(|held| held.set(cut));
-        let result = self.store.transact_fleet_state_held(
+        let result = self.store.transact_fleet_state_policy_held(
             &held,
             NOW,
             &mut None,
             (&self.roster, FLEET),
-            |state| {
+            (false, |state| {
                 state.swarm_label = Some("m16".into());
                 Ok(Vec::new())
-            },
+            }),
         );
         CUT.with(|held| held.set(None));
         result
@@ -424,10 +424,16 @@ fn a_new_fleet_plan_does_not_implicitly_recover_a_pending_plan() {
     let mut edited = false;
     assert!(
         bed.store
-            .transact_fleet_state_held(&held, NOW, &mut None, (&bed.roster, FLEET), |_| {
-                edited = true;
-                Ok(Vec::new())
-            },)
+            .transact_fleet_state_policy_held(
+                &held,
+                NOW,
+                &mut None,
+                (&bed.roster, FLEET),
+                (false, |_| {
+                    edited = true;
+                    Ok(Vec::new())
+                }),
+            )
             .is_err()
     );
     assert!(!edited, "a stale plan may not run its state edit");

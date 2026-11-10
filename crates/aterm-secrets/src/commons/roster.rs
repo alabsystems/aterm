@@ -571,6 +571,8 @@ impl Access {
             std::collections::VecDeque<(HistoricalCacheKey, HistoricalCacheVal)>,
         > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
+        #[cfg(any(test, debug_assertions))]
+        KEY_CACHE_ASKS.with(|asks| asks.set(asks.get() + 1));
         let Some(paths) = &self.log_paths else {
             return Ok(None);
         };
@@ -605,11 +607,11 @@ impl Access {
                     local_recipient: Some(self.local().binding.recipient()),
                 }));
         }
-        let writers = match epoch.as_ref() {
-            Some(epoch) => lease.historical_commons_writers(epoch)?,
+        let opened = match epoch.as_ref() {
+            Some(epoch) => open_from_lease(identity, epoch, lease)?,
             None => None,
         };
-        let Some((generation, bindings)) = writers else {
+        let Some((generation, bindings, key)) = opened else {
             if let Ok(mut cache) = HISTORICAL_CACHE.lock() {
                 if cache.len() >= 16 {
                     cache.pop_front();
@@ -617,11 +619,6 @@ impl Access {
                 cache.push_back((cache_key, None));
             }
             return Ok(None);
-        };
-        let Some(key) = lease.unwrap_commons_epoch(epoch.as_ref().unwrap(), identity)? else {
-            return Err(Error::new(
-                "historical Commons epoch is not wrapped to this device",
-            ));
         };
         let members = self.log_writers(bindings);
         if let Ok(mut cache) = HISTORICAL_CACHE.lock() {
@@ -642,6 +639,42 @@ impl Access {
             log_heads_digest: self.log_heads_digest,
             local_recipient: Some(self.local().binding.recipient()),
         }))
+    }
+
+    /// Whether [`Access::historical_from_lease`] would answer `basis` with a key, asked without
+    /// one: an epoch `identity` opened under the same held records before is answered without its
+    /// key unwrapped again ([`HistoryLease::opened`]), and a key unwrapped to answer is neither kept
+    /// nor given. A repair round asks whether this Mac holds each epoch of its history, sixteen a
+    /// round on each side (`aterm-db`'s `Session::history_needs`): unwrapping each again took 7.7%
+    /// of a quiet round over a log of 9,605 records, and keeping each pushed the keys a table's
+    /// reads take out of the sixteen kept (2026-11-09).
+    ///
+    /// [`HistoryLease::opened`]: crate::membership_log::history::HistoryLease::opened
+    ///
+    /// # Errors
+    /// As [`Access::historical_from_lease`]: the epoch is pending its parents, or its key is not
+    /// wrapped to `identity` or does not open.
+    fn opens_from_lease(
+        &self,
+        identity: &Identity,
+        basis: [u8; 32],
+        lease: &crate::membership_log::history::HistoryLease<'_>,
+    ) -> Result<bool> {
+        use crate::membership_log::history::RecordState;
+        if self.log_paths.is_none() {
+            return Ok(false);
+        }
+        let epoch = match lease.record(&basis)? {
+            RecordState::Complete(epoch) => epoch,
+            RecordState::Pending => {
+                return Err(Error::new("historical Commons epoch is not complete"));
+            }
+            RecordState::Absent => return Ok(false),
+        };
+        if lease.opened(&epoch, identity)? {
+            return Ok(true);
+        }
+        Ok(open_from_lease(identity, &epoch, lease)?.is_some())
     }
 
     /// The writers of a log-era Commons epoch in this network, by binding, one per actor.
@@ -826,6 +859,52 @@ impl Access {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The calls of [`Access::historical_from_lease`], which asks the kept historical keys, made
+    /// on this thread, counted (never timed).
+    pub(super) static KEY_CACHE_ASKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The calls of [`Access::historical_from_lease`], which asks the kept historical keys, this
+/// thread made: a law that a history ask takes no kept key (`aterm-db`'s `Session::history_needs`)
+/// reads it before and after.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_kept_key_asks() -> usize {
+    KEY_CACHE_ASKS.with(std::cell::Cell::get)
+}
+
+/// What [`open_from_lease`] unwraps of an epoch: its generation, the bindings of its writers and
+/// its key.
+type OpenedEpoch = (u64, Vec<Binding>, Zeroizing<[u8; 32]>);
+
+/// `epoch`'s generation, the bindings of its writers and its key, unwrapped for `identity` under
+/// `lease` and noted as opened there ([`HistoryLease::note_opened`]), or `None` where the log names
+/// no writers of it.
+///
+/// [`HistoryLease::note_opened`]: crate::membership_log::history::HistoryLease::note_opened
+///
+/// # Errors
+/// The epoch belongs to another history, or its key is not wrapped to `identity` or does not open.
+fn open_from_lease(
+    identity: &Identity,
+    epoch: &crate::membership_log::history::RecordLease<'_>,
+    lease: &crate::membership_log::history::HistoryLease<'_>,
+) -> Result<Option<OpenedEpoch>> {
+    let Some((generation, bindings)) = lease.historical_commons_writers(epoch)? else {
+        return Ok(None);
+    };
+    let Some(key) = lease.unwrap_commons_epoch(epoch, identity)? else {
+        return Err(Error::new(
+            "historical Commons epoch is not wrapped to this device",
+        ));
+    };
+    lease.note_opened(epoch, identity)?;
+    Ok(Some((generation, bindings, key)))
+}
+
 /// One check of the current local membership and one lease of the log's complete history, which
 /// the historical reads of one batch share ([`Access::with_log_history`]).
 pub(super) struct LogHistory<'h> {
@@ -844,6 +923,13 @@ impl LogHistory<'_> {
     pub(super) fn historical(&self, basis: [u8; 32]) -> Result<Option<Historical>> {
         self.access
             .historical_from_lease(self.identity, basis, self.lease)
+    }
+
+    /// Whether [`LogHistory::historical`] would answer `basis` with a key, asked without one
+    /// ([`Access::opens_from_lease`]).
+    pub(super) fn opens(&self, basis: [u8; 32]) -> Result<bool> {
+        self.access
+            .opens_from_lease(self.identity, basis, self.lease)
     }
 
     /// [`Access::historical_from_log_with_key`], over this history.

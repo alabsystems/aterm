@@ -146,7 +146,7 @@ mod tests {
     /// goes too: `` assertion `left == right` failed left: 2 right: 1 ``.
     #[test]
     fn only_a_dead_makers_scratch_folder_is_swept() {
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::test_scratch_dir("edit");
         let folder = |name: &str| {
             let path = root.path().join(name);
             std::fs::create_dir(&path).unwrap();

@@ -1619,9 +1619,9 @@ impl App {
                     .tabs()
                     .iter()
                     .position(|tab| {
-                        tab.root.leaves().into_iter().any(|view| {
+                        tab.root.any_leaf(&mut |view| {
                             self.view_store
-                                .get(view)
+                                .get(*view)
                                 .copied()
                                 .and_then(crate::tab_model::View::terminal_session)
                                 == Some(terminal.session)

@@ -178,7 +178,7 @@ pub(crate) fn engine_fixture(
 
 #[cfg(test)]
 pub(crate) fn claim_fixture(repo: &std::path::Path, bare: &std::path::Path) -> Remote {
-    let mut command = crate::ledger::object_git(repo);
+    let mut command = crate::ledger::object_git(repo).unwrap();
     command.args(["rev-parse", "--absolute-git-dir"]);
     let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
         &mut command,

@@ -244,11 +244,8 @@ mod tests {
     #[test]
     fn ensure_private_dir_creates_0700_tightens_and_is_idempotent() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!(
-            "aterm-fs-restricted-{}-{}",
-            std::process::id(),
-            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
-        ));
+        let scratch = crate::test_scratch_dir("priv");
+        let root = scratch.path().join("nested-root");
         let dir = root.join("identities").join("worker");
         ensure_private_dir(&dir).expect("created");
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -263,7 +260,6 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         ensure_private_dir(&dir).expect("an existing dir of ours is tightened, not refused");
         assert_eq!(mode(&dir), 0o700);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An already-`0700` directory of ours gets no `chmod(2)`, so its `st_ctime` holds; a drifted mode is still forced back to `0700`.
@@ -271,8 +267,8 @@ mod tests {
     #[test]
     fn an_already_private_dir_keeps_its_ctime_and_a_drifted_one_is_hardened() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir = std::env::temp_dir().join(format!("atypes-privdir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("ctime");
+        let dir = scratch.path().join("privdir");
         ensure_private_dir(&dir).unwrap();
         let stamp = || {
             let m = std::fs::metadata(&dir).unwrap();
@@ -286,21 +282,16 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         ensure_private_dir(&dir).unwrap();
         assert_eq!(stamp().2, 0o700, "a drifted mode is hardened");
-        let outside = std::env::temp_dir().join(format!("atypes-outside-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&outside);
+        let outside = scratch.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let link = std::env::temp_dir().join(format!("atypes-link-{}", std::process::id()));
-        let _ = std::fs::remove_file(&link);
+        let link = scratch.path().join("link");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         assert!(ensure_private_dir(&link).is_err());
         assert_eq!(
             std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
             0o755
         );
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_dir_all(&outside);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A leaf that is a symbolic link or a file is refused in words that name it, with mkdir's
@@ -309,8 +300,8 @@ mod tests {
     #[test]
     fn a_leaf_that_is_no_real_directory_is_refused_by_name() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("atypes-noreal-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let scratch = crate::test_scratch_dir("noreal");
+        let root = scratch.path();
         let target = root.join("target");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -333,6 +324,5 @@ mod tests {
         assert!(e.to_string().contains("a file, not a directory"), "{e}");
         // CONTROL: a real directory is taken as it is.
         create_dir_all_unshared(&target, 0o700).expect("a real directory");
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

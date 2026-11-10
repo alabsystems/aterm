@@ -338,6 +338,7 @@ impl Fixture {
         static BUILT: crate::template::Template<Shas> = crate::template::Template::new();
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("aterm-release-line-{name}-"))
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let root = dir.path().to_path_buf();

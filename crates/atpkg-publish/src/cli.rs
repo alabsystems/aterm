@@ -104,7 +104,7 @@ pub const VERBS: &[Verb] = &[
     },
     Verb {
         name: "lane",
-        synopsis: "lane stage linux --reuse-package PKG… | lane run <alab|linux> [--dry-run] [--staged-only] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux> [--allow-dirty] [--no-arm] [--keyless] [--host gh|agh-staging|agh] | lane disarm <alab|linux>",
+        synopsis: "lane stage linux --reuse-package PKG… | lane run <alab|linux> [--dry-run] [--staged-only [--queued]] [--json] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux> [--staged-only] [--allow-dirty] [--no-arm] [--keyless] [--host gh|agh-staging|agh] | lane disarm <alab|linux>",
         does: "stage retained GNU bottles unsigned, or run/install/disarm a lane (a run without --dry-run needs its installed unit's --sha256)",
     },
     Verb {

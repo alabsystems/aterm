@@ -6,8 +6,9 @@ use aterm_spec::derive::Model;
 /// The host answers an expired restart prepare replay `unadmitted` only for a prepare it never
 /// admitted and no replay of which it can admit. One id under one prepare and its one deadline
 /// (a fresh deadline is a new admission), on one host epoch: the epoch check before this answer
-/// is an unmodelled premise, since a new epoch's clock and a second live process share no
-/// deadline.
+/// is an unmodelled premise, since a new epoch's table is not the one that admitted it. What a
+/// later reader can answer from the issuer journal alone, `lapsed`, is the
+/// `NativeHistoricalClosure` model.
 /// `deadline` is too far (0), in its window (1) or expired (2) on the one monotonic clock. `op`
 /// is the id in the reached table: absent (0), reserved (1), published (2), recorded (3), started
 /// (4), completed (5) or reclaimed (6). `journal` is the durable issuer record admission writes

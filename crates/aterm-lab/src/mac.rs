@@ -158,6 +158,7 @@ pub fn cmd_mac(args: &[String]) -> Res {
         Some("nux") => crate::mac_nux::cmd_nux(&args[1..]),
         Some("runtime") => crate::mac_runtime::run(&args[1..]),
         Some("count-ranks") => crate::mac_runtime::count_ranks(&args[1..]),
+        Some("settle-ranks") => crate::mac_runtime::settle_ranks(&args[1..]),
         Some("clean") => cmd_clean(&args[1..]),
         None | Some("help" | "-h" | "--help") => {
             print!(

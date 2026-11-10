@@ -2295,12 +2295,15 @@ fn a_companion_crossing_a_wrap_keeps_off_the_line() {
 /// the fitted body its room ([`last_row_cols`]): the gallery's three cells on its 14 x 26 px cell,
 /// four under Linux's 13 x 29, where the body is 3.38 cells across. A line that ends nearer the
 /// grid's end leaves the body no seat, and the wall's law hides it there instead
-/// ([`a_last_row_that_holds_no_seat_hides_the_companion`]). Negative control:
-/// [`OldPath::FitCentredAtTheWall`] reverted alone, its box lies across the line's last letter in
-/// 28 of the 565 frames held, from the line's last key, until that wall, which now holds it no
-/// seat, hides it (off the glass in 350 of them); with [`OldPath::NoSeatHidesTheBody`] reverted
-/// too it meets the letter in 378 and never leaves the glass (Linux arm64, 2026-11-07). The floor,
-/// 19, is two thirds of the 28 rounded up.
+/// ([`a_last_row_that_holds_no_seat_hides_the_companion`]). Negative controls, the cat on dark:
+/// [`OldPath::FitCentredAtTheWall`] reverted alone, its box lies across the line's last letter
+/// from the line's last key, and the wall, which now holds it no seat, hides it, off the glass in
+/// 250 or more of the 565 frames held (measured 375, its box on the letter in 3 before the wall's
+/// cut took it off); with [`OldPath::LettersCutTheFade`] reverted too, its fade lies on the
+/// letter in 19 or more (measured 28, off the glass in 350); with it and
+/// [`OldPath::NoSeatHidesTheBody`] reverted (not taken), it meets the letter in 378 and never
+/// leaves the glass (Linux arm64, 2026-11-09). Each floor is two thirds of the measure, rounded
+/// up.
 #[test]
 fn on_a_full_screen_s_last_row_the_companion_stands_beside_the_caret() {
     const FIRST_KEYS: u64 = 300;
@@ -2341,6 +2344,15 @@ fn on_a_full_screen_s_last_row_the_companion_stands_beside_the_caret() {
     }
     let old = held("rainbow kitty pet", DARK, &[OldPath::FitCentredAtTheWall]);
     assert!(
+        old.iter().filter(|f| !f.2).count() >= 250,
+        "negative control: centred in its whole box the fitted body kept its seat at the wall"
+    );
+    let old = held(
+        "rainbow kitty pet",
+        DARK,
+        &[OldPath::FitCentredAtTheWall, OldPath::LettersCutTheFade],
+    );
+    assert!(
         old.iter().filter(|f| !f.1.is_empty()).count() >= 19,
         "negative control: centred in its whole box the fitted body kept off the last letter"
     );
@@ -2365,6 +2377,9 @@ struct WallCoat {
     gone: Option<u64>,
     /// Frames (ms) from `first` to `gone` whose alpha rose over the frame before's.
     rose: Vec<u64>,
+    /// Frames from `first` to `gone` on glass below full alpha whose box meets a lettered cell or
+    /// whose body lies on letter ink or the caret's cell: the wall's fade over the letters.
+    faded_on: usize,
     /// Frames (ms) on glass from `gone` to the Enter (not judged where the line wraps).
     unfaded: Vec<u64>,
     /// The first frame (ms) on glass from `gone` to the Enter: the companion back before it.
@@ -2474,6 +2489,17 @@ fn wall_coat(judged: &[Judged], (room, then): (i16, LastRowThen)) -> WallCoat {
             .filter(|p| p[0].ms >= first && p[1].ms <= gone && p[1].coat.alpha > p[0].coat.alpha)
             .map(|p| p[1].ms)
             .collect();
+        w.faded_on = judged
+            .iter()
+            .filter(|j| {
+                let c = &j.coat;
+                j.ms >= first
+                    && j.ms < gone
+                    && c.alpha > 0
+                    && c.alpha < u8::MAX
+                    && (!c.box_cells.is_empty() || c.ink_px > 0 || c.caret_px > 0)
+            })
+            .count();
         if !wraps {
             let rested: Vec<&&Judged> = held.iter().filter(|j| j.ms >= gone).collect();
             w.unfaded = rested
@@ -2618,29 +2644,38 @@ type WallRun = (
 /// 13 x 29 and 14 x 26) or its body on letter ink or the caret's cell. Negative control of that
 /// reach (built to measure, not kept): with [`head_law`]'s fit raised to 1.06 rows, the box
 /// 1 to 2 px down into the lettered row over the line, it reached across it in 486 of the 565
-/// frames at four blank cells on 13 x 29 (Linux arm64, 2026-11-09). Where it leaves less, a frame's box
-/// meets the last letters as they come, and from that frame the companion fades out, its alpha
-/// never rising, and is off the glass a fade (0.45 s) and two frames on. Past the Enter (to the
-/// next line's first key), and past the wrap (to the Enter), it is back on glass within a second,
-/// and no frame lays its box more than [`SWELL`] into a lettered cell or its body on ink or the
-/// caret: it comes back by the new caret, and the wrapped line's first row stays clear.
-/// The fade itself lies over the letters as they come, for its 28 frames (on Linux's 13 x 29: box
-/// only at three blank cells; art on up to 39 px of ink at two, 103 at one, 165 and the caret's
-/// cell at none, 128 where the line wraps, each at the fade's alpha, below full; after the pause,
-/// 29 at one and none, one of them at full alpha with its art on no ink; 11 x 28 the same, and
-/// 14 x 26 the same a cell sooner, 29 after the pause at none alone).
+/// frames at four blank cells on 13 x 29 (Linux arm64, 2026-11-09). Where it leaves less, a frame's
+/// box meets the last letters as they come, and from that frame the companion fades out (0.45 s),
+/// drawn off the glass within the wall's cut of it ([`OldPath::LettersCutTheFade`], 64 ms): its
+/// alpha never rises, it lies on the letters or the caret below full alpha in 3 frames at most
+/// (the cut's 4 frames at 60 Hz, the 4th off the glass; measured 3 in every run, at alphas 184,
+/// 118 and 57), and it is off the glass the cut and a frame on (measured 48 ms, and 64 where the
+/// first frame on the letters comes at full alpha, a tick before the wall's law hides it, past the
+/// pause). Past the Enter (to the next line's first key), and past the wrap (to the Enter), it is
+/// back on glass within a second, and no frame lays its box more than [`SWELL`] into a lettered
+/// cell or its body on ink or the caret: it comes back by the new caret, and the wrapped line's
+/// first row stays clear. In those 3 frames (the cat and the dog on dark), at rest, past the Left
+/// arrows, the erases and the cleared row, its art lies on no ink and off the caret's cell on
+/// 13 x 29 and 11 x 28, and on 14 x 26 on 2 to 7 px of ink at two and one blank cells, on none at
+/// none or where the line wraps. Past the pause the first of its 4 frames on the letters is at
+/// full alpha, on no ink, and the last, at 57, lies on 37 to 51 px of ink at one blank cell on
+/// 13 x 29 and 11 x 28 and at none on 14 x 26. Past the gap all 3 lie on ink at one blank cell and
+/// at none (38 to 68 px on 13 x 29, 48 to 55 on 11 x 28, 2 to 63 on 14 x 26, and 6 to 9 at two
+/// there). Without the cut the fade lay over the letters for its 28 frames, its art on up to 160
+/// px of ink and the caret's cell in 19 at none on 13 x 29 (142 and 22 on 14 x 26, 146 and 19 on
+/// 11 x 28; Linux arm64, 2026-11-09).
 ///
 /// Where the line leaves no seat, what follows it before the Enter ([`WALL_THENS`]):
 /// - It rests: off the glass from its fade's end to the Enter.
-/// - 3, 6 or 12 Backspaces 1.5 s past the last key, or 6 from 150 ms, while it fades: where the
-///   erase leaves the fitted body its room ([`erased_room`]), it is back on glass within a second
-///   of the erase's last key (or of its fade's end), and where it leaves less, off the glass to
-///   the Enter. Either way no frame from its fade's end to the Enter lays its box more than
-///   [`SWELL`] into a lettered cell or its body on ink or the caret.
+/// - 3, 6 or 12 Backspaces 1.5 s past the last key, or 6 from 150 ms, while its fade runs on (off
+///   the glass by then): where the erase leaves the fitted body its room ([`erased_room`]), it is
+///   back on glass within a second of the erase's last key (or of its fade's end), and where it
+///   leaves less, off the glass to the Enter. Either way no frame from its fade's end to the Enter
+///   lays its box more than [`SWELL`] into a lettered cell or its body on ink or the caret.
 /// - Ten Left arrows back into the line 1.5 s past the last key: off the glass from its fade's
 ///   end to the Enter.
-/// - The burst paused six keys short of its end for 3 s: off the glass within 0.45 s and 150 ms of
-///   its last key, and to the Enter.
+/// - The burst paused six keys short of its end for 3 s: off the glass from its fade's end to the
+///   Enter.
 /// - 1.5 s past the last key the program clears the row over the line
 ///   ([`LastRowThen::Opened`]), so a seat opens beside the line while the companion is out: back
 ///   on glass within a second of the clearing (or of its fade's end; measured 24 ms past the
@@ -2697,7 +2732,11 @@ type WallRun = (
 /// line's last letters at full alpha, more than [`SWELL`] into them in 15 frames or more over the
 /// rooms (measured 22: 10 at three blank cells and 10 at two, on up to 120 and 95 px of their ink,
 /// 1 at one and 1 at none; 2026-11-08), against 2 with the law. Each floor is two thirds of the
-/// fewest measured. Linux arm64, 2026-11-07.
+/// fewest measured. Linux arm64, 2026-11-07. Negative control of the cut
+/// ([`OldPath::LettersCutTheFade`] reverted, the cat on dark, both ways of typing, the rest at
+/// every room that leaves no seat, in every face): its fade lies on the letters or the caret below
+/// full alpha in 19 frames or more (measured 28 at every room that holds the line; to the wrap 12
+/// on 13 x 29 and 11 x 28 and 9 on 14 x 26, so 6 or more there; Linux arm64, 2026-11-09).
 #[test]
 fn a_last_row_that_holds_no_seat_hides_the_companion() {
     const ROOMS: [i16; 6] = [4, 3, 2, 1, 0, -1];
@@ -2737,6 +2776,10 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
                         for &style in styles {
                             runs.push((f, style, look, (room, then), drive, None));
                         }
+                    }
+                    if unseated && then == LastRowThen::Rests {
+                        let old = Some(OldPath::LettersCutTheFade);
+                        runs.push((f, cat, DARK, (room, then), drive, old));
                     }
                     if !window {
                         if unseated && room >= 0 && then == LastRowThen::Rests {
@@ -2812,6 +2855,16 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
         if control == Some(OldPath::CaretTypesOn) {
             continue;
         }
+        if control == Some(OldPath::LettersCutTheFade) {
+            let bites = if room < 0 { 6 } else { 19 };
+            assert!(
+                w.faded_on >= bites,
+                "negative control, {why}: the cut reverted, its fade lay on the letters in only \
+                 {} frames ({w:?})",
+                w.faded_on
+            );
+            continue;
+        }
         if control == Some(OldPath::KeptOffTheLine) {
             assert!(
                 w.then_on >= 186,
@@ -2859,15 +2912,18 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
         let gone = w
             .gone
             .unwrap_or_else(|| panic!("{why}: the companion never left the glass ({w:?})"));
-        let by = match then {
-            LastRowThen::Paused => w.last_key + 450 + 150,
-            _ => first + 450 + 32,
-        };
+        // The wall's cut (`FADE_OFF_THE_LETTERS`, 64 ms: 4 frames, the 4th off the glass) and a
+        // frame.
         assert!(
-            w.rose.is_empty() && gone <= by,
+            w.rose.is_empty() && gone <= first + 64 + 16,
             "{why}: from the box's meeting the letters at {first} ms its fade rose at {:?}, or \
              took to {gone} ms",
             w.rose
+        );
+        assert!(
+            w.faded_on <= 3,
+            "{why}: its fade lay on the letters or the caret in {} frames ({w:?})",
+            w.faded_on
         );
         assert!(
             w.full <= 1,

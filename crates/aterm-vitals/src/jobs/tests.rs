@@ -338,6 +338,80 @@ fn proc_with(pid: u32, name: &str, fds: Vec<Fd>) -> JobProc {
     }
 }
 
+#[test]
+fn admission_keeps_kernel_and_other_unproven_dependencies_visible() {
+    let mut queued = proc_with(10, "python3", Vec::new());
+    queued.build_admission = Some(vec![50, 51]);
+    let other = proc_with(11, "worker", Vec::new());
+    let by = HashMap::from([(10, &queued), (11, &other)]);
+    let mut ages = HashMap::new();
+    let mut elsewhere = HashMap::from([(50, Standing::Capable), (51, Standing::Legit)]);
+    let classify = |ages: &HashMap<u32, u64>, elsewhere: &HashMap<u32, Standing>, both| {
+        let scene = Scene {
+            procs: &by,
+            lanes: LanesSeen::default(),
+            d_age: ages,
+            elsewhere,
+            program_check: true,
+        };
+        let leaves = if both {
+            vec![(10, "python3".into()), (11, "worker".into())]
+        } else {
+            vec![(10, "python3".into())]
+        };
+        name_job(&scene, &JobFacts::default(), &leaves, (1, "sh"))
+    };
+    let blocked = classify(&ages, &elsewhere, false);
+    assert_eq!(blocked.name, WaitName::BuildAdmission);
+    assert_eq!(
+        blocked.standing,
+        Standing::Capable,
+        "one busy holder cannot hide a stuck one"
+    );
+    elsewhere.clear();
+    assert_eq!(classify(&ages, &elsewhere, false).standing, Standing::Legit);
+    assert_eq!(classify(&ages, &elsewhere, true).standing, Standing::Capped);
+    ages.insert(10, KERNEL_WAIT_MS);
+    assert_eq!(classify(&ages, &elsewhere, false).name, WaitName::Kernel);
+    ages.clear();
+    ages.insert(11, KERNEL_WAIT_MS);
+    assert_eq!(classify(&ages, &elsewhere, true).name, WaitName::Kernel);
+}
+
+#[test]
+fn a_pipe_retains_its_peer_and_follows_native_admission_standing() {
+    let end = |fd, handle, peer, write_end, status| Fd {
+        fd,
+        kind: FdKind::Pipe {
+            handle,
+            peer,
+            write_end: Some(write_end),
+            status: Some(status),
+            queued: Some(0),
+        },
+    };
+    let mut queued = proc_with(10, "python3", vec![end(1, 2, 1, true, 0)]);
+    queued.build_admission = Some(Vec::new());
+    let reader = proc_with(11, "reader", vec![end(0, 1, 2, false, wait::PIPE_WANTR)]);
+    let w = name_of(
+        &[queued.clone(), reader.clone()],
+        LanesSeen::default(),
+        &[],
+        None,
+        11,
+    );
+    assert_eq!(
+        (w.name, w.peer, w.leaf, w.standing),
+        (WaitName::Pipe, Some(10), 11, Standing::Legit)
+    );
+    queued.build_admission = None;
+    let w = name_of(&[queued, reader], LanesSeen::default(), &[], None, 11);
+    assert_eq!(
+        (w.name, w.peer, w.leaf, w.standing),
+        (WaitName::Pipe, Some(10), 11, Standing::Capped)
+    );
+}
+
 fn name_of(
     procs: &[JobProc],
     lanes: LanesSeen,

@@ -186,9 +186,18 @@ fn matching_pair_can_still_observe_completion_or_retirement() {
         let opts = opts(home.path());
         let mut st = bound_record(&opts);
         let binding = st.native.clone().unwrap();
+        let kept = prepared(&st);
         let (mut client, worker) = endpoint(move |line| {
+            let seen = request(line);
+            if retirement && seen == Request::Prepare(kept.clone()) {
+                // Retirement replays the kept prepare first; its admission keeps the binding.
+                return Some(format!(
+                    "OK native-act state=admitted id={} cap={}\n",
+                    binding.id, binding.capability
+                ));
+            }
             assert_eq!(
-                request(line),
+                seen,
                 if retirement {
                     Request::Reconcile(binding.clone())
                 } else {
@@ -210,7 +219,11 @@ fn matching_pair_can_still_observe_completion_or_retirement() {
             assert!(st.native.is_none() && st.native_prepare.is_empty());
         }
         drop(client);
-        assert_eq!(worker.join().unwrap().len(), 1);
+        assert_eq!(
+            worker.join().unwrap().len(),
+            1 + usize::from(retirement),
+            "retirement reconciles after its replay"
+        );
     }
 }
 

@@ -595,8 +595,9 @@ fn named_sync(desk: &Desk) {
 
 /// A copy aterm wrote to `~/.secrets` before a person synced a named list is superseded by it:
 /// no later sync reads the copy, so the account the named list dropped stays dropped, and the
-/// copy is left as it was. CONTROL: an edit that makes the copy the newer file makes it a source
-/// again, and a copy the vault delivered keeps its precedence however old it is.
+/// copy is left as it was. The first automatic read records retirement even if the rows are
+/// already settled; a later timestamp cannot undo it. An initially unretired vault delivery
+/// keeps its precedence however old it is.
 #[test]
 fn a_named_sync_supersedes_the_copy_aterm_wrote_before_it() {
     let desk = Desk::new("m27");
@@ -607,15 +608,26 @@ fn a_named_sync_supersedes_the_copy_aterm_wrote_before_it() {
     let named = ["a1@example.test", "new@example.test"];
     assert_eq!(emails(&desk), named);
     assert!(
-        !needs_init_accounts_sync(&desk.home, &desk.state, &desk.roster(), NOW + 1),
-        "nothing newer than the named list"
+        needs_init_accounts_sync(&desk.home, &desk.state, &desk.roster(), NOW + 1),
+        "the replacement still needs durable retirement"
     );
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW + 2).expect("sync");
     assert_eq!(emails(&desk), named, "`old@` stays dropped");
     assert_eq!(fs::read(&copy).unwrap(), kept, "the copy is left as it was");
+    assert!(!needs_init_accounts_sync(
+        &desk.home,
+        &desk.state,
+        &desk.roster(),
+        NOW + 2
+    ));
     let config = desk.config.join("aterm.toml");
     assert_eq!(
-        fleet_origin(Some(&desk.home), Some(&config), &desk.roster()),
+        fleet_origin(
+            &accounts::Store::at(&desk.state),
+            Some(&desk.home),
+            Some(&config),
+            &desk.roster()
+        ),
         FleetOrigin::Local {
             files: vec![desk.fleet_file()],
             opt_in: Some(OptIn::Named),
@@ -624,8 +636,8 @@ fn a_named_sync_supersedes_the_copy_aterm_wrote_before_it() {
 
     set_mtime(&copy, SystemTime::now() + Duration::from_secs(60));
     assert!(
-        needs_init_accounts_sync(&desk.home, &desk.state, &desk.roster(), NOW + 3),
-        "CONTROL: the newer copy is read again"
+        !needs_init_accounts_sync(&desk.home, &desk.state, &desk.roster(), NOW + 3),
+        "a newer timestamp cannot undo retirement"
     );
 
     let desk = Desk::new("m27");

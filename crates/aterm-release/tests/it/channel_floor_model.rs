@@ -182,11 +182,8 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
     assert_eq!(crashed["frozen_floor"], 0);
     assert_eq!(crashed["journal_floor"], 2);
 
-    let path = std::env::temp_dir().join(format!(
-        "aterm-channel-floor-journal-{}.toml",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&path);
+    let scratch = crate::test_scratch_dir("floor");
+    let path = scratch.path().join("journal.toml");
     let journal = publish::Journal {
         verify_pubkey: None,
         format: publish::JOURNAL_FORMAT,
@@ -243,7 +240,6 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
         impossible.save(&path).is_err(),
         "journal must reject a frozen floor above its claimed build"
     );
-    let _ = std::fs::remove_file(path);
 }
 
 #[test]

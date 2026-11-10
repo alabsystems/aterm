@@ -16,6 +16,7 @@ fn resolve_scope(state: &State, action: &str, promote: bool) -> State {
             "Pool" => "pool",
             "Vault" => "vault",
             "Sheet" => "sheet",
+            "Retire" => "retired",
             _ => panic!("unknown selection action"),
         };
         next.insert(key, 1);
@@ -63,7 +64,12 @@ fn resolve_scope(state: &State, action: &str, promote: bool) -> State {
     } else {
         Scope::Configured
     };
-    let selected = select(Some(home), Some(&config), Some(&roster), scope);
+    let store = accounts::Store::at(&home.join("state"));
+    if state["retired"] == 1 {
+        let held = store.acquire().unwrap();
+        store.retire_source_held(&held, 1).unwrap();
+    }
+    let selected = select_for(&store, Some(home), Some(&config), Some(&roster), scope).unwrap();
     let slot = match selected {
         Selection::Absent => 0,
         Selection::Key(_) => 1,
@@ -99,7 +105,7 @@ fn source_selection_conforms_and_rejects_promoted_manual_scope() {
             }
         }
     }
-    assert_eq!(selections, 128);
+    assert_eq!(selections, 256);
     let mut manual = model.init_state();
     manual.insert("vault", 1);
     let promoted = resolve_scope(&manual, "Select", true);

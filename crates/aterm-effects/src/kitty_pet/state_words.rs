@@ -108,6 +108,8 @@ impl PetBrain {
             f.flag("wrap_back", self.wrap_back);
             f.opt("wrap_ahead", self.wrap_ahead, wrap_ahead_words);
             f.u16_opt("unseated", self.unseated);
+            f.f32("wall_cut", self.wall_cut);
+            f.flag("wall_cut_falls", self.wall_cut_falls);
             f.opt("writing_wrap", self.writing_wrap, |f, v| f.f64("v", v));
             f.flag("launch_running", self.launch_running);
             f.flag("launch_brisk", self.launch_brisk);
@@ -686,7 +688,7 @@ mod tests {
         use super::super::PetMoteKind;
         let t0 = Instant::now();
         let base = words(&PetBrain::new(), t0);
-        let cases: [Case; 36] = [
+        let cases: [Case; 38] = [
             ("the surface", |p, _| p.surface = Some((7, true))),
             ("a held stand", |p, _| {
                 p.held_stash[1] = Some(HeldStand {
@@ -700,6 +702,8 @@ mod tests {
                 p.wrap_ahead = Some(WrapAhead::Rest(4.0, 2.0));
             }),
             ("the wall that holds no seat", |p, _| p.unseated = Some(13)),
+            ("the wall's cut", |p, _| p.wall_cut = 0.5),
+            ("the wall's cut falling", |p, _| p.wall_cut_falls = true),
             ("the room cheer's air", |p, _| {
                 p.room_cheer_air = Some(CheerAir::Compact);
             }),

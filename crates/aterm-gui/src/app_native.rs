@@ -10905,7 +10905,7 @@ impl App {
                 .tab_set
                 .tabs()
                 .iter()
-                .find(|tab| tab.root.leaves().contains(&view))
+                .find(|tab| tab.root.contains(view))
                 .map(|tab| tab.id)
         });
         if let Some(tab) = tab {

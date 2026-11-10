@@ -114,14 +114,26 @@ pub(crate) fn install_objc_containment_sink() {
 #[cfg(target_os = "macos")]
 fn objc_containment_sink(e: &aterm_objc::ContainedException<'_>) {
     aterm_log::error!(
-        "objc: contained {} ({}) in Objective-C method `{}` (containment #{}): {} | stack: {}",
+        "objc: contained {} ({}) in Objective-C method `{}` (containment #{}): {}",
         e.name,
         e.class,
         e.method,
         e.ordinal,
-        e.reason,
-        e.call_stack
+        e.reason
     );
+    // One bounded log record cannot carry the collector's full native stack.
+    // Keep each captured frame independent so a long reason or early framework
+    // frames cannot discard the later application frames.
+    if !e.call_stack.is_empty() {
+        for (index, frame) in e.call_stack.split(" | ").enumerate() {
+            aterm_log::error!(
+                "objc: containment #{} stack frame {}: {}",
+                e.ordinal,
+                index,
+                frame
+            );
+        }
+    }
     // A fatal callback aborts as soon as this sink returns, before the writer
     // necessarily runs. Give its diagnostic the same bounded drain as a panic.
     let _ = flush_within(LOG_FLUSH_EXIT_WAIT);
@@ -1874,8 +1886,11 @@ mod tests {
                 method: "applicationDidFinishLaunching:",
                 class: "NSException",
                 name: "LaunchException",
-                reason: "launch failed",
-                call_stack: "throw site",
+                reason: &format!("launch failed {}", "r".repeat(2048)),
+                call_stack: &(0..48)
+                    .map(|index| format!("native-frame-{index:02} {}", "symbol".repeat(30)))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
                 ordinal: 1,
             });
             let report = read(path);
@@ -1883,11 +1898,18 @@ mod tests {
                 "applicationDidFinishLaunching:",
                 "LaunchException",
                 "launch failed",
-                "throw site",
+                "native-frame-00",
+                "native-frame-47",
             ] {
                 assert!(
                     report.contains(detail),
                     "queued report lost {detail:?}: {report}"
+                );
+            }
+            for index in 0..48 {
+                assert!(
+                    report.contains(&format!("native-frame-{index:02} ")),
+                    "the bounded header or preceding frames discarded frame {index}"
                 );
             }
             return;

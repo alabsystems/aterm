@@ -707,7 +707,7 @@ fn a_worker_whose_first_prompt_comes_late_still_starts() {
         "the launcher is waiting for its prompt",
         || clock.join(&worker).with_extension("seen").exists(),
     );
-    std::fs::write(clock.join(&worker), "25000").expect("advance past the former 20 s deadline");
+    crate::turn_submit_live_headless::write_clock(&clock.join(&worker), "25000");
     until(&inst, &worker, "the launcher judged the late clock", || {
         std::fs::read_to_string(clock.join(&worker).with_extension("seen"))
             .is_ok_and(|seen| seen == "25000")

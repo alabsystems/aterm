@@ -256,22 +256,22 @@ impl App {
             };
             let mut chips: Vec<OverviewChip> = Vec::new();
             for tab in ws.tab_set.tabs() {
-                for view in tab.root.leaves() {
+                tab.root.visit(&mut |&view| {
                     let Some(local) = self
                         .view_store
                         .get(view)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
                     else {
-                        continue;
+                        return;
                     };
                     let Some(h) = by_local.get(&local) else {
-                        continue; // an unregistered stub labels no chip
+                        return; // an unregistered stub labels no chip
                     };
                     if placed.insert(local) {
                         chips.push(self.overview_chip(h, &hosting));
                     }
-                }
+                });
             }
             if chips.is_empty() {
                 continue; // an all-native window has no session lines to head

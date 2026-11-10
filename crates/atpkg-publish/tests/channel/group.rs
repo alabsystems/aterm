@@ -16,7 +16,7 @@ use atpkg_publish::api::{
 use atpkg_publish::artifact::lineage_switch::Switch;
 use atpkg_publish::channel::Log;
 use atpkg_publish::channel::group::{
-    GroupOutcome, GroupRequest, Mode, Parts, SealProbe, publish_group,
+    GroupOutcome, GroupRequest, Mode, Parts, SealProbe, preflight, publish_group,
 };
 use atpkg_publish::ctx::{Ctx, HostChoice, STAGING_OWNER};
 use atpkg_publish::error::{Error, Result};
@@ -229,6 +229,15 @@ fn cut_unstaged(label: &str, pins: &[(&str, u64)], overlay: &[(&str, u64)]) -> C
     }
     let trust_repo = rig.path("trust");
     let commit = repo(&trust_repo, 5);
+    git(
+        &trust_repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/{}.git", rig.ctx.staging_slug("trust")),
+        ],
+    );
     let mut checkouts = BTreeMap::new();
     for s in SIBLINGS {
         let dir = rig.path(s);
@@ -308,6 +317,58 @@ fn a_dry_run_judges_everything_and_runs_nothing() {
     assert!(o.builds.is_empty() && o.index_build.is_none());
     assert!(c.packs.bundles.borrow().is_empty() && c.packs.packs.borrow().is_empty());
     assert!(c.packs.indexes.borrow().is_empty());
+}
+
+#[test]
+fn native_preview_rejects_a_local_origin_before_running_any_seal_probe() {
+    struct NoProbe;
+    impl SealProbe for NoProbe {
+        fn trustc_vv(&self, _: &Path) -> std::result::Result<String, String> {
+            panic!("invalid source origin must stop before a compiler probe")
+        }
+        fn lineage_switch(&self, _: &Ctx, _: &Path) -> Switch {
+            panic!("invalid source origin must stop before lineage inspection")
+        }
+    }
+
+    let mut c = cut("group-native-origin", &FLOOR, &[]);
+    c.rig.ctx = c.rig.ctx.clone().with_host_choice(HostChoice::Agh);
+    git(
+        &c.trust_repo,
+        &["remote", "set-url", "origin", "/local/copy"],
+    );
+    let req = request(&c, Mode::DryRun);
+    let calls = c.rig.host.calls();
+    let parts = Parts {
+        probe: &NoProbe,
+        bundle: &c.packs,
+        packer: &c.packs,
+        indexer: &c.packs,
+    };
+    let rejected = preflight(&c.rig.ctx, &req, &parts);
+    assert_eq!(rejected.problems.len(), 1);
+    assert!(rejected.problems[0].contains("source origin does not name"));
+    assert!(rejected.seal_commit.is_empty());
+    assert_eq!(c.rig.host.calls(), calls, "local refusal needs no network");
+    assert!(c.packs.bundles.borrow().is_empty());
+
+    git(
+        &c.trust_repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &format!("https://github.com/{}.git", c.rig.ctx.staging_slug("trust")),
+        ],
+    );
+    let parts = Parts {
+        probe: &c.probe,
+        ..parts
+    };
+    let accepted = preflight(&c.rig.ctx, &req, &parts);
+    assert!(accepted.problems.is_empty(), "{:?}", accepted.problems);
+    assert_eq!(accepted.seal_commit, c.commit);
+    assert!(c.packs.bundles.borrow().is_empty());
 }
 
 #[test]
@@ -724,9 +785,14 @@ fn staging_needs_its_writer_and_key_but_never_a_public_writer() {
     );
     let control = cut("group-identity-ok", &FLOOR, &[]);
     std::fs::write(&control.rig.ctx.tokens.staging, "staging-token\n").expect("token");
-    let (o, _) = ok(&control, &request(&control, Mode::StageUpload));
+    let (o, log) = ok(&control, &request(&control, Mode::StageUpload));
     assert_eq!(o.index_build, None);
     assert!(control.packs.indexes.borrow().is_empty());
+    assert!(
+        log.text()
+            .contains("record staged builds; leave the public packages")
+    );
+    assert!(!log.text().contains("  3. index "));
 
     std::fs::remove_file(&c.rig.ctx.tokens.channel).expect("rm token");
     std::fs::write(&c.rig.ctx.tokens.staging, "staging-token\n").expect("token");

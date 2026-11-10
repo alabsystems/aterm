@@ -266,11 +266,11 @@ impl crate::App {
     /// bootstrap shell the leaf took, one a seamless update carried) keeps its own.
     pub(crate) fn note_restored_opens(&self, wid: crate::WindowId, tab: &crate::tab_model::Tab) {
         let _act = ActScope::enter(ExitActor::Harness, "restored");
-        for view in tab.root.leaves() {
+        tab.root.visit(&mut |&view| {
             let Some(crate::tab_model::View::Terminal(terminal)) =
                 self.view_store.get(view).copied()
             else {
-                continue;
+                return;
             };
             let placed = self.pool.get(terminal.session).is_some_and(|session| {
                 session
@@ -284,7 +284,7 @@ impl crate::App {
             if !placed {
                 self.note_tab_open(terminal.session, wid, tab.parked, None, "restored");
             }
-        }
+        });
     }
 
     /// THE KEEP CHOKE POINT: the worker tab holding `sessions` became the person's (Keep as Tab):
@@ -315,14 +315,14 @@ impl crate::App {
             return;
         };
         for tab in ws.tab_set.tabs() {
-            for view in tab.root.leaves() {
+            tab.root.visit(&mut |&view| {
                 let Some(crate::tab_model::View::Terminal(terminal)) =
                     self.view_store.get(view).copied()
                 else {
-                    continue;
+                    return;
                 };
                 let Some(session) = self.pool.get(terminal.session) else {
-                    continue;
+                    return;
                 };
                 session
                     .ctx
@@ -331,7 +331,7 @@ impl crate::App {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .slog_mut()
                     .place_tab(wid.0, tab.parked);
-            }
+            });
         }
     }
 

@@ -312,6 +312,10 @@ pub struct JobProc {
     /// process, and for a front whose ledger holds its claim (admitted, handing it to its holder),
     /// which reads by its own wait.
     pub claims_ahead: Option<Vec<u32>>,
+    /// A native held legacy build-admission ticket sampled with this process birth, with the
+    /// observed slot holders whose known stalls remain dependencies. None means unproven or
+    /// absent evidence; this never denotes a grant.
+    pub build_admission: Option<Vec<u32>>,
     /// Its state.
     pub state: ProcState,
     /// A debugger traces it (a debugger's child at a breakpoint is no job-control stop).
@@ -989,6 +993,8 @@ pub enum WaitName {
     /// A build's front waiting for its memory claim in the capacity ledger
     /// ([`JobProc::claims_ahead`]): work in line behind other claims.
     Memory,
+    /// A native held legacy build-slot admission ticket; no grant is implied.
+    BuildAdmission,
     /// The person's foreground job reads a password (canonical, no echo).
     TtyPassword,
     /// The shell's own `read` builtin.
@@ -1037,6 +1043,7 @@ impl WaitName {
             Self::ProgramCheck => "program-check",
             Self::Translating => "translating",
             Self::Memory => "memory",
+            Self::BuildAdmission => "build-admission",
             Self::TtyPassword => "tty-password",
             Self::TtyBuiltinRead => "tty-builtin-read",
             Self::TtyRaw => "tty-raw",

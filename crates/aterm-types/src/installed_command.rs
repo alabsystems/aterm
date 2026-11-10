@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn installation_and_removal_keep_the_selected_runtime() {
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::test_scratch_dir("instcmd");
         let uid = aterm_uds::peer::our_uid();
         let home = root.path().join("home");
         let first = root.path().join("source store/aterm");
@@ -386,7 +386,7 @@ mod tests {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::test_scratch_dir("instcmd");
         let home = root.path().join("home");
         let first = root.path().join("first/aterm");
         let waiting = root.path().join("waiting/aterm");

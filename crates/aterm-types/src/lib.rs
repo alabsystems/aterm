@@ -285,6 +285,20 @@ pub enum BiDiMode {
     Explicit = 2,
 }
 
+/// Create a short `.noindex` temporary directory for unit tests in this crate.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let short = &tag[..tag.floor_char_boundary(8)];
+    let builder = aterm_tempfile::Builder::new()
+        .prefix(&format!("aty-{short}-"))
+        .suffix(".noindex");
+    #[cfg(unix)]
+    let made = builder.tempdir_in("/tmp");
+    #[cfg(not(unix))]
+    let made = builder.tempdir();
+    made.expect("test scratch dir")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

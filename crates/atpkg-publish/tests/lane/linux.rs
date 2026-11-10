@@ -125,9 +125,23 @@ impl World {
     }
 
     fn run_mode(&self, dry_run: bool, staged_only: bool) -> (Result<Outcome>, Transcript) {
+        self.run_options(dry_run, staged_only, false)
+    }
+
+    fn run_queued(&self) -> (Result<Outcome>, Transcript) {
+        self.run_options(false, true, true)
+    }
+
+    fn run_options(
+        &self,
+        dry_run: bool,
+        staged_only: bool,
+        queued: bool,
+    ) -> (Result<Outcome>, Transcript) {
         let tx = Transcript::memory(linux::ME);
         let mut opts = Options::new(&self.fx.ctx, self.host, dry_run, &[]).expect("options");
         opts.staged_only = staged_only;
+        opts.queued = queued;
         let sw = |_: &Ctx| -> Result<Switch> {
             Ok(self
                 .switch
@@ -246,8 +260,34 @@ fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to
         std::fs::write(&path, pkgdoc::fresh_bottle(&header, &row).unwrap().bytes()).unwrap();
         retained.push(path);
     }
+    let state = LaneState::of(LaneKind::Linux, &w.fx.ctx.state_dir);
+    let later_bad = w.fx.tmp.path().join("later-invalid-pin.toml");
+    std::fs::write(
+        &later_bad,
+        std::fs::read_to_string(&retained[1])
+            .unwrap()
+            .replace("build_number = 12", "build_number = 13"),
+    )
+    .unwrap();
+    assert!(
+        atpkg_publish::lane::reuse::stage(
+            &w.fx.ctx,
+            &[retained[0].clone(), later_bad],
+            &w.fx.packer
+        )
+        .is_err()
+    );
+    assert!(
+        state.ready_pending().unwrap(),
+        "a later refusal cannot hide the earlier persisted stage"
+    );
+    state.clear_ready().unwrap();
     let staged_paths =
         atpkg_publish::lane::reuse::stage(&w.fx.ctx, &retained, &w.fx.packer).unwrap();
+    assert!(
+        state.ready_pending().unwrap(),
+        "successful staging wakes the dispatcher"
+    );
     assert_eq!(
         staged_paths,
         [linux::staged_manifest(&w.staged(), "git", 12)]
@@ -315,6 +355,18 @@ fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to
     assert_eq!(std::fs::read(&staged_paths[0]).unwrap(), bytes);
     w.fx.publish_pkg("git", 12, &public);
 
+    let (unsigned, _) = w.run_queued();
+    assert!(
+        unsigned
+            .unwrap_err()
+            .to_string()
+            .contains("was not published")
+    );
+    assert!(
+        state.ready_pending().unwrap(),
+        "missing signing authority retains work"
+    );
+
     let (staged, tx) = ok(w.run_mode(false, true));
     assert!(staged.staged.is_empty());
     assert_eq!(staged.ready, ["git"]);
@@ -326,9 +378,14 @@ fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to
         "an upstream Git package is not built from the aterm repo"
     );
     w.rekey();
-    let (published, _) = ok(w.run_mode(false, true));
+    let (published, _) = ok(w.run_queued());
     assert_eq!(published.signed, ["git"]);
     assert_eq!(published.published, Some(8));
+    assert_eq!(published.deferred, ["ay"]);
+    assert!(
+        !state.ready_pending().unwrap(),
+        "only completed publication retires work"
+    );
     assert!(
         w.fx.packer.legs().is_empty(),
         "staged qualified rows are reused"
@@ -360,6 +417,14 @@ fn staged_only_is_explicit_linux_only_and_refuses_an_empty_stage_without_buildin
             .staged_only
     );
     assert!(RunFlags::parse(LaneKind::Alab, &["--staged-only".into()]).is_err());
+    assert!(RunFlags::parse(LaneKind::Linux, &["--queued".into()]).is_err());
+    assert!(RunFlags::parse(LaneKind::Alab, &["--json".into()]).is_err());
+    let flags = RunFlags::parse(
+        LaneKind::Linux,
+        &["--staged-only".into(), "--queued".into(), "--json".into()],
+    )
+    .unwrap();
+    assert!(flags.staged_only && flags.queued && flags.json);
     let w = World::new("linux-staged-only-empty");
     for dry_run in [true, false] {
         let (result, tx) = w.run_mode(dry_run, true);
@@ -385,12 +450,49 @@ fn staged_only_is_explicit_linux_only_and_refuses_an_empty_stage_without_buildin
 }
 
 #[test]
+fn queued_dispatch_is_idle_without_notification_and_revalidates_stale_notifications() {
+    let w = World::new("linux-queued-idle");
+    let before = w.fx.calls("");
+    let (idle, _) = ok(w.run_queued());
+    assert!(idle.idle);
+    assert_eq!(w.fx.calls(""), before, "no pending work contacts no host");
+    assert!(w.fx.packer.legs().is_empty());
+    assert_eq!(w.fx.indexer.count(), 0);
+
+    let state = LaneState::of(LaneKind::Linux, &w.fx.ctx.state_dir);
+    let invalid = linux::staged_manifest(&w.staged(), "ay", 10);
+    std::fs::create_dir_all(invalid.parent().unwrap()).unwrap();
+    std::fs::write(&invalid, b"not a package manifest").unwrap();
+    state.notify_ready().unwrap();
+    assert!(
+        w.run_queued().0.is_err(),
+        "a broken pending stage is not idle"
+    );
+    assert!(state.ready_pending().unwrap());
+    assert!(w.fx.packer.legs().is_empty());
+    std::fs::remove_file(invalid).unwrap();
+
+    ok(w.run(false));
+    state.notify_ready().unwrap();
+    let count = w.fx.indexer.count();
+    let (idle, _) = ok(w.run_queued());
+    assert!(
+        idle.idle,
+        "fresh signed head confirms work was already published"
+    );
+    assert_eq!(w.fx.indexer.count(), count);
+    assert!(!state.ready_pending().unwrap());
+}
+
+#[test]
 fn staged_only_keeps_lineage_and_whole_group_refusals_before_signing() {
     let w = World::after_staging("linux-staged-only-live-lineage", true);
     w.rekey();
+    let state = LaneState::of(LaneKind::Linux, &w.fx.ctx.state_dir);
+    state.notify_ready().unwrap();
     *w.switch.lock().unwrap() = Some(Switch::Live);
     let before = w.fx.packer.legs().len();
-    let (result, _) = w.run_mode(false, true);
+    let (result, _) = w.run_queued();
     assert!(
         result
             .unwrap_err()
@@ -399,6 +501,10 @@ fn staged_only_keeps_lineage_and_whole_group_refusals_before_signing() {
     );
     assert_eq!(w.fx.packer.legs().len(), before);
     assert_eq!(w.fx.indexer.count(), 0);
+    assert!(
+        state.ready_pending().unwrap(),
+        "a lineage refusal retains work"
+    );
     assert!(
         !linux::staged_manifest(&w.staged(), "ay", 10)
             .with_extension("toml.sig")

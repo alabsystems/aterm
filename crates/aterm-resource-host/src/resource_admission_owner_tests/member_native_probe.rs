@@ -8,8 +8,8 @@ pub(super) fn run(
     lease: &aterm_capacity::build_cpu::Lease,
     query: &str,
     nonce: u8,
-    end: Instant,
 ) {
+    let end = Instant::now() + HANG;
     let cpu = aterm_uds::kept_out(|| lease.as_fd().try_clone_to_owned()).unwrap();
     let mut request = original.clone();
     request.member_attempt = [nonce; 16];

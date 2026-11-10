@@ -580,39 +580,20 @@ pub fn remove(keychain: &Path, run: &dyn Run) -> Result<(), String> {
     }
 }
 
-struct PrivateDir(PathBuf);
+struct PrivateDir(aterm_tempfile::TempDir);
 
 impl PrivateDir {
     fn create() -> Result<Self, Stop> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
-        }
-        loop {
-            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("aterm-dev-identity.{}.{n}", std::process::id()));
-            match builder.create(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1024 => {}
-                Err(e) => {
-                    return Err(Stop::Refused(format!("create {}: {e}", path.display())));
-                }
-            }
-        }
+        aterm_tempfile::Builder::new()
+            .prefix("aterm-dev-identity.")
+            .suffix(".noindex")
+            .tempdir()
+            .map(Self)
+            .map_err(|e| Stop::Refused(format!("create private dir: {e}")))
     }
 
     fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for PrivateDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }
 

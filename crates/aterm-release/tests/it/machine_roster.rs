@@ -254,7 +254,6 @@ fn an_unattributed_cut_stages_byte_identical_manifest_bytes() {
     publish::stage_roster_assets(&dir, None).expect("no document, no assets");
     assert!(!dir.join("aterm-machines.toml").exists());
     assert!(!dir.join("aterm-machines.toml.sig").exists());
-    clean(&dir);
 }
 
 /// Every manifest gate refuses the retired `dmg_x86_64` pair by name.
@@ -432,7 +431,6 @@ fn attribution_is_inside_the_bytes_the_signature_covers() {
     );
     publish::verify_detached_manifest_signature(&pk(&M3), &late_bytes, &early_signature)
         .expect_err("a signature made before the stamp cannot cover the stamped bytes");
-    clean(&dir);
 }
 
 /// An armed cut stages and requires both roster assets.
@@ -464,7 +462,6 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
     let forgotten = channel::required_asset_names("0.5.0", true, false);
     channel::validate_channel_asset_set(&forgotten, "0.5.0", true, true, &[])
         .expect_err("a rostered channel head without its roster is unelectable");
-    clean(&dir);
 }
 
 /// A resume aborts if its live attribution disagrees with the journaled one.
@@ -522,7 +519,6 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
         !rendered.contains(&pkcs8_b64()),
         "the private key must never render"
     );
-    clean(&dir);
 }
 
 /// A `~/` roster path in a profile resolves under the supplied home and refuses relative homes.
@@ -602,7 +598,6 @@ fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
         Some(Path::new("~someone/aterm-machines.toml")),
         "only `~/` names this home"
     );
-    clean(&dir);
 }
 
 /// End-to-end verdict from a real credentials profile and roster file on disk.
@@ -657,7 +652,6 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
     let creds = sign::ReleaseCredentials::load(&orphan, None).expect("loads");
     publish::signing_verdict(Some(&creds), &anchors(&dir, &masters, None))
         .expect_err("a named-but-missing roster must refuse");
-    clean(&dir);
 }
 
 #[test]
@@ -719,7 +713,6 @@ fn current_signing_observes_the_floor_while_finish_preserves_completed_receipts(
         assert!(completed.attribution.is_none(), "{home:?}");
         assert!(completed.roster.is_none(), "{home:?}");
     }
-    clean(&dir);
 }
 
 /// The profile's machine id wins; the mint record answers only when the profile declares none.
@@ -748,21 +741,26 @@ fn the_declared_machine_id_prefers_the_profile_and_falls_back_to_the_mint_record
     assert_eq!(machines::declared_machine_id(None, None).unwrap(), None);
     std::fs::write(&identity, "id = = =").unwrap();
     assert!(machines::declared_machine_id(None, Some(&identity)).is_err());
-    clean(&dir);
 }
 
-fn tempdir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "aterm-machine-roster-{label}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+struct TestDir(aterm_tempfile::TempDir);
+
+impl TestDir {
+    fn as_path(&self) -> &Path {
+        self.0.path()
+    }
 }
 
-fn clean(dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir);
+impl std::ops::Deref for TestDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+fn tempdir(label: &str) -> TestDir {
+    TestDir(crate::test_scratch_dir(label))
 }
 
 fn write_profile(dir: &Path, body: &str) -> PathBuf {

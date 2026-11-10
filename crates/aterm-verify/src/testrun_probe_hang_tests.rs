@@ -24,9 +24,10 @@ const PEER_PROBED: &str = "ATERM_VERIFY_PROBE_HANG_PEER_PROBED";
 const ARMED: &str = "ATERM_VERIFY_PROBE_HANG_ARMED";
 
 fn binary(spec: &str, executable: &Path, variables: &[(&str, &Path)]) -> Binary {
-    let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(key, _)| key != STANDIN)
-        .collect();
+    // These shell stand-ins read only their declared fixture variables and cat.
+    // Ambient Cargo/libtest switches must not silently choose another JSON mode
+    // or become unrelated runtime-input evidence.
+    let mut env: Vec<(OsString, OsString)> = vec![("PATH".into(), "/usr/bin:/bin".into())];
     env.extend(
         variables
             .iter()

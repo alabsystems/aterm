@@ -67,6 +67,7 @@ fn every_production_done_subset_matches_exact_prefix_model() {
     let model = release_journal_prefix_model();
     let root = aterm_tempfile::Builder::new()
         .prefix("aterm-journal-prefix-tier1-")
+        .suffix(".noindex")
         .tempdir()
         .unwrap();
     let path = root.path().join("cut-state.toml");

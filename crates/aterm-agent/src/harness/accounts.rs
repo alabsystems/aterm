@@ -129,11 +129,13 @@ pub mod shared;
 mod native_publication;
 pub(in crate::harness) use native_publication::{ActualPublicationPermit, ActualPublicationStamp};
 
+#[path = "accounts_source_policy.rs"]
+pub(super) mod source_policy;
 #[path = "accounts_sync_commit.rs"]
 mod sync_commit;
 #[cfg(test)]
 pub(super) use sync_commit::CUT as SYNC_COMMIT_CUT;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) use sync_commit::EARLY_ROSTER as SYNC_COMMIT_EARLY_ROSTER;
 pub(super) use sync_commit::SyncTarget;
 use sync_commit::usage_target;

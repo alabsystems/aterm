@@ -13271,6 +13271,14 @@ fn restart(
                     super::native_restart::WAIT_RETIRED_UNISSUED,
                 ));
             }
+            Ok(super::native_restart::Recovery::Lapsed) => {
+                break 'signal Some(super::native_restart::end_lapsed(
+                    opts,
+                    &r,
+                    st,
+                    &sf.session_id,
+                ));
+            }
             Ok(
                 super::native_restart::Recovery::Cancelled
                 | super::native_restart::Recovery::Unadmitted,
@@ -13280,9 +13288,19 @@ fn restart(
                 // The exact plan/id was saved before dispatch. Preserve it on an unknown ACK;
                 // only a proved pre-mutation abort, or the host's proof that it never admitted
                 // the plan, permits a later fresh constructor.
-                if st.native_prepare.is_empty()
-                    || super::native_restart::abort(opts, &sf.session_id, c, tab, st)
-                {
+                let ended = st.native_prepare.is_empty()
+                    || match super::native_restart::abort(opts, &sf.session_id, c, tab, st) {
+                        Some(super::native_restart::Recovery::Lapsed) => {
+                            break 'signal Some(super::native_restart::end_lapsed(
+                                opts,
+                                &r,
+                                st,
+                                &sf.session_id,
+                            ));
+                        }
+                        ended => ended.is_some(),
+                    };
+                if ended {
                     st.unsent(back);
                 }
                 save(opts, &sf.session_id, st);
@@ -13302,8 +13320,17 @@ fn restart(
                 || host_claim.is_some_and(|claim| !claim_still_live(c, sf.pid, claim))
                 || require_unique_owner(&opts.home, sf).is_err())
         {
-            if super::native_restart::abort(opts, &sf.session_id, c, tab, st) {
-                st.unsent(back);
+            match super::native_restart::abort(opts, &sf.session_id, c, tab, st) {
+                Some(super::native_restart::Recovery::Lapsed) => {
+                    break 'signal Some(super::native_restart::end_lapsed(
+                        opts,
+                        &r,
+                        st,
+                        &sf.session_id,
+                    ));
+                }
+                Some(_) => st.unsent(back),
+                None => {}
             }
             save(opts, &sf.session_id, st);
             if st.native_retired_unissued {

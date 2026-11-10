@@ -373,6 +373,7 @@ struct TreeEntry {
 
 fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = crate::ledger::object_git(dir)
+        .map_err(|error| error.to_string())?
         .args(args)
         .output()
         .map_err(|e| format!("spawn git {}: {e}", args.join(" ")))?;
@@ -428,6 +429,7 @@ struct ObjectReader {
 impl ObjectReader {
     fn spawn(dir: &Path) -> Result<Self, String> {
         let mut child = crate::ledger::object_git(dir)
+            .map_err(|error| error.to_string())?
             .args(["cat-file", "--batch"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -736,6 +738,7 @@ fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Re
             continue;
         }
         let mut child = crate::ledger::object_git(dir)
+            .map_err(|error| error.to_string())?
             .args(["cat-file", "--batch", "--buffer"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

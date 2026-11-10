@@ -825,9 +825,9 @@ impl App {
             .and_then(|ws| ws.tab_set.tabs().iter().find(|t| t.id == tab))
             .is_some_and(|t| {
                 let store = self.store.read().unwrap_or_else(|p| p.into_inner());
-                t.root.leaves().into_iter().any(|view| {
+                t.root.any_leaf(&mut |view| {
                     self.view_store
-                        .get(view)
+                        .get(*view)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
                         .and_then(|session| store.by_local(session))

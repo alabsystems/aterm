@@ -101,6 +101,15 @@ impl Kernel for DeferredFacts {
     fn historical_noexec(&self, request: &Request) -> bool {
         self.base.historical_noexec(request)
     }
+    fn historical_closure(&self, prepare: &Prepare) -> Result<Closure, ()> {
+        self.base.historical_closure(prepare)
+    }
+    fn custody(&self) -> Option<String> {
+        self.base.custody()
+    }
+    fn boot(&self) -> Option<BootStamp> {
+        self.base.boot()
+    }
     fn account_execution(
         &self,
         command: &RestartCommand,

@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.190.0"
+version = "0.191.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -1255,6 +1255,7 @@ version = "0.0.0"
 dependencies = [
  "aterm-dl",
  "aterm-objc",
+ "aterm-uds",
 ]
 
 [[package]]

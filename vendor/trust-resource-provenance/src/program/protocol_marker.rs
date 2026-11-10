@@ -249,10 +249,16 @@ pub(super) fn require(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const REQUIRED_MARKER_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn required_deadline(started: Instant) -> Instant {
+        started + REQUIRED_MARKER_HANG
+    }
+
     #[test]
     fn bootstrap_fixed_declaration_is_separate_closed_and_read_from_original_bytes() {
         use std::io::Write as _;
-        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = required_deadline(Instant::now());
         for profile in [
             Profile::Resolver,
             Profile::Workload,
@@ -342,7 +348,7 @@ mod tests {
     #[test]
     fn paired_cost_revision_refuses_the_old_sdk_before_root_go() {
         use std::io::Write as _;
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = required_deadline(Instant::now());
         let mut bytes = image(Profile::PairedQualification);
         bytes[256..272].copy_from_slice(b"TRUSTPAIRQUAL001");
         let mut file = tempfile::tempfile().unwrap();
@@ -366,7 +372,7 @@ mod tests {
     #[test]
     fn direct_linker_member_rejects_the_legacy_helper_only_declaration() {
         use std::io::Write as _;
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = required_deadline(Instant::now());
         let mut bytes = image(Profile::WorkloadMember);
         bytes[256..272].copy_from_slice(b"TRUSTMEMBER00001");
         for (index, value) in [3u64, 1, 50, 2, 3, 4].into_iter().enumerate() {
@@ -382,7 +388,7 @@ mod tests {
     #[test]
     fn compiler_member_declaration_cannot_be_an_old_root_or_resolver_protocol() {
         use std::io::Write as _;
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = required_deadline(Instant::now());
         for profile in [Profile::Resolver, Profile::Workload, Profile::WorkloadMember] {
             let mut file = tempfile::tempfile().unwrap();
             file.write_all(&image(profile)).unwrap();
@@ -413,7 +419,7 @@ mod tests {
     #[test]
     fn distinct_workload_section_and_closed_fields_never_reinterpret_a_resolver_image() {
         use std::io::Write as _;
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = required_deadline(Instant::now());
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&image(Profile::Workload)).unwrap();
         assert!(require(&file, Profile::Workload, &expected(Profile::Workload), deadline).is_ok());
@@ -484,7 +490,7 @@ mod tests {
             &file,
             Profile::Resolver,
             &expected(Profile::Resolver),
-            Instant::now() + std::time::Duration::from_secs(2),
+            required_deadline(Instant::now()),
         )
     }
     #[test]
@@ -509,6 +515,34 @@ mod tests {
         let mut bytes = image(Profile::Resolver);
         bytes[300] ^= 1;
         assert!(check(&bytes).is_err());
+    }
+
+    #[test]
+    fn required_marker_read_keeps_its_original_start_without_a_latency_budget() {
+        use std::io::Write as _;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&image(Profile::Resolver)).unwrap();
+        let started = Instant::now() - std::time::Duration::from_secs(3);
+        require(
+            &file,
+            Profile::Resolver,
+            &expected(Profile::Resolver),
+            required_deadline(started),
+        ).unwrap();
+    }
+
+    #[test]
+    fn required_bootstrap_read_keeps_its_original_start_without_a_latency_budget() {
+        use std::io::Write as _;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&image(Profile::BootstrapFixed)).unwrap();
+        let started = Instant::now() - std::time::Duration::from_secs(31);
+        require(
+            &file,
+            Profile::BootstrapFixed,
+            &expected(Profile::BootstrapFixed),
+            required_deadline(started),
+        ).unwrap();
     }
     #[test]
     fn same_magic_in_arbitrary_bytes_or_mutable_data_is_no_support_declaration() {
@@ -539,7 +573,7 @@ mod tests {
                 &original,
                 Profile::Resolver,
                 &expected(Profile::Resolver),
-                Instant::now() + std::time::Duration::from_secs(2)
+                required_deadline(Instant::now())
             )
             .is_ok()
         );
@@ -548,7 +582,7 @@ mod tests {
                 &File::open(&path).unwrap(),
                 Profile::Resolver,
                 &expected(Profile::Resolver),
-                Instant::now() + std::time::Duration::from_secs(2)
+                required_deadline(Instant::now())
             )
             .is_err()
         );

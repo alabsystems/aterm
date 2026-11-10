@@ -160,6 +160,7 @@ pub fn read_record(root: &Path, git: &dyn GitRunner, ask: &Ask<'_>) -> Result<pi
     };
     let scratch = aterm_tempfile::Builder::new()
         .prefix("aterm-pin-verifier-")
+        .suffix(".noindex")
         .tempdir_in(ask.scratch)
         .map_err(|e| format!("make a private download directory: {e}"))?;
     for receipt in &receipts {

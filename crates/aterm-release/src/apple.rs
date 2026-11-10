@@ -1621,57 +1621,52 @@ fn install_issuer_intermediate(
          issued it cannot be proved",
     )?;
     let dir = temp_run_dir("issuer")?;
-    let outcome = (|| -> Result<Option<String>, String> {
-        let mut urls = CA_URLS;
-        if !issuer.contains("G2") {
-            urls.swap(0, 1);
-        }
-        let mut refused: Vec<String> = Vec::new();
-        for url in urls {
-            let name = url.rsplit('/').next().unwrap_or(url);
-            let tmp = dir.join("issuer.cer");
-            let _ = std::fs::remove_file(&tmp);
-            let bytes = match aterm_update_core::download_bytes_uncached(url, 1 << 20) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    refused.push(format!("{name}: not downloadable ({error})"));
-                    continue;
-                }
-            };
-            std::fs::write(&tmp, bytes)
-                .map_err(|error| format!("write {}: {error}", tmp.display()))?;
-            let Some(form) = ["DER", "PEM"]
-                .into_iter()
-                .find(|f| cert_subject(&tmp, f).is_some())
-            else {
-                refused.push(format!("{name}: not a certificate"));
-                continue;
-            };
-            let got = cert_field(&tmp, form, "-subject")
-                .map(|s| s.strip_prefix("subject=").unwrap_or(&s).trim().to_string());
-            if got.as_deref() != Some(issuer.as_str()) {
-                refused.push(format!("{name}: a different issuer name"));
+    let mut urls = CA_URLS;
+    if !issuer.contains("G2") {
+        urls.swap(0, 1);
+    }
+    let mut refused: Vec<String> = Vec::new();
+    for url in urls {
+        let name = url.rsplit('/').next().unwrap_or(url);
+        let tmp = dir.path().join("issuer.cer");
+        let _ = std::fs::remove_file(&tmp);
+        let bytes = match aterm_update_core::download_bytes_uncached(url, 1 << 20) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                refused.push(format!("{name}: not downloadable ({error})"));
                 continue;
             }
-            if cert_key_id(&tmp, form, SUBJECT_KEY_ID).as_deref() != Some(want_key.as_str()) {
-                refused.push(format!("{name}: a different issuing key"));
-                continue;
-            }
-            kc.install_certificate(&tmp)?;
-            return Ok(Some(format!(
-                "installed the missing issuing intermediate ({issuer}) — without it macOS \
-                 cannot chain your certificate to Apple Root CA and reports the identity \
-                 as invalid"
-            )));
+        };
+        std::fs::write(&tmp, bytes).map_err(|error| format!("write {}: {error}", tmp.display()))?;
+        let Some(form) = ["DER", "PEM"]
+            .into_iter()
+            .find(|f| cert_subject(&tmp, f).is_some())
+        else {
+            refused.push(format!("{name}: not a certificate"));
+            continue;
+        };
+        let got = cert_field(&tmp, form, "-subject")
+            .map(|s| s.strip_prefix("subject=").unwrap_or(&s).trim().to_string());
+        if got.as_deref() != Some(issuer.as_str()) {
+            refused.push(format!("{name}: a different issuer name"));
+            continue;
         }
-        Err(format!(
-            "no published Apple CA proved to be the issuer of this certificate ('{issuer}') \
-             — {}",
-            refused.join("; ")
-        ))
-    })();
-    let _ = std::fs::remove_dir_all(&dir);
-    outcome
+        if cert_key_id(&tmp, form, SUBJECT_KEY_ID).as_deref() != Some(want_key.as_str()) {
+            refused.push(format!("{name}: a different issuing key"));
+            continue;
+        }
+        kc.install_certificate(&tmp)?;
+        return Ok(Some(format!(
+            "installed the missing issuing intermediate ({issuer}) — without it macOS \
+             cannot chain your certificate to Apple Root CA and reports the identity \
+             as invalid"
+        )));
+    }
+    Err(format!(
+        "no published Apple CA proved to be the issuer of this certificate ('{issuer}') \
+         — {}",
+        refused.join("; ")
+    ))
 }
 
 const AUTHORITY_KEY_ID: &str = "X509v3 Authority Key Identifier:";
@@ -1729,7 +1724,7 @@ fn repair_installed_chain(kc: &Keychains<'_>) -> Option<String> {
         if !block.contains("BEGIN CERTIFICATE") {
             continue;
         }
-        let Ok(leaf) = temp_cert(block.as_bytes()) else {
+        let Ok((_leaf_dir, leaf)) = temp_cert(block.as_bytes()) else {
             continue;
         };
         let cer = MatchedCert {
@@ -1743,7 +1738,6 @@ fn repair_installed_chain(kc: &Keychains<'_>) -> Option<String> {
         } else {
             None
         };
-        let _ = std::fs::remove_file(&cer.path);
         if note.is_some() {
             return note;
         }
@@ -1752,34 +1746,24 @@ fn repair_installed_chain(kc: &Keychains<'_>) -> Option<String> {
 }
 
 /// A temp file nobody else can hold.
-fn temp_cert(bytes: &[u8]) -> Result<PathBuf, String> {
+fn temp_cert(bytes: &[u8]) -> Result<(aterm_tempfile::TempDir, PathBuf), String> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    let dir = std::env::temp_dir();
-    for n in 0..16u32 {
-        let path = dir.join(format!(
-            "aterm-provision-leaf-{}-{n}.pem",
-            std::process::id()
-        ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(bytes) {
-                    drop(f);
-                    let _ = std::fs::remove_file(&path);
-                    return Err(format!("{}: {e}", path.display()));
-                }
-                return Ok(path);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("{}: {e}", path.display())),
-        }
-    }
-    Err("no free temp name".into())
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-provision-leaf-")
+        .suffix(".noindex")
+        .tempdir()
+        .map_err(|e| e.to_string())?;
+    let path = dir.path().join("leaf.pem");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.write_all(bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((dir, path))
 }
 
 /// Whether any certificate in `kc`'s keychains has exactly this subject.
@@ -1862,18 +1846,12 @@ pub(crate) fn prove_can_sign(
 }
 
 /// A directory this run alone can hold.
-fn temp_run_dir(what: &str) -> Result<PathBuf, String> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let base = std::env::temp_dir();
-    for n in 0..16u32 {
-        let path = base.join(format!("aterm-provision-{what}-{}-{n}", std::process::id()));
-        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => return Ok(path),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("{}: {e}", path.display())),
-        }
-    }
-    Err(format!("no free temp name for {what}"))
+fn temp_run_dir(what: &str) -> Result<aterm_tempfile::TempDir, String> {
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("aterm-provision-{what}-"))
+        .suffix(".noindex")
+        .tempdir()
+        .map_err(|e| format!("temp run dir for {what}: {e}"))
 }
 
 /// Writes the `--release-credentials` profile once signing is verified.

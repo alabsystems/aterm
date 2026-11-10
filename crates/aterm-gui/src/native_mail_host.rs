@@ -11,13 +11,24 @@ impl crate::App {
         };
         let existing = self.windows.get(&wid).and_then(|window| {
             window.tab_set.tabs().iter().find_map(|tab| {
-                tab.root.leaves().into_iter().find_map(|view| {
-                    let crate::tab_model::View::Native(native) = self.view_store.get(view)? else {
-                        return None;
+                let mut found = None;
+                tab.root.any_leaf(&mut |&view| {
+                    let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view)
+                    else {
+                        return false;
                     };
-                    (self.native_runtime.app(native.instance)?.kind() == AppKind::Mail)
-                        .then_some((tab.id, view))
-                })
+                    if self
+                        .native_runtime
+                        .app(native.instance)
+                        .is_some_and(|app| app.kind() == AppKind::Mail)
+                    {
+                        found = Some((tab.id, view));
+                        true
+                    } else {
+                        false
+                    }
+                });
+                found
             })
         });
         let placed = existing.map(Ok).unwrap_or_else(|| self.stage_mail_tab(wid));

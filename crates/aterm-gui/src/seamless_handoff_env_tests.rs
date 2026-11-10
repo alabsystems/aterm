@@ -798,7 +798,10 @@ fn a_theme_file_edit_during_the_hold_is_warmed_again() {
     save_theme("#102030");
     crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
         let read = crate::WarmConfigRead::take(Some(&path));
-        let early = crate::warm_config(true, crate::app_config::CarriedZoom::default());
+        let early = crate::warm_config(
+            crate::WarmLaunch::Headless,
+            crate::app_config::CarriedZoom::default(),
+        );
         assert_eq!(
             early.theme.bg, 0x10_2030,
             "the early warm read the theme file"
@@ -812,7 +815,10 @@ fn a_theme_file_edit_during_the_hold_is_warmed_again() {
             crate::warm_config_moved(&read, Some(&path)),
             "the theme the outgoing process parked under is not the one the early warm read"
         );
-        let late = crate::warm_config(true, crate::app_config::CarriedZoom::default());
+        let late = crate::warm_config(
+            crate::WarmLaunch::Headless,
+            crate::app_config::CarriedZoom::default(),
+        );
         assert_eq!(late.theme.bg, 0x40_5060, "the re-warm reads the edit");
         let _ = early.backend_handle.join().expect("the early worker");
         let _ = late.backend_handle.join().expect("the re-warm's worker");

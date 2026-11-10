@@ -60,6 +60,8 @@ pub(super) fn fixture(rollback: bool, wrapper: bool, future: bool) -> (St, Prepa
             observation: None,
             cold: None,
         },
+        boot: None,
+        custody: None,
     };
     assert!(Request::prepare(prepare.clone()).encode().is_some());
     let observation = SavedObservation {

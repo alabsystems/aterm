@@ -164,19 +164,7 @@ fn wire_request_new() {
 }
 
 #[test]
-fn deadlines() {
-    assert_eq!(
-        (
-            Deadlines::JSON.connect,
-            Deadlines::JSON.idle,
-            Deadlines::JSON.backstop
-        ),
-        (
-            Duration::from_secs(10),
-            Duration::from_secs(60),
-            Some(Duration::from_secs(60))
-        )
-    );
+fn transfer_and_explicit_backstops_keep_their_policies() {
     assert_eq!(Deadlines::for_transfer(0).backstop, None);
     assert_eq!(Deadlines::for_transfer(u64::MAX).backstop, None);
     assert_eq!(

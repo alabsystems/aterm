@@ -81,6 +81,7 @@ impl Git {
 fn scratch() -> (aterm_tempfile::TempDir, PathBuf, Git) {
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-hooks-")
+        .suffix(".noindex")
         .tempdir()
         .unwrap();
     let root = dir.path().canonicalize().unwrap();

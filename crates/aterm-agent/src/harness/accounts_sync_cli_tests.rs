@@ -214,7 +214,7 @@ fn a_conflicting_sheet_row_skips_that_address_and_the_sync_reads_the_rest() {
                         .any(|e| accounts::email_matches(e, "new@example.test")),
                     "{cli:?} {rows}: the conflicting address is in no row: {emails:?}"
                 );
-                let conflicts = sheet_conflicts(&bed.home, &bed.aterm_toml());
+                let conflicts = sheet_conflicts(&bed.home, &bed.state, &bed.aterm_toml());
                 assert_eq!(conflicts.len(), 1, "{cli:?} {rows}: {conflicts:?}");
                 assert_eq!(
                     (conflicts[0].cli, conflicts[0].rows.clone()),
@@ -223,6 +223,7 @@ fn a_conflicting_sheet_row_skips_that_address_and_the_sync_reads_the_rest() {
                 assert_eq!(
                     crate::harness::alab_roster::while_pending(|| sheet_conflicts(
                         &bed.home,
+                        &bed.state,
                         &bed.aterm_toml()
                     )),
                     Vec::<SheetConflict>::new(),
@@ -277,7 +278,7 @@ fn a_conflicting_sheet_address_this_machine_lists_keeps_its_row() {
                 .is_some_and(|email| accounts::email_matches(email, "keep@example.test"))),
             "{rows}: the rest of the sheet is read"
         );
-        let conflicts = sheet_conflicts(&bed.home, &bed.aterm_toml());
+        let conflicts = sheet_conflicts(&bed.home, &bed.state, &bed.aterm_toml());
         assert_eq!(
             conflicts
                 .iter()
@@ -333,7 +334,7 @@ fn a_conflict_naming_only_other_machines_drops_the_row_as_one_such_row_does() {
             "{later}: no conflict of this machine's: {err}"
         );
         assert_eq!(
-            sheet_conflicts(&bed.home, &bed.aterm_toml()),
+            sheet_conflicts(&bed.home, &bed.state, &bed.aterm_toml()),
             Vec::<SheetConflict>::new(),
             "{later}"
         );
@@ -2264,7 +2265,7 @@ fn an_unlisted_mac_syncs_codex_again_only_once_its_inputs_change() {
     fs::remove_file(bed.aterm_toml()).unwrap();
     std::os::unix::fs::symlink(&dotfile, bed.aterm_toml()).unwrap();
     bed.secret(ACCOUNTS_CSV_FILE, SHEET);
-    let inputs = || cli_sync_inputs(Cli::Codex, &bed.home, &bed.aterm_toml());
+    let inputs = || cli_sync_inputs(Cli::Codex, &bed.home, &bed.state, &bed.aterm_toml());
     with_effects(&|_work| Ok(()), &read_named, |fx| {
         let upkeep_pools_now = || {
             upkeep_pools(
@@ -2308,7 +2309,14 @@ fn an_unlisted_mac_syncs_codex_again_only_once_its_inputs_change() {
         super::super::ai_pool::AI_POOL_FILE,
         "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.com\"\nwarm = [\"m16\"]\n",
     );
-    let pool_inputs = || cli_sync_inputs(Cli::Codex, &pool_bed.home, &pool_bed.aterm_toml());
+    let pool_inputs = || {
+        cli_sync_inputs(
+            Cli::Codex,
+            &pool_bed.home,
+            &pool_bed.state,
+            &pool_bed.aterm_toml(),
+        )
+    };
     with_effects(&|_work| Ok(()), &read_named, |fx| {
         let upkeep_pools_now = || {
             upkeep_pools(
@@ -2337,6 +2345,64 @@ fn an_unlisted_mac_syncs_codex_again_only_once_its_inputs_change() {
         upkeep_pools_now();
         assert_eq!(codex_labels(&pool_bed), [ACCOUNTS_OWN_LABEL, "codex-m9"]);
     });
+}
+
+#[test]
+fn retired_provider_sources_do_not_lift_retry_holds() {
+    use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
+    let _source = TestSourceOverride::new(SourceSnapshot::Absent);
+    for cli in OTHER_CLIS {
+        let bed = Bed::new("retired-retry-inputs");
+        let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+        let inputs = || cli_sync_inputs(cli, &bed.home, &bed.state, &bed.aterm_toml());
+        let legacy = cli_fleet_file(cli);
+        bed.secret(&legacy, "account=[]\n");
+        let initial = inputs();
+        bed.secret(&legacy, "# changed legacy\naccount=[]\n");
+        let eligible = inputs();
+        assert_ne!(eligible, initial, "an eligible source lifts the hold");
+
+        let held = store.acquire().unwrap();
+        store.retire_source_held(&held, NOW).unwrap();
+        drop(held);
+        let retired = inputs();
+        assert_ne!(
+            retired, eligible,
+            "retirement invalidates the old observation"
+        );
+        let rediscovery = Mutex::new(Rediscovery::default());
+        note_default_sync(&rediscovery, cli, Some(retired));
+        bed.secret(&legacy, "unparseable retired bytes");
+        assert!(default_sync_holds(&rediscovery, cli, &inputs()));
+        fs::remove_file(bed.secrets().join(&legacy)).unwrap();
+        assert!(default_sync_holds(&rediscovery, cli, &inputs()));
+
+        let member = csv_columns(cli)[0];
+        let value = if cli == Cli::Kimi { "global" } else { "1" };
+        bed.secret(
+            ACCOUNTS_CSV_FILE,
+            &format!("email,computer,{member}\nnew@example.test,m16,{value}\n"),
+        );
+        assert!(!default_sync_holds(&rediscovery, cli, &inputs()));
+        let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
+        let table = load_cli_fleet(cli, &env, &bed.home, None, &read_named)
+            .unwrap()
+            .unwrap();
+        assert_eq!(table.roster.accounts[0].email, "new@example.test");
+
+        let policy = fs::read(store.source_policy_file()).unwrap();
+        let valid = inputs();
+        fs::remove_file(store.source_policy_file()).unwrap();
+        let refused = inputs();
+        assert_ne!(refused, valid, "a lost policy lifts the old retry hold");
+        assert!(load_cli_fleet(cli, &env, &bed.home, None, &read_named).is_err());
+        bed.secret(&legacy, "another retired edit while policy is refused");
+        assert_eq!(inputs(), refused, "refused policy reads no source bytes");
+        note_default_sync(&rediscovery, cli, Some(refused));
+        fs::write(store.source_policy_file(), policy).unwrap();
+        assert_eq!(inputs(), valid);
+        assert!(!default_sync_holds(&rediscovery, cli, &inputs()));
+    }
 }
 
 /// A MAC THAT LEFT CODEX'S POOL stays out: one that kept `accounts-codex.toml` and removed it,
@@ -2383,7 +2449,7 @@ fn a_mac_that_removed_its_codex_roster_stays_out_of_the_pool() {
                     (&claude_roster(&bed), NOW, UpkeepStep::Sync),
                     fx,
                 );
-                let inputs = cli_sync_inputs(Cli::Codex, &bed.home, &bed.aterm_toml());
+                let inputs = cli_sync_inputs(Cli::Codex, &bed.home, &bed.state, &bed.aterm_toml());
                 assert!(default_sync_holds(fx.rediscovery, Cli::Codex, &inputs));
             });
             assert!(!bed.roster(Cli::Codex).exists());

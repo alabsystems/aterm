@@ -4,7 +4,8 @@
 //! Concurrent stage scheduler ([`Lane`], [`StageSpec::after_stages`],
 //! [`crate::plan::StageId::opens_windows`], [`crate::plan::Lane::AfterCompile`], [`awaited`],
 //! [`check_waits`]), within the run's memory budget ([`StageSpec::mem`], [`memory_holders`]),
-//! ended early by its first proven red under `release` and `--fail-fast` ([`Halt`]).
+//! ended early by a source-preflight red, or its first proven red under `release` and
+//! `--fail-fast` ([`Halt`]).
 
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use crate::plan::{Lane, StageSpec};
 
 /// What a run's first proven red ends (design §4.3, A3): set once, by the first stage row that is
 /// a finding or the first test binary that ended FAIL, in a run that stops there (`release`, or
-/// `--fail-fast`); a bare run never halts and keeps its full sweep. Once set, no stage or test
+/// `--fail-fast`), or a source/type preflight in an ordinary run. Once set, no stage or test
 /// binary starts: [`run_stages`] stops holding a waiting stage back, so each starts at once and
 /// says NOT RUN with [`Halt::words`] (`staged`'s first look); the test dispatcher starts no
 /// binary; and the end it was given ends the run's live children (`exec::group::halt`: SIGTERM,
@@ -25,6 +26,8 @@ pub struct Halt {
     /// What a red ends, when it ends anything: the subject its words name ("the release", "the
     /// run") and what else ends with it.
     armed: Option<Armed>,
+    /// Ordinary runs stop only at failures which cannot be inherited from main.
+    preflight: Option<fn(&str)>,
     /// The halt's words, once set: `stopped: <subject> failed at <check>`.
     words: OnceLock<String>,
 }
@@ -41,6 +44,7 @@ impl Halt {
     pub const fn off() -> Self {
         Self {
             armed: None,
+            preflight: None,
             words: OnceLock::new(),
         }
     }
@@ -51,29 +55,48 @@ impl Halt {
     pub const fn at_first_red(subject: &'static str, end: fn(&str)) -> Self {
         Self {
             armed: Some(Armed { subject, end }),
+            preflight: None,
             words: OnceLock::new(),
         }
     }
 
-    /// Whether a proven red ends this run.
+    /// Stop an ordinary run at a source or type-preflight failure. Test failures still
+    /// complete the sweep so `verify land` can apply its existing inheritance rule.
+    #[must_use]
+    pub const fn after_preflight(end: fn(&str)) -> Self {
+        Self {
+            armed: None,
+            preflight: Some(end),
+            words: OnceLock::new(),
+        }
+    }
+
+    /// Whether every proven red ends this run. A preflight-only stop does not alter the test
+    /// dispatcher's full-sweep behavior or its inherited-failure evidence.
     #[must_use]
     pub const fn armed(&self) -> bool {
         self.armed.is_some()
     }
 
-    /// A proven red of `check`: the first one in an armed run halts it, ending what else runs,
-    /// and is `true`; any later one, and any in a run that never halts, changes nothing.
+    /// A proven red of `check`: the first selected red halts the run and is `true`.
+    /// A preflight-only run ignores test reds; a completely unarmed run ignores every red.
     pub fn red(&self, check: &str) -> bool {
-        let Some(armed) = &self.armed else {
-            return false;
+        let (subject, end) = match &self.armed {
+            Some(armed) => (armed.subject, armed.end),
+            None => match self.preflight {
+                Some(end) if matches!(check, "fmt" | "census" | "export-scan" | "lint") => {
+                    ("the run", end)
+                }
+                _ => return false,
+            },
         };
         let mut first = false;
         let words = self.words.get_or_init(|| {
             first = true;
-            format!("stopped: {} failed at {check}", armed.subject)
+            format!("stopped: {subject} failed at {check}")
         });
         if first {
-            (armed.end)(words);
+            end(words);
         }
         first
     }
@@ -596,6 +619,23 @@ mod tests {
             (bare.armed(), bare.red("test"), bare.words()),
             (false, false, None)
         );
+    }
+
+    #[test]
+    fn ordinary_preflight_halts_without_shortening_test_failure_evidence() {
+        for check in ["fmt", "census", "export-scan", "lint"] {
+            let halt = Halt::after_preflight(|_| {});
+            assert!(!halt.armed(), "tests still run their complete sweep");
+            assert!(!halt.red("test"));
+            assert!(!halt.red("doc"));
+            assert!(halt.words().is_none());
+            assert!(halt.red(check));
+            assert_eq!(
+                halt.words(),
+                Some(format!("stopped: the run failed at {check}").as_str())
+            );
+            assert!(!halt.red(check));
+        }
     }
 
     #[test]

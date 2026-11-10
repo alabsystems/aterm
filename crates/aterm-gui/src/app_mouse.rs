@@ -12245,7 +12245,7 @@ mod tests {
             "palette_live, publish_menu_live, overlay_coordinate_transform, and dispatch_ime_event need no VisibleLeafPlan"
         );
 
-        // 6. Single-pane/zoomed focus_pane_would_move and single-pane shared_target_geometry build 0 plans.
+        // 6. Single-pane/zoomed focus_pane_would_move, single-pane shared_target_geometry, and drawn_chip_lines build 0 plans.
         let mut single_native_app = App::headless_for_test();
         assert!(
             single_native_app
@@ -12261,10 +12261,13 @@ mod tests {
             assert!(!single_native_app.focus_pane_would_move(wid, dir));
         }
         let _ = single_native_app.shared_target_geometry(0);
+        let _ = single_native_app.drawn_chip_lines();
+        let _ = app.drawn_chip_lines();
+        let _ = mixed_app.drawn_chip_lines();
         assert_eq!(
             visible_leaf_plan_builds(),
             0,
-            "single-pane native focus_pane_would_move and shared_target_geometry need no VisibleLeafPlan"
+            "single-pane native focus_pane_would_move, shared_target_geometry, and unsupervised drawn_chip_lines need no VisibleLeafPlan"
         );
 
         #[cfg(a11y_tree)]

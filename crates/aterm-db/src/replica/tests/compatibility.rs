@@ -621,6 +621,30 @@ fn a_quiet_catalog_pair_reports_its_cpu() {
     quiet_rounds(8, Workload::Catalog);
 }
 
+/// A history ask over a vault history asks the kept historical keys nothing: it asks whether each
+/// epoch opens (`Bootstrap::holds_histories`), not for its key, so a round's asks leave the keys
+/// its table reads take where those find them. Nine rotations give the log 18 epochs, more than
+/// the sixteen keys kept.
+/// NEGATIVE CONTROL: `Session::history_needs` asking `Bootstrap::historicals` (and keeping none of
+/// its answers) fails the second assertion.
+#[test]
+fn a_history_ask_over_a_vault_history_asks_no_kept_key() {
+    let pair = pair_from_lab_with(Lab::new(&[Role::Writer, Role::Writer]), 9, Holder::Wrapped);
+    let bootstrap = pair.lab.bootstrap(1);
+    let session = Session::open(&bootstrap).unwrap();
+    let asks = aterm_secrets::commons::roster::test_kept_key_asks();
+    let (needs, _) = session.history_needs(None, usize::MAX).unwrap();
+    assert!(
+        needs.is_empty(),
+        "CONTROL: the second Mac holds every epoch"
+    );
+    assert_eq!(
+        aterm_secrets::commons::roster::test_kept_key_asks(),
+        asks,
+        "a history ask asks no kept key"
+    );
+}
+
 /// What the suite keeps of the measurements above: a converged catalog pair's rounds move nothing
 /// and visit both its tables. The asserts are a superset of the explicit pair's.
 /// An explicitly listed table's rounds are kept by
@@ -938,6 +962,17 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
     let measuring = measured > SUITE_ROUNDS;
     let mut warmed = warm;
     if measuring {
+        // An idle Mac's rounds asked long ago whether it holds each epoch of its history, sixteen
+        // a round on each side (`replica::BATCH`), and it answers each one that opened from what
+        // opened it (`Bootstrap::holds_histories`), where this pair's warm-up asked 32 of the
+        // 2,400 epochs a long log's rotations add: each side asks every one once, as a whole cycle
+        // of rounds would, so the rounds measured ask what an idle Mac's ask.
+        for n in 0..2 {
+            let bootstrap = pair.lab.bootstrap(n);
+            let session = Session::open(&bootstrap).unwrap();
+            let (needs, _) = session.history_needs(None, usize::MAX).unwrap();
+            assert!(needs.is_empty(), "a converged pair holds every epoch");
+        }
         // An idle Mac's vault and journals stood unchanged long before its rounds, where this
         // pair's setup and warm-up wrote them just now, and a journal view or a file digest of a
         // file changed within the settled time of a read reads it again at each ask

@@ -410,7 +410,20 @@ impl JobsPass {
         let read = self.reader.read_all_at(&reqs, now_us);
         let roots: BTreeSet<u32> = tabs.iter().map(|t| t.shell_pid).collect();
         let fronts = &mut self.fronts;
-        let procs = job_procs(&read, &roots, stand_in, readers.exec, |p| fronts.front(p));
+        let mut procs = job_procs(&read, &roots, stand_in, readers.exec, |p| fronts.front(p));
+        // One read per actual native pass, after detailed descriptors were sampled. Never
+        // consult a request's path or HOME; tests remain inert like the other host readers.
+        if !cfg!(test) {
+            let waits = aterm_capacity::build_slot_wait::read(&read, now_us);
+            for p in &mut procs {
+                if let Some(wait) = waits
+                    .iter()
+                    .find(|w| w.process.pid == p.pid && Some(w.process.birth_us) == p.start)
+                {
+                    p.build_admission = Some(wait.blockers.iter().map(|h| h.pid).collect());
+                }
+            }
+        }
         fronts.keep(&read);
         let clock = &read_ms;
         let read_ms = clock();
@@ -1859,6 +1872,7 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
         exec_version: None,
         becomes: None,
         claims_ahead: None,
+        build_admission: None,
     }
 }
 

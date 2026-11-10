@@ -16,6 +16,32 @@ use aterm_uds::process::{
 const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
 
+#[cfg(unix)]
+#[test]
+fn a_notice_reply_survives_the_instance_closing_before_the_send_returns() {
+    use std::io::{Read as _, Write as _};
+    let (stream, mut instance) = aterm_uds::CtlStream::pair().unwrap();
+    let must = aterm_spec::wait::MUST_HAPPEN;
+    instance.set_read_timeout(Some(must)).unwrap();
+    let (closed, closure) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let mut request = [0; 6];
+        instance.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"notice");
+        instance.write_all(b"OK recorded\n").unwrap();
+        drop(instance);
+        closed.send(()).unwrap();
+    });
+    tell_exchange(&stream, 1, Instant::now() + must, || {
+        (&stream).write_all(b"notice")?;
+        closure.recv_timeout(must).unwrap();
+        aterm_spec::wait::until_peer_closed(&stream);
+        Ok(())
+    })
+    .unwrap();
+    peer.join().unwrap();
+}
+
 fn birth(us: u64) -> Birth {
     Birth(us)
 }

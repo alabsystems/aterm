@@ -8,8 +8,9 @@
 //! the sheet gives no row retried and logged the same failure at every upkeep. A sync now copies
 //! only a list found on this Mac into `~/.secrets`; the sheet outranks a copy aterm wrote, in any
 //! format any aterm wrote it, wherever the sheet gives this machine rows (the sync that reads the
-//! sheet removes it); a fleet the vault delivered (its own record says so) or a person wrote
-//! keeps its precedence; and a failing sync waits for its inputs to change. Every fixture email
+//! sheet retires its automatic use and preserves it); an initially selected fleet keeps
+//! precedence, but delivery bookkeeping cannot reactivate a retired one. A failing sync
+//! waits for its inputs to change. Every fixture email
 //! is `example.test`.
 
 use std::os::unix::fs::PermissionsExt;
@@ -19,6 +20,535 @@ use super::login_tests::{Desk, NOW, upkeep_effects};
 use super::*;
 
 const SHEET: &str = "email,computer,claude\na1@example.test,m27,1\na2@example.test,m28,1\n";
+
+fn manual(desk: &Desk, source: Option<&str>, fetch: &Fetch<'_>) -> Result<SyncReport, String> {
+    let env = quiet_env(
+        &desk.home,
+        &desk.state,
+        &desk.config.join("aterm.toml"),
+        NOW,
+    );
+    sync_accounts_with(
+        &env,
+        source,
+        None,
+        &SyncHow {
+            fetch,
+            ladder: &[],
+            fleet_snapshots: &[],
+            heal: None,
+            allow_empty_pool: false,
+        },
+    )
+}
+
+#[test]
+fn source_less_manual_sync_preserves_an_active_legacy_source() {
+    let desk = Desk::new("m27");
+    desk.default_login("a1@example.test");
+    let copy = secrets_dir(&desk).join(FLEET_ROSTER_FILE);
+    fs::write(
+        &copy,
+        "[[account]]\nlabel='m27'\nemail='a1@example.test'\nmachines=['m27']\n",
+    )
+    .unwrap();
+    sync(&desk, NOW);
+    manual(&desk, None, &fetch_source_text).unwrap();
+    assert!(
+        !accounts::Store::at(&desk.state)
+            .source_policy()
+            .unwrap()
+            .retired()
+    );
+    assert!(matches!(
+        origin(&desk),
+        FleetOrigin::Vault(_) | FleetOrigin::Local { .. }
+    ));
+}
+
+#[test]
+fn automatic_local_source_bytes_are_rechecked_before_publication() {
+    for init in [false, true] {
+        let desk = Desk::new("m27");
+        desk.default_login("a1@example.test");
+        let source = desk.home.join("source.csv");
+        fs::write(&source, SHEET).unwrap();
+        fs::write(
+            desk.config.join("aterm.toml"),
+            format!(
+                "[fleet]\nmachine='m27'\naccounts_source='{}'\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+        let fetch = |env: &Env, named: &str| {
+            let text = fetch_source_text(env, named)?;
+            fs::write(&source, SHEET.replace("a1@", "changed@")).unwrap();
+            Ok(text)
+        };
+        let why = if init {
+            sync_accounts_for_init_with(&desk.home, &desk.state, &desk.roster(), NOW, || {}, &fetch)
+                .unwrap_err()
+        } else {
+            manual(&desk, None, &fetch).err().expect("source changed")
+        };
+        assert!(why.contains("changed"), "{why}");
+        assert!(!desk.roster().exists());
+        assert!(
+            !accounts::Store::at(&desk.state)
+                .source_policy()
+                .unwrap()
+                .retired()
+        );
+    }
+}
+
+#[test]
+fn source_inputs_cannot_be_overwritten_through_either_output_path() {
+    for roster in [false, true] {
+        for hard in [false, true] {
+            for input in [
+                FLEET_ROSTER_FILE,
+                ACCOUNTS_CSV_FILE,
+                super::super::ai_pool::AI_POOL_FILE,
+                "custom",
+            ] {
+                let desk = Desk::new("m27");
+                desk.default_login("a1@example.test");
+                let requested = desk.home.join("requested.csv");
+                fs::write(&requested, SHEET).unwrap();
+                let protected = if input == "custom" {
+                    requested.clone()
+                } else {
+                    secrets_dir(&desk).join(input)
+                };
+                if input != "custom" {
+                    fs::write(&protected, "account=[]\n").unwrap();
+                }
+                let before = fs::read(&protected).unwrap();
+                let output = if roster {
+                    desk.roster()
+                } else {
+                    desk.fleet_file()
+                };
+                if hard {
+                    fs::hard_link(&protected, &output).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&protected, &output).unwrap();
+                }
+                let why = manual(&desk, requested.to_str(), &fetch_source_text)
+                    .err()
+                    .expect("aliased input refused");
+                assert!(
+                    why.contains("aliases"),
+                    "{input} roster={roster} hard={hard}: {why}"
+                );
+                assert_eq!(fs::read(&protected).unwrap(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn explicitly_named_profile_inputs_are_read_only() {
+    for configured in [false, true] {
+        let desk = Desk::new("m27");
+        desk.default_login("a1@example.test");
+        let path = desk.fleet_file();
+        let text = "[[account]]\nlabel='m27'\nemail='a1@example.test'\nmachines=['m27']\n";
+        fs::write(&path, text).unwrap();
+        if configured {
+            fs::write(
+                desk.config.join("aterm.toml"),
+                format!(
+                    "[fleet]\nmachine='m27'\naccounts_source='{}'\n",
+                    path.display()
+                ),
+            )
+            .unwrap();
+        }
+        let why = manual(
+            &desk,
+            (!configured).then(|| path.to_str().unwrap()),
+            &fetch_source_text,
+        )
+        .err()
+        .expect("explicit input is read-only");
+        assert!(why.contains("aliases"), "{why}");
+        assert_eq!(fs::read_to_string(path).unwrap(), text);
+    }
+}
+
+#[test]
+fn a_new_automatic_source_cannot_retire_itself_through_an_alias() {
+    let desk = Desk::new("m27");
+    desk.default_login("a1@example.test");
+    let legacy = secrets_dir(&desk).join(FLEET_ROSTER_FILE);
+    fs::write(
+        &legacy,
+        "[[account]]\nlabel='m27'\nemail='a1@example.test'\nmachines=['m27']\n",
+    )
+    .unwrap();
+    let alias = desk.home.join("source.toml");
+    fs::hard_link(&legacy, &alias).unwrap();
+    fs::write(
+        desk.config.join("aterm.toml"),
+        format!(
+            "[fleet]\nmachine='m27'\naccounts_source='{}'\n",
+            alias.display()
+        ),
+    )
+    .unwrap();
+    let why = sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).unwrap_err();
+    assert!(why.contains("another path"), "{why}");
+    assert!(
+        !accounts::Store::at(&desk.state)
+            .source_policy()
+            .unwrap()
+            .retired()
+    );
+}
+
+#[test]
+fn a_dangling_retired_path_does_not_disable_live_sources() {
+    let desk = Desk::new("m27");
+    desk.default_login("a1@example.test");
+    let secrets = secrets_dir(&desk);
+    fs::write(secrets.join(ACCOUNTS_CSV_FILE), SHEET).unwrap();
+    sync(&desk, NOW);
+    std::os::unix::fs::symlink(desk.home.join("gone"), secrets.join(FLEET_ROSTER_FILE)).unwrap();
+    sync(&desk, NOW + 1);
+    assert_eq!(emails(&desk), ["a1@example.test"]);
+    assert!(
+        accounts::Store::at(&desk.state)
+            .source_policy()
+            .unwrap()
+            .retired()
+    );
+}
+
+#[test]
+fn empty_manual_source_uses_captured_automatic_policy() {
+    for source in [None, Some(""), Some(" \t ")] {
+        let desk = Desk::new("m27");
+        desk.default_login("a1@example.test");
+        let named = desk.home.join("chosen.csv");
+        fs::write(&named, SHEET).unwrap();
+        let config = desk.config.join("aterm.toml");
+        fs::write(
+            &config,
+            format!(
+                "[fleet]\nmachine='m27'\naccounts_source='{}'\n",
+                named.display()
+            ),
+        )
+        .unwrap();
+        let env = quiet_env(&desk.home, &desk.state, &config, NOW);
+        let how = SyncHow {
+            fetch: &fetch_source_text,
+            ladder: &[],
+            fleet_snapshots: &[],
+            heal: None,
+            allow_empty_pool: false,
+        };
+        sync_accounts_with(&env, source, None, &how).unwrap();
+        assert!(env.accounts_store().source_policy().unwrap().retired());
+    }
+}
+
+#[test]
+fn every_provider_source_reader_preserves_retirement() {
+    for cli in std::iter::once(Cli::Claude).chain(OTHER_CLIS) {
+        let desk = Desk::new("m27");
+        let env = quiet_env(
+            &desk.home,
+            &desk.state,
+            &desk.config.join("aterm.toml"),
+            NOW,
+        );
+        let secrets = secrets_dir(&desk);
+        fs::write(secrets.join(cli_fleet_file(cli)), "retired source").unwrap();
+        if cli == Cli::Claude {
+            fs::write(secrets.join(FLEET_ROSTER_FILE), "retired source").unwrap();
+        }
+        let sheet = secrets.join(ACCOUNTS_CSV_FILE);
+        fs::write(&sheet, SHEET).unwrap();
+        let store = accounts::Store::at_for(&desk.state, cli, &desk.home);
+        let held = store.acquire().unwrap();
+        store.retire_source_held(&held, NOW).unwrap();
+        drop(held);
+        let selected = local_cli_source(cli, &env, &desk.home, &mut |path, _| {
+            source_entry_present(path)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.path, sheet);
+        assert!(selected.csv);
+        fs::remove_file(store.source_policy_file()).unwrap();
+        assert!(
+            local_cli_source(cli, &env, &desk.home, &mut |path, _| source_entry_present(
+                path
+            ))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn a_local_list_without_a_legacy_input_does_not_retire_or_seed_a_retired_slot() {
+    let desk = Desk::new("m27");
+    desk.default_login("a1@example.test");
+    let secrets = secrets_dir(&desk);
+    fs::write(desk.fleet_file(), "opt_in='discovered'\n[[account]]\nlabel='m27'\nemail='a1@example.test'\nmachines=['m27']\n").unwrap();
+    sync(&desk, NOW);
+    assert!(
+        !accounts::Store::at(&desk.state)
+            .source_policy()
+            .unwrap()
+            .retired()
+    );
+    assert!(secrets.join(FLEET_ROSTER_FILE).exists());
+    manual(&desk, None, &fetch_source_text).unwrap();
+    assert!(
+        !accounts::Store::at(&desk.state)
+            .source_policy()
+            .unwrap()
+            .retired()
+    );
+    sync(&desk, NOW + 1);
+    assert!(
+        !accounts::Store::at(&desk.state)
+            .source_policy()
+            .unwrap()
+            .retired()
+    );
+}
+
+#[test]
+fn unannotated_local_list_is_not_scheduled_for_automatic_import() {
+    let desk = Desk::new("m27");
+    fs::write(
+        desk.fleet_file(),
+        "[[account]]\nlabel='m27'\nemail='a1@example.test'\nmachines=['m27']\n",
+    )
+    .unwrap();
+    assert!(!needs_sync(&desk, NOW));
+    assert!(
+        !accounts::Store::at(&desk.state)
+            .source_policy()
+            .unwrap()
+            .retired()
+    );
+}
+
+#[test]
+fn an_unassigned_sheet_neither_retires_nor_commits_a_stale_assignment() {
+    for changed in [false, true] {
+        let desk = Desk::new("m99");
+        let sheet = secrets_dir(&desk).join(ACCOUNTS_CSV_FILE);
+        fs::write(&sheet, SHEET).unwrap();
+        let result = sync_accounts_for_init_with(
+            &desk.home,
+            &desk.state,
+            &desk.roster(),
+            NOW,
+            || {
+                if changed {
+                    fs::write(&sheet, "email,computer,claude\na1@example.test,m99,1\n").unwrap();
+                }
+            },
+            &fetch_source_text,
+        );
+        assert_eq!(result.is_err(), changed);
+        assert!(
+            !accounts::Store::at(&desk.state)
+                .source_policy()
+                .unwrap()
+                .retired()
+        );
+        assert!(!desk.roster().exists());
+    }
+}
+
+#[test]
+fn retired_source_changes_do_not_change_sync_inputs_or_source_presence() {
+    let desk = Desk::new("m27");
+    desk.default_login("a1@example.test");
+    let secrets = secrets_dir(&desk);
+    let sheet = secrets.join(ACCOUNTS_CSV_FILE);
+    fs::write(&sheet, SHEET).unwrap();
+    sync(&desk, NOW);
+    let before = sync_inputs(&desk.home, &desk.state, &desk.roster(), NOW);
+    fs::write(secrets.join(FLEET_ROSTER_FILE), "ignored retired source").unwrap();
+    assert_eq!(
+        sync_inputs(&desk.home, &desk.state, &desk.roster(), NOW),
+        before
+    );
+    let env = quiet_env(
+        &desk.home,
+        &desk.state,
+        &desk.config.join("aterm.toml"),
+        NOW,
+    );
+    let table = account_source_table(Cli::Claude, &env, None).unwrap();
+    assert!(
+        table
+            .roster
+            .accounts
+            .iter()
+            .any(|row| row.email == "a1@example.test")
+    );
+    fs::remove_file(sheet).unwrap();
+    assert!(!has_fleet_source(&secrets, &env.accounts_store()));
+}
+
+#[test]
+fn linked_local_projections_neither_overwrite_nor_reactivate_a_legacy_source() {
+    for hard in [false, true] {
+        for retired in [false, true] {
+            let desk = Desk::new("m27");
+            desk.default_login("a1@example.test");
+            let secrets = secrets_dir(&desk);
+            let sheet = secrets.join(ACCOUNTS_CSV_FILE);
+            let copy = secrets.join(FLEET_ROSTER_FILE);
+            fs::write(&sheet, SHEET).unwrap();
+            if retired {
+                sync(&desk, NOW);
+                fs::remove_file(desk.fleet_file()).unwrap();
+                fs::remove_file(&sheet).unwrap();
+            }
+            let text = format!(
+                "{FLEET_HEAD_NAMED}\nopt_in='named'\n[[account]]\nlabel='m27'\nemail='a1@example.test'\nmachines=['m27']\n"
+            );
+            fs::write(&copy, &text).unwrap();
+            if hard {
+                fs::hard_link(&copy, desk.fleet_file()).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&copy, desk.fleet_file()).unwrap();
+            }
+            let why = sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW + 1)
+                .unwrap_err();
+            assert!(
+                why.contains("aliases") || why.contains("another path"),
+                "{why}"
+            );
+            assert_eq!(fs::read_to_string(&copy).unwrap(), text);
+            assert_eq!(fs::read_to_string(desk.fleet_file()).unwrap(), text);
+        }
+    }
+}
+
+#[test]
+fn an_automatic_key_cannot_name_the_retired_source_through_an_alias() {
+    let desk = Desk::new("m27");
+    desk.default_login("a1@example.test");
+    let secrets = secrets_dir(&desk);
+    fs::write(secrets.join(ACCOUNTS_CSV_FILE), SHEET).unwrap();
+    sync(&desk, NOW);
+    let copy = secrets.join(FLEET_ROSTER_FILE);
+    fs::write(&copy, "account=[]\n").unwrap();
+    fs::remove_file(desk.fleet_file()).unwrap();
+    let alias = desk.home.join("old-fleet.toml");
+    std::os::unix::fs::symlink(&copy, &alias).unwrap();
+    fs::write(
+        desk.config.join("aterm.toml"),
+        format!(
+            "[fleet]\nmachine='m27'\naccounts_source='{}'\n",
+            alias.display()
+        ),
+    )
+    .unwrap();
+    let why = sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW + 1).unwrap_err();
+    assert!(why.contains("another path"), "{why}");
+    assert!(matches!(origin(&desk), FleetOrigin::SourcePending(_)));
+}
+
+#[test]
+fn retired_copy_is_preserved_and_does_not_return_after_sheet_withdrawal() {
+    let desk = Desk::new("m27");
+    desk.default_login("a1@example.test");
+    let secrets = secrets_dir(&desk);
+    let sheet = secrets.join(ACCOUNTS_CSV_FILE);
+    let copy = secrets.join(FLEET_ROSTER_FILE);
+    fs::write(&sheet, SHEET).unwrap();
+    sync(&desk, NOW);
+    let store = accounts::Store::at(&desk.state);
+    let policy = fs::read(store.source_policy_file()).unwrap();
+    let stale = "opt_in='named'\n[[account]]\nlabel='stale'\nemail='stale@example.test'\nmachines=['m27']\n";
+    fs::write(&copy, stale).unwrap();
+    fs::remove_file(&sheet).unwrap();
+    sync(&desk, NOW + 1);
+    assert_eq!(fs::read_to_string(&copy).unwrap(), stale);
+    assert_eq!(emails(&desk), ["a1@example.test"]);
+    assert_eq!(fs::read(store.source_policy_file()).unwrap(), policy);
+    assert!(store.source_policy().unwrap().retired());
+
+    let env = quiet_env(
+        &desk.home,
+        &desk.state,
+        &desk.config.join("aterm.toml"),
+        NOW + 2,
+    );
+    let how = SyncHow {
+        fetch: &fetch_source_text,
+        ladder: &sync_lock_ladder(),
+        fleet_snapshots: &[],
+        heal: None,
+        allow_empty_pool: false,
+    };
+    sync_accounts_with(&env, Some(copy.to_str().unwrap()), None, &how).unwrap();
+    assert_eq!(
+        fs::read(store.source_policy_file()).unwrap(),
+        policy,
+        "explicit import grants no future automatic use"
+    );
+    assert!(store.source_policy().unwrap().retired());
+    assert!(matches!(origin(&desk), FleetOrigin::Local { files, .. } if !files.contains(&copy)));
+}
+
+#[test]
+fn a_lost_or_corrupt_policy_refuses_automatic_sync_without_touching_accounts() {
+    for replacement in [None, Some("broken policy")] {
+        let desk = Desk::new("m27");
+        desk.default_login("a1@example.test");
+        let sheet = secrets_dir(&desk).join(ACCOUNTS_CSV_FILE);
+        fs::write(&sheet, SHEET).unwrap();
+        sync(&desk, NOW);
+        let store = accounts::Store::at(&desk.state);
+        let roster = fs::read(desk.roster()).unwrap();
+        match replacement {
+            None => fs::remove_file(store.source_policy_file()).unwrap(),
+            Some(text) => fs::write(store.source_policy_file(), text).unwrap(),
+        }
+        assert!(matches!(origin(&desk), FleetOrigin::SourcePending(_)));
+        assert!(sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW + 1).is_err());
+        assert_eq!(fs::read(desk.roster()).unwrap(), roster);
+    }
+}
+
+#[test]
+fn a_source_retired_after_capture_cannot_publish_old_rows() {
+    let desk = Desk::new("m27");
+    desk.default_login("a1@example.test");
+    let copy = secrets_dir(&desk).join(FLEET_ROSTER_FILE);
+    let text = "[[account]]\nlabel='old'\nemail='a1@example.test'\nmachines=['m27']\n";
+    fs::write(&copy, text).unwrap();
+    let result = sync_accounts_for_init_with(
+        &desk.home,
+        &desk.state,
+        &desk.roster(),
+        NOW,
+        || {
+            let store = accounts::Store::at(&desk.state);
+            let held = store.acquire().unwrap();
+            store.retire_source_held(&held, NOW).unwrap();
+        },
+        &fetch_source_text,
+    );
+    assert!(result.unwrap_err().contains("source policy changed"));
+    assert!(!desk.roster().exists());
+    assert_eq!(fs::read_to_string(copy).unwrap(), text);
+}
 
 fn secrets_dir(desk: &Desk) -> PathBuf {
     let secrets = desk.home.join(".secrets");
@@ -36,6 +566,7 @@ fn needs_sync(desk: &Desk, now: i64) -> bool {
 
 fn origin(desk: &Desk) -> FleetOrigin {
     fleet_origin(
+        &accounts::Store::at(&desk.state),
         Some(&desk.home),
         Some(&desk.config.join("aterm.toml")),
         &desk.roster(),
@@ -73,7 +604,7 @@ fn vault_wrote(desk: &Desk, name: &str) {
 
 /// A sync from the vault's sheet writes no copy into `~/.secrets`; a copy an earlier build wrote
 /// there (byte for byte the fleet file beside the roster) is outranked by the sheet, named as
-/// the sheet by `accounts`, and removed by the next sync, which takes the edited sheet; every
+/// the sheet by `accounts`, and durably excluded without deleting it; every
 /// later edit of the sheet, a row added or dropped, reaches the roster; and a sheet withdrawn
 /// leaves its rows out of `~/.secrets`. CONTROL: the first sync, before any copy, takes the sheet
 /// and needs no other.
@@ -95,34 +626,37 @@ fn the_sheet_outranks_the_copy_aterm_wrote_and_each_edit_reaches_the_roster() {
     // What an earlier build wrote: the fleet file's own bytes, beside the sheet.
     fs::copy(desk.fleet_file(), &copy).unwrap();
     assert_eq!(origin(&desk), FleetOrigin::Vault(sheet.clone()));
-    assert!(needs_sync(&desk, NOW + 2), "the copy is removed by a sync");
+    assert!(
+        !needs_sync(&desk, NOW + 2),
+        "the retired copy cannot request another sync"
+    );
 
     let edited = format!("{SHEET}a3@example.test,m27.2,1\n");
     fs::write(&sheet, &edited).unwrap();
     sync(&desk, NOW + 3);
     assert_eq!(emails(&desk), ["a1@example.test", "a3@example.test"]);
-    assert!(!copy.exists(), "the copy aterm wrote is removed");
+    assert!(copy.exists(), "the retired copy is preserved");
     assert!(!needs_sync(&desk, NOW + 4));
 
     fs::write(&sheet, SHEET).unwrap();
     assert!(needs_sync(&desk, NOW + 5), "a dropped row is an edit too");
     sync(&desk, NOW + 6);
     assert_eq!(emails(&desk), ["a1@example.test"]);
-    assert!(!copy.exists(), "nothing is copied back");
+    assert!(copy.exists(), "the retired copy stays preserved");
 
     fs::remove_file(&sheet).unwrap();
     sync(&desk, NOW + 7);
     assert_eq!(emails(&desk), ["a1@example.test"]);
     assert!(
-        !copy.exists(),
-        "a withdrawn sheet's rows are not copied there"
+        copy.exists(),
+        "withdrawal does not remove the retired source"
     );
 }
 
 /// A copy an older aterm wrote yields to the sheet though its bytes are not the fleet file's: one
 /// with the comments of builds before 0.137 and one that records `opt_in = "key"`, as a sync from
-/// a URL wrote it. One an older aterm writes again after a removal (its sync from the sheet
-/// copies it there) is removed again. With no sheet, such a copy calls for no sync at every
+/// a URL wrote it. One an older aterm writes again after retirement is still excluded.
+/// With no sheet, such a copy calls for no sync at every
 /// upkeep: it holds the fleet file's accounts.
 #[test]
 fn a_copy_an_older_aterm_wrote_yields_to_the_sheet_whenever_it_writes_it() {
@@ -151,9 +685,9 @@ fn a_copy_an_older_aterm_wrote_yields_to_the_sheet_whenever_it_writes_it() {
         assert_ne!(older.as_str(), beside, "CONTROL: another format");
         fs::write(&copy, older).unwrap();
         assert_eq!(origin(&desk), FleetOrigin::Vault(sheet.clone()), "{older}");
-        assert!(needs_sync(&desk, now));
+        assert!(!needs_sync(&desk, now));
         sync(&desk, now + 1);
-        assert!(!copy.exists(), "{older}");
+        assert_eq!(fs::read_to_string(&copy).unwrap(), *older, "{older}");
         assert!(!needs_sync(&desk, now + 2));
     }
 
@@ -161,7 +695,7 @@ fn a_copy_an_older_aterm_wrote_yields_to_the_sheet_whenever_it_writes_it() {
     fs::copy(desk.fleet_file(), &copy).unwrap();
     fs::write(&sheet, format!("{SHEET}a3@example.test,m27.2,1\n")).unwrap();
     sync(&desk, NOW + 30);
-    assert!(!copy.exists(), "removed again");
+    assert!(copy.exists(), "retirement preserves the source");
     assert_eq!(emails(&desk), ["a1@example.test", "a3@example.test"]);
 
     fs::remove_file(&sheet).unwrap();
@@ -174,12 +708,10 @@ fn a_copy_an_older_aterm_wrote_yields_to_the_sheet_whenever_it_writes_it() {
     assert!(!needs_sync(&desk, NOW + 40), "nothing new to read from it");
 }
 
-/// A fleet in `~/.secrets` that aterm did not write keeps its precedence over the sheet: one a
-/// person wrote, and one the vault delivered though aterm wrote its bytes (another Mac's fleet
-/// file, published to the vault) and this Mac's fleet file holds them byte for byte; with no
-/// sheet, that vault fleet is reported as one this machine reads and does not write.
+/// An initially selected fleet keeps precedence. A manifest entry alone cannot
+/// restore automatic use after a sheet has retired the legacy source slot.
 #[test]
-fn a_fleet_the_vault_delivered_or_a_person_wrote_keeps_its_precedence() {
+fn initial_fleet_precedence_does_not_make_delivery_bookkeeping_a_reactivation_grant() {
     let desk = Desk::new("m27");
     desk.default_login("v1@example.test");
     let secrets = secrets_dir(&desk);
@@ -220,16 +752,18 @@ fn a_fleet_the_vault_delivered_or_a_person_wrote_keeps_its_precedence() {
     );
     assert_eq!(
         emails(&delivered),
-        ["a1@example.test"],
-        "the fleet outranks"
+        ["a1@example.test", "a3@example.test"],
+        "the retired fleet cannot outrank the sheet"
     );
-    assert_eq!(origin(&delivered), FleetOrigin::Vault(copy.clone()));
+    assert_eq!(origin(&delivered), FleetOrigin::Vault(sheet.clone()));
     fs::remove_file(&sheet).unwrap();
-    assert_eq!(origin(&delivered), FleetOrigin::Vault(copy.clone()));
+    assert!(
+        matches!(origin(&delivered), FleetOrigin::Local { files, .. } if !files.contains(&copy))
+    );
 }
 
 /// A list found on this Mac is still copied into `~/.secrets`, and a sheet the vault delivers
-/// later that gives this machine rows outranks that copy, whose sync removes it and takes the
+/// later that gives this machine rows outranks that copy, whose sync retires it and takes the
 /// sheet's rows.
 #[test]
 fn a_copy_of_a_list_found_here_yields_to_a_sheet_delivered_later() {
@@ -260,7 +794,7 @@ fn a_copy_of_a_list_found_here_yields_to_a_sheet_delivered_later() {
     assert!(needs_sync(&desk, NOW + 1));
     sync(&desk, NOW + 2);
     assert_eq!(emails(&desk), ["sol-m27@example.test", "star@example.test"]);
-    assert!(!copy.exists());
+    assert!(copy.exists());
 }
 
 /// A Mac the sheet gives no row keeps the list found on it: aterm's copy stays its source (no
@@ -307,13 +841,11 @@ fn a_mac_the_sheet_does_not_name_keeps_the_list_found_on_it() {
     assert_eq!(origin(&desk), FleetOrigin::Vault(sheet.clone()));
     assert!(needs_sync(&desk, NOW + 3));
     sync(&desk, NOW + 4);
-    assert!(!copy.exists());
+    assert!(copy.exists());
     assert_eq!(emails(&desk), ["sol-m27@example.test"]);
 }
 
-/// What `accounts` says of the list names who wrote it: with the sheet gone, aterm's own copy
-/// is the fleet file it copies (`named`, both files written by `accounts add`), not a file this
-/// machine reads and does not write.
+/// With the sheet gone, a retired legacy copy is not reported as a selected source.
 #[test]
 fn the_copy_aterm_wrote_is_never_reported_as_the_vaults() {
     let desk = Desk::new("m27");
@@ -330,7 +862,7 @@ fn the_copy_aterm_wrote_is_never_reported_as_the_vaults() {
     assert_eq!(
         origin(&desk),
         FleetOrigin::Local {
-            files: vec![desk.fleet_file(), copy],
+            files: vec![desk.fleet_file()],
             opt_in: Some(OptIn::Named),
         }
     );

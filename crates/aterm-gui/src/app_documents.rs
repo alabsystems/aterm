@@ -2863,7 +2863,7 @@ impl App {
                 .tab_set
                 .tabs()
                 .iter()
-                .any(|tab| tab.root.leaves().contains(&source_view))
+                .any(|tab| tab.root.contains(source_view))
                 .then_some(*wid)
         });
         let Some(wid) = source_window else {
@@ -2907,9 +2907,9 @@ impl App {
                 let open_elsewhere = self.windows.iter().any(|(candidate_window, state)| {
                     *candidate_window != wid
                         && state.tab_set.tabs().iter().any(|tab| {
-                            tab.root.leaves().into_iter().any(|view| {
+                            tab.root.any_leaf(&mut |view| {
                                 let Some(crate::tab_model::View::Native(native)) =
-                                    self.view_store.get(view).copied()
+                                    self.view_store.get(*view).copied()
                                 else {
                                     return false;
                                 };
@@ -3724,19 +3724,19 @@ impl App {
             .ok_or_else(|| "document tab disappeared".to_string())?;
         let mut grouped =
             BTreeMap::<DocumentId, (BTreeSet<DocumentViewId>, crate::tab_model::ViewId)>::new();
-        for view in tab.root.leaves() {
+        tab.root.visit(&mut |&view| {
             let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view).copied()
             else {
-                continue;
+                return;
             };
             let Some(document) = self.native_runtime.document_id(native.instance) else {
-                continue;
+                return;
             };
             let entry = grouped
                 .entry(document)
                 .or_insert_with(|| (BTreeSet::new(), view));
             entry.0.insert(DocumentViewId(view.get()));
-        }
+        });
         if grouped.is_empty() {
             return Ok(true);
         }
@@ -4392,23 +4392,21 @@ impl App {
             .ok_or_else(|| "window disappeared before document close planning".to_string())?;
         let mut grouped =
             BTreeMap::<DocumentId, (BTreeSet<DocumentViewId>, crate::tab_model::ViewId)>::new();
-        for view in state
-            .tab_set
-            .tabs()
-            .iter()
-            .flat_map(|tab| tab.root.leaves())
-        {
-            let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view).copied()
-            else {
-                continue;
-            };
-            let Some(document) = self.native_runtime.document_id(native.instance) else {
-                continue;
-            };
-            let entry = grouped
-                .entry(document)
-                .or_insert_with(|| (BTreeSet::new(), view));
-            entry.0.insert(DocumentViewId(view.get()));
+        for tab in state.tab_set.tabs() {
+            tab.root.visit(&mut |&view| {
+                let Some(crate::tab_model::View::Native(native)) =
+                    self.view_store.get(view).copied()
+                else {
+                    return;
+                };
+                let Some(document) = self.native_runtime.document_id(native.instance) else {
+                    return;
+                };
+                let entry = grouped
+                    .entry(document)
+                    .or_insert_with(|| (BTreeSet::new(), view));
+                entry.0.insert(DocumentViewId(view.get()));
+            });
         }
         Ok(DocumentClosePlan {
             documents: grouped
@@ -4588,7 +4586,7 @@ impl App {
                     .tab_set
                     .tabs()
                     .iter()
-                    .position(|tab| tab.root.leaves().contains(&view))?;
+                    .position(|tab| tab.root.contains(view))?;
                 state.tab_set.tab_at_mut(index)
             }) {
                 tab.presentation.indicators.attention = true;
@@ -4616,7 +4614,7 @@ impl App {
                     .tab_set
                     .tabs()
                     .iter()
-                    .position(|tab| tab.root.leaves().contains(&view))?;
+                    .position(|tab| tab.root.contains(view))?;
                 state.tab_set.tab_at_mut(index)
             }) {
                 tab.presentation.indicators.attention = edit_mark;
@@ -4646,22 +4644,22 @@ impl App {
         crate::tab_model::AppInstanceId,
         crate::tab_model::ViewId,
     )> {
-        let keep = &keep;
-        self.windows
-            .iter()
-            .flat_map(|(wid, ws)| {
-                ws.tab_set.tabs().iter().flat_map(move |tab| {
-                    tab.root.leaves().into_iter().filter_map(move |view| {
-                        let crate::tab_model::View::Native(native) =
-                            self.view_store.get(view).copied()?
-                        else {
-                            return None;
-                        };
-                        keep(native.instance).then_some((*wid, native.instance, view))
-                    })
-                })
-            })
-            .collect()
+        let mut views = Vec::new();
+        for (&wid, ws) in &self.windows {
+            for tab in ws.tab_set.tabs() {
+                tab.root.visit(&mut |&view| {
+                    let Some(crate::tab_model::View::Native(native)) =
+                        self.view_store.get(view).copied()
+                    else {
+                        return;
+                    };
+                    if keep(native.instance) {
+                        views.push((wid, native.instance, view));
+                    }
+                });
+            }
+        }
+        views
     }
 
     /// At a park: let go of the documents nothing holds any more when a look is due.
@@ -5686,16 +5684,24 @@ impl App {
             .tabs()
             .iter()
             .find_map(|tab| {
-                tab.root.leaves().into_iter().find_map(|view| {
-                    let crate::tab_model::View::Native(native) =
-                        self.view_store.get(view).copied()?
+                let mut found = None;
+                tab.root.any_leaf(&mut |&view| {
+                    let Some(crate::tab_model::View::Native(native)) =
+                        self.view_store.get(view).copied()
                     else {
-                        return None;
+                        return false;
                     };
-                    let app = self.native_runtime.app(native.instance)?;
-                    (app.kind() == kind && app.document_id() == Some(document))
-                        .then_some((tab.id, view))
-                })
+                    let Some(app) = self.native_runtime.app(native.instance) else {
+                        return false;
+                    };
+                    if app.kind() == kind && app.document_id() == Some(document) {
+                        found = Some((tab.id, view));
+                        true
+                    } else {
+                        false
+                    }
+                });
+                found
             })
     }
 
@@ -10759,7 +10765,7 @@ mod tests {
             .tab_set
             .tabs()
             .iter()
-            .find(|tab| tab.root.leaves().contains(&view))
+            .find(|tab| tab.root.contains(view))
             .expect("document tab");
         assert!(!tab.presentation.indicators.attention);
 

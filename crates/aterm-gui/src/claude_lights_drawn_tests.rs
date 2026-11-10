@@ -118,7 +118,13 @@ fn node_label(app: &App, wid: WindowId, session: u64) -> Option<String> {
 #[test]
 fn chrome_reads_the_chip_the_frame_drew() {
     let (mut app, wid, session, _reader, _host) = desk();
+    crate::reset_visible_leaf_plan_builds();
     let line = line_of(&app, session);
+    assert_eq!(
+        crate::visible_leaf_plan_builds(),
+        0,
+        "single-pane supervised drawn_chip_lines needs no VisibleLeafPlan"
+    );
     assert_eq!(token(&line, "window"), "0", "{line}");
     assert_eq!(token(&line, "program"), "claude", "{line}");
     assert_eq!(token(&line, "face"), "cruise", "{line}");

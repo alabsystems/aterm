@@ -1123,11 +1123,18 @@ fn escaped_daemon(scrubbed: bool) {
         + Duration::from_secs(daemon.pbsd.pbi_start_tvsec)
         + Duration::from_micros(daemon.pbsd.pbi_start_tvusec);
     if scrubbed {
+        // `$!` names the forked subshell, which becomes `env -i` and then the daemon: until the
+        // daemon's exec its environment still names the run. Wait for the scrubbed image.
+        while !atpkg::caller_shell::process_args(daemon_pid as u32)
+            .is_some_and(|args| args.env.is_empty())
+        {
+            assert!(
+                Instant::now() < give_up,
+                "the fixture's daemon never cleared its environment"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(environment_names(daemon_pid, FIXTURE_SID), Some(false));
-        assert!(
-            atpkg::caller_shell::process_args(daemon_pid as u32)
-                .is_some_and(|args| args.env.is_empty())
-        );
     }
     let caught = escape_scan(
         shell_pid,
@@ -2656,16 +2663,21 @@ impl ForeignSession {
         let pid = waits.pid_in(&self.mark);
         let birth = bsdinfo_uniq(pid).expect("the orphan-to-be").p_uniqueid;
         self.owned.daemon = Some((pid, birth));
+        // Adopted is not enough: until the background job has exec'd its own image, a read of
+        // its arguments and environment can fail, and the scan then has no evidence the orphan
+        // is the run's. Under a loaded test phase that read raced the exec and the scan answered
+        // Clean for the run's own orphan (aterm 0.191.0's qualify tree).
         loop {
             if let Some(info) = bsdinfo_uniq(pid)
                 && info.p_uniqueid == birth
                 && info.pbsd.pbi_ppid == 1
+                && info.pbsd.pbi_flags & PROC_FLAG_EXEC != 0
             {
                 return (pid, info);
             }
             assert!(
                 Instant::now() < waits.give_up,
-                "launchd never adopted the background job"
+                "launchd never adopted the background job, or it never exec'd its own image"
             );
             std::thread::sleep(Duration::from_millis(10));
         }

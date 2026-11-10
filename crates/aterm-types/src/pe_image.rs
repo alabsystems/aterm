@@ -59,12 +59,15 @@ mod tests {
         );
         assert_eq!(subsystem(&header(0xF8, 3)), Some(3));
         assert_eq!(subsystem(b"#!/bin/sh\n"), None);
-        let dir = std::env::temp_dir().join(format!("aterm-pe-image-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let scratch = crate::test_scratch_dir("éééééé");
+        let dir = scratch.path();
+        assert_eq!(
+            dir.extension().and_then(|ext| ext.to_str()),
+            Some("noindex")
+        );
         let file = dir.join("image.exe");
         std::fs::write(&file, header(0x100, IMAGE_SUBSYSTEM_WINDOWS_GUI)).expect("write");
         assert_eq!(file_subsystem(&file), Some(IMAGE_SUBSYSTEM_WINDOWS_GUI));
         assert_eq!(file_subsystem(&dir.join("missing.exe")), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

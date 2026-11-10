@@ -3,7 +3,9 @@
 
 use super::super::upgrade_drive::{HarnessToken, Instances, Tell};
 use super::*;
-use crate::harness::native_restart::fixture::retain_bound_preparation;
+use crate::harness::native_restart::fixture::{
+    retain_asked, retain_bound_preparation, retain_cold,
+};
 use crate::harness::upgrade_drive::load;
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
@@ -120,6 +122,13 @@ fn uncertain_queries_and_unsealed_timeouts_preserve_native_debt() {
                     "OK native-act state=unknown\n"
                 }
                 .into()
+            } else if line.contains(" native-act prepare ") {
+                // Retirement replays the kept prepare first; its admission keeps the binding.
+                format!(
+                    "OK native-act state=admitted id={} cap={}\n",
+                    "ab".repeat(16),
+                    "cd".repeat(32)
+                )
             } else {
                 panic!("uncertain native debt must not dispatch {line}")
             }
@@ -382,6 +391,8 @@ fn retirement_discovered_during_abort_is_saved_before_any_further_observation() 
             forward: Box::new(command),
             rollback: None,
         },
+        boot: None,
+        custody: None,
     })
     .encode()
     .unwrap();
@@ -1049,6 +1060,283 @@ fn an_unadmitted_prepare_ends_a_crash_record_and_leaves_a_completed_rollback_exi
     }
 }
 
+/// The fixture's crash record with its kept prepare a cold restart, a later host epoch's
+/// `lapsed` the only answer, bound or not (its admission reply lost).
+fn lapsable_crash(bound: bool) -> St {
+    let mut st = state(true);
+    st.native = Some(super::super::native_act::Binding {
+        id: "ab".repeat(16),
+        capability: "cd".repeat(32),
+    });
+    retain_bound_preparation(&mut st);
+    retain_cold(&mut st);
+    if !bound {
+        st.native = None;
+    }
+    st
+}
+
+fn lapsed_host(line: &str) -> String {
+    if line.contains(" lease acquire ") || line.contains(" lease release ") {
+        "ERR busy\n".into()
+    } else if line.ends_with(" native-act constructors") {
+        // What production advertises: no private restart, which the old crash plan's gate
+        // asked for before it replayed a kept prepare.
+        "OK native-act state=constructors plans=cold-restart,asked-upgrade,asked-relaunch\n".into()
+    } else if line.contains(" native-act prepare ") {
+        super::super::native_act::lapsed_reply(&"ab".repeat(16)).unwrap()
+    } else {
+        panic!("a lapsed prepare dispatches nothing else: {line}")
+    }
+}
+
+fn prepares(seen: &[String]) -> usize {
+    seen.iter()
+        .filter(|line| line.contains(" native-act prepare "))
+        .count()
+}
+
+#[test]
+fn a_lapsed_prepare_ends_a_crash_record_bound_or_not() {
+    for bound in [false, true] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = options(world.path());
+        let mut st = lapsable_crash(bound);
+        let (mut client, worker) = endpoint_with(lapsed_host);
+        let result = relaunch(&opts, report(), &mut st, &mut client, SESSION, &Live);
+        assert_eq!(result.step, super::super::native_restart::WAIT_LAPSED);
+        assert!(st.native_prepare.is_empty() && st.native.is_none());
+        assert_eq!(st.phase, upgrade::Phase::Failed("native-lapsed".into()));
+        let saved = load(&opts, SESSION).expect("the lapsed record is saved");
+        assert!(saved.native_prepare.is_empty() && saved.native.is_none());
+        assert_eq!(saved.phase, st.phase);
+        drop(client);
+        assert_eq!(prepares(&worker.join().unwrap()), 1, "bound={bound}");
+    }
+}
+
+/// KI-1107-2's held lanes: a record whose host ended with a cold relaunch in flight kept only its
+/// prepare (the reply lost); its expired stop sent it to the fresh lane, whose crash plan met that
+/// prepare unresolved on every pass. The fresh lane now replays it first, and the later host's
+/// `lapsed` stops the record without minting a plan; the next pass finds nothing native
+/// unresolved, earns the host-ended exemption ([`host_ended_fresh`]) and goes on to the typed
+/// relaunch with no native act at all.
+#[test]
+fn a_lapsed_prepare_frees_a_host_ended_record_for_its_fresh_relaunch() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = options(world.path());
+    let mut st = lapsable_crash(false);
+    st.stop("stale-exit", now_s());
+    let mut exited = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
+        .spawn()
+        .unwrap();
+    let pid = exited.id();
+    exited.wait().unwrap();
+    let input = |st: &St| {
+        let (mut snap, mut plan) = exit_input(world.path(), st);
+        snap.pid = pid;
+        plan.command = Some(PlannedCommand {
+            dialect: Dialect::Zsh,
+            heal: None,
+            cwd: None,
+            target: std::env::current_exe().unwrap(),
+            argv: Vec::new(),
+            env: Vec::new(),
+            unset: None,
+            account_intent: None,
+        });
+        (snap, plan)
+    };
+    let (snap, plan) = input(&st);
+    let (client, worker) = endpoint_with(lapsed_host);
+    let result = launch_after_exit(
+        &opts,
+        &snap,
+        ExitCause::HostEnded,
+        true,
+        report(),
+        st,
+        plan,
+        client,
+    );
+    let seen = worker.join().unwrap();
+    assert_eq!(
+        result.step,
+        super::super::native_restart::WAIT_LAPSED,
+        "{seen:?}"
+    );
+    assert_eq!(
+        prepares(&seen),
+        1,
+        "the kept prepare replays; none is minted"
+    );
+    let saved = load(&opts, SESSION).expect("the lapsed record is saved");
+    assert_eq!(saved.phase, upgrade::Phase::Failed("native-lapsed".into()));
+    assert!(saved.native_prepare.is_empty() && saved.native.is_none());
+    assert!(saved.native_coordination, "the record keeps its mark");
+    let (snap, plan) = input(&saved);
+    let (client, worker) = endpoint_with(lapsed_host);
+    let result = launch_after_exit(
+        &opts,
+        &snap,
+        ExitCause::HostEnded,
+        true,
+        report(),
+        saved,
+        plan,
+        client,
+    );
+    let seen = worker.join().unwrap();
+    assert!(
+        !result.step.starts_with("wait:native-"),
+        "{}: {seen:?}",
+        result.step
+    );
+    assert!(
+        seen.iter().all(|line| !line.contains(" native-act ")),
+        "{seen:?}"
+    );
+    let saved = load(&opts, SESSION).expect("the relaunch's record");
+    assert!(host_ended_fresh(true, false, false, &saved));
+}
+
+/// The exit lane meets a kept prepare its host keeps held (a grant may have been delivered on
+/// this boot): the replay answers nothing, and the record is saved as it stood, never rewritten
+/// into a relaunch in flight bound to this exit's agent with a new exit clock.
+#[test]
+fn a_held_replay_leaves_the_exit_lanes_record_as_it_stood() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = options(world.path());
+    let mut st = lapsable_crash(true);
+    st.stop("stale-exit", now_s());
+    save(&opts, SESSION, &st);
+    let before = load(&opts, SESSION).expect("the held record");
+    let mut exited = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
+        .spawn()
+        .unwrap();
+    let pid = exited.id();
+    exited.wait().unwrap();
+    let (mut snap, mut plan) = exit_input(world.path(), &st);
+    snap.pid = pid;
+    plan.line = "a new crash plan's own line".into();
+    plan.command = Some(PlannedCommand {
+        dialect: Dialect::Zsh,
+        heal: None,
+        cwd: None,
+        target: std::env::current_exe().unwrap(),
+        argv: Vec::new(),
+        env: Vec::new(),
+        unset: None,
+        account_intent: None,
+    });
+    let (client, worker) = endpoint_with(|line| {
+        if line.contains(" lease acquire ") || line.contains(" lease release ") {
+            "ERR busy\n".into()
+        } else if line.contains(" native-act prepare ") {
+            "ERR native host epoch changed\n".into()
+        } else {
+            panic!("a held prepare dispatches nothing else: {line}")
+        }
+    });
+    let result = launch_after_exit(
+        &opts,
+        &snap,
+        ExitCause::HostEnded,
+        true,
+        report(),
+        st,
+        plan,
+        client,
+    );
+    assert_eq!(result.step, "wait:native-unresolved-operation");
+    assert_eq!(prepares(&worker.join().unwrap()), 1);
+    let after = load(&opts, SESSION).expect("the record after the exit lane");
+    assert!(!after.in_flight(), "{:?}", after.phase);
+    assert_eq!(
+        (
+            &after.phase,
+            after.pid,
+            &after.line,
+            &after.native,
+            &after.native_prepare
+        ),
+        (
+            &before.phase,
+            before.pid,
+            &before.line,
+            &before.native,
+            &before.native_prepare
+        )
+    );
+}
+
+/// The checked relaunch's carry of its own kept prepare: a later host's `lapsed` stops the record
+/// where it stands. The operation may have signalled the agent, so nothing is restored, and no
+/// producer authorization is asked for.
+#[test]
+fn a_lapsed_checked_relaunch_stops_where_it_stands_without_authorization() {
+    use crate::supervise::policy::turn_end::{Restart, RestartAsk};
+    let world = aterm_tempfile::tempdir().unwrap();
+    let mut opts = options(world.path());
+    let (socket, requests) =
+        crate::harness::fake_instance(&world.path().join("checked.sock"), "lapsed", |line| {
+            if line == "version" {
+                "OK fixture".into()
+            } else {
+                lapsed_host(line).trim_end().into()
+            }
+        });
+    opts.sock = Some(socket);
+    opts.token = Some(HarnessToken::new("lapsed"));
+    let why = Restart::Memory;
+    let ask = RestartAsk::of(&why, 0);
+    let mut st = lapsable_crash(false);
+    retain_asked(&mut st, Some(ask.word()));
+    st.cause = CAUSE_MEMORY.into();
+    st.ask = ask.word().into();
+    let super::super::native_act::NativePlan::Restart { process, .. } =
+        super::super::native_restart::retained_prepare(&st)
+            .unwrap()
+            .plan
+    else {
+        unreachable!()
+    };
+    let (mut snap, _) = exit_input(world.path(), &st);
+    snap.start = squash(&super::super::native_restart::vendor_start(&process));
+    let records = Records::of_snapshot(&opts.home, &snap);
+    let file = SessionFile {
+        pid: snap.pid,
+        session_id: SESSION.into(),
+        cwd: snap.cwd.clone(),
+        version: "2.1.283".into(),
+        status: "busy".into(),
+        status_updated_at_ms: 1,
+        proc_start: snap.start.clone(),
+        kind: "interactive".into(),
+        entrypoint: "cli".into(),
+        claude_dir: None,
+        profile: None,
+    };
+    let refuse = |_: &CheckedRelaunch| -> Result<Box<dyn Send>, &'static str> {
+        panic!("a lapse asks no producer authorization")
+    };
+    let result = retry_checked_relaunch(
+        &opts,
+        (&why, &ask),
+        (&snap, &records, &file),
+        None,
+        &Live,
+        (report(), st),
+        &refuse,
+    )
+    .expect("the checked relaunch carries its own kept prepare");
+    assert_eq!(result.step, super::super::native_restart::WAIT_LAPSED);
+    let saved = load(&opts, SESSION).expect("the lapsed record is saved");
+    assert_eq!(saved.phase, upgrade::Phase::Failed("native-lapsed".into()));
+    assert!(saved.native_prepare.is_empty() && saved.native.is_none());
+    assert_eq!(prepares(&requests.lock().unwrap()), 1);
+}
+
 #[test]
 fn disabled_native_kind_relaunch_held_continues_legacy_exit_guard_only_when_fresh() {
     for coordinated in [false, true] {
@@ -1442,6 +1730,8 @@ fn a_native_act_is_this_hosts_only_by_its_epoch() {
             },
             version: "0.1.0".into(),
         },
+        boot: None,
+        custody: None,
     }));
     assert!(native_of_this_host(&st, || Some("34".repeat(16))));
     assert!(

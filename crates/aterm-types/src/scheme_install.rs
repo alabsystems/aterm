@@ -255,6 +255,7 @@ pub fn write_atomically(
     std::fs::create_dir_all(dir).map_err(|e| failed(dir, e))?;
     let stage = aterm_tempfile::Builder::new()
         .prefix(".theme-import-")
+        .suffix(".noindex")
         .tempdir_in(dir)
         .map_err(|e| failed(dir, e))?;
     let tmp = stage.path().join("theme");
@@ -375,7 +376,8 @@ mod tests {
 
     #[test]
     fn windows_replace_waits_for_a_scheduled_file_holder() {
-        let dir = scratch("scheduled-windows-replace");
+        let scratch = scratch("scheduled-windows-replace");
+        let dir = scratch.path();
         let staged = dir.join("staged");
         let target = dir.join("target");
         std::fs::write(&staged, b"complete").unwrap();
@@ -397,7 +399,6 @@ mod tests {
         assert_eq!(calls, 32);
         assert_eq!(std::fs::read(&target).unwrap(), b"complete");
         assert!(!staged.exists());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -423,15 +424,8 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-types-install-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    fn scratch(tag: &str) -> aterm_tempfile::TempDir {
+        crate::test_scratch_dir(tag)
     }
 
     /// A refused replace is tried again on Windows until it goes through,
@@ -494,7 +488,8 @@ mod tests {
 
     #[test]
     fn a_failed_exclusive_publication_never_falls_back_to_overwriting() {
-        let root = scratch("exclusive");
+        let dir = scratch("exclusive");
+        let root = dir.path();
         let tmp = root.join("pending");
         let dest = root.join("mine.conf");
         std::fs::write(&tmp, "new theme").unwrap();
@@ -517,7 +512,6 @@ mod tests {
             "a failed publication must not install a theme"
         );
         assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "new theme");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An arbitrary export filename can be our usual temporary basename.
@@ -550,8 +544,9 @@ mod tests {
             publish(Path::new("."), &bare);
             return;
         }
-        let dir = scratch("temp-destination");
-        publish(&dir, &dir.join(&name));
+        let temp = scratch("temp-destination");
+        let dir = temp.path();
+        publish(dir, &dir.join(&name));
         let cwd = dir.join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
         let test = format!(
@@ -588,14 +583,14 @@ mod tests {
             "{left:?}"
         );
         assert_eq!(std::fs::read_to_string(&left[0]).unwrap(), LAST);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A window's import keeps the theme's own name, steps around a
     /// built-in's id, and never replaces an existing theme.
     #[test]
     fn import_as_new_keeps_the_display_name_and_steps_around_builtins() {
-        let root = scratch("as-new");
+        let dir = scratch("as-new");
+        let root = dir.path();
         let themes = root.join("themes");
         let source = root.join("Nord.conf");
         std::fs::write(&source, KITTY).unwrap();
@@ -612,14 +607,14 @@ mod tests {
         let parsed =
             scheme::parse_theme_str(&std::fs::read_to_string(&named.dest).unwrap()).unwrap();
         assert_eq!(parsed.scheme.name, "mine");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An import whose id is an existing theme's in another case writes
     /// nothing, even with `replace`: the pair would disable both themes.
     #[test]
     fn import_refuses_a_case_variant_of_an_existing_theme() {
-        let root = scratch("case");
+        let dir = scratch("case");
+        let root = dir.path();
         let themes = root.join("themes");
         std::fs::create_dir_all(&themes).unwrap();
         let existing = themes.join("Harbour.conf");
@@ -640,12 +635,12 @@ mod tests {
         assert_eq!(names, ["Harbour.conf"], "nothing was written");
         assert_eq!(std::fs::read_to_string(&existing).unwrap(), KITTY);
         install_theme_file(&source, Some("Lighthouse"), false, Some(&themes)).unwrap();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_refused_request_reads_and_writes_nothing() {
-        let root = scratch("refused");
+        let dir = scratch("refused");
+        let root = dir.path();
         let themes = root.join("themes");
         for (path, name) in [
             ("https://example.com/x.conf", None),
@@ -659,14 +654,13 @@ mod tests {
             );
         }
         assert!(!themes.exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Publishing must not remove a preexisting staging-name collision;
     /// a failed commit must clean only the stage this call created.
     #[test]
     fn atomic_writes_keep_foreign_stage_entries_and_clean_owned_failures() {
-        let owned = aterm_tempfile::TempDir::new().expect("owned fixture");
+        let owned = scratch("owned");
         let dir = owned.path().join("themes");
         std::fs::create_dir(&dir).unwrap();
         let id = "owned-stage";

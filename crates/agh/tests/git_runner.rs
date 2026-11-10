@@ -2866,6 +2866,64 @@ fn a_fetch_of_main_writes_only_its_record_ref() {
     assert_eq!(refs(), before, "the fetch of main moved another ref");
 }
 
+/// Partial intake retains native original ancestry and trees, but grants no blob completeness.
+#[test]
+fn blobless_main_keeps_ancestry_and_omits_blob_bodies() {
+    let world = World::canonical("git-main-blobless");
+    let bare = bare_repo(world.path(), "app");
+    let work = world.path().join("app-work");
+    let first = host_git(&bare, &["rev-parse", "main"]);
+    std::fs::write(
+        work.join("payload"),
+        "only selected blobs belong in a consumer snapshot",
+    )
+    .unwrap();
+    host_git(&work, &["add", "payload"]);
+    host_git(&work, &["commit", "--quiet", "-m", "payload"]);
+    host_git(&work, &["push", "--quiet", &bare.to_string_lossy(), "main"]);
+    host_git(&bare, &["config", "uploadpack.allowFilter", "true"]);
+    let tip = host_git(&bare, &["rev-parse", "main"]);
+    let blob = host_git(&bare, &["rev-parse", "main:payload"]);
+    let target = world.path().join("target.git");
+    std::fs::create_dir(&target).unwrap();
+    host_git(&target, &["init", "--bare", "--quiet"]);
+    let config = std::fs::read(target.join("config")).unwrap();
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    let ordinary = GitRun::fetch_main(&slug, &target, "refs/agh/main");
+    let filtered = ordinary.clone().without_blobs();
+    assert_ne!(
+        agh::fx::canon::git_request(&ordinary),
+        agh::fx::canon::git_request(&filtered)
+    );
+    gh.run_git(&filtered)
+        .unwrap_or_else(|error| panic!("filtered fetch: {error:?}"));
+    assert_eq!(host_git(&target, &["rev-parse", "refs/agh/main"]), tip);
+    host_git(&target, &["merge-base", "--is-ancestor", &first, &tip]);
+    assert!(host_git(&target, &["ls-tree", &tip]).contains("payload"));
+    assert!(
+        host_git(
+            &target,
+            &["rev-list", "--objects", "--all", "--missing=print"]
+        )
+        .contains(&format!("?{blob}"))
+    );
+    assert_eq!(
+        std::fs::read(target.join("config")).unwrap(),
+        config,
+        "fetch must not install implicit promisor remotes"
+    );
+    let ran = gh.fx().children_run().len();
+    let error = gh
+        .run_git(&GitRun::fetch_main(&slug, &target, "refs/heads/main").without_blobs())
+        .expect_err("private ref screen remains mandatory");
+    assert_eq!(error.kind, Kind::Usage);
+    assert_eq!(gh.fx().children_run().len(), ran);
+}
+
 #[test]
 fn an_exact_fetch_keeps_tag_objects_and_leaves_checkout_state_alone() {
     let world = World::canonical("git-exact-fetch");
@@ -3965,6 +4023,99 @@ fn scripted_anonymous_git(world: &World, answers: Vec<ChildOut>) -> (Github, Arc
     .fx(fx.clone())
     .build();
     (gh, fx)
+}
+
+#[test]
+fn github_transport_preserves_only_the_selected_git_certificate_default() {
+    let world = World::canonical("git-certificate-default");
+    for (answer, allowed, expected) in [
+        (
+            git_answer(0, b"/moved store/cacert.pem\0", ""),
+            true,
+            Some("/moved store/cacert.pem"),
+        ),
+        (git_answer(1, b"", ""), true, None),
+        (git_answer(0, b"relative.pem\0", ""), false, None),
+        (
+            git_answer(128, b"", "unreadable system config"),
+            false,
+            None,
+        ),
+    ] {
+        let fx = Arc::new(Fx::simulated(live_start()).with_git_answers_for_tests(vec![
+            answer,
+            git_answer(0, b"abc\trefs/heads/main\n", ""),
+        ]));
+        let gh = git_builder(
+            Router::empty(),
+            Endpoints::github_com(),
+            &world.dirs,
+            git_env()
+                .with("GIT_SSL_NO_VERIFY", "1")
+                .with("GIT_CONFIG_NOSYSTEM", "0"),
+            live_start(),
+        )
+        .fx(fx.clone())
+        .build();
+        let result = gh.run_git(&GitRun::public_refs(&common::slug("fixture-anon/app")));
+        let calls = fx.children_run();
+        assert_eq!(
+            calls[0].args,
+            [
+                "config",
+                "--system",
+                "--no-includes",
+                "--null",
+                "--path",
+                "--get",
+                "http.sslCAInfo"
+            ]
+            .map(OsString::from)
+        );
+        if !allowed {
+            assert!(result.is_err());
+            assert_eq!(calls.len(), 1, "bad CA discovery sends no network request");
+            assert_eq!(fx.git_answers_remaining_for_tests(), Some(1));
+            continue;
+        }
+        assert!(result.is_ok());
+        assert_eq!(calls.len(), 2);
+        let network = &calls[1];
+        assert_eq!(
+            env_of(network, "GIT_CONFIG_NOSYSTEM"),
+            Some(&OsString::from("1"))
+        );
+        assert!(env_of(network, "GIT_SSL_NO_VERIFY").is_none());
+        let count: usize = env_of(network, "GIT_CONFIG_COUNT")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let config: std::collections::BTreeMap<_, _> = (0..count)
+            .map(|i| {
+                (
+                    env_of(network, &format!("GIT_CONFIG_KEY_{i}"))
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    env_of(network, &format!("GIT_CONFIG_VALUE_{i}"))
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            config.get("http.sslVerify").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(config.get("http.sslCAInfo").map(String::as_str), expected);
+        assert_eq!(
+            config.get("core.hooksPath").map(String::as_str),
+            Some("/dev/null")
+        );
+    }
 }
 
 #[test]

@@ -777,7 +777,7 @@ pub fn unpushed_ledger(copy: &Path, run: aterm_verify::engine::RunGit<'_>) -> Op
         return None;
     }
     let git = |args: &[&str]| {
-        let mut cmd = crate::ledger::object_git(copy);
+        let mut cmd = crate::ledger::object_git(copy).ok()?;
         cmd.args(args);
         run(&mut cmd)
             .ok()
@@ -1217,7 +1217,8 @@ pub fn place_cut_tree(git: &dyn GitRunner, repo: &Path, commit: &str) -> Result<
         return Ok(CutTree { path, moved: true });
     }
     let common = |dir: &Path| -> Option<PathBuf> {
-        let out = command(aterm_uds::os_path!("git"))
+        let out = crate::ledger::git_command()
+            .ok()?
             .arg("-C")
             .arg(dir)
             .args([
@@ -3202,8 +3203,12 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
         }
     }
     let targo = resolve_targo()?;
-    let dir = std::env::temp_dir().join(format!("aterm-trust-probe-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let probe_dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-trust-probe-")
+        .suffix(".noindex")
+        .tempdir()
+        .map_err(|e| Error::new(format!("probe scratch: {e}")))?;
+    let dir = probe_dir.path();
     let setup = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(dir.join("src"))?;
         std::fs::create_dir_all(dir.join(".cargo"))?;
@@ -3220,14 +3225,13 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
         Ok(())
     })();
     if let Err(e) = setup {
-        let _ = std::fs::remove_dir_all(&dir);
         return Err(Error::new(format!(
             "probe package in {}: {e}",
             dir.display()
         )));
     }
     let out = command(&targo)
-        .current_dir(&dir)
+        .current_dir(dir)
         .env("CARGO_TARGET_DIR", dir.join("target"))
         .env("CARGO_HOME", dir.join("cargo-home"))
         .env_remove("RUSTC")
@@ -3240,7 +3244,7 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
         .env_remove("RUSTUP_TOOLCHAIN")
         .args(["--unverified", "check", "--offline"])
         .output();
-    let result = match out {
+    match out {
         Ok(o) if o.status.success() => {
             verification_off_verdict(&String::from_utf8_lossy(&o.stderr)).map(|()| trustc.clone())
         }
@@ -3258,9 +3262,7 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
                 .unwrap_or("(no error line)")
         ))),
         Err(e) => Err(Error::new(format!("probe compile spawn: {e}"))),
-    };
-    let _ = std::fs::remove_dir_all(&dir);
-    result
+    }
 }
 
 /// Probe stable's installed `x86_64-apple-darwin` target (STOCK EXCEPTION: Trust lacks an `x86_64-apple-darwin` std).
@@ -3496,21 +3498,19 @@ mod cut_lease_tests {
             !LEASE_ARMED.load(std::sync::atomic::Ordering::Relaxed),
             "no test arms the cut's lease"
         );
-        let prefix =
-            std::env::temp_dir().join(format!("aterm-release-cut-lease-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&prefix);
+        let root = crate::test_scratch_dir("lease");
+        let prefix = root.path();
         let bin = prefix.join("store/trust/9192/bin");
         fs::create_dir_all(&bin).unwrap();
-        let lease = take_cut_lease(&prefix, &bin).expect("a store toolchain is leased");
+        let lease = take_cut_lease(prefix, &bin).expect("a store toolchain is leased");
         let subject = atpkg::lease::Subject::build("trust", 9192).unwrap();
         assert_eq!(lease.subject(), &subject);
-        let atpkg::lease::Holders::Held(who) = atpkg::lease::holders(&prefix, &subject) else {
+        let atpkg::lease::Holders::Held(who) = atpkg::lease::holders(prefix, &subject) else {
             panic!("atpkg reads the cut's lease");
         };
         assert_eq!(who.len(), 1, "{who:?}");
         drop(lease);
-        assert!(take_cut_lease(&prefix, &std::env::temp_dir()).is_none());
-        let _ = fs::remove_dir_all(&prefix);
+        assert!(take_cut_lease(prefix, &std::env::temp_dir()).is_none());
     }
 
     /// The gate exports one close-on-exec copy and retains an adopted original description

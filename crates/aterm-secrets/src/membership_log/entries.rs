@@ -1155,7 +1155,7 @@ struct ControlRef {
 impl Log {
     /// Replay the previous host-wrapper selector while priming an upgrade fixture.
     /// Only its actual read/apply is changed; the scope restores the current selector.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_host_wrapper_precedence<T>(read: impl FnOnce() -> T) -> T {
         struct Restore(bool);
         impl Drop for Restore {

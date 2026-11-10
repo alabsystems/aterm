@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn time_advances_monotonically_and_only_a_judged_reading_gets_a_receipt() {
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::test_scratch_dir("clock");
         let clock = Clock::new(Some(root.path().as_os_str().to_owned()), "operation");
         let path = root.path().join("operation");
         let before = clock.read().now;
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn a_held_read_takes_the_time_written_before_its_release() {
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::test_scratch_dir("clock");
         let path = root.path().join("operation");
         std::fs::write(path.with_extension("hold"), "").unwrap();
         let clock = Clock::new(Some(root.path().as_os_str().to_owned()), "operation");

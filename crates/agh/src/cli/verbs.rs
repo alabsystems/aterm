@@ -834,13 +834,16 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["repo", "fetch-main"],
         class: Class::Git,
-        usage: "agh repo fetch-main REPO DIR",
+        usage: "agh repo fetch-main REPO DIR [--blobless]",
         summary: "refresh refs/agh/fetched-main with a reflog; leave other refs and files untouched",
         example: "agh repo fetch-main alabsystems/aterm <dir> --meta",
         noun: Noun::Repo,
         gh: "git fetch",
         milestone: 2,
-        flags: &[],
+        flags: &[on(
+            "--blobless",
+            "omit blobs; retain complete commit and tree ancestry",
+        )],
         positionals: &["REPO", "DIR"],
         run: cmd_repo::repo_fetch_main,
     },

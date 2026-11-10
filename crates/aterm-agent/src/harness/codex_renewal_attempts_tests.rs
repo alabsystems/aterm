@@ -74,6 +74,8 @@ pub(super) fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
             cold: None,
             rollback: None,
         },
+        boot: None,
+        custody: None,
     };
     let receipt = Receipt {
         destination: None,

@@ -63,6 +63,8 @@ pub(super) fn pending() -> St {
             forward: Box::new(command.clone()),
             rollback: Some(Box::new(command)),
         },
+        boot: None,
+        custody: None,
     })
     .encode()
     .unwrap();
@@ -159,6 +161,8 @@ pub(super) fn transition(state: &State, action: &str) -> State {
         reply(&mut st, Retirement::Exited);
     }
     let mut dispatched = false;
+    // A lapsed answer is only for a cold or typed asked restart: the plain record is cold then.
+    let mut cold = false;
     match action {
         "Ask" => {
             asked = true;
@@ -211,6 +215,13 @@ pub(super) fn transition(state: &State, action: &str) -> State {
                 assert_eq!(st, before, "a binding or a hold keeps its record");
             }
         }
+        "Lapsed" => {
+            if !asked {
+                cold = true;
+                st = cold_baseline(state["bound"] == 1);
+            }
+            assert_eq!(lapsed_reply(&mut st), Ok(Recovery::Lapsed));
+        }
         _ => unreachable!("unmapped model action"),
     }
     let mut next = state.clone();
@@ -223,7 +234,12 @@ pub(super) fn transition(state: &State, action: &str) -> State {
     );
     let bound = st.native.is_some();
     next.insert("bound", i64::from(bound));
-    next.insert("kept", i64::from(unchanged_for(&st, bound, asked)));
+    let kept = if cold {
+        unchanged_cold(&st, bound)
+    } else {
+        unchanged_for(&st, bound, asked)
+    };
+    next.insert("kept", i64::from(kept));
     next.insert("asked", i64::from(asked));
     next.insert("owed", i64::from(matches!(st.phase, Phase::Exiting { .. })));
     next.insert("dispatched", i64::from(dispatched));
@@ -389,6 +405,132 @@ fn an_unbound_typed_asked_answer_clears_only_its_exact_wire_and_rollback() {
     st.native_prepare.clear();
     before.insert("kept", i64::from(unchanged_for(&st, true, true)));
     assert!(!model.check_invariant("BindingRetained", &before));
+}
+
+fn lapsed_reply(st: &mut St) -> Result<Recovery, &'static str> {
+    recover_reply(st, Reply::Lapsed("ab".repeat(16)))
+}
+
+/// The baseline record with its prepare made a cold crash restart, the kind (with a typed asked
+/// one) a later host epoch answers `lapsed`.
+fn cold_baseline(bound: bool) -> St {
+    let mut st = baseline(bound);
+    let mut prepare = retained_prepare(&st).unwrap();
+    prepare.duty = Scope::Relaunch;
+    let NativePlan::Restart { cold, .. } = &mut prepare.plan else {
+        unreachable!()
+    };
+    *cold = Some(Box::new(native_act::ColdIntent {
+        login: None,
+        home: None,
+        auth_observed: true,
+        route: super::super::accounts::AuthRoute::Stored,
+        conversation: None,
+        profile: None,
+        mode: super::super::accounts::Mode::Wall,
+        billing: native_act::ColdBilling::Keep,
+    }));
+    st.native_prepare = Request::prepare(*prepare).encode().unwrap();
+    st
+}
+
+/// [`unchanged_for`] of the cold record.
+fn unchanged_cold(st: &St, bound: bool) -> bool {
+    let mut copy = st.clone();
+    copy.native_retired_unissued = false;
+    copy == cold_baseline(bound)
+}
+
+#[test]
+fn a_lapsed_answer_drops_exactly_the_operation_of_a_cold_or_asked_restart_bound_or_not() {
+    for asked in [false, true] {
+        for bound in [false, true] {
+            let mut st = if asked {
+                asked_baseline(bound)
+            } else {
+                cold_baseline(bound)
+            };
+            let mut expected = st.clone();
+            expected.native = None;
+            expected.native_prepare.clear();
+            expected.native_rollback = false;
+            assert_eq!(
+                lapsed_reply(&mut st),
+                Ok(Recovery::Lapsed),
+                "asked={asked} bound={bound}"
+            );
+            assert_eq!(
+                st, expected,
+                "asked={asked} bound={bound}: only the operation, its binding and its phase go"
+            );
+            assert_eq!(refusal_word(Ok(Recovery::Lapsed)), "native-lapsed");
+        }
+    }
+}
+
+#[test]
+fn a_lapsed_answer_never_drops_a_private_restart_an_unsupported_ask_history_or_a_hold() {
+    let refused = |mut st: St, why: &str| {
+        assert!(retained_prepare(&st).is_ok(), "{why}: the guard is reached");
+        let before = st.clone();
+        assert_eq!(lapsed_reply(&mut st), Err("native-unknown"), "{why}");
+        assert_eq!(st, before, "{why}");
+    };
+    // A private restart (the renewal's kind) is not one the host answers.
+    for bound in [false, true] {
+        refused(baseline(bound), "private restart");
+    }
+    // A checked relaunch whose forward settles on another build is not a supported asked shape.
+    let mut st = asked_baseline(false);
+    let mut prepare = retained_prepare(&st).unwrap();
+    prepare.duty = Scope::Relaunch;
+    prepare.asked = Some(native_act::AskedIntent::Relaunch(
+        native_act::AskedRelaunchIntent {
+            predecessor: "cd".repeat(16),
+            ask: "memory@1".into(),
+        },
+    ));
+    let NativePlan::Restart {
+        forward, process, ..
+    } = &mut prepare.plan
+    else {
+        unreachable!()
+    };
+    forward.settles = Some(process.image.clone());
+    assert!(!prepare.asked_restart_shape());
+    st.native_prepare = Request::prepare(*prepare).encode().unwrap();
+    refused(st, "unsupported asked shape");
+    // A terminal record of the same id is a completion or a positive no-grant.
+    for asked in [false, true] {
+        for completed in [false, true] {
+            let mut st = if asked {
+                asked_baseline(false)
+            } else {
+                cold_baseline(false)
+            };
+            let prepare = retained_prepare(&st).unwrap();
+            if completed {
+                st.native_completed_prepare = Some(prepare);
+            } else {
+                st.native_noexec_prepare = Some(prepare);
+            }
+            refused(st, "terminal history");
+        }
+    }
+    // An answer about another operation.
+    let mut st = cold_baseline(false);
+    let before = st.clone();
+    assert_eq!(
+        recover_reply(&mut st, Reply::Lapsed("cd".repeat(16))),
+        Err("native-unknown")
+    );
+    assert_eq!(st, before);
+    // A retired-unissued record stays held whatever a later epoch answers.
+    let mut st = cold_baseline(false);
+    reply(&mut st, Retirement::NotGranted);
+    let held = st.clone();
+    assert_eq!(lapsed_reply(&mut st), Ok(Recovery::Held));
+    assert_eq!(st, held);
 }
 
 #[test]

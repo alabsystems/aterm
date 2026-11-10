@@ -128,9 +128,28 @@ fn handoff_arbiter_linearizes_commit_and_reject_interleavings() {
     assert_eq!(failed_state["parent_exited"], 0);
 }
 
+/// [`arm_outgoing_handoff`]'s handoff, in flight: it derefs to the receiver that hears the cancel a
+/// deferred teardown sends, and holds the update ledger while it lives
+/// ([`crate::app_update_screen::hold_update_ledger_for_test`]). The handoff has no apply attempt,
+/// so its return books a failed apply in the process's one scratch ledger, which the ledger's
+/// other tests read back under that lock.
+pub(crate) struct ArmedHandoff {
+    cancelled: std::sync::mpsc::Receiver<()>,
+    _ledger: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for ArmedHandoff {
+    type Target = std::sync::mpsc::Receiver<()>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cancelled
+    }
+}
+
 /// Test fixture: an overlap update handoff in flight over `app`'s current
-/// layout; the receiver hears the cancel a deferred teardown sends.
-pub(crate) fn arm_outgoing_handoff(app: &mut App) -> std::sync::mpsc::Receiver<()> {
+/// layout ([`ArmedHandoff`]).
+pub(crate) fn arm_outgoing_handoff(app: &mut App) -> ArmedHandoff {
+    let ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let layout = app.capture_restore_manifest();
     let layout_digest = crate::seamless::layout_digest(&layout).expect("canonical layout");
     let live: Vec<_> = app
@@ -168,7 +187,24 @@ pub(crate) fn arm_outgoing_handoff(app: &mut App) -> std::sync::mpsc::Receiver<(
         held_commit: None,
         revoked_by_activity: false,
     });
-    cancelled
+    ArmedHandoff {
+        cancelled,
+        _ledger: ledger,
+    }
+}
+
+#[test]
+fn an_armed_outgoing_handoff_holds_the_update_ledger_while_it_lives() {
+    let mut app = App::headless_for_test();
+    let armed = arm_outgoing_handoff(&mut app);
+    assert!(
+        matches!(
+            crate::app_update_screen::UPDATE_LEDGER_TEST_LOCK.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ),
+        "a handoff whose return books a failed apply holds the ledger its other tests read"
+    );
+    drop(armed);
 }
 
 #[test]

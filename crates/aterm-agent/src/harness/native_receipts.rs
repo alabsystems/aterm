@@ -9,12 +9,14 @@
 //! NoExec receipt; its caller must retain and revalidate live native evidence.
 //! Absence alone is unknown, never proof of nonexecution: the host's `unadmitted` answer
 //! composes it with its own operation table and an expired same-epoch deadline
-//! ([`contains_operation`]). Across epochs, [`reject_unadmitted`] instead commits
-//! permanent denial before absence can release an unbound recipe.
+//! ([`contains_operation`]), and its `lapsed` answer with a prepare's custody stamp, a clock
+//! read before the journal and an expired deadline or another boot ([`observe_closure`]).
+//! Across epochs, [`reject_unadmitted`] instead commits permanent denial before absence can
+//! release an unbound recipe.
 //! The separate enrollment file detects a missing established journal; neither
 //! it nor a signed log protects against rollback of the whole custody tree.
 
-use super::native_act::{Binding, ImagePhase, NativePlan, Prepare, Request};
+use super::native_act::{Binding, Closure, ImagePhase, NativePlan, Prepare, Recorded, Request};
 use aterm_journal::{Committed, Limits, Log};
 use aterm_secrets::{age::Identity, client::Paths};
 use aterm_uds::private_file::{self, PrivateFileError};
@@ -219,11 +221,26 @@ pub struct PhaseObserved {
 struct View {
     entries: BTreeMap<Digest, Entry>,
     head: Digest,
+    /// The authenticated head after the first record: it names this journal instance, which
+    /// the anchor alone does not (a journal enrolled again under the same identity, or a copy
+    /// of that identity beside another journal, has the same anchor). `None` while empty.
+    genesis: Option<Digest>,
     sequence: u64,
     committed_bytes: usize,
 }
 
 impl View {
+    /// The `custody=` spelling of this journal instance: SHA-256 of the public anchor and the
+    /// first record's authenticated head, which carries no secret. `None` while the journal
+    /// holds no record, so an absence from it proves nothing.
+    fn custody(&self, key: &Key) -> Option<String> {
+        let genesis = self.genesis?;
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(&key.anchor);
+        digest.update(&genesis);
+        Some(aterm_codec::hex::encode_lower(digest.finish().as_ref()))
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -250,8 +267,15 @@ impl View {
     )]
     fn ingest(&mut self, key: &Key, body: &[u8]) -> io::Result<()> {
         if body.starts_with(b"ANS4") || body.starts_with(b"ANF4") {
-            return account::ingest(self, key, body);
+            account::ingest(self, key, body)?;
+        } else {
+            self.ingest_issuer(key, body)?;
         }
+        self.genesis.get_or_insert(self.head);
+        Ok(())
+    }
+
+    fn ingest_issuer(&mut self, key: &Key, body: &[u8]) -> io::Result<()> {
         let legacy = body.len() == BODY_BYTES && &body[..4] == b"ANE1";
         let issuer = body.len() == ISSUER_BYTES && &body[..4] == b"ANI2";
         let successor = body.len() == SUCCESSOR_BYTES && &body[..4] == b"ANI3";
@@ -1418,6 +1442,70 @@ fn observe_prepare_at(paths: &Paths, prepare: &Prepare) -> io::Result<Option<Obs
         .map(|entry| entry.observed))
 }
 
+/// The established journal's `custody=` digest, which a prepare stamps and a host compares
+/// with its own: it names this journal instance by the anchor the enrollment file names and
+/// its first record, so a journal enrolled again under the same identity is another custody.
+/// It writes, creates and locks nothing; `None` when no journal is established here or the
+/// journal holds no record yet.
+/// # Errors
+/// Refuses unreadable, untrusted, damaged or partly enrolled custody.
+pub fn custody() -> io::Result<Option<String>> {
+    custody_at(&Paths::locate().map_err(|_| invalid())?)
+}
+
+/// [`custody`] of the vault under `home` (the harness's own home, which its records name),
+/// located the same read-only way.
+/// # Errors
+/// As [`custody`].
+pub(super) fn custody_for_home(home: &std::path::Path) -> io::Result<Option<String>> {
+    custody_at(&Paths::locate_for_home(home))
+}
+
+fn custody_at(paths: &Paths) -> io::Result<Option<String>> {
+    Ok(read(paths)?.and_then(|(key, view)| view.custody(&key)))
+}
+
+/// Read what the journal holds for this exact restart prepare: its own record (matched by its
+/// digest or its legacy cold digest), another record of its id, or none. The read takes no
+/// lock and sees every acknowledged append; an absence carries the custody digest of the
+/// journal instance it was read from ([`custody`]), since only that instance's history proves
+/// it, and none from a journal with no record. Account claims and fences read as
+/// [`Closure::Other`]. This never returns a capability or grants anything.
+/// # Errors
+/// Refuses a prepare that is not a valid restart recipe, and damaged, incomplete or
+/// untrusted established custody.
+pub fn observe_closure(prepare: &Prepare) -> io::Result<Closure> {
+    observe_closure_at(&Paths::locate().map_err(|_| invalid())?, prepare)
+}
+
+fn observe_closure_at(paths: &Paths, prepare: &Prepare) -> io::Result<Closure> {
+    if !matches!(prepare.plan, NativePlan::Restart { .. })
+        || Request::prepare(prepare.clone()).encode().is_none()
+    {
+        return Err(invalid());
+    }
+    let Some((key, view)) = read(paths)? else {
+        return Ok(Closure::Absent(None));
+    };
+    let Some(entry) = view.entries.get(&key.operation(&prepare.id)) else {
+        return Ok(Closure::Absent(view.custody(&key)));
+    };
+    let exact = entry.receipt.prepare == key.prepare(prepare)?
+        || Some(entry.receipt.prepare) == key.legacy_prepare(prepare);
+    if !exact || entry.account.is_some() {
+        return Ok(Closure::Other);
+    }
+    Ok(match entry.state {
+        IssuerState::Prepared => Closure::Exact(Recorded::Prepared),
+        IssuerState::MayExecute => Closure::Exact(Recorded::MayExecute),
+        IssuerState::NoExec => Closure::Exact(Recorded::NoExec),
+        IssuerState::Sealed { may_execute } => Closure::Exact(Recorded::Sealed { may_execute }),
+        // A rejected prepare's answer is the rejection's own (`unadmitted`, which the epoch
+        // refusal serves before this read); this read claims nothing from it.
+        IssuerState::Fenced | IssuerState::Rejected => Closure::Other,
+    })
+}
+
 /// Whether any authenticated issuer record already owns this restart ID. The log only
 /// appends, so a record one read finds, every later read finds, short of a rollback of the
 /// whole custody tree (module docs).
@@ -1709,6 +1797,20 @@ pub mod testing {
         /// Refuses damaged or untrusted established custody.
         pub fn observe(&self, binding: &Binding) -> io::Result<Option<Observed>> {
             observe_at(&self.paths, binding)
+        }
+
+        /// Read an exact prepare's closure with the production lock-free reader.
+        /// # Errors
+        /// Refuses invalid recipes and damaged or untrusted established custody.
+        pub fn observe_closure(&self, prepare: &Prepare) -> io::Result<Closure> {
+            observe_closure_at(&self.paths, prepare)
+        }
+
+        /// The established custody digest a prepare would be stamped with.
+        /// # Errors
+        /// Refuses damaged or partly enrolled custody.
+        pub fn custody(&self) -> io::Result<Option<String>> {
+            custody_at(&self.paths)
         }
 
         /// Read the exact recorded phase without turning it into live authority.

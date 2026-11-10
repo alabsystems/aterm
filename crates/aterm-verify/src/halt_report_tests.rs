@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The first proven red ends a `--fail-fast` run as it ends a release (design §4.3, A3): a
-//! stand-in run in a process of its own (`fmt` and `lint`), whose fmt stage fails once lint's
-//! tippy stage runs a child that would nap past the hang detector. The halt ends that child's
-//! group, the run's verdict reads FAIL with lint NOT RUN, stopped at the first red, and the run
+//! stand-in run in a process of its own (`test` and `doc`), whose test stage fails once the
+//! doctest stage runs a child that would nap past the hang detector. The halt ends that child's
+//! group, the run's verdict reads FAIL with doc NOT RUN, stopped at the first red, and the run
 //! exits inside the hang detector rather than after the nap. An interrupt that reaches the halted
 //! run is its first: it reports, then dies of it.
 
@@ -24,7 +24,7 @@ use crate::{Ctx, EnvSnapshot, Scope, Seams, Show};
 const STANDIN: &str = "ATERM_VERIFY_HALT_STANDIN";
 /// Set, the test binary is [`standin_napping_child`], which writes its pid into this directory.
 const CHILD: &str = "ATERM_VERIFY_HALT_CHILD";
-/// Set, the stand-in run's tippy stage, once the halt ended its child, waits for an interrupt
+/// Set, the stand-in run's doctest stage, once the halt ended its child, waits for an interrupt
 /// to reach the run before it returns.
 const SIGNALLED: &str = "ATERM_VERIFY_HALT_SIGNALLED";
 
@@ -45,13 +45,13 @@ fn admit_in_scratch(need: Need, _: Admit) -> Result<Claim, Error> {
     )
 }
 
-/// The stand-in run's stages: tippy runs [`standin_napping_child`] as a stage child; formatting
+/// The stand-in run's stages: doctests run [`standin_napping_child`] as a stage child; the test
 /// fails once that child runs, noting when; any other passes at once.
 fn stage(ctx: &Ctx, spec: &StageSpec) -> Report {
     let dir = standin_dir();
     let mut r = Report::new(spec.title.clone());
     match spec.id {
-        StageId::Tippy => {
+        StageId::Doctests => {
             let mut cmd = Cmd::new(std::env::current_exe().expect("test binary"));
             cmd.args = [
                 "--exact",
@@ -70,8 +70,8 @@ fn stage(ctx: &Ctx, spec: &StageSpec) -> Report {
             }
             r.decide_child(&child, "the napping child");
         }
-        StageId::Formatting => {
-            until_within(MUST_HAPPEN, "the tippy stage's child running", || {
+        StageId::Test => {
+            until_within(MUST_HAPPEN, "the doctest stage's child running", || {
                 std::fs::metadata(dir.join("child")).ok()
             });
             std::fs::write(dir.join("red"), "").expect("said it failed");
@@ -94,7 +94,7 @@ fn standin_napping_child() {
 }
 
 /// Run by the tests below in a process of its own, since a halt ends every stage child of its
-/// process: a `--fail-fast` verify run of `fmt` and `lint` that takes interrupts as verify does,
+/// process: a `--fail-fast` verify run of `test` and `doc` that takes interrupts as verify does,
 /// its log a file, that exits with its verdict's code, or dies of an interrupt once it reported.
 #[test]
 fn standin_halted_run() {
@@ -112,7 +112,7 @@ fn standin_halted_run() {
         EnvSnapshot::default(),
         scratch.clone(),
     )
-    .with_checks(&[Check::Fmt, Check::Lint])
+    .with_checks(&[Check::Test, Check::Doc])
     .with_quiet(Some(Admit::Now))
     .with_halt(crate::halt_of(false, true));
     let mut log = std::fs::File::create(dir.join("log")).expect("the log");
@@ -181,11 +181,11 @@ fn gone_child(dir: &std::path::Path) -> i32 {
 
 /// The halted run's verdict.
 const VERDICT: &str =
-    "verify: FAIL — fmt failed; 1 not run (stopped at the first red: lint); 0 ok in ";
+    "verify: FAIL — test failed; 1 not run (stopped at the first red: doc); 0 ok in ";
 
-/// fmt's red while lint's tippy child naps: the run ends that child, reads FAIL with lint not run
+/// The test's red while the doctest child naps: the run ends that child, reads FAIL with doc not run
 /// (stopped at the first red, its row saying so), and exits FAILED inside the hang detector, half
-/// the child's nap. Negative control: with the halt off (`halt_of(false, false)`, a bare run) the
+/// the child's nap. Negative control: without `--fail-fast` the test red does not stop the run; it
 /// run waits out the nap, and this test's hang detector on its end fails it.
 #[test]
 fn the_first_red_ends_a_fail_fast_run_and_its_napping_child() {
@@ -194,7 +194,7 @@ fn the_first_red_ends_a_fail_fast_run_and_its_napping_child() {
         .tempdir()
         .expect("a scratch dir");
     let mut run = start(dir.path(), false);
-    until_within(MUST_HAPPEN, "fmt's red", || {
+    until_within(MUST_HAPPEN, "the test's red", || {
         std::fs::metadata(dir.path().join("red")).ok()
     });
     let red = Instant::now();
@@ -209,7 +209,7 @@ fn the_first_red_ends_a_fail_fast_run_and_its_napping_child() {
         "the verdict: {log}"
     );
     assert!(
-        log.contains("the napping child — stopped: the run failed at fmt"),
+        log.contains("the napping child — stopped: the run failed at test"),
         "the child the halt ended reads NOT RUN with its words: {log}"
     );
     gone_child(dir.path());
@@ -228,7 +228,7 @@ fn an_interrupt_after_the_halt_reports_before_the_run_dies() {
         .tempdir()
         .expect("a scratch dir");
     let mut run = start(dir.path(), true);
-    until_within(MUST_HAPPEN, "fmt's red", || {
+    until_within(MUST_HAPPEN, "the test's red", || {
         std::fs::metadata(dir.path().join("red")).ok()
     });
     gone_child(dir.path());

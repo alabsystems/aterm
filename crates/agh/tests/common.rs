@@ -213,10 +213,8 @@ pub fn tape_path(dir: &Path, label: &str) -> PathBuf {
 }
 
 /// `Ctx::for_tests(root, Arc::new(HttpTransport::direct(env)), endpoints(fake), env)`, with
-/// this process's vault adoption `GET /user` bounded by `HANG`: a fake must answer it.
+/// the product's minute hang detector also applies to vault adoption `GET /user`.
 pub fn ctx(root: &Path, fake: &FakeGithub, env: MapEnv) -> (Ctx, Captured) {
-    #[cfg(unix)]
-    agh::github::users::set_learn_deadlines_for_test(HANG);
     let transport = Arc::new(HttpTransport::direct(Arc::new(env.clone())));
     Ctx::for_tests(root, transport, endpoints(fake), env)
 }

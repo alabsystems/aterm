@@ -1581,7 +1581,9 @@ fn ai_accounts_rows_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converg
         .home
         .as_deref()
         .zip(env.config.as_deref())
-        .and_then(|(home, config)| sheet_conflicts_words(&sheet_conflicts(home, config)))
+        .and_then(|(home, config)| {
+            sheet_conflicts_words(&sheet_conflicts(home, &env.state, config))
+        })
     else {
         return probe;
     };

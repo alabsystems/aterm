@@ -176,9 +176,9 @@ impl App {
         let mut documents: BTreeMap<DocumentId, Vec<(WindowId, ViewId)>> = BTreeMap::new();
         for (wid, ws) in &self.windows {
             for tab in ws.tab_set.tabs() {
-                for view in tab.root.leaves() {
+                tab.root.visit(&mut |&view| {
                     let Some(View::Native(native)) = self.view_store.get(view).copied() else {
-                        continue;
+                        return;
                     };
                     let editor = self
                         .native_runtime
@@ -191,7 +191,7 @@ impl App {
                     {
                         documents.entry(document).or_default().push((*wid, view));
                     }
-                }
+                });
             }
         }
         for views in documents.values_mut() {

@@ -62,6 +62,10 @@ pub struct RunFlags {
     pub dry_run: bool,
     /// Publish eligible existing Linux stages without building missing rows this run.
     pub staged_only: bool,
+    /// Consume a staging notification, or report idle without contacting a host.
+    pub queued: bool,
+    /// Emit a typed outcome on stdout; diagnostic lines remain in its log.
+    pub json: bool,
     /// The sha256 the unit names for this binary.
     pub sha256: Option<String>,
     /// Write the transcript to this file instead of stdout (what a unit passes).
@@ -86,6 +90,8 @@ impl RunFlags {
             match a.as_str() {
                 "--dry-run" => flags.dry_run = true,
                 "--staged-only" if kind == LaneKind::Linux => flags.staged_only = true,
+                "--queued" if kind == LaneKind::Linux => flags.queued = true,
+                "--json" if kind == LaneKind::Linux => flags.json = true,
                 "--sha256" => {
                     let v = value("--sha256")?;
                     if v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -105,13 +111,16 @@ impl RunFlags {
                          --log <file>{})",
                         kind.as_str(),
                         if kind == LaneKind::Linux {
-                            ", --triple <linux target>, --staged-only"
+                            ", --triple <linux target>, --staged-only, --queued, --json"
                         } else {
                             ""
                         }
                     )));
                 }
             }
+        }
+        if flags.queued && !flags.staged_only {
+            return Err(Error::usage("--queued requires --staged-only"));
         }
         Ok(flags)
     }
@@ -151,6 +160,66 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
 }
 
 fn run_lane(ctx: &Ctx, kind: LaneKind, flags: &RunFlags) -> Result<()> {
+    let mut log = Vec::new();
+    let result = run_lane_inner(ctx, kind, flags, &mut log);
+    if flags.json {
+        let report = outcome_report(flags, &result, log);
+        println!(
+            "{}",
+            aterm_json::to_string(&report)
+                .map_err(|e| Error::refused(format!("encode lane outcome: {e}")))?
+        );
+    }
+    result.map(|_| ())
+}
+
+fn outcome_report<'a>(
+    flags: &RunFlags,
+    result: &'a Result<Option<linux::Outcome>>,
+    log: Vec<String>,
+) -> RunReport<'a> {
+    let outcome = result.as_ref().ok().and_then(Option::as_ref);
+    RunReport {
+        schema: "atpkg.lane.outcome.v1",
+        status: match &result {
+            Err(_) => "refused",
+            Ok(Some(value)) if value.covered => "covered",
+            Ok(Some(value)) if value.idle => "idle",
+            Ok(_) if flags.dry_run => "planned",
+            Ok(Some(value)) if value.published.is_some() => "published",
+            Ok(_) => "completed",
+        },
+        exit: result.as_ref().err().map_or(0, Error::exit_code),
+        head: outcome.and_then(|value| value.head),
+        published_index: outcome.and_then(|value| value.published),
+        ready: outcome.map_or(&[], |value| value.ready.as_slice()),
+        deferred: outcome.map_or(&[], |value| value.deferred.as_slice()),
+        held: outcome.map_or(&[], |value| value.held.as_slice()),
+        error: result.as_ref().err().map(ToString::to_string),
+        log,
+    }
+}
+
+#[derive(serde::Serialize)]
+struct RunReport<'a> {
+    schema: &'static str,
+    status: &'static str,
+    exit: u8,
+    head: Option<u64>,
+    published_index: Option<u64>,
+    ready: &'a [String],
+    deferred: &'a [String],
+    held: &'a [String],
+    error: Option<String>,
+    log: Vec<String>,
+}
+
+fn run_lane_inner(
+    ctx: &Ctx,
+    kind: LaneKind,
+    flags: &RunFlags,
+    log: &mut Vec<String>,
+) -> Result<Option<linux::Outcome>> {
     let exe = std::env::current_exe().map_err(|e| Error::io("find this binary's own path", &e))?;
     mark_ran(&exe);
     let pinned = self_check(&exe, flags.sha256.as_deref(), flags.dry_run, &ctx.state_dir)?;
@@ -160,10 +229,16 @@ fn run_lane(ctx: &Ctx, kind: LaneKind, flags: &RunFlags) -> Result<()> {
     };
     let tx = report::Transcript::new(
         me,
-        flags
-            .log
-            .clone()
-            .map_or(report::Sink::Stdout, report::Sink::File),
+        flags.log.clone().map_or(
+            {
+                if flags.json {
+                    report::Sink::Memory
+                } else {
+                    report::Sink::Stdout
+                }
+            },
+            report::Sink::File,
+        ),
     );
     tx.say(match &pinned {
         Some(hex) => format!("snapshot verified: {} (sha256 {hex})", ctx.shown(&exe)),
@@ -176,6 +251,7 @@ fn run_lane(ctx: &Ctx, kind: LaneKind, flags: &RunFlags) -> Result<()> {
     if let Err(e) = &result {
         tx.say(format!("{e}"));
     }
+    *log = tx.lines();
     result
 }
 
@@ -184,7 +260,7 @@ fn run_with_production_deps(
     kind: LaneKind,
     flags: &RunFlags,
     tx: &report::Transcript,
-) -> Result<()> {
+) -> Result<Option<linux::Outcome>> {
     let packer = crate::artifact::pack::Pack;
     let indexer = crate::channel::index::Index;
     match kind {
@@ -201,7 +277,7 @@ fn run_with_production_deps(
                 notifier: &notifier,
                 pin_commit: &alab::installed_pin_commit,
             };
-            alab::run(ctx, &alab::Options::new(ctx, flags.dry_run), &deps, tx).map(|_| ())
+            alab::run(ctx, &alab::Options::new(ctx, flags.dry_run), &deps, tx).map(|_| None)
         }
         LaneKind::Linux => {
             let host = Triple::host().ok_or_else(|| {
@@ -211,6 +287,7 @@ fn run_with_production_deps(
             })?;
             let mut opts = linux::Options::new(ctx, host, flags.dry_run, &flags.triples)?;
             opts.staged_only = flags.staged_only;
+            opts.queued = flags.queued;
             let builder = linux::TrustBuilder::new(ctx);
             let deps = linux::Deps {
                 packer: &packer,
@@ -218,7 +295,7 @@ fn run_with_production_deps(
                 builder: &builder,
                 switch: &linux::live_switch,
             };
-            linux::run(ctx, &opts, &deps, tx).map(|_| ())
+            linux::run(ctx, &opts, &deps, tx).map(Some)
         }
     }
 }
@@ -305,4 +382,55 @@ pub fn self_check(
         )));
     }
     Ok(Some(actual))
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn typed_outcomes_do_not_turn_idle_or_failure_into_publication() {
+        let flags = RunFlags::default();
+        for (result, status, exit, index) in [
+            (
+                Ok(Some(linux::Outcome {
+                    idle: true,
+                    ..linux::Outcome::default()
+                })),
+                "idle",
+                0,
+                None,
+            ),
+            (
+                Ok(Some(linux::Outcome {
+                    covered: true,
+                    ..linux::Outcome::default()
+                })),
+                "covered",
+                0,
+                None,
+            ),
+            (
+                Ok(Some(linux::Outcome {
+                    published: Some(118),
+                    ..linux::Outcome::default()
+                })),
+                "published",
+                0,
+                Some(118),
+            ),
+            (
+                Err(Error::refused("signer unavailable")),
+                "refused",
+                1,
+                None,
+            ),
+        ] {
+            let encoded = aterm_json::to_string(&outcome_report(&flags, &result, vec![])).unwrap();
+            let value: aterm_json::Value = aterm_json::from_str(&encoded).unwrap();
+            assert_eq!(value["status"].as_str(), Some(status));
+            assert_eq!(value["exit"].as_u64(), Some(exit));
+            assert_eq!(value["published_index"].as_u64(), index);
+        }
+    }
 }

@@ -2023,6 +2023,7 @@ scope = "user"
         assert!(sys.calls().is_empty());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_live_tool_reads_a_missing_system_domain_as_absent_and_a_real_one_as_known() {
         // Read only: `defaults export` of system domains, as whoever runs the tests.
@@ -2037,6 +2038,7 @@ scope = "user"
         assert!(!matches!(read, Read::Unusable(_)), "{read:?}");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_live_tool_reads_a_system_domain_it_may_not_read_as_unusable_not_absent() {
         let path = Path::new("/Library/Preferences/com.apple.apsd.plist");

@@ -50,7 +50,7 @@ fn context_variable(name: &OsStr) -> bool {
 /// Windows process launch and temporary-file lookup need these OS locations after `env_clear`.
 /// They are named individually; account data and every other caller variable stay out.
 #[cfg(windows)]
-fn platform_variables(mut cmd: Cmd) -> Cmd {
+fn platform_variables(_ctx: &Ctx, mut cmd: Cmd) -> Cmd {
     for key in ["SystemRoot", "ComSpec", "PATHEXT", "TEMP", "TMP"] {
         if let Some(value) = std::env::var_os(key) {
             cmd = cmd.env(key, value);
@@ -59,8 +59,31 @@ fn platform_variables(mut cmd: Cmd) -> Cmd {
     cmd
 }
 
-#[cfg(not(windows))]
-fn platform_variables(cmd: Cmd) -> Cmd {
+/// Linux tools need the login runtime location even under the declared test
+/// environment. Test binaries redirect this canonical location into their own
+/// private scratch; another caller-selected runtime must not cross this boundary.
+#[cfg(target_os = "linux")]
+fn platform_variables(ctx: &Ctx, mut cmd: Cmd) -> Cmd {
+    if let Some(dir) = ctx.env.xdg_runtime_dir.as_deref()
+        && aterm_uds::test_binary::is_login_runtime_dir(dir.as_os_str())
+        && private_runtime(dir, aterm_uds::peer::our_uid())
+    {
+        cmd = cmd.env("XDG_RUNTIME_DIR", dir);
+    }
+    cmd
+}
+
+#[cfg(target_os = "linux")]
+fn private_runtime(dir: &std::path::Path, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    dir.is_absolute()
+        && std::fs::symlink_metadata(dir)
+            .is_ok_and(|md| md.is_dir() && md.uid() == owner && md.mode() & 0o7777 == 0o700)
+        && std::fs::canonicalize(dir).is_ok_and(|physical| physical == dir)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn platform_variables(_ctx: &Ctx, cmd: Cmd) -> Cmd {
     cmd
 }
 
@@ -90,7 +113,7 @@ fn declared(ctx: &Ctx, mut cmd: Cmd) -> Cmd {
     }
     let local = std::mem::take(&mut cmd.envs);
     cmd.exact_env = true;
-    cmd = platform_variables(cmd.env("PATH", &ctx.path_env));
+    cmd = platform_variables(ctx, cmd.env("PATH", &ctx.path_env));
     for (key, value) in &ctx.child_env_add {
         if context_variable(key) {
             cmd = cmd.env(key, value);
@@ -148,6 +171,30 @@ pub(crate) fn command(ctx: &Ctx, mut cmd: Cmd) -> Cmd {
 mod tests {
     use super::*;
     use crate::{EnvSnapshot, Scope, exec};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_runtime_is_owned_private_and_the_login_location() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = aterm_uds::peer::our_uid();
+        assert!(private_runtime(&runtime, owner));
+        assert!(!private_runtime(&runtime, owner.wrapping_add(1)));
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(!private_runtime(&runtime, owner));
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = dir.path().join("link");
+        symlink(&runtime, &link).unwrap();
+        assert!(!private_runtime(&link, owner));
+        assert!(!private_runtime(std::path::Path::new("relative"), owner));
+        let mut ctx = context(dir.path(), false);
+        ctx.env.xdg_runtime_dir = Some(runtime);
+        let cmd = command(&ctx, Cmd::new("probe"));
+        assert!(cmd.envs.iter().all(|(key, _)| key != "XDG_RUNTIME_DIR"));
+    }
 
     fn context(root: &std::path::Path, release: bool) -> Ctx {
         let env = EnvSnapshot {

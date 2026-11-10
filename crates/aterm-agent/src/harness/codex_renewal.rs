@@ -1109,8 +1109,9 @@ pub(super) fn drive_connection(
         if client.reply_unread() {
             return None;
         }
+        // A renewal is a private restart, which no lapse answers ([`native_restart::Recovery::Lapsed`]).
         if !matches!(signal, upgrade_drive::Terminated::Sent)
-            && native_restart::abort(opts, &key, &mut client, sid, &mut state)
+            && native_restart::abort(opts, &key, &mut client, sid, &mut state).is_some()
         {
             upgrade_drive::save_checked(opts, &key, &state).ok()?;
             return completion_value(&state, sid, prepare);
@@ -2248,6 +2249,8 @@ mod tests {
                 cold: None,
                 rollback: None,
             },
+            boot: None,
+            custody: None,
         };
         let mut receipt = receipt();
         receipt.candidate = Some(Candidate::of(&attached, true));

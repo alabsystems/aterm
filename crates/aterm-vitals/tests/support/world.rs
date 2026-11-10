@@ -33,6 +33,8 @@ pub struct Proc {
     pub becomes: Option<String>,
     /// While its claim waits, the pids of the claims ahead of it, as the host read its ledger.
     pub claims_ahead: Option<Vec<u32>>,
+    /// Native held legacy build-admission ticket, sampled with this process birth.
+    pub build_admission: Option<Vec<u32>>,
     pub state: ProcState,
     /// Its controlling terminal is the tab's.
     pub tty: bool,
@@ -95,6 +97,7 @@ impl Proc {
             exe: None,
             becomes: None,
             claims_ahead: None,
+            build_admission: None,
             state: ProcState::Sleeping,
             tty: false,
             uid: UID,
@@ -610,6 +613,7 @@ impl World {
             exe: p.exe.clone().filter(|_| !zombie),
             becomes: p.becomes.clone().filter(|_| !zombie),
             claims_ahead: p.claims_ahead.clone().filter(|_| !zombie),
+            build_admission: p.build_admission.clone().filter(|_| !zombie),
             state: if p.d_state {
                 ProcState::Uninterruptible
             } else {

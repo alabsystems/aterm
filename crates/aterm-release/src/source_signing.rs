@@ -163,7 +163,11 @@ impl Tools {
         if derived.trim_ascii() != identity.pubkey.as_bytes() {
             return Err("source signing helper and ring identity disagree".into());
         }
-        let scratch = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-source-sign-")
+            .suffix(".noindex")
+            .tempdir()
+            .map_err(|e| e.to_string())?;
         let message = scratch.path().join("message");
         let signature = scratch.path().join("signature");
         let public = scratch.path().join("public.pem");

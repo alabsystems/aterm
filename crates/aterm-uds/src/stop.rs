@@ -27,9 +27,12 @@ pub struct Stop {
     /// How many sleeps took the lock to wait, for a test to set the stop only once they wait.
     #[cfg(test)]
     entered: std::sync::atomic::AtomicUsize,
-    /// How many times a sleeper woke in its wait, for a test to tell one wait from a poll.
-    #[cfg(test)]
+    /// How many waits returned, including notifications that leave the stop unset.
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     wakes: std::sync::atomic::AtomicUsize,
+    /// How many waits expired, to distinguish timer polling from predicate rechecks.
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    expired: std::sync::atomic::AtomicUsize,
 }
 
 impl Stop {
@@ -65,14 +68,20 @@ impl Stop {
             if left.is_zero() {
                 return false;
             }
-            set = self
+            let (next, _timeout) = self
                 .rung
                 .wait_timeout(set, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-            #[cfg(test)]
-            self.wakes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .unwrap_or_else(PoisonError::into_inner);
+            set = next;
+            #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+            {
+                self.wakes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if _timeout.timed_out() {
+                    self.expired
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
         true
     }
@@ -83,10 +92,16 @@ impl Stop {
         self.entered.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// How many times a sleeper on this stop has woken in its wait ([`Stop::sleep`]).
-    #[cfg(test)]
+    /// How many waits on this stop returned ([`Stop::sleep`]).
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     fn wakes(&self) -> usize {
         self.wakes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many waits on this stop reached their timeout, rather than being notified.
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    fn expired(&self) -> usize {
+        self.expired.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

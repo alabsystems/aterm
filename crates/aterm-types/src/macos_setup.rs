@@ -1496,6 +1496,7 @@ pub mod access_record {
         let start = lines.len().saturating_sub(KEEP);
         let staging = aterm_tempfile::Builder::new()
             .prefix(".system-state-access-")
+            .suffix(".noindex")
             .tempdir_in(dir)?;
         let staged = staging.path().join(FILE);
         {
@@ -1663,7 +1664,7 @@ pub mod access_record {
 
         #[test]
         fn access_record_an_unreadable_history_is_preserved_until_it_can_be_read() {
-            let dir = aterm_tempfile::tempdir().unwrap();
+            let dir = crate::test_scratch_dir("access");
             let root = dir.path();
             let revision = 8_176;
             append(
@@ -1721,7 +1722,7 @@ pub mod access_record {
 
         #[test]
         fn access_record_write_failure_releases_its_lock_and_removes_its_staging() {
-            let dir = aterm_tempfile::tempdir().unwrap();
+            let dir = crate::test_scratch_dir("access");
             let root = dir.path();
             assert!(
                 append_with(
@@ -1767,7 +1768,7 @@ pub mod access_record {
 
         #[test]
         fn access_record_concurrent_writers_keep_independent_outcomes_and_the_latest_decline() {
-            let dir = aterm_tempfile::tempdir().unwrap();
+            let dir = crate::test_scratch_dir("access");
             let root = dir.path();
             let revision = 8_173;
             let other_revision = revision + 1;
@@ -1876,7 +1877,7 @@ pub mod access_record {
         /// extra fields, an unparsed revision.
         #[test]
         fn access_record_the_latest_of_any_revision_reads_every_revision_and_skips_unknown_lines() {
-            let dir = aterm_tempfile::tempdir().unwrap();
+            let dir = crate::test_scratch_dir("access");
             let root = dir.path();
             assert_eq!(latest_of_any_revision(root, Access::Debugger), None);
             append(root, 0, Access::Debugger, AccessOutcome::Handed).unwrap();
@@ -2361,7 +2362,7 @@ mod tests {
 
     #[test]
     fn the_access_record_keeps_each_revision_apart_and_skips_foreign_lines() {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("access");
         let root = dir.path();
         assert!(access_record::read(root, 7).is_empty());
         access_record::append(root, 7, Access::FullDiskAccess, AccessOutcome::Handed).unwrap();
@@ -2409,7 +2410,7 @@ mod tests {
     /// earlier one included, and so is the same outcome in another revision.
     #[test]
     fn the_access_record_does_not_repeat_a_rows_latest_outcome() {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("access");
         let root = dir.path();
         let lines = || {
             std::fs::read_to_string(root.join(access_record::FILE))
@@ -2474,7 +2475,7 @@ mod tests {
             access_record::append(&dir, 4_203, Access::Debugger, AccessOutcome::Granted).unwrap();
         }
         access_record::on_append(appended);
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("access");
         *DIR.lock().unwrap() = Some(dir.path().to_path_buf());
         access_record::append(
             dir.path(),

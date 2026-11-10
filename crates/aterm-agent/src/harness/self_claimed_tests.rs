@@ -180,6 +180,20 @@ fn a_raw_fallback_record_keeps_its_producer_bound_resume_route() {
         validate(&good, 4242, &run).map(|resume| resume.argv),
         good.resume_argv.clone().ok_or("no-resume-line"),
     );
+
+    // Earlier managed execs retained stable argv0 but had no producer environment.
+    // The physical package and complete current producer independently authenticate it.
+    let mut legacy_args = args.clone();
+    legacy_args.argv[0] = entry.to_str().unwrap().to_owned();
+    legacy_args.env.clear();
+    let mut legacy = run.clone();
+    legacy.argv = legacy_args.argv.clone();
+    legacy.managed_launch =
+        atpkg::managed_launch::Hints::capture_for_pid(&layout, &legacy_args, 4242);
+    assert!(legacy.managed_launch.is_some());
+    assert!(validate(&good, 4242, &legacy).is_ok());
+    legacy.managed_launch = None;
+    assert_eq!(validate(&good, 4242, &legacy), Err("launch-path"));
 }
 
 /// THE VALIDATION.

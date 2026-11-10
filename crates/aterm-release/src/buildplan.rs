@@ -681,6 +681,7 @@ fn own_slice_pool(temporary: &Path) -> Result<SlicePool, String> {
     .map_err(|e| e.to_string())?;
     let dir = aterm_tempfile::Builder::new()
         .prefix("release-pool-")
+        .suffix(".noindex")
         .tempdir_in(temporary)
         .map_err(|e| format!("release pool directory: {e}"))?;
     let pool = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), claim.cores())
@@ -2477,7 +2478,7 @@ impl PrivateSliceDir {
         for _ in 0..128 {
             let sequence = TEMP_SLICE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "aterm-update-pin-proof-{}-{sequence}",
+                "aterm-update-pin-proof-{}-{sequence}.noindex",
                 std::process::id()
             ));
             let mut builder = std::fs::DirBuilder::new();
@@ -2779,7 +2780,7 @@ pub(crate) fn private_slice_scratch() -> Result<PathBuf, String> {
     for _ in 0..128 {
         let sequence = TEMP_SLICE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let dir = PathBuf::from(format!(
-            "/tmp/aterm-slice-probe-{}-{nanos}-{sequence}",
+            "/tmp/aterm-slice-probe-{}-{nanos}-{sequence}.noindex",
             std::process::id()
         ));
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
@@ -3450,12 +3451,8 @@ mod tests {
                 .collect()
         };
 
-        let scratch = std::env::temp_dir().join(format!(
-            "aterm-x86-probe-test-diagnose-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&scratch);
-        let home = scratch.join("home");
+        let scratch = crate::test_scratch_dir("x86diag");
+        let home = scratch.path().join("home");
 
         let err = x86_64_slice_runs(bin, &home, &mut |_| Ok(output(1, ""))).unwrap_err();
         assert_eq!(err, crate::gates::ROSETTA_REFUSAL);
@@ -3487,7 +3484,6 @@ mod tests {
             rendered[1]
         );
         assert!(home_writable, "the probe HOME must exist and be writable");
-        let _ = std::fs::remove_dir_all(&scratch);
         assert_eq!(report, "app-version: 0.93.0\n");
         assert_eq!(
             seen[1],
@@ -3511,9 +3507,9 @@ mod tests {
             stderr: verdict.as_bytes().to_vec(),
         };
         let settled = "aterm-ctl: turn submitted=1 status=settled seq=4 id=1 dur_ms=188\n";
+        let root = crate::test_scratch_dir("x86turn");
         let scratch_for = |name: &str| {
-            let dir = std::env::temp_dir()
-                .join(format!("aterm-x86-turn-test-{name}-{}", std::process::id()));
+            let dir = root.path().join(name);
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             dir
@@ -3682,21 +3678,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("opened no control socket"), "{err}");
-        for name in [
-            "pass",
-            "refuse",
-            "exit",
-            "silent",
-            "arm64",
-            "arm64-cpu",
-            "arm64-none",
-            "arm64-noframe",
-        ] {
-            let _ = std::fs::remove_dir_all(
-                std::env::temp_dir()
-                    .join(format!("aterm-x86-turn-test-{name}-{}", std::process::id())),
-            );
-        }
     }
 
     const EXPECTED: &str = "529d8b60583fdc58b13afdba7050de6b21c0740b86dd87e5af769a2afb6c30f4";

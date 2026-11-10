@@ -13,5 +13,8 @@ description = "AppKit, Carbon, ServiceManagement and AudioQueue acquired by nati
 aterm-objc = { workspace = true }
 aterm-dl = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+aterm-uds = { workspace = true }
+
 [lints]
 workspace = true

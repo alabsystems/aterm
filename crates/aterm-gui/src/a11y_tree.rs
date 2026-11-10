@@ -34,26 +34,25 @@ const PANE_BASE: u64 = 1 << 62;
 const RUN_CHARS: usize = 256;
 const RUNS_PER_ROW: u64 = 256;
 
-fn row_chunks(line: &str) -> Vec<String> {
-    let count = line.chars().count();
-    if count <= RUN_CHARS {
-        return vec![line.to_string()];
-    }
-    let cap = RUN_CHARS * RUNS_PER_ROW as usize;
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for (i, ch) in line.chars().enumerate() {
-        if !current.is_empty()
-            && i % RUN_CHARS == 0
-            && (chunks.len() as u64) < RUNS_PER_ROW - 1
-            && i < cap
-        {
-            chunks.push(std::mem::take(&mut current));
+fn row_chunks(line: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = Some(line);
+    let mut emitted = 0;
+    std::iter::from_fn(move || {
+        let line = remaining.take()?;
+        let end = if emitted < RUNS_PER_ROW - 1 {
+            line.char_indices()
+                .nth(RUN_CHARS)
+                .map_or(line.len(), |(byte, _)| byte)
+        } else {
+            line.len()
+        };
+        let (chunk, tail) = line.split_at(end);
+        if !tail.is_empty() {
+            remaining = Some(tail);
         }
-        current.push(ch);
-    }
-    chunks.push(current);
-    chunks
+        emitted += 1;
+        Some(chunk)
+    })
 }
 
 /// A terminal's document as a client reads it.
@@ -839,17 +838,34 @@ pub(crate) fn tab_action_index(
     (request.context == Some(expected)).then_some(index)
 }
 
-fn word_starts_of(line: &str) -> Vec<u8> {
-    let mut starts = vec![0u8];
-    let mut prev_ws = false;
-    for (i, ch) in line.chars().enumerate() {
-        if i > 0 && prev_ws && !ch.is_whitespace() {
-            let Ok(index) = u8::try_from(i) else { break };
-            starts.push(index);
-        }
-        prev_ws = ch.is_whitespace();
+fn word_starts_of(line: &str) -> Box<[u8]> {
+    // The u8 offset space bounds both the useful scalar prefix and the scratch.
+    const INDEX_SPACE: usize = u8::MAX as usize + 1;
+    if line.is_empty() {
+        return Box::new([0]);
     }
-    starts
+    let mut starts = None;
+    let mut len = 1;
+    let mut prev_ws = false;
+    let mut chars = line.chars();
+    for offset in 0..INDEX_SPACE {
+        let Some(ch) = chars.next() else { break };
+        let whitespace = ch.is_whitespace();
+        if offset > 0 && prev_ws && !whitespace {
+            #[expect(
+                clippy::unnecessary_lazy_evaluations,
+                reason = "initialize the 256-byte scratch only at the first transition, not at every word start"
+            )]
+            let scratch = starts.get_or_insert_with(|| [0u8; INDEX_SPACE]);
+            scratch[len] = offset as u8;
+            len += 1;
+        }
+        prev_ws = whitespace;
+    }
+    match starts.as_ref() {
+        Some(starts) => Box::from(&starts[..len]),
+        None => Box::new([0]),
+    }
 }
 
 const fn row_run_id(slot: usize, row: usize, chunk: usize) -> NodeId {
@@ -887,21 +903,21 @@ fn push_terminal_document(
     let (row_off, col_off) = origin;
 
     for (row, line) in lines.iter().enumerate() {
-        for (chunk_index, chunk) in row_chunks(line).into_iter().enumerate() {
-            let line = &chunk;
+        for (chunk_index, line) in row_chunks(line).enumerate() {
             let id = row_run_id(slot, row, chunk_index);
             row_ids.push(id);
             let mut run = Node::new(Role::TextRun);
-            run.set_value((*line).to_string());
-            run.set_character_lengths(
-                line.chars()
-                    .map(|c| u8::try_from(c.len_utf8()).unwrap_or(4))
-                    .collect::<Vec<u8>>(),
-            );
+            run.set_value(line);
+            let character_lengths: Vec<u8> = line
+                .chars()
+                .map(|c| u8::try_from(c.len_utf8()).unwrap_or(4))
+                .collect();
+            let characters = character_lengths.len();
+            run.set_character_lengths(character_lengths);
             run.set_word_starts(word_starts_of(line.strip_suffix('\n').unwrap_or(line)));
             if let Some(g) = geom {
-                let mut positions: Vec<f32> = Vec::with_capacity(line.len());
-                let mut widths: Vec<f32> = Vec::with_capacity(line.len());
+                let mut positions: Vec<f32> = Vec::with_capacity(characters);
+                let mut widths: Vec<f32> = Vec::with_capacity(characters);
                 let col0 = chunk_index * RUN_CHARS;
                 for (i, ch) in line.chars().enumerate() {
                     positions.push(((col0 + i) as f64 * g.cell_w) as f32);
@@ -924,7 +940,7 @@ fn push_terminal_document(
 
     let mut grid = Node::new(Role::Terminal);
     grid.set_label(label);
-    grid.set_value(snap.value().to_string());
+    grid.set_value(snap.value());
     grid.set_read_only();
     grid.set_text_direction(TextDirection::LeftToRight);
     grid.set_children(row_ids);
@@ -1391,6 +1407,166 @@ mod tests {
     }
 
     #[test]
+    fn word_metadata_allocates_only_its_owned_slice() {
+        let mut observed = Vec::new();
+        for line in [
+            "hello".to_string(),
+            "hello world".to_string(),
+            " 中".repeat(300),
+        ] {
+            let mut run = Node::new(Role::TextRun);
+            let (_, allocations) = aterm_heap_count::allocations_in(|| {
+                run.set_word_starts(word_starts_of(std::hint::black_box(&line)));
+                std::hint::black_box(run.word_starts());
+            });
+            println!(
+                "characters={} entries={} allocations={allocations}",
+                line.chars().count(),
+                run.word_starts().len()
+            );
+            observed.push(allocations);
+        }
+        assert_eq!(
+            observed,
+            [1, 1, 1],
+            "only the final node slice needs storage"
+        );
+    }
+
+    #[test]
+    #[ignore = "measures word metadata construction; run alone"]
+    fn word_metadata_construction_cost() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        const CALLS: usize = 200_000;
+        fn vector_reference(line: &str) -> Box<[u8]> {
+            let mut starts = vec![0u8];
+            let mut prev_ws = false;
+            for (i, ch) in line.chars().enumerate() {
+                if i > 0 && prev_ws && !ch.is_whitespace() {
+                    let Ok(index) = u8::try_from(i) else { break };
+                    starts.push(index);
+                }
+                prev_ws = ch.is_whitespace();
+            }
+            starts.into_boxed_slice()
+        }
+        for (case, line) in [
+            ("empty", String::new()),
+            ("single", "hello".to_string()),
+            ("long_single", "x".repeat(1024)),
+            ("two", "hello world".to_string()),
+            ("unicode_limit", " 中".repeat(300)),
+        ] {
+            assert_eq!(word_starts_of(&line), vector_reference(&line));
+            for sample in 0..5 {
+                for reference in if sample % 2 == 0 {
+                    [true, false]
+                } else {
+                    [false, true]
+                } {
+                    let make: fn(&str) -> Box<[u8]> = if reference {
+                        vector_reference
+                    } else {
+                        word_starts_of
+                    };
+                    for _ in 0..100 {
+                        drop(black_box(make(black_box(&line))));
+                    }
+                    let start = Instant::now();
+                    for _ in 0..CALLS {
+                        let mut run = Node::new(Role::TextRun);
+                        run.set_word_starts(make(black_box(&line)));
+                        black_box(run.word_starts());
+                    }
+                    println!(
+                        "case={case} calls={CALLS} sample={sample} reference={reference} elapsed_ns={}",
+                        start.elapsed().as_nanos()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn word_metadata_preserves_scalar_offsets_and_the_index_limit() {
+        for (line, expected) in [
+            ("".to_string(), vec![0]),
+            (" \u{a0}\u{2003}".to_string(), vec![0]),
+            (" \u{a0}中\u{2003}é".to_string(), vec![0, 2, 4]),
+            (format!("{} a", "x".repeat(254)), vec![0, 255]),
+            (format!("{} a", "x".repeat(255)), vec![0]),
+            (format!("{} tail word", "x".repeat(1024)), vec![0]),
+            (
+                " 中".repeat(300),
+                std::iter::once(0)
+                    .chain((0..128).map(|i| (2 * i + 1) as u8))
+                    .collect(),
+            ),
+        ] {
+            let mut run = Node::new(Role::TextRun);
+            run.set_word_starts(word_starts_of(&line));
+            assert_eq!(run.word_starts(), expected);
+        }
+    }
+
+    #[test]
+    fn text_runs_borrow_rows_without_intermediate_allocations() {
+        for line in ["abc\n".to_string(), "中".repeat(257), "é".repeat(65_537)] {
+            let ((chunks, bytes), allocations) = aterm_heap_count::allocations_in(|| {
+                row_chunks(&line).fold((0, 0), |(chunks, bytes), chunk| {
+                    (chunks + 1, bytes + std::hint::black_box(chunk).len())
+                })
+            });
+            assert_eq!(bytes, line.len());
+            assert!((1..=RUNS_PER_ROW as usize).contains(&chunks));
+            assert_eq!(allocations, 0, "text-run projection must borrow its source");
+        }
+    }
+
+    #[test]
+    fn text_runs_preserve_unicode_and_the_bounded_address_space() {
+        for count in [0usize, 1, 255, 256, 257, 65_280, 65_536, 65_537] {
+            for newline in [false, true] {
+                let mut line = "中".repeat(count);
+                if newline {
+                    line.push('\n');
+                }
+                let chunks: Vec<_> = row_chunks(&line).collect();
+                assert_eq!(chunks.iter().copied().collect::<String>(), line);
+                assert_eq!(
+                    chunks.len(),
+                    (count + usize::from(newline))
+                        .div_ceil(RUN_CHARS)
+                        .clamp(1, RUNS_PER_ROW as usize)
+                );
+                for chunk in chunks.iter().take(chunks.len() - 1) {
+                    assert_eq!(chunk.chars().count(), RUN_CHARS);
+                }
+            }
+        }
+        let text = format!("{}\n", "中".repeat(65_537));
+        let snap = crate::accessibility::AccessibleSnapshot {
+            text: text.clone(),
+            rows: 1,
+            cols: 65_537,
+            cursor: Some((0, 65_536)),
+        };
+        let update = grid_tree(&snap, None, &GridFrame::default());
+        let terminal = node(&update, GRID);
+        assert_eq!(terminal.children().len(), RUNS_PER_ROW as usize);
+        let joined: String = terminal
+            .children()
+            .iter()
+            .map(|id| node(&update, *id).value().unwrap())
+            .collect();
+        assert_eq!(joined, text);
+        let caret = terminal.text_selection().unwrap().focus;
+        assert_eq!(caret.node, row_run_id(0, 0, 255));
+        assert_eq!(caret.character_index, 256);
+    }
+
+    #[test]
     #[ignore = "measures selection lookup cost; run optimized and alone"]
     fn unselected_document_lookup_cost() {
         use std::hint::black_box;
@@ -1628,11 +1804,11 @@ mod tests {
 
     #[test]
     fn word_starts_follow_the_model_definition() {
-        assert_eq!(word_starts_of("hello world"), [0, 6]);
-        assert_eq!(word_starts_of("  ab"), [0, 2]);
-        assert_eq!(word_starts_of(""), [0]);
-        assert_eq!(word_starts_of("   "), [0]);
-        assert_eq!(word_starts_of("$ echo hi"), [0, 2, 7]);
+        assert_eq!(&*word_starts_of("hello world"), &[0, 6]);
+        assert_eq!(&*word_starts_of("  ab"), &[0, 2]);
+        assert_eq!(&*word_starts_of(""), &[0]);
+        assert_eq!(&*word_starts_of("   "), &[0]);
+        assert_eq!(&*word_starts_of("$ echo hi"), &[0, 2, 7]);
         let update = grid_tree(
             &live_grid(1, 20, b"echo hi", Some((0, 7))),
             None,

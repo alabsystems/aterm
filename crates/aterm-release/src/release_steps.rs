@@ -43,6 +43,16 @@ fn preflight_cache(repo: &Path) -> Result<PathBuf, String> {
 /// `pub stage` gets it only from [`hand_transforms_cutter`].
 pub const RELEASE_CUTTER_ENV: &str = "ATERM_RELEASE_CUTTER";
 
+fn local_git() -> Result<Command, Refusal> {
+    crate::ledger::git_command().map_err(|why| {
+        Refusal::new(
+            why.to_string(),
+            "repair the managed Git installation and retry",
+        )
+        .could_not_run()
+    })
+}
+
 /// The moment the cutter [`RELEASE_CUTTER_ENV`] names was judged from, with the pid and start of
 /// the process that hands it on, set and removed with it ([`hand_this_cutter`]), so the handed
 /// cutter judges itself from that moment too while that process is its live ancestor
@@ -921,7 +931,10 @@ impl Real {
         let logs = if dry {
             static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let nth = NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            std::env::temp_dir().join(format!("aterm-release-dry-{}-{nth}", std::process::id()))
+            std::env::temp_dir().join(format!(
+                "aterm-release-dry-{}-{nth}.noindex",
+                std::process::id()
+            ))
         } else {
             state
                 .join("logs")
@@ -997,7 +1010,7 @@ impl Real {
     }
 
     fn engine_git(&self, args: &[&str]) -> Option<String> {
-        let mut cmd = command(aterm_uds::os_path!("git"));
+        let mut cmd = local_git().ok()?;
         cmd.args(["-c", "protocol.allow=never"])
             .arg("-C")
             .arg(&self.engine)
@@ -1010,7 +1023,7 @@ impl Real {
 
     fn engine_git_code(&self, args: &[&str]) -> Result<(i32, std::process::Output), String> {
         let e = self.engine.display();
-        let mut cmd = command(aterm_uds::os_path!("git"));
+        let mut cmd = crate::ledger::git_command().map_err(|why| why.to_string())?;
         cmd.args(["-c", "protocol.allow=never"])
             .arg("-C")
             .arg(&self.engine)
@@ -1926,7 +1939,7 @@ impl Real {
             }
         }
         for key in ["user.name", "user.email"] {
-            let mut cmd = command(aterm_uds::os_path!("git"));
+            let mut cmd = local_git()?;
             cmd.arg("-C")
                 .arg(&self.engine_source)
                 .args(["config", "--get", key]);
@@ -2171,7 +2184,7 @@ impl Real {
     }
 
     fn submodule_sync(&self, step: Step) -> Result<(), Refusal> {
-        let mut cmd = command(aterm_uds::os_path!("git"));
+        let mut cmd = local_git()?;
         cmd.args(["submodule", "update", "--init", "vendor/astream"])
             .current_dir(&self.repo);
         let ran = self.logged(step, &mut cmd);
@@ -2227,7 +2240,7 @@ impl Real {
         let _timing = crate::cut_timing::Timer::start(&self.step_log(self.step), "source-checkout");
         let head = self.head();
         let ancestor = |s: &mut Self, a: &str, b: &str| s.is_ancestor(a, b);
-        let mut cmd = command(aterm_uds::os_path!("git"));
+        let mut cmd = local_git()?;
         cmd.current_dir(&self.repo);
         if ancestor(self, &head, rev) {
             cmd.args(["merge", "-q", "--ff-only", rev]);
@@ -2305,14 +2318,14 @@ impl Real {
         let copy_s = copy.display().to_string();
         let ran = |cmd: &mut Command| self.output_forwarded(cmd).is_ok_and(|o| o.status.success());
         let in_copy = |args: &[&str]| {
-            let mut cmd = command(aterm_uds::os_path!("git"));
+            let mut cmd = local_git()?;
             cmd.args(["-c", "protocol.allow=never"])
                 .arg("-C")
                 .arg(&copy)
                 .args(args);
-            cmd
+            Ok::<_, Refusal>(cmd)
         };
-        let mut clone = command(aterm_uds::os_path!("git"));
+        let mut clone = local_git()?;
         clone
             .args([
                 "-c",
@@ -2329,7 +2342,7 @@ impl Real {
                 "fix what keeps it from being written, then run it again",
             ));
         }
-        if !ran(&mut in_copy(&["remote", "set-url", "origin", &origin])) {
+        if !ran(&mut in_copy(&["remote", "set-url", "origin", &origin])?) {
             return Err(Refusal::new(
                 format!("cannot bind the scratch engine to its origin ({origin})"),
                 "read the local clone refusal, then re-run",
@@ -2345,7 +2358,7 @@ impl Real {
                 )
                 .detail([why])
             })?;
-        if !ran(&mut in_copy(&["checkout", "--quiet", "-B", "main", &tip])) {
+        if !ran(&mut in_copy(&["checkout", "--quiet", "-B", "main", &tip])?) {
             return Err(Refusal::new(
                 format!("git could not check the engine's origin main out in {copy_s}"),
                 "fix what keeps it from being written, then run it again",
@@ -2846,7 +2859,8 @@ impl Real {
         self.scanner_tools = None;
         let not_run = |why: Refusal| (Outcome::CouldNotRun(why), None);
         if let Err(why) = aterm_census::export::mainline::require(r, |args| {
-            let mut git = crate::ledger::object_git(&self.repo);
+            let mut git =
+                crate::ledger::object_git(&self.repo).map_err(|error| error.to_string())?;
             git.args(args);
             aterm_uds::deadline::output_within(&mut git, aterm_census::export::mainline::READ_WAIT)
                 .map(|out| {
@@ -3011,9 +3025,10 @@ impl Real {
         let origin = self
             .git_out(&["remote", "get-url", "origin"])
             .ok_or("this checkout names no origin")?;
-        let git = |dir: &Path, args: &[&str]| -> bool {
+        let git = |dir: &Path, args: &[&str]| -> Result<bool, String> {
             let out = self.output_forwarded(
-                command(aterm_uds::os_path!("git"))
+                crate::ledger::git_command()
+                    .map_err(|why| why.to_string())?
                     .arg("-C")
                     .arg(dir)
                     .args(args),
@@ -3023,7 +3038,7 @@ impl Real {
             {
                 let _ = f.write_all(&o.stderr);
             }
-            out.is_ok_and(|o| o.status.success())
+            Ok(out.is_ok_and(|o| o.status.success()))
         };
         let clone = |from: &str, into: &str| {
             let args = [
@@ -3034,8 +3049,8 @@ impl Real {
             git(base, &args.concat())
         };
         let (repo, root_s) = (self.repo.display().to_string(), root.display().to_string());
-        if !clone(&repo, &root_s)
-            || !git(root, &["remote", "set-url", "origin", &origin])
+        if !clone(&repo, &root_s)?
+            || !git(root, &["remote", "set-url", "origin", &origin])?
             || !git(
                 root,
                 &[
@@ -3046,7 +3061,7 @@ impl Real {
                     "--detach",
                     r,
                 ],
-            )
+            )?
         {
             return Err(format!(
                 "git could not clone this checkout at {} into {root_s}",
@@ -3057,7 +3072,8 @@ impl Real {
             crate::gates::gitlinks(&self.git_out(&["ls-tree", "-r", r]).unwrap_or_default())
         {
             let sub = self.repo.join(&path);
-            let own = command(aterm_uds::os_path!("git"))
+            let own = crate::ledger::git_command()
+                .map_err(|why| why.to_string())?
                 .arg("-C")
                 .arg(&sub)
                 .args(["rev-parse", "--show-toplevel"])
@@ -3065,7 +3081,7 @@ impl Real {
                 .ok()
                 .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
             let is_own = own.and_then(|p| p.canonicalize().ok()) == sub.canonicalize().ok();
-            if !is_own || !git(&sub, &["cat-file", "-e", &format!("{rev}^{{commit}}")]) {
+            if !is_own || !git(&sub, &["cat-file", "-e", &format!("{rev}^{{commit}}")])? {
                 return Err(format!(
                     "the submodule {path} is not initialized at its gitlink {} in this checkout, \
                      and the stage writes it from there (git submodule update --init {path})",
@@ -3075,7 +3091,8 @@ impl Real {
             let dest = root.join(&path);
             let _ = std::fs::remove_dir_all(&dest);
             let (sub_s, dest_s) = (sub.display().to_string(), dest.display().to_string());
-            if !clone(&sub_s, &dest_s) || !git(&dest, &["checkout", "--quiet", "--detach", &rev]) {
+            if !clone(&sub_s, &dest_s)? || !git(&dest, &["checkout", "--quiet", "--detach", &rev])?
+            {
                 return Err(format!(
                     "git could not clone the submodule {path} at {} into the scratch clone",
                     short(&rev)
@@ -6533,7 +6550,11 @@ impl Backend for Real {
         // A dry run does not move the person's checkout to the fetched candidate.
         // Only that case needs a private worktree; a real cut already runs at R.
         let temporary = if self.off_tree(tip).is_some() {
-            let dir = aterm_tempfile::tempdir().map_err(|e| unavailable(e.to_string()))?;
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("aterm-release-input-")
+                .suffix(".noindex")
+                .tempdir()
+                .map_err(|e| unavailable(e.to_string()))?;
             let root = dir.path().join("input");
             self.git()
                 .git(&[
@@ -6567,13 +6588,125 @@ impl Backend for Real {
         ]);
         let result = (|| match initialized {
             Ok(out) if out.success() => {
+                let input = aterm_verify::release_input::discover(
+                    root,
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                    base,
+                    tip,
+                )
+                .map_err(unavailable)?;
+                if let Some(note) = input.no_work_note() {
+                    return Ok(note);
+                }
                 let mut child = self.child(prover.bin.join("targo"), Some(prover));
                 if let Some(layout) = verify_layout(root).1 {
                     child.args(["--config", &layout]);
                 }
                 child
                     .args(["--unverified", "verify", "release-input", "--base", base])
+                    .env("PUBLICATION_ENGINE", &self.engine)
                     .current_dir(root);
+                crate::input_record::detach_launcher(&mut child);
+                let seal = (self.build_inputs)().map_err(unavailable)?;
+                let scanner = atpkg::prerequisite::configured(
+                    &[atpkg::prerequisite::Prerequisite::Gitleaks],
+                    "release input records",
+                )
+                .map_err(unavailable)?;
+                let scanner = scanner
+                    .tool(atpkg::prerequisite::Prerequisite::Gitleaks)
+                    .ok_or_else(|| unavailable("no signed scanner was acquired".into()))?;
+                scanner.validate().map_err(unavailable)?;
+                let input_tools = format!("{seal}\ngitleaks {}", scanner.tree_root());
+                // The handoff filename is a capability for reading this already-bound seal.
+                // It differs between a dry run and a real run, without changing any input.
+                let mut identity_child = self.child(prover.bin.join("targo"), Some(prover));
+                if let Some(layout) = verify_layout(root).1 {
+                    identity_child.args(["--config", &layout]);
+                }
+                identity_child
+                    .args(["--unverified", "verify", "release-input", "--base", base])
+                    .env("PUBLICATION_ENGINE", &self.engine)
+                    .current_dir(root);
+                crate::input_record::detach_launcher(&mut identity_child);
+                self.finalize_spawn_environment(&mut identity_child)
+                    .map_err(unavailable)?;
+                identity_child.env_remove(crate::build_inputs::SEAL_ENV);
+                let git = crate::ledger::GitCli::new(root);
+                let identity = || {
+                    crate::input_record::identity(
+                        &git,
+                        root,
+                        &self.engine,
+                        tip,
+                        base,
+                        &input_tools,
+                        &identity_child,
+                    )
+                };
+                let (tree, input_seal) = identity().map_err(unavailable)?;
+                let records = self
+                    .release
+                    .join(crate::check_record::DIR)
+                    .join("release-input");
+                let description = crate::input_record::describe(&identity_child, &input_tools)
+                    .map_err(unavailable)?;
+                crate::durable::write_atomic_durable(
+                    &records
+                        .join(&tree)
+                        .join(crate::check_record::seal_dir(&input_seal))
+                        .join("inputs.json"),
+                    description.as_bytes(),
+                    0o600,
+                )
+                .map_err(|e| unavailable(e.to_string()))?;
+                let _input_claim = crate::input_record::claim(
+                    &records
+                        .join(&tree)
+                        .join(crate::check_record::seal_dir(&input_seal)),
+                )
+                .map_err(unavailable)?;
+                let missing = crate::check_record::input_missing(&records, &tree, &input_seal)
+                    .map_err(|why| match why {
+                        crate::check_record::InputError::Failed(why) => {
+                            Refusal::new(why, remedy.clone())
+                        }
+                        crate::check_record::InputError::Unavailable(why) => unavailable(why),
+                    })?;
+                if missing.is_empty() {
+                    return Ok(format!(
+                        "release input: reused 4 checks for tree {tree}; 0 checks run"
+                    ));
+                }
+                let run_id = self
+                    .logs
+                    .file_name()
+                    .ok_or_else(|| unavailable("no run name".into()))?
+                    .to_string_lossy();
+                let evidence = records
+                    .join(&tree)
+                    .join(crate::check_record::seal_dir(&input_seal));
+                let events = evidence.join(format!("{run_id}.events.jsonl"));
+                let retained_log = evidence.join(format!("{run_id}.log"));
+                crate::durable::write_atomic_durable(&events, b"", 0o600)
+                    .map_err(|e| unavailable(e.to_string()))?;
+                child
+                    .arg("--checks")
+                    .arg(missing.join(","))
+                    .arg("--events")
+                    .arg(&events);
+                let log_path = self.step_log(Step::Checks);
+                let facts = crate::check_record::RunFacts {
+                    commit: tip,
+                    tree: &tree,
+                    seal: &input_seal,
+                    executable: None,
+                    log: &retained_log,
+                    run: &run_id,
+                    asked: &missing,
+                    content: None,
+                };
+                crate::check_record::begin_run(&records, &facts).map_err(unavailable)?;
                 let (out, record) = self
                     .output_accounted(Step::Checks, &mut child)
                     .map_err(|e| unavailable(e.to_string()))?;
@@ -6584,6 +6717,39 @@ impl Backend for Real {
                 log.write_all(&out.stderr)
                     .map_err(|e| unavailable(e.to_string()))?;
                 writeln!(log, "{record}").map_err(|e| unavailable(e.to_string()))?;
+                crate::durable::sync_all(&log).map_err(|e| unavailable(e.to_string()))?;
+                std::fs::copy(&log_path, &retained_log).map_err(|e| unavailable(e.to_string()))?;
+                let same_scanner = atpkg::prerequisite::configured(
+                    &[atpkg::prerequisite::Prerequisite::Gitleaks],
+                    "release input records",
+                )
+                .is_ok_and(|held| {
+                    held.tool(atpkg::prerequisite::Prerequisite::Gitleaks)
+                        .is_some_and(|now| {
+                            now.tree_root() == scanner.tree_root() && now.validate().is_ok()
+                        })
+                });
+                if !(self.build_inputs)().is_ok_and(|now| now == seal)
+                    || !identity().is_ok_and(|now| now == (tree.clone(), input_seal.clone()))
+                    || !same_scanner
+                {
+                    crate::check_record::abandon_run(&records, &facts).map_err(unavailable)?;
+                    return Err(unavailable(
+                        "inputs changed during release-input; no verdict retained".into(),
+                    ));
+                }
+                let read = crate::check_record::events(&events).map_err(|e| e.to_string());
+                crate::check_record::write_run(
+                    &records,
+                    &facts,
+                    crate::check_record::RunEnd {
+                        exit: out.status.code().unwrap_or(-1),
+                        log_sha256: &crate::artifact::file_sha256(&retained_log)
+                            .map_err(unavailable)?,
+                        events: read.as_ref().map_err(String::as_str),
+                    },
+                )
+                .map_err(unavailable)?;
                 let text = format!(
                     "{}\n{}",
                     String::from_utf8_lossy(&out.stdout),
@@ -7148,7 +7314,7 @@ impl Backend for Real {
                         names.join(", ")
                     )
                 };
-                let mut commit = command(aterm_uds::os_path!("git"));
+                let mut commit = local_git()?;
                 commit
                     .args(["commit", "-q", "-m", &msg, "--", "Cargo.toml", "Cargo.lock"])
                     .args(&followed)
@@ -7268,7 +7434,7 @@ impl Backend for Real {
         let prefix = crate::line::recorded_prefix(&self.git(), line)?;
         // verify_pending proved every discarded hop is reproducible from its landed fix,
         // author/committer metadata and predecessor. A dirty or unrelated head never gets here.
-        let mut cmd = command(aterm_uds::os_path!("git"));
+        let mut cmd = local_git()?;
         cmd.current_dir(&self.repo)
             .args(["reset", "-q", "--keep", prefix.head()]);
         let ran = self.logged(Step::Commit, &mut cmd);
@@ -8911,6 +9077,33 @@ impl CheckOptions {
         } else {
             (true, true, true)
         }
+    }
+}
+
+/// The release-input instrument, without entering any publishing step.
+pub fn input_check(repo: &Path, base: &str) -> Result<(), String> {
+    let mut real = Real::new(repo, None, true, true)?;
+    if !real.dirty()?.is_empty() {
+        return Err("input-check requires a clean committed checkout".into());
+    }
+    let tip = real.head();
+    let prover = real.prover(None)?;
+    let start = std::time::Instant::now();
+    let result = real.input_checks(base, &tip, &prover);
+    println!(
+        "release input wall: {:.3}s; records {}",
+        start.elapsed().as_secs_f64(),
+        real.release
+            .join(crate::check_record::DIR)
+            .join("release-input")
+            .display()
+    );
+    match result {
+        Ok(note) => {
+            println!("{note}");
+            Ok(())
+        }
+        Err(refusal) => Err(refusal.why),
     }
 }
 
@@ -11487,6 +11680,7 @@ mod tests {
 
         let alias = format!("alias.fd-proof=!{probe}");
         let out = crate::ledger::object_git(&repo)
+            .unwrap()
             .args(["-c", &alias, "fd-proof"])
             .output()
             .unwrap();

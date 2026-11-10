@@ -15,6 +15,9 @@ pub const MAC_ONLY_REFUSAL: &str = "this cut says nothing about Linux: pass --li
 pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release cutter
 
 USAGE
+  targo --unverified ship input-check --base COMMIT
+      Judge unreceipted source inputs with the release's per-check records.
+      No release, credentials, build of the product or publication.
   targo --unverified ship qualify-pilot --verify PATH --mode alone|shared|chain|tree|series
       Cold concurrent release slices, optionally beside test compilation and lint,
       with one Release jobserver and one-second descendant CPU/QoS/core samples.
@@ -27,7 +30,7 @@ USAGE
       Builds only: no product execution or publication. Retains all evidence.
   targo --unverified ship profile-pilot --arm ARM [--arm ARM]... [--takes 2]
       Build cut-shaped profile arms in fresh roots, without executing the product.
-      ARM: fat1, fat1-lines, fat16, fat16-lines, thin16-lines.
+      ARM: fat1, fat1-lines, fat16, fat16-lines, thin16, thin16-lines.
       Two takes run in forward/reverse order (ABBA for two arms).
       Each take retains Cargo's unit timeline in cargo-timings/ and one-second
       process-group observations in build-resources.jsonl (sampled, not accounting).
@@ -512,6 +515,7 @@ pub enum Cmd {
     },
     /// `check`: would a release of one commit pass ([`crate::release_steps::check`]).
     Check(crate::release_steps::CheckOptions),
+    InputCheck(String),
     Recover {
         version: String,
         owner: String,
@@ -858,6 +862,19 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                 return Err("--source requires --cut".into());
             }
             Ok(Cmd::Check(opts))
+        }
+        "input-check" => {
+            if it.next() != Some("--base") {
+                return Err("input-check requires --base COMMIT".into());
+            }
+            let base = it
+                .next()
+                .ok_or("input-check requires --base COMMIT")?
+                .to_owned();
+            if it.next().is_some() {
+                return Err("input-check takes only --base COMMIT".into());
+            }
+            Ok(Cmd::InputCheck(base))
         }
         "recover" => {
             let version = normalize_version(
@@ -1410,6 +1427,9 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             0 => Ok(()),
             code => Err(Error::new(format!("check exited {code}"))),
         },
+        Cmd::InputCheck(base) => {
+            crate::release_steps::input_check(&repo_root()?, &base).map_err(Error::new)
+        }
         Cmd::Recover {
             version,
             owner,
@@ -1469,7 +1489,7 @@ fn own_code(cmd: &Cmd) -> Option<i32> {
 }
 
 fn repo_root() -> ledger::Result<std::path::PathBuf> {
-    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+    let out = ledger::git_command()?
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|e| Error::new(format!("failed to run git rev-parse --show-toplevel: {e}")))?;
@@ -1485,6 +1505,20 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_check_requires_only_a_base_and_cannot_request_publication() {
+        let args = |parts: &[&str]| parts.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(matches!(parse(&args(&["input-check", "--base", "abc"])),
+            Ok(Cmd::InputCheck(base)) if base == "abc"));
+        for parts in [
+            vec!["input-check"],
+            vec!["input-check", "--base"],
+            vec!["input-check", "--base", "abc", "--publish"],
+        ] {
+            assert!(parse(&args(&parts)).is_err());
+        }
+    }
+
     #[test]
     fn qualify_replay_requires_historical_windows_and_independent_pilot_takes() {
         let args = |parts: &[&str]| parts.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();

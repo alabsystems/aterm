@@ -2313,10 +2313,18 @@ fn a_pid_pin_whose_process_has_ended_unreaped_is_gone_at_once() {
     let Served::Child(child) = &mut old.process else {
         unreachable!("spawned as this process's child")
     };
-    child.0.kill().expect("SIGKILL the pinned instance");
     stream
         .set_read_timeout(Some(Duration::from_secs(60)))
         .expect("read timeout");
+    child.0.kill().expect("SIGKILL the pinned instance");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !aterm_uds::hangup::peer_closed(&stream) {
+        assert!(
+            Instant::now() < deadline,
+            "the killed instance never closed"
+        );
+        aterm_uds::deadline::poll_yield();
+    }
     let mut rest = Vec::new();
     reader.read_to_end(&mut rest).expect("the stream ends");
     assert!(

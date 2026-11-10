@@ -84,6 +84,9 @@ pub struct UnitRead {
     /// ([`crate::compile_width`]); the wrapper's marker cannot say so, as Cargo and every build
     /// script it starts carry it too.
     pub wrapper: bool,
+    /// Whether the explicit `--emit` selection asks for backend code generation.
+    /// Missing, unknown or unexpanded arguments are unread, never metadata-only.
+    pub codegen_requested: Option<bool>,
 }
 
 /// One read of a live process's command line ([`UnitReader`]).
@@ -120,14 +123,17 @@ pub fn read_unit(pid: u32) -> Named {
 #[must_use]
 pub fn named(args: &aterm_sysprobe::procargs::ProcArgs2<'_>, own: Option<&Path>) -> Named {
     let env = args.env().map(|e| String::from_utf8_lossy(e).into_owned());
-    let argv = args
+    let argv: Vec<String> = args
         .argv
         .iter()
-        .map(|a| String::from_utf8_lossy(a).into_owned());
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    let codegen_requested = compiler_codegen_requested(&argv);
     match unit_of(argv, env) {
         Some(unit) => Named::Unit(UnitRead {
             unit,
             wrapper: own.is_some_and(|own| own.as_os_str().as_encoded_bytes() == args.exec_path),
+            codegen_requested,
         }),
         None => Named::Nothing,
     }
@@ -159,6 +165,39 @@ pub fn unit_of(
         package,
         kind: format!("{crate_name} {kind}"),
     })
+}
+
+/// Whether an explicit rustc output selection requests backend code generation.
+/// Response files and missing or unknown selections cannot establish metadata-only work.
+#[must_use]
+pub(crate) fn compiler_codegen_requested(argv: &[String]) -> Option<bool> {
+    let mut args = argv.iter();
+    let mut seen = false;
+    let mut codegen = false;
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg.starts_with('@') {
+            return None;
+        }
+        let outputs = if arg == "--emit" {
+            args.next()?.as_str()
+        } else if let Some(outputs) = arg.strip_prefix("--emit=") {
+            outputs
+        } else {
+            continue;
+        };
+        seen = true;
+        for output in outputs.split(',') {
+            match output.split('=').next()? {
+                "dep-info" | "metadata" | "mir" => {}
+                "asm" | "llvm-bc" | "llvm-ir" | "obj" | "link" => codegen = true,
+                _ => return None,
+            }
+        }
+    }
+    seen.then_some(codegen)
 }
 
 /// What [`Book::keep`] did with a peak.
@@ -293,6 +332,9 @@ struct Units {
 pub struct UnitSpan {
     /// The unit.
     pub unit: crate::unitgraph::UnitName,
+    /// The compiler's explicit output selection, as read by [`named`]. This describes
+    /// requested work, not the fraction of its CPU spent in the backend.
+    pub codegen_requested: Option<bool>,
     /// When its admission wrapper was first read, ms since the Unix epoch.
     pub queued_at_unix_ms: Option<u64>,
     /// When its compiler was first read, ms since the Unix epoch.
@@ -435,6 +477,7 @@ impl Meter {
                 });
                 UnitSpan {
                     unit: unit.clone(),
+                    codegen_requested: seen.read.as_ref().and_then(|read| read.codegen_requested),
                     queued_at_unix_ms: queued.map(unix_ms),
                     started_at_unix_ms: unix_ms(seen.first),
                     ended_at_unix_ms: unix_ms(seen.last),

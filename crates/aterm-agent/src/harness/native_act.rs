@@ -955,6 +955,84 @@ pub struct Prepare {
     pub asked: Option<AskedIntent>,
     /// The complete planned mutation.
     pub plan: NativePlan,
+    /// The machine and boot of the host this prepare is for, as `boot=`. A host admits a
+    /// stamped prepare only when the stamp is its own current machine and boot.
+    pub boot: Option<BootStamp>,
+    /// The issuer journal's custody this prepare is for, as `custody=<64 lowercase hex>`: the
+    /// SHA-256 of the established custody anchor (`native_receipts::custody`). A host admits a
+    /// stamped prepare only when the stamp is its own current custody.
+    pub custody: Option<String>,
+}
+
+/// The machine and boot a prepare names, `boot=<host_id>:<boot_id>`: the host id of
+/// [`aterm_uds::process::host_id`] (`<os>:<32 lowercase hex>`) and the boot id of
+/// [`aterm_uds::process::boot_id`] (32 lowercase hex). It is data the host checks against its
+/// own; it grants nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootStamp {
+    /// This machine's stable identity, independent of a boot.
+    pub host: String,
+    /// The boot this machine is in.
+    pub boot: String,
+}
+
+impl BootStamp {
+    /// This process's machine and boot, or `None` when either does not read canonically.
+    #[must_use]
+    pub fn current() -> Option<Self> {
+        let stamp = Self {
+            host: aterm_uds::process::host_id()?,
+            boot: aterm_uds::process::boot_id()?,
+        };
+        stamp.canonical().then_some(stamp)
+    }
+
+    fn canonical(&self) -> bool {
+        self.host.split_once(':').is_some_and(|(os, id)| {
+            !os.is_empty()
+                && os.bytes().all(|b| b.is_ascii_lowercase())
+                && aterm_codec::hex::is_lower(id, 32)
+        }) && aterm_codec::hex::is_lower(&self.boot, 32)
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        let (host, boot) = word.rsplit_once(':')?;
+        let stamp = Self {
+            host: host.to_string(),
+            boot: boot.to_string(),
+        };
+        stamp.canonical().then_some(stamp)
+    }
+
+    fn word(&self) -> String {
+        format!("{}:{}", self.host, self.boot)
+    }
+}
+
+/// What the issuer journal holds for one exact restart prepare, read without a lock and
+/// without a capability (`native_receipts::observe_closure`). It grants nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Closure {
+    /// No record names the prepare's operation id. This carries the custody digest of the
+    /// journal that was read (the `custody=` spelling), or `None` when none is established.
+    Absent(Option<String>),
+    /// The record of this exact prepare (its digest, or its legacy cold digest).
+    Exact(Recorded),
+    /// A record names the id under another prepare, an account relation or a fence.
+    Other,
+}
+
+/// The issuer state of an exact prepare's record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recorded {
+    /// Admitted, with no possible execution recorded.
+    Prepared,
+    /// Possible execution recorded, not yet closed.
+    MayExecute,
+    /// Positively closed with no execution grant.
+    NoExec,
+    /// Closed without a decision; `may_execute` is whether possible execution was recorded.
+    Sealed { may_execute: bool },
 }
 
 impl Prepare {
@@ -1335,6 +1413,17 @@ impl Request {
                     }
                     Some(_) => return None,
                 };
+                let boot = match words.remove("boot") {
+                    None => None,
+                    Some(word) => Some(BootStamp::parse(word)?),
+                };
+                let custody = match words.remove("custody") {
+                    None => None,
+                    Some(digest) if aterm_codec::hex::is_lower(digest, 64) => {
+                        Some(digest.to_string())
+                    }
+                    Some(_) => return None,
+                };
                 if holder.is_empty() {
                     return None;
                 }
@@ -1358,6 +1447,8 @@ impl Request {
                     duty,
                     asked,
                     plan,
+                    boot,
+                    custody,
                 };
                 if verb == "cancel-prepare" {
                     if !matches!(prepare.plan, NativePlan::OwnImage { .. }) {
@@ -1417,11 +1508,14 @@ impl Request {
     }
 
     /// The exact older spelling of a supported in-flight cold preparation.
-    /// New token routes and settled images had no representation in that protocol.
+    /// New token routes, settled images and stamps had no representation in that protocol.
     pub(super) fn encode_legacy_cold(&self) -> Option<String> {
         let Self::Prepare(prepare) = self else {
             return None;
         };
+        if prepare.boot.is_some() || prepare.custody.is_some() {
+            return None;
+        }
         let NativePlan::Restart {
             cold: Some(_),
             forward,
@@ -1564,6 +1658,14 @@ impl Request {
                             .ok()?;
                         }
                     }
+                }
+                // Stamps are written only when present, so an unstamped prepare keeps the
+                // exact spelling (and issuer digest) it had before stamps existed.
+                if let Some(boot) = &p.boot {
+                    write!(out, " boot={}", boot.word()).ok()?;
+                }
+                if let Some(custody) = &p.custody {
+                    write!(out, " custody={custody}").ok()?;
                 }
                 if let Self::CancelPrepare(cancel) = self {
                     encode_process(&mut out, "actor", &cancel.actor);
@@ -1736,12 +1838,23 @@ pub enum Reply {
     /// constructor that saved this exact prepare without a binding
     /// may drop it; it records nothing completed.
     Unadmitted(String),
+    /// No execution grant was or can be issued under this restart prepare: the host read its
+    /// issuer record (or, for a stamped prepare, its absence from the stamped custody) after
+    /// its clock passed the deadline, or across a reboot, or read a seal that never recorded
+    /// possible execution. It claims nothing about the old operation's other resources.
+    Lapsed(String),
 }
 
 /// The host's [`Reply::Unadmitted`] line for operation `id`, or `None` for a malformed id.
 #[must_use]
 pub fn unadmitted_reply(id: &str) -> Option<String> {
     aterm_codec::hex::is_lower(id, 32).then(|| format!("OK native-act state=unadmitted id={id}\n"))
+}
+
+/// The host's [`Reply::Lapsed`] line for operation `id`, or `None` for a malformed id.
+#[must_use]
+pub fn lapsed_reply(id: &str) -> Option<String> {
+    aterm_codec::hex::is_lower(id, 32).then(|| format!("OK native-act state=lapsed id={id}\n"))
 }
 
 impl Reply {
@@ -1953,12 +2066,16 @@ impl Reply {
                 },
             )),
             "unwritten" => Self::Unwritten,
-            "unadmitted" => {
+            "unadmitted" | "lapsed" => {
                 let id = words.next()?.strip_prefix("id=")?;
                 if !aterm_codec::hex::is_lower(id, 32) {
                     return None;
                 }
-                Self::Unadmitted(id.to_string())
+                if state == "lapsed" {
+                    Self::Lapsed(id.to_string())
+                } else {
+                    Self::Unadmitted(id.to_string())
+                }
             }
             "unissued" => Self::Unissued(match words.next()?.strip_prefix("phase=")? {
                 "forward" => ImagePhase::Forward,
@@ -2144,29 +2261,91 @@ mod tests {
                 target: image,
                 version: "0.1.0+g123".into(),
             },
+            boot: None,
+            custody: None,
         })
     }
 
     #[test]
-    fn unadmitted_reply_names_exactly_one_lower_hex_operation_id() {
+    fn unadmitted_and_lapsed_replies_name_exactly_one_lower_hex_operation_id() {
         let id = "ab".repeat(16);
-        let line = unadmitted_reply(&id).expect("a canonical id");
-        assert_eq!(Reply::parse(&line), Some(Reply::Unadmitted(id.clone())));
-        for bad in [
-            "OK native-act state=unadmitted\n".to_string(),
-            "OK native-act state=unadmitted id=\n".to_string(),
-            format!("OK native-act state=unadmitted id={}\n", "AB".repeat(16)),
-            format!("OK native-act state=unadmitted id={}\n", "ab".repeat(15)),
-            format!(
-                "OK native-act state=unadmitted id={id} cap={}\n",
-                "cd".repeat(32)
-            ),
-            format!("OK native-act state=unadmitted {id}\n"),
+        for (state, expected) in [
+            ("unadmitted", Reply::Unadmitted(id.clone())),
+            ("lapsed", Reply::Lapsed(id.clone())),
         ] {
-            assert_eq!(Reply::parse(&bad), None, "{bad}");
+            let reply = |id: &str| {
+                if state == "lapsed" {
+                    lapsed_reply(id)
+                } else {
+                    unadmitted_reply(id)
+                }
+            };
+            let line = reply(&id).expect("a canonical id");
+            assert_eq!(line, format!("OK native-act state={state} id={id}\n"));
+            assert_eq!(Reply::parse(&line), Some(expected));
+            for bad in [
+                format!("OK native-act state={state}\n"),
+                format!("OK native-act state={state} id=\n"),
+                format!("OK native-act state={state} id={}\n", "AB".repeat(16)),
+                format!("OK native-act state={state} id={}\n", "ab".repeat(15)),
+                format!(
+                    "OK native-act state={state} id={id} cap={}\n",
+                    "cd".repeat(32)
+                ),
+                format!("OK native-act state={state} {id}\n"),
+            ] {
+                assert_eq!(Reply::parse(&bad), None, "{bad}");
+            }
+            assert_eq!(reply(&"AB".repeat(16)), None);
+            assert_eq!(reply("ab"), None);
         }
-        assert_eq!(unadmitted_reply(&"AB".repeat(16)), None);
-        assert_eq!(unadmitted_reply("ab"), None);
+    }
+
+    #[test]
+    fn stamps_are_optional_canonical_words_that_change_only_a_stamped_spelling() {
+        let Request::Prepare(unstamped) = fixture() else {
+            unreachable!()
+        };
+        let legacy = Request::Prepare(unstamped.clone()).encode().unwrap();
+        assert!(!legacy.contains(" boot=") && !legacy.contains(" custody="));
+        let boot = BootStamp {
+            host: format!("darwin:{}", "1f".repeat(16)),
+            boot: "2e".repeat(16),
+        };
+        let custody = "3d".repeat(32);
+        let mut stamped = (*unstamped).clone();
+        stamped.boot = Some(boot.clone());
+        stamped.custody = Some(custody.clone());
+        let wire = Request::prepare(stamped.clone()).encode().unwrap();
+        assert_eq!(
+            wire,
+            format!(
+                "{legacy} boot={}:{} custody={custody}",
+                boot.host, boot.boot
+            )
+        );
+        assert_eq!(
+            Request::parse(&wire),
+            Some(Request::prepare(stamped.clone()))
+        );
+        let mut boot_only = stamped.clone();
+        boot_only.custody = None;
+        assert_eq!(
+            Request::parse(&wire.replace(&format!(" custody={custody}"), "")),
+            Some(Request::prepare(boot_only))
+        );
+        for bad in [
+            format!("{legacy} boot={}", boot.host),
+            format!("{legacy} boot={}", boot.boot),
+            format!("{legacy} boot=darwin:{}:{}", "1F".repeat(16), boot.boot),
+            format!("{legacy} boot={}:{}", boot.host, "2e".repeat(15)),
+            format!("{legacy} boot=:{}:{}", "1f".repeat(16), boot.boot),
+            format!("{legacy} custody={}", "3d".repeat(31)),
+            format!("{legacy} custody={}", "3D".repeat(32)),
+            format!("{wire} custody={custody}"),
+        ] {
+            assert_eq!(Request::parse(&bad), None, "{bad}");
+        }
     }
 
     #[test]

@@ -39,8 +39,14 @@ mod constructor_capabilities;
 #[path = "native_account_execution_tests.rs"]
 mod account_execution;
 #[cfg(unix)]
+#[path = "native_historical_closure_tests.rs"]
+mod historical_closure;
+#[cfg(unix)]
 #[path = "native_issuer_tests.rs"]
 mod issuer;
+#[cfg(unix)]
+#[path = "native_lapsed_tests.rs"]
+mod lapsed;
 #[cfg(unix)]
 #[path = "native_phase_receipt_tests.rs"]
 mod phase_receipts;
@@ -71,7 +77,7 @@ enum JournalState {
     Prepared,
     MayExecute,
     NoExec,
-    Sealed,
+    Sealed { may_execute: bool },
 }
 
 struct JournalEntry {
@@ -103,6 +109,15 @@ struct Facts {
     historical_pin_probe: Option<(std::sync::Weak<crate::SessionCtx>, Arc<AtomicBool>)>,
     receipt_history: Mutex<Vec<(Prepare, Binding)>>,
     receipt_gate: Option<PublicationGate>,
+    /// The established custody digest the fake journal is read from.
+    custody: Mutex<Option<String>>,
+    /// A reading the next `historical_closure` returns instead of the journal's: a negative
+    /// control's stand-in for a read the host did not make then.
+    closure_view: Mutex<Option<Closure>>,
+    /// Holds the next `historical_closure`, once, after it has read the journal.
+    closure_gate: Mutex<Option<PublicationGate>>,
+    /// This fake host's machine and boot, at first the process's own.
+    boot: Mutex<Option<BootStamp>>,
     #[cfg(unix)]
     fence_allowed: AtomicBool,
     #[cfg(unix)]
@@ -146,6 +161,33 @@ impl Facts {
             );
         }
     }
+    /// The fake journal's lock-free reading of one exact prepare, or the stand-in a negative
+    /// control set in its place.
+    fn closure_reading(&self, prepare: &Prepare) -> Result<Closure, ()> {
+        if !self.receipt_readable.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        if let Some(view) = self.closure_view.lock().unwrap().take() {
+            return Ok(view);
+        }
+        #[cfg(unix)]
+        if let Some(journal) = &self.native_journal {
+            return journal.observe_closure(prepare).map_err(|_| ());
+        }
+        let journal = self.journal.lock().unwrap();
+        Ok(match journal.get(&prepare.id) {
+            None => Closure::Absent(self.custody()),
+            Some(entry) if entry.prepare != *prepare || entry.account_phase.is_some() => {
+                Closure::Other
+            }
+            Some(entry) => Closure::Exact(match entry.state {
+                JournalState::Prepared => Recorded::Prepared,
+                JournalState::MayExecute => Recorded::MayExecute,
+                JournalState::NoExec => Recorded::NoExec,
+                JournalState::Sealed { may_execute } => Recorded::Sealed { may_execute },
+            }),
+        })
+    }
     /// The host double rejects the same illegal transitions as the real issuer
     /// journal. History vectors are observations, not permission to advance.
     fn journal_event(
@@ -183,13 +225,16 @@ impl Facts {
             (Some(JournalState::Prepared), JournalEvent::Prepare)
             | (Some(JournalState::MayExecute), JournalEvent::MayExecute)
             | (Some(JournalState::NoExec), JournalEvent::NoExec(_))
-            | (Some(JournalState::Sealed | JournalState::NoExec), JournalEvent::Seal) => {
+            | (Some(JournalState::Sealed { .. } | JournalState::NoExec), JournalEvent::Seal) => {
                 return Some(false);
             }
             (Some(JournalState::Prepared), JournalEvent::MayExecute) => JournalState::MayExecute,
             (Some(JournalState::Prepared), JournalEvent::NoExec(_)) => JournalState::NoExec,
-            (Some(JournalState::Prepared | JournalState::MayExecute), JournalEvent::Seal) => {
-                JournalState::Sealed
+            (Some(JournalState::Prepared), JournalEvent::Seal) => {
+                JournalState::Sealed { may_execute: false }
+            }
+            (Some(JournalState::MayExecute), JournalEvent::Seal) => {
+                JournalState::Sealed { may_execute: true }
             }
             _ => return None,
         };
@@ -254,6 +299,11 @@ impl Facts {
             historical_pin_probe: None,
             receipt_history: Mutex::new(Vec::new()),
             receipt_gate: None,
+            custody: Mutex::new(Some("c5".repeat(32))),
+            closure_view: Mutex::new(None),
+            closure_gate: Mutex::new(None),
+            // The boot this process runs in, which a harness driven in it stamps.
+            boot: Mutex::new(BootStamp::current()),
             #[cfg(unix)]
             fence_allowed: AtomicBool::new(true),
             #[cfg(unix)]
@@ -449,7 +499,7 @@ impl Kernel for Facts {
             JournalState::Prepared => Some(ChildState::Prepared),
             JournalState::MayExecute => Some(ChildState::MayExecute),
             JournalState::NoExec => child.closed_phase.map(ChildState::NoExec),
-            JournalState::Sealed => Some(ChildState::Sealed { may_execute: true }),
+            JournalState::Sealed { .. } => Some(ChildState::Sealed { may_execute: true }),
         }
     }
     fn record_account_claim(
@@ -502,7 +552,7 @@ impl Kernel for Facts {
                 JournalState::Prepared => Some(ChildState::Prepared),
                 JournalState::MayExecute => Some(ChildState::MayExecute),
                 JournalState::NoExec => old.closed_phase.map(ChildState::NoExec),
-                JournalState::Sealed => Some(ChildState::Sealed { may_execute: true }),
+                JournalState::Sealed { .. } => Some(ChildState::Sealed { may_execute: true }),
             });
             drop(journal);
             return if exact && self.prepare_record_acknowledged() {
@@ -794,6 +844,32 @@ impl Kernel for Facts {
                 _ => false,
             })
     }
+    fn historical_closure(&self, prepare: &Prepare) -> Result<Closure, ()> {
+        let closure = self.closure_reading(prepare);
+        let gate = self.closure_gate.lock().unwrap().take();
+        if let Some((entered, proceed)) = gate {
+            entered.send(()).unwrap();
+            let (lock, ready) = &*proceed;
+            let (guard, waited) = ready
+                .wait_timeout_while(lock.lock().unwrap(), PATIENCE, |go| !*go)
+                .unwrap();
+            assert!(
+                *guard && !waited.timed_out(),
+                "journal read was not released"
+            );
+        }
+        closure
+    }
+    fn custody(&self) -> Option<String> {
+        #[cfg(unix)]
+        if let Some(journal) = &self.native_journal {
+            return journal.custody().ok().flatten();
+        }
+        self.custody.lock().unwrap().clone()
+    }
+    fn boot(&self) -> Option<BootStamp> {
+        self.boot.lock().unwrap().clone()
+    }
     fn account_execution(
         &self,
         _: &RestartCommand,
@@ -1000,7 +1076,29 @@ fn plan(ctx: &crate::SessionCtx, facts: &Facts) -> Prepare {
             target: image(9),
             version: "0.1.0+g123".into(),
         },
+        boot: None,
+        custody: None,
     }
+}
+
+/// Turn a restart plan into the cold restart a crash or relaunch lane prepares: a captured
+/// account intent and no rollback ([`Constructor::ColdRestart`]).
+fn cold_restart(request: &mut Prepare) {
+    let NativePlan::Restart { cold, rollback, .. } = &mut request.plan else {
+        panic!("a restart plan");
+    };
+    *cold = Some(Box::new(ColdIntent {
+        login: None,
+        home: None,
+        auth_observed: false,
+        route: aterm_agent::harness::accounts::AuthRoute::Stored,
+        conversation: Some("captured-conversation".into()),
+        profile: None,
+        mode: aterm_agent::harness::accounts::Mode::Wall,
+        billing: aterm_agent::harness::native_act::ColdBilling::Keep,
+    }));
+    *rollback = None;
+    assert_eq!(request.constructor(), Constructor::ColdRestart);
 }
 
 fn run(

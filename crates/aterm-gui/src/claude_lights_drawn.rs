@@ -216,25 +216,25 @@ impl App {
     pub(crate) fn drawn_chip_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for (&wid, ws) in &self.windows {
-            let plan = ws
-                .tab_set
-                .active_id()
-                .and_then(|tab| self.visible_leaf_plan_for_tab(wid, tab));
+            let active_id = ws.tab_set.active_id();
+            let single_pane_active = self.active_tab_is_single_focused_pane(wid);
+            let mut plan = None;
             for tab in ws.tab_set.tabs() {
-                for view in tab.root.leaves() {
+                let is_active_tab = Some(tab.id) == active_id;
+                tab.root.visit(&mut |&view| {
                     let Some(session) = self
                         .view_store
                         .get(view)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
                     else {
-                        continue;
+                        return;
                     };
                     let Some(program) = self.session_agent(session) else {
-                        continue;
+                        return;
                     };
                     let Some(entry) = self.pool.get(session) else {
-                        continue;
+                        return;
                     };
                     let sid = entry.ctx.self_id.as_str();
                     let published = entry
@@ -259,23 +259,43 @@ impl App {
                             &Drawn::NoFooter,
                             None,
                         ));
-                        continue;
+                        return;
                     }
                     let (_, view_now, _) = self.session_autopilot(session);
                     let glass = self.chip_glass(session);
                     let face = ChipFace::of(view_now, &glass);
-                    let drawn = plan
-                        .as_ref()
-                        .and_then(|plan| {
-                            plan.leaves.iter().enumerate().find(|(_, l)| l.view == view)
-                        })
-                        .map_or(Drawn::NoRule, |(pane, leaf)| {
-                            let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
-                            let cols = leaf.rect.size.width.round().max(1.0) as usize;
-                            ws.claude_lights.drawn_chip(session, pane, |row| {
-                                self.chrome_owns_terminal_span(wid, row, col_off..col_off + cols)
+                    let drawn = if !is_active_tab {
+                        Drawn::NoRule
+                    } else if single_pane_active {
+                        if view == tab.focus {
+                            let cols = usize::from(ws.cols.max(1));
+                            ws.claude_lights.drawn_chip(session, 0, |row| {
+                                self.chrome_owns_terminal_span(wid, row, 0..cols)
                             })
-                        });
+                        } else {
+                            Drawn::NoRule
+                        }
+                    } else {
+                        if plan.is_none() {
+                            plan = active_id
+                                .and_then(|active| self.visible_leaf_plan_for_tab(wid, active));
+                        }
+                        plan.as_ref()
+                            .and_then(|plan| {
+                                plan.leaves.iter().enumerate().find(|(_, l)| l.view == view)
+                            })
+                            .map_or(Drawn::NoRule, |(pane, leaf)| {
+                                let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
+                                let cols = leaf.rect.size.width.round().max(1.0) as usize;
+                                ws.claude_lights.drawn_chip(session, pane, |row| {
+                                    self.chrome_owns_terminal_span(
+                                        wid,
+                                        row,
+                                        col_off..col_off + cols,
+                                    )
+                                })
+                            })
+                    };
                     let spoken = matches!(drawn, Drawn::Cells(_)).then(|| {
                         let built = ws
                             .claude_lights
@@ -309,7 +329,7 @@ impl App {
                             title: title.as_deref(),
                         }),
                     ));
-                }
+                });
             }
         }
         lines

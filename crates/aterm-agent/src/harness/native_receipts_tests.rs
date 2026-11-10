@@ -19,6 +19,9 @@ mod accounts;
 #[path = "native_receipts_legacy_cold_tests.rs"]
 mod legacy_cold;
 
+#[path = "native_receipts_closure_tests.rs"]
+mod closure;
+
 #[path = "native_receipts_rejection_tests.rs"]
 mod rejection;
 
@@ -69,6 +72,8 @@ fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
             }),
             rollback: None,
         },
+        boot: None,
+        custody: None,
     };
     let binding = Binding {
         id: prepare.id.clone(),
@@ -220,6 +225,7 @@ fn lost_or_changed_established_custody_is_never_fresh_authority() {
         }
         assert!(observe_at(&paths, &binding).is_err(), "{damage}");
         assert!(observe_prepare_at(&paths, &prepare).is_err(), "{damage}");
+        assert!(observe_closure_at(&paths, &prepare).is_err(), "{damage}");
     }
 }
 

@@ -42,6 +42,7 @@ enum WakeRule {
 struct Publication<'a> {
     target: Option<SyncTarget<'a>>,
     wake: WakeRule,
+    retire_legacy: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -49,6 +50,41 @@ struct Publication<'a> {
 struct Image {
     before: Option<String>,
     after: Option<String>,
+}
+
+/// A receipt image's fixed meaning, independent of which optional roles are present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageRole {
+    State,
+    Logins,
+    Ledger,
+    Roster,
+    Fleet,
+    SourcePolicy,
+}
+
+impl ImageRole {
+    const fn limit(self) -> u64 {
+        match self {
+            Self::State => MAX_STATE_BYTES,
+            Self::Logins => MAX_LOGINS_BYTES,
+            Self::Ledger => MAX_LEDGER,
+            Self::Roster => MAX_ROSTER_BYTES,
+            Self::Fleet => MAX_FLEET,
+            Self::SourcePolicy => super::source_policy::MAX_BYTES,
+        }
+    }
+
+    const fn replay_step(self) -> usize {
+        match self {
+            Self::State => 1,
+            Self::Logins => 2,
+            Self::Ledger => 3,
+            Self::Roster => 4,
+            Self::Fleet => 5,
+            Self::SourcePolicy => 6,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -61,6 +97,7 @@ struct FleetImage {
 
 enum StateTarget<'a> {
     Fleet(&'a Path, &'a str),
+    RetiringFleet(&'a Path, &'a str),
     Roster(SyncTarget<'a>),
 }
 
@@ -112,6 +149,8 @@ struct Plan {
     // Omission preserves the canonical encoding and digest of admitted older receipts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fleet: Option<FleetImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_policy: Option<Image>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -152,7 +191,7 @@ fn encode_stored_receipt(receipt: &Receipt) -> Result<String, String> {
     Ok(text)
 }
 
-fn read(path: &Path, max: u64) -> Result<Option<String>, String> {
+pub(super) fn read(path: &Path, max: u64) -> Result<Option<String>, String> {
     use std::io::Read as _;
     let file = match astream_sys::open_nonblocking(path, astream_sys::Links::Refuse) {
         Ok(file) => file,
@@ -250,8 +289,11 @@ fn publication_parent(path: &Path) -> &Path {
 }
 
 impl Plan {
-    fn paths(&self, store: &Store, scope: Scope<'_>) -> Result<Vec<(usize, PathBuf)>, String> {
-        let mut paths = vec![(0, store.state_file()), (2, store.ledger_path())];
+    fn paths(&self, store: &Store, scope: Scope<'_>) -> Result<Vec<(ImageRole, PathBuf)>, String> {
+        let mut paths = vec![
+            (ImageRole::State, store.state_file()),
+            (ImageRole::Ledger, store.ledger_path()),
+        ];
         if let Some(admitted) = &self.roster_path {
             if self.local_logins {
                 return Err("local login receipt cannot name an external roster".into());
@@ -267,8 +309,8 @@ impl Plan {
             if roster.to_str() != Some(admitted.as_str()) {
                 return Err("account sync recovery target differs from the admitted roster".into());
             }
-            paths.insert(1, (1, store.logins_file()));
-            paths.push((3, roster));
+            paths.insert(1, (ImageRole::Logins, store.logins_file()));
+            paths.push((ImageRole::Roster, roster));
         } else {
             if self.roster_mode.is_some()
                 || self.roster.before.is_some()
@@ -277,7 +319,7 @@ impl Plan {
                 return Err("local account receipt contains external roster images".into());
             }
             if self.local_logins {
-                paths.insert(1, (1, store.logins_file()));
+                paths.insert(1, (ImageRole::Logins, store.logins_file()));
             } else if self.logins.before.is_some() || self.logins.after.is_some() {
                 return Err("state-only account receipt contains login images".into());
             }
@@ -289,12 +331,38 @@ impl Plan {
             if target.to_str() != Some(fleet.path.as_str()) {
                 return Err("account sync recovery target differs from the admitted fleet".into());
             }
-            paths.push((4, target.to_path_buf()));
+            paths.push((ImageRole::Fleet, target.to_path_buf()));
+        }
+        let include_policy = self.source_policy.is_some();
+        #[cfg(test)]
+        let include_policy = include_policy && RETIREMENT_MUTANT.get() != 1;
+        if include_policy {
+            paths.push((ImageRole::SourcePolicy, store.source_policy_file()));
         }
         Ok(paths)
     }
 
     fn validate(&self, store: &Store, scope: Scope<'_>) -> Result<(), String> {
+        if let Some(roster) = scope.roster {
+            validate_external_target(store, roster)?;
+        }
+        if let Some(image) = &self.source_policy {
+            image.check(super::source_policy::MAX_BYTES)?;
+            for text in image.before.iter().chain(image.after.iter()) {
+                super::source_policy::validate(text)?;
+            }
+            if image.after.is_none() {
+                return Err("account source retirement cannot be removed".into());
+            }
+            // During first-retirement replay the witness can precede the policy image.
+            // Existing retirement still requires its witness; neither may be linked.
+            let witness = read(&store.source_policy_witness(), 0)?;
+            if image.before.is_some() && witness.is_none() {
+                return Err("account source retirement witness is missing".into());
+            }
+        } else {
+            store.source_policy_unfenced()?;
+        }
         if self.roster_mode.is_some_and(|mode| mode & !0o777 != 0) {
             return Err("account sync receipt has invalid roster permissions".into());
         }
@@ -317,7 +385,7 @@ impl Plan {
                     &fleet.path,
                 )?;
             }
-            validate_fleet_target(store, scope.fleet.ok_or("missing fleet scope")?)?;
+            validate_external_target(store, scope.fleet.ok_or("missing fleet scope")?)?;
         }
         for (image, max) in [
             (&self.state, MAX_STATE_BYTES),
@@ -345,6 +413,25 @@ impl Plan {
         [&self.state, &self.logins, &self.ledger, &self.roster]
             .into_iter()
             .chain(self.fleet.iter().map(|fleet| &fleet.image))
+            .chain(self.source_policy.iter())
+    }
+
+    fn image(&self, role: ImageRole) -> Result<&Image, String> {
+        match role {
+            ImageRole::State => Ok(&self.state),
+            ImageRole::Logins => Ok(&self.logins),
+            ImageRole::Ledger => Ok(&self.ledger),
+            ImageRole::Roster => Ok(&self.roster),
+            ImageRole::Fleet => self
+                .fleet
+                .as_ref()
+                .map(|fleet| &fleet.image)
+                .ok_or_else(|| "account receipt lost its fleet image".to_owned()),
+            ImageRole::SourcePolicy => self
+                .source_policy
+                .as_ref()
+                .ok_or_else(|| "account receipt lost its source policy".to_owned()),
+        }
     }
 }
 
@@ -366,7 +453,7 @@ fn prepare_fleet_image(
     text: &str,
 ) -> Result<(PathBuf, FleetImage), String> {
     let (path, mode) = fleet_target(roster)?;
-    validate_fleet_target(store, &path)?;
+    validate_external_target(store, &path)?;
     super::super::accounts_sync::FleetRoster::from_toml_for(store.cli, text, "local fleet")?;
     let image = FleetImage {
         path: path.to_str().ok_or("fleet path is not UTF-8")?.to_owned(),
@@ -380,7 +467,8 @@ fn prepare_fleet_image(
     Ok((path, image))
 }
 
-fn validate_fleet_target(store: &Store, target: &Path) -> Result<(), String> {
+fn validate_external_target(store: &Store, target: &Path) -> Result<(), String> {
+    let target = usage_target(Some(target))?.ok_or("missing sync destination")?;
     // A link must not grant authority over receipt, witness or lock files that are not
     // themselves images in this transaction. Check this before preparing any state too.
     for path in [
@@ -394,15 +482,91 @@ fn validate_fleet_target(store: &Store, target: &Path) -> Result<(), String> {
         store.dir.join(RECEIPT),
         store.dir.join(WITNESS),
         store.dir.join(LOCK_FILE),
+        store.source_policy_file(),
+        store.source_policy_witness(),
     ] {
-        if usage_target(Some(&path))?.as_deref() == Some(target) {
-            return Err("fleet destination aliases account authority".into());
+        if usage_target(Some(&path))?.as_deref() == Some(target.as_path()) {
+            return Err("sync destination aliases account authority".into());
         }
     }
     Ok(())
 }
 
 impl Store {
+    /// Retire an automatic source when an unassigned import has no row images
+    /// to publish. It still shares the ordinary fixed-file recovery protocol.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSourceRetirement",
+            action = "Commit",
+            project = "aterm_agent::harness::accounts::sync_commit::source_policy_tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountSourceRetirement",
+            action = "Mode",
+            reason = "The caller selects a fixed-role publication scope."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountSourceRetirement",
+            action = "Cut",
+            reason = "The environment chooses a durable interruption boundary."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountSourceRetirement",
+            action = "Conflict",
+            reason = "An independent writer supplies conflicting retained bytes."
+        )
+    )]
+    pub(in crate::harness) fn retire_source_held(
+        &self,
+        held: &Lock,
+        now: i64,
+    ) -> Result<bool, String> {
+        if !self.native_writer_matches(held) {
+            return Err("source retirement requires this account store's writer".into());
+        }
+        self.sync_read_receipt()?;
+        let source_policy = self.source_policy_image(true, now)?;
+        let changed = source_policy
+            .as_ref()
+            .is_some_and(|image| image.before != image.after);
+        let state = read(&self.state_file(), MAX_STATE_BYTES)?;
+        if state.is_none() {
+            self.absent_state()?;
+        }
+        let ledger = read(&self.ledger_path(), MAX_LEDGER)?;
+        let plan = Plan {
+            roster_path: None,
+            roster_mode: None,
+            local_logins: false,
+            state: Image {
+                before: state.clone(),
+                after: state,
+            },
+            logins: Image::default(),
+            ledger: Image {
+                before: ledger.clone(),
+                after: ledger,
+            },
+            roster: Image::default(),
+            wake: Some(changed),
+            fleet: None,
+            source_policy,
+        };
+        self.publish_plan_scoped(held, Scope::default(), plan, &[], || Ok(()))?;
+        Ok(changed)
+    }
+
     /// Receipt bookkeeping is tested by crash recovery separately from retained
     /// account and credential images in provider admission projections.
     #[cfg(test)]
@@ -466,19 +630,26 @@ impl Store {
     /// Commit the local fleet projection with account state under one retained receipt.
     /// The caller supplies the logical roster scope, never an extra write destination.
     /// Returns whether any admitted image or event changed.
-    pub(in crate::harness) fn transact_fleet_state_held(
+    pub(in crate::harness) fn transact_fleet_state_policy_held(
         &self,
         held: &Lock,
         now: i64,
         note: &mut Option<String>,
         fleet: (&Path, &str),
-        edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
+        (retire, edit): (bool, impl FnOnce(&mut State) -> Result<Vec<Event>, String>),
     ) -> Result<bool, String> {
+        if retire && !self.native_writer_matches(held) {
+            return Err("source retirement requires this account store's writer".into());
+        }
         self.transact_state_images_held(
             held,
             now,
             note,
-            Some(StateTarget::Fleet(fleet.0, fleet.1)),
+            Some(if retire {
+                StateTarget::RetiringFleet(fleet.0, fleet.1)
+            } else {
+                StateTarget::Fleet(fleet.0, fleet.1)
+            }),
             Some(edit),
         )
         .map(|(_, changed)| changed)
@@ -531,6 +702,7 @@ impl Store {
         target: Option<StateTarget<'_>>,
         edit: Option<impl FnOnce(&mut State) -> Result<Vec<Event>, String>>,
     ) -> Result<(Vec<Event>, bool), String> {
+        let retire_legacy = matches!(&target, Some(StateTarget::RetiringFleet(..)));
         // A scoped caller planned outside this lock. A newly pending commit invalidates that
         // plan; it must recover and plan again, not silently continue from stale inputs.
         if target.is_some() {
@@ -541,7 +713,7 @@ impl Store {
         let target = target
             .map(|target| {
                 let (roster_path, roster_mode, roster, fleet) = match target {
-                    StateTarget::Fleet(roster, text) => {
+                    StateTarget::Fleet(roster, text) | StateTarget::RetiringFleet(roster, text) => {
                         let fleet = prepare_fleet_image(self, roster, text)?;
                         let path = usage_target(Some(roster))?.ok_or("missing roster target")?;
                         let before = read(&path, MAX_ROSTER_BYTES)?;
@@ -627,6 +799,10 @@ impl Store {
             }
             (Vec::new(), old_state.clone(), None, false)
         };
+        let source_policy = self.source_policy_image(retire_legacy, now)?;
+        let policy_changed = source_policy
+            .as_ref()
+            .is_some_and(|image| image.before != image.after);
         let plan = Plan {
             local_logins: false,
             roster_path: target.as_ref().map(|target| target.roster_name.clone()),
@@ -645,7 +821,8 @@ impl Store {
                 .map(|target| target.roster.clone())
                 .unwrap_or_default(),
             wake: Some(
-                auth_changed
+                policy_changed
+                    || auth_changed
                     || events.iter().any(Event::wakes)
                     || target
                         .as_ref()
@@ -654,6 +831,7 @@ impl Store {
             fleet: target
                 .as_ref()
                 .and_then(|target| target.fleet.as_ref().map(|(_, image)| image.clone())),
+            source_policy,
         };
         let changed = plan.images().any(|image| image.before != image.after) || !events.is_empty();
         self.publish_plan_scoped(
@@ -698,6 +876,7 @@ impl Store {
             Publication {
                 target: None,
                 wake: WakeRule::Events,
+                retire_legacy: false,
             },
             edit,
             || Ok(()),
@@ -885,6 +1064,7 @@ impl Store {
                     mode,
                 }),
                 wake,
+                retire_legacy: false,
             },
             |state, logins| {
                 let events = edit(&raw, state, logins)?;
@@ -978,6 +1158,7 @@ impl Store {
                     mode: None,
                 }),
                 wake: WakeRule::Events,
+                retire_legacy: false,
             },
             |state, logins| {
                 let events = edit(&raw, state, logins)?;
@@ -1183,6 +1364,9 @@ impl Store {
         scope: Scope<'_>,
         progress: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<bool, String> {
+        if !self.native_writer_matches(held) {
+            return Err("account recovery requires this account store's writer".into());
+        }
         let Some(receipt) = self.receipt()? else {
             return Ok(false);
         };
@@ -1206,17 +1390,13 @@ impl Store {
             return Ok(());
         };
         let paths = plan.paths(self, scope)?;
-        let images: Vec<_> = plan.images().collect();
-        let limits = [
-            MAX_STATE_BYTES,
-            MAX_LOGINS_BYTES,
-            MAX_LEDGER,
-            MAX_ROSTER_BYTES,
-            MAX_FLEET,
-        ];
-        for &(index, ref path) in &paths {
-            let image = images[index];
-            let max = limits[index];
+        for &(role, ref path) in &paths {
+            #[cfg(test)]
+            if role == ImageRole::SourcePolicy && RETIREMENT_MUTANT.get() == 2 {
+                continue;
+            }
+            let image = plan.image(role)?;
+            let max = role.limit();
             image.check(max)?;
             if !image.admits(&read(path, max)?) {
                 return Err(format!(
@@ -1226,9 +1406,9 @@ impl Store {
             }
         }
         progress(0)?;
-        for &(index, ref path) in &paths {
-            let image = images[index];
-            let max = limits[index];
+        for &(role, ref path) in &paths {
+            let image = plan.image(role)?;
+            let max = role.limit();
             let current = read(path, max)?;
             if !image.admits(&current) {
                 return Err(format!(
@@ -1236,20 +1416,27 @@ impl Store {
                     path.display()
                 ));
             }
-            if index < 2 && image.after.is_some() {
-                let witness = if index == 0 {
-                    self.state_witness_file()
-                } else {
-                    self.logins_witness_file()
+            let retain = matches!(
+                role,
+                ImageRole::State | ImageRole::Logins | ImageRole::SourcePolicy
+            ) && image.after.is_some();
+            #[cfg(test)]
+            let retain =
+                retain && !(role == ImageRole::SourcePolicy && RETIREMENT_MUTANT.get() == 3);
+            if retain {
+                let witness = match role {
+                    ImageRole::State => self.state_witness_file(),
+                    ImageRole::Logins => self.logins_witness_file(),
+                    _ => self.source_policy_witness(),
                 };
                 self.retain_witness(&witness)
                     .map_err(|why| why.to_string())?;
             }
             if current != image.after {
                 let text = image.after.as_deref().ok_or("sync cannot remove files")?;
-                let mode = match index {
-                    3 => plan.roster_mode,
-                    4 => plan.fleet.as_ref().and_then(|fleet| fleet.mode),
+                let mode = match role {
+                    ImageRole::Roster => plan.roster_mode,
+                    ImageRole::Fleet => plan.fleet.as_ref().and_then(|fleet| fleet.mode),
                     _ => Some(0o600),
                 };
                 super::super::upgrade_models::write_atomic_mode(path, text, mode)
@@ -1260,19 +1447,25 @@ impl Store {
             // A missing roster may also have missing parent directories. Preserve its
             // absence without creating configuration; persist the nearest existing parent.
             let barrier = publication_parent(path);
-            if matches!(index, 3 | 4) {
+            if matches!(role, ImageRole::Roster | ImageRole::Fleet) {
                 durable_ancestry(std::iter::once(barrier))?;
             } else {
                 aterm_durable::durable_dir(barrier)
                     .map_err(|why| format!("{}: {why}", path.display()))?;
             }
-            progress(index + 1)?;
+            progress(role.replay_step())?;
         }
         if plan.wake.unwrap_or(true) {
             self.touch_wake().map_err(|why| why.to_string())?;
         }
         aterm_durable::durable_dir(&self.dir).map_err(|why| why.to_string())?;
-        progress(if plan.fleet.is_some() { 6 } else { 5 })?;
+        progress(if plan.source_policy.is_some() {
+            7
+        } else if plan.fleet.is_some() {
+            6
+        } else {
+            5
+        })?;
         self.save_receipt(&receipt)
     }
 
@@ -1287,6 +1480,24 @@ impl Store {
         edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
         auxiliary: impl FnOnce() -> Result<(), String>,
     ) -> Result<Vec<Event>, String> {
+        self.transact_sync_policy_held(held, now, note, target, (false, edit), auxiliary)
+    }
+
+    pub(in crate::harness) fn transact_sync_policy_held(
+        &self,
+        held: &Lock,
+        now: i64,
+        note: &mut Option<String>,
+        target: SyncTarget<'_>,
+        (retire_legacy, edit): (
+            bool,
+            impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+        ),
+        auxiliary: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Vec<Event>, String> {
+        if retire_legacy && !self.native_writer_matches(held) {
+            return Err("source retirement requires this account store's writer".into());
+        }
         // This path runs no recovery of its own: a pending or damaged receipt refuses it here.
         self.sync_read_receipt()?;
         self.transact_images_held(
@@ -1296,6 +1507,7 @@ impl Store {
             Publication {
                 target: Some(target),
                 wake: WakeRule::Always,
+                retire_legacy,
             },
             edit,
             auxiliary,
@@ -1341,7 +1553,11 @@ impl Store {
             impl FnOnce(ActualPublicationPermit<'_>) -> NativePublicationResult,
         >,
     ) -> Result<Vec<Event>, String> {
-        let Publication { target, wake } = publication;
+        let Publication {
+            target,
+            wake,
+            retire_legacy,
+        } = publication;
         let roster = usage_target(target.as_ref().map(|target| target.path))?;
         let fleet = target
             .as_ref()
@@ -1483,6 +1699,7 @@ impl Store {
                 WakeRule::Events => Some(auth_changed || events.iter().any(Event::wakes)),
             },
             fleet: fleet.as_ref().map(|(_, image)| image.clone()),
+            source_policy: self.source_policy_image(retire_legacy, now)?,
         };
         self.publish_plan_scoped(
             held,
@@ -1520,6 +1737,17 @@ impl Store {
         Ok(Image { before, after })
     }
 
+    fn source_policy_image(&self, retire: bool, now: i64) -> Result<Option<Image>, String> {
+        if !retire {
+            return Ok(None);
+        }
+        let (before, after) = self.retirement_image(now)?;
+        Ok(Some(Image {
+            before,
+            after: Some(after),
+        }))
+    }
+
     fn publish_plan_scoped(
         &self,
         held: &Lock,
@@ -1528,6 +1756,9 @@ impl Store {
         events: &[Event],
         auxiliary: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
+        if plan.source_policy.is_some() && !self.native_writer_matches(held) {
+            return Err("source retirement requires this account store's writer".into());
+        }
         plan.validate(self, scope)?;
         let changed = plan.images().any(|image| image.before != image.after);
         // Entropy and serialization failures are also admission failures, not partial commits.
@@ -1538,6 +1769,14 @@ impl Store {
         };
         encode_stored_receipt(&receipt)?;
         auxiliary()?;
+        if receipt
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.source_policy.is_some())
+            && !self.native_writer_matches(held)
+        {
+            return Err("source retirement writer changed before publication".into());
+        }
         #[cfg(test)]
         if EARLY_ROSTER.with(std::cell::Cell::take)
             && let Some(path) = scope.roster
@@ -1590,6 +1829,7 @@ impl Store {
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static RETIREMENT_MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// A test's crash: the next commit on this thread stops before replay step `n`, its receipt
     /// pending, as a process killed there would leave it.
     pub(in crate::harness) static CUT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -1699,6 +1939,10 @@ mod local_commit_tests;
 #[cfg(test)]
 #[path = "accounts_fleet_commit_tests.rs"]
 mod fleet_commit_tests;
+
+#[cfg(test)]
+#[path = "accounts_source_policy_tests.rs"]
+mod source_policy_tests;
 
 #[cfg_attr(
     any(test, debug_assertions),

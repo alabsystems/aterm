@@ -31,8 +31,10 @@ pub const ME: &str = "linux-auto-atpkg";
 pub struct Options {
     /// Decide and print; change nothing.
     pub dry_run: bool,
-    /// Consume existing stages only; never persist this choice in an installed unit.
+    /// Consume existing stages only; installing this mode is an explicit choice.
     pub staged_only: bool,
+    /// An installed staged-only dispatcher wakes only for a pending notification.
+    pub queued: bool,
     /// The target this builder runs on.
     pub host: Triple,
     /// The Linux targets this lane serves.
@@ -63,6 +65,7 @@ impl Options {
         Ok(Self {
             dry_run,
             staged_only: false,
+            queued: false,
             host,
             triples,
         })
@@ -445,6 +448,8 @@ pub fn narrow(
 pub struct Outcome {
     /// Another run held the lock.
     pub covered: bool,
+    /// No pending work, or a queued pass found everything already published.
+    pub idle: bool,
     /// The verified head.
     pub head: Option<u64>,
     /// The targets this run could pack.
@@ -455,6 +460,8 @@ pub struct Outcome {
     pub table: Vec<(Program, Decision)>,
     /// Programs that staged a row this run.
     pub staged: Vec<String>,
+    /// Missing builds deliberately left to the normal build lane.
+    pub deferred: Vec<String>,
     /// Programs READY to sign.
     pub ready: Vec<String>,
     /// Programs held by their group.
@@ -473,9 +480,17 @@ pub struct Outcome {
 /// A refusal for a downgrade, a refused signing step, or a run that finished with
 /// BLOCKED/ERROR rows; a could-not-run when the channel head cannot be read.
 pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Result<Outcome> {
+    if opts.queued && !opts.staged_only {
+        return Err(Error::usage("queued publication requires --staged-only"));
+    }
     let state = LaneState::of(LaneKind::Linux, &ctx.state_dir);
     state.ensure()?;
-    let _guard = match state.try_lock()? {
+    let lock = if opts.queued {
+        state.queued_lock()?
+    } else {
+        state.try_lock()?
+    };
+    let _guard = match lock {
         Lock::Held(g) => g,
         Lock::Busy => {
             if let Some(started) = state.stalled_since(ctx.now_unix) {
@@ -496,10 +511,16 @@ pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Resul
             });
         }
     };
+    if opts.queued && !state.ready_pending()? {
+        return Ok(Outcome {
+            idle: true,
+            ..Outcome::default()
+        });
+    }
     if !opts.dry_run {
         state.mark_started(ctx.now_unix);
     }
-    let result = Run {
+    let mut result = Run {
         ctx,
         opts,
         deps,
@@ -508,8 +529,24 @@ pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Resul
         failures: false,
     }
     .go();
+    if opts.queued
+        && !opts.dry_run
+        && result
+            .as_ref()
+            .is_ok_and(|outcome| !outcome.idle && outcome.published.is_none())
+    {
+        result = Err(Error::refused(
+            "queued staged work was not published; its notification remains pending",
+        ));
+    }
     if !opts.dry_run {
         state.clear_started();
+        if result
+            .as_ref()
+            .is_ok_and(|outcome| outcome.idle || outcome.published.is_some())
+        {
+            state.clear_ready()?;
+        }
     }
     result
 }
@@ -782,18 +819,26 @@ impl Run<'_> {
             .filter(|(_, d)| matches!(d, Decision::Build { .. }))
             .map(|(i, _)| i)
             .collect();
-        if opts.staged_only {
+        let deferred = if opts.staged_only {
             self.tx.say(format!(
                 "STAGED_ONLY — deferred {} unstaged program(s): {}; no new builds this run",
                 build_list.len(),
                 list(build_list.iter().map(|i| programs[*i].name.as_str()))
             ));
+            let names = build_list
+                .iter()
+                .map(|i| programs[*i].name.clone())
+                .collect();
             build_list.clear();
-        }
+            names
+        } else {
+            Vec::new()
+        };
         let mut outcome = Outcome {
             head: Some(n),
             can: can.clone(),
             cannot: cannot.clone(),
+            deferred,
             ..Outcome::default()
         };
         if opts.dry_run && !opts.staged_only {
@@ -877,6 +922,28 @@ impl Run<'_> {
         outcome.unsignable = unsignable.iter().map(|(p, _)| p.name.clone()).collect();
 
         if opts.staged_only && ready.is_empty() && signed_earlier.is_empty() {
+            let mut unaccounted_stage = false;
+            for program in programs.iter().filter(|_| opts.queued) {
+                let path = staged_manifest(&staged_dir, &program.name, program.build);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(_) => {
+                        unaccounted_stage |=
+                            !same_bytes(&path, detail[&program.name].published.as_deref())
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(Error::io("inspect pending stage", &error)),
+                }
+            }
+            if opts.queued
+                && held.is_empty()
+                && unsignable.is_empty()
+                && !self.failures
+                && !unaccounted_stage
+            {
+                outcome.idle = true;
+                outcome.table = programs.into_iter().zip(decisions).collect();
+                return Ok(outcome);
+            }
             return Err(Error::refused(
                 "--staged-only found no eligible staged rows for the fresh signed head — \
                  nothing signed or indexed; missing rows remain deferred",

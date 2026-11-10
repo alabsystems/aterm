@@ -131,27 +131,37 @@ fn notice_text(line: &str) -> String {
 /// instance token's `AUTH` (which answers nothing), on one connection; each answers one line,
 /// and every write and read is done by `deadline`.
 fn tell(dir: &Path, sid: &str, lines: &[String], deadline: Instant) -> std::io::Result<()> {
-    let left = || {
-        deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_millis(1))
-    };
     let sid = aterm_types::control_request::Sid::parse(sid)
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let sock = aterm_ctl::hosting_sock(dir, sid)
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
     let (stream, token) = aterm_ctl::connect_then_read_token(&sock)?;
     let token = token?;
-    stream.set_write_timeout(Some(left()))?;
     let mut request = format!("AUTH {token}\n");
     for line in lines {
         request.push_str(&format!("appnotice proc {}\n", notice_text(line)));
     }
-    (&stream).write_all(request.as_bytes())?;
-    (&stream).flush()?;
-    stream.set_read_timeout(Some(left()))?;
-    let mut reader = std::io::BufReader::new(&stream);
-    for _ in lines {
+    tell_exchange(&stream, lines.len(), deadline, || {
+        (&stream).write_all(request.as_bytes())?;
+        (&stream).flush()
+    })
+}
+
+fn tell_exchange(
+    stream: &aterm_uds::CtlStream,
+    replies: usize,
+    deadline: Instant,
+    send: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let left = || {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1))
+    };
+    stream.set_write_timeout(Some(left()))?;
+    send()?;
+    let mut reader = std::io::BufReader::new(NoticeReply { stream, deadline });
+    for _ in 0..replies {
         use std::io::Read as _;
         let mut reply = String::new();
         if (&mut reader).take(64 * 1024).read_line(&mut reply)? == 0 || Instant::now() >= deadline {
@@ -159,6 +169,17 @@ fn tell(dir: &Path, sid: &str, lines: &[String], deadline: Instant) -> std::io::
         }
     }
     Ok(())
+}
+
+struct NoticeReply<'a> {
+    stream: &'a aterm_uds::CtlStream,
+    deadline: Instant,
+}
+
+impl std::io::Read for NoticeReply<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        aterm_uds::hangup::read_until(self.stream, bytes, self.deadline)
+    }
 }
 
 /// One process a pass ended: what [`Poster::post`] tells of it.

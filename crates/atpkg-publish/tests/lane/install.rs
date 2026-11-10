@@ -275,6 +275,7 @@ fn spec(kind: LaneKind, root: &Path) -> UnitSpec {
         xdg_config_home: root.join("home/.config"),
         shim_bin: root.join("home/Library/Application Support/aterm/pkg/bin"),
         host: HostChoice::Gh,
+        staged_only: false,
     }
 }
 
@@ -363,12 +364,72 @@ fn the_systemd_units_run_the_snapshot_hourly_with_their_words_escaped() {
     );
 }
 
+#[test]
+fn staged_only_install_adds_an_event_source_without_changing_default_units() {
+    let mut spec = spec(LaneKind::Linux, Path::new("/home/o%x$y"));
+    let normal = units::render(&spec);
+    assert_eq!(normal.len(), 2);
+    spec.staged_only = true;
+    let queued = units::render(&spec);
+    assert_eq!(queued.len(), 3);
+    assert_eq!(
+        queued[1], normal[1],
+        "hourly reconciliation stays unchanged"
+    );
+    assert!(
+        queued[0]
+            .text
+            .contains("\"--staged-only\" \"--queued\" \"--json\"")
+    );
+    let path = &queued[2];
+    assert_eq!(path.name, units::SYSTEMD_PATH);
+    assert!(
+        path.text
+            .contains("PathChanged=/home/o%%x$y/state root/aterm-auto/publish-ready\n")
+    );
+    assert!(path.text.contains("Unit=aterm-auto-atpkg.service"));
+    assert!(
+        !path.text.contains("PathExists="),
+        "a refused pending cohort must not spin"
+    );
+    assert!(
+        InstallFlags::parse(&["--staged-only".into(), "--no-arm".into()])
+            .unwrap()
+            .staged_only
+    );
+    let b = machine("install-staged-only-unarmed", Os::Linux);
+    let (result, _) = install(
+        &b,
+        LaneKind::Linux,
+        InstallFlags {
+            staged_only: true,
+            no_arm: true,
+            ..InstallFlags::default()
+        },
+    );
+    let installed = result.unwrap();
+    assert_eq!(installed.rendered.len(), 3);
+    assert!(installed.armed.is_empty());
+    assert!(!b.rec.calls().iter().any(|call| call.starts_with("arm ")));
+    assert!(
+        std::fs::read_to_string(installed.snapshot.join("INSTALLED-FROM"))
+            .unwrap()
+            .contains("mode staged-only\n")
+    );
+    assert!(
+        !atpkg_publish::lane::state::LaneState::of(LaneKind::Linux, &b.fx.ctx.state_dir)
+            .ready_pending()
+            .unwrap()
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn the_rendered_units_verify_with_systemd_analyze() {
     let fx = Fx::new("systemd-analyze");
     let mut s = spec(LaneKind::Linux, &fx.path("r"));
     s.binary = fx.path("atpkg-publish");
+    s.staged_only = true;
     std::fs::write(&s.binary, "#!/bin/false\n").expect("write");
     #[cfg(unix)]
     {

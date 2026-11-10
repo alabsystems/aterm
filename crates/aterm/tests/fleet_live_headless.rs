@@ -244,7 +244,7 @@ fn a_worlds_aterm_serves_a_connection_past_a_persons_lifetime() {
     // An exchange proves the listener finished admission before the clock advances.
     assert!(ask(peer.stream(), "version").starts_with("OK version="));
     let clock = inst.tmp.join("fleet-clock/lifetime");
-    std::fs::write(&clock, "32000").expect("advance past a person's lifetime");
+    crate::turn_submit_live_headless::write_clock(&clock, "32000");
     aterm_spec::wait::until_within(HANG, "the listener judged the advanced clock", || {
         std::fs::read_to_string(clock.with_extension("seen"))
             .is_ok_and(|seen| seen == "32000")

@@ -14778,20 +14778,23 @@ impl App {
 
     /// Canonical terminal-view attachments owned by one window, across ordinary terminal tabs and heterogeneous terminal/native trees.
     pub(crate) fn window_terminal_sessions(&self, wid: WindowId) -> Vec<u64> {
-        self.windows.get(&wid).map_or_else(Vec::new, |window| {
-            window
-                .tab_set
-                .tabs()
-                .iter()
-                .flat_map(|tab| tab.root.leaves())
-                .filter_map(|view| {
-                    self.view_store
-                        .get(view)
-                        .copied()
-                        .and_then(tab_model::View::terminal_session)
-                })
-                .collect()
-        })
+        let Some(window) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        let mut sessions = Vec::new();
+        for tab in window.tab_set.tabs() {
+            tab.root.visit(&mut |&view| {
+                if let Some(session) = self
+                    .view_store
+                    .get(view)
+                    .copied()
+                    .and_then(tab_model::View::terminal_session)
+                {
+                    sessions.push(session);
+                }
+            });
+        }
+        sessions
     }
 
     /// Whether any canonical terminal view in `wid` owns `session`.
@@ -26012,6 +26015,28 @@ struct WarmPrologue {
     document_write_cap: aterm_cap::Cap<aterm_buffer::BufferWrite>,
 }
 
+/// A windowed font warm requires AppKit's font classes to be registered first.
+#[derive(Clone, Copy)]
+enum WarmLaunch {
+    Headless,
+    #[cfg(target_os = "macos")]
+    Windowed(platform::Windowed),
+    #[cfg(not(target_os = "macos"))]
+    Windowed,
+}
+
+impl WarmLaunch {
+    fn headless(self) -> bool {
+        match self {
+            Self::Headless => true,
+            #[cfg(target_os = "macos")]
+            Self::Windowed(_windowed) => false,
+            #[cfg(not(target_os = "macos"))]
+            Self::Windowed => false,
+        }
+    }
+}
+
 enum WarmConfigRuntime {
     Ready(app_config::PreparedPathFeedGeneration),
     Spawned(std::io::Result<std::thread::JoinHandle<app_config::PreparedPathFeedGeneration>>),
@@ -26048,7 +26073,8 @@ struct WarmConfig {
     reason = "moved verbatim out of `main_entry` (warm successor P2); splitting it further \
               would re-thread two dozen launch values through more signatures"
 )]
-fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
+fn warm_config(launch: WarmLaunch, zoom: app_config::CarriedZoom) -> WarmConfig {
+    let headless = launch.headless();
     let mut launch_harness = None;
     let native_config_service = native_config_service::VersionedConfigService::load_current()
         .unwrap_or_else(|error| {
@@ -26389,10 +26415,11 @@ fn warm_accessibility_reads() {
 }
 
 fn warm_prologue(
-    headless: bool,
+    launch: WarmLaunch,
     runs_a_command: bool,
     zoom: app_config::CarriedZoom,
 ) -> WarmPrologue {
+    let headless = launch.headless();
     let integrate = !cli::launch_flags().no_shell_integration;
     if integrate && !runs_a_command {
         warm_shell_integration_scripts();
@@ -26401,7 +26428,7 @@ fn warm_prologue(
     if !headless {
         warm_accessibility_reads();
     }
-    let config = warm_config(headless, zoom);
+    let config = warm_config(launch, zoom);
     let mut env_add: Vec<(String, String)> = vec![
         ("TERM".to_string(), "xterm-256color".to_string()),
         ("COLORTERM".to_string(), "truecolor".to_string()),
@@ -27054,6 +27081,19 @@ pub fn main_entry_with_network(
     }
     #[cfg(unix)]
     descriptor_limit::settle_incoming_descriptor_limit(&handoff_env);
+    // Register AppKit's font bridge before a warm worker can create a cached
+    // Core Text font. Loading it after that creation leaves __NSCFType objects
+    // in the cache that NSFont cannot use to create window controls.
+    #[cfg(target_os = "macos")]
+    let windowed = (!headless).then(platform::Windowed::launch);
+    #[cfg(target_os = "macos")]
+    let warm_launch = windowed.map_or(WarmLaunch::Headless, WarmLaunch::Windowed);
+    #[cfg(not(target_os = "macos"))]
+    let warm_launch = if headless {
+        WarmLaunch::Headless
+    } else {
+        WarmLaunch::Windowed
+    };
     #[cfg(target_os = "macos")]
     let warm_order = warm_order(
         handoff_rendezvous::rendezvous_present(&handoff_env),
@@ -27087,7 +27127,7 @@ pub fn main_entry_with_network(
         let config_read = WarmConfigRead::take(app_config::config_path().as_deref());
         Some((
             config_read,
-            warm_prologue(headless, exec_command.is_some(), zoom),
+            warm_prologue(warm_launch, exec_command.is_some(), zoom),
         ))
     } else {
         None
@@ -27098,8 +27138,6 @@ pub fn main_entry_with_network(
             crate::exit_without_process_teardown(0)
         }
     };
-    #[cfg(target_os = "macos")]
-    let windowed = (!headless).then(platform::Windowed::launch);
     #[cfg(target_os = "macos")]
     let mut handoff_claimed_at: Option<std::time::Instant> = None;
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -27433,12 +27471,12 @@ pub fn main_entry_with_network(
                      fonts and backend again after the intake, at the files the outgoing process \
                      parked under (the startup-worker stamps describe the discarded warm)"
                 );
-                warm.config = warm_config(headless, carried_zoom);
+                warm.config = warm_config(warm_launch, carried_zoom);
             }
             (warm, !moved)
         }
         None => (
-            warm_prologue(headless, exec_command.is_some(), carried_zoom),
+            warm_prologue(warm_launch, exec_command.is_some(), carried_zoom),
             false,
         ),
     };
@@ -29868,11 +29906,17 @@ mod backend_slot_tests {
         crate::test_scratch::write_config(&path, format!("font_family = {FAMILY:?}\n"));
         crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
             let read = crate::WarmConfigRead::take(Some(&path));
-            let early = crate::warm_config(true, crate::app_config::CarriedZoom::default());
+            let early = crate::warm_config(
+                crate::WarmLaunch::Headless,
+                crate::app_config::CarriedZoom::default(),
+            );
             let _ = early.backend_handle.join().expect("the early worker");
             std::fs::write(&path, "\n").expect("the hold's edit");
             assert!(crate::warm_config_moved(&read, Some(&path)));
-            let late = crate::warm_config(true, crate::app_config::CarriedZoom::default());
+            let late = crate::warm_config(
+                crate::WarmLaunch::Headless,
+                crate::app_config::CarriedZoom::default(),
+            );
             let _ = late.backend_handle.join().expect("the re-warm's worker");
         });
         let stale: Vec<_> = crate::message_inbox::take_queued()
@@ -30792,19 +30836,22 @@ mod session_pool_conformance {
     use std::collections::BTreeMap;
 
     fn project(app: &App, sid: u64) -> [i64; 2] {
-        let refcount = app
-            .windows
-            .values()
-            .flat_map(|window| window.tab_set.tabs())
-            .flat_map(|tab| tab.root.leaves())
-            .filter(|view| {
-                app.view_store
-                    .get(*view)
-                    .copied()
-                    .and_then(crate::tab_model::View::terminal_session)
-                    == Some(sid)
-            })
-            .count() as i64;
+        let mut refcount = 0i64;
+        for window in app.windows.values() {
+            for tab in window.tab_set.tabs() {
+                tab.root.visit(&mut |&view| {
+                    if app
+                        .view_store
+                        .get(view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        == Some(sid)
+                    {
+                        refcount += 1;
+                    }
+                });
+            }
+        }
         let closed = i64::from(app.pool.views(sid).is_none());
         [refcount, closed]
     }

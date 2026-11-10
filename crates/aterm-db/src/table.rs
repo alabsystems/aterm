@@ -779,19 +779,19 @@ impl<'a> Session<'a> {
             .collect();
         // One batch: a log-backed session leases the log's history once, for the ids the log
         // answers and the handoffs it opens; a fallback to the control journal still checks the
-        // membership for each id.
-        let answers = self
+        // membership for each id. It asks whether each opens, not for its key: an epoch this Mac
+        // opened under the same log is answered without its key unwrapped again, and no asked
+        // epoch's key is kept, so this round's asks leave the keys its table reads take where those
+        // find them. An epoch this Mac holds only through a handoff opens the handoff at each ask,
+        // which reads the handoff's issuance epoch through the kept keys as the historical reads do.
+        let held = self
             .bootstrap
-            .historicals(&self.journal, &self.access, &unknown);
-        let mut needed = Vec::new();
-        for (id, answer) in unknown.into_iter().zip(answers) {
-            match answer {
-                Ok(history) => {
-                    self.history.borrow_mut().insert(id, history);
-                }
-                Err(_) => needed.push(id),
-            }
-        }
+            .holds_histories(&self.journal, &self.access, &unknown);
+        let needed = unknown
+            .into_iter()
+            .zip(held)
+            .filter_map(|(id, held)| (!held).then_some(id))
+            .collect();
         Ok((needed, next))
     }
 

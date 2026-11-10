@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use aterm_agent::harness::contract::Scope;
 use aterm_agent::harness::native_act::{
-    AskedIntent, Binding, CancelPrepare, ClaimOutcome, ColdEnvironmentFacts, ColdIntent,
-    Constructor, Decision, Image, ImagePhase, NativePlan, Prepare, Process, Request,
-    RestartCommand, Retirement,
+    AskedIntent, Binding, BootStamp, CancelPrepare, ClaimOutcome, Closure, ColdEnvironmentFacts,
+    ColdIntent, Constructor, Decision, Image, ImagePhase, NativePlan, Prepare, Process, Recorded,
+    Request, RestartCommand, Retirement,
 };
 
 use crate::session_timeline::{
@@ -1173,6 +1173,15 @@ trait Kernel {
     fn record_noexec(&self, prepare: &Prepare, binding: &Binding, phase: ImagePhase) -> bool;
     /// Authenticated read-only history; absent, damaged or unavailable is false.
     fn historical_noexec(&self, request: &Request) -> bool;
+    /// The issuer journal's lock-free reading of this exact restart prepare
+    /// ([`aterm_agent::harness::native_receipts::observe_closure`]); damaged or
+    /// unavailable history is an error.
+    fn historical_closure(&self, prepare: &Prepare) -> Result<Closure, ()>;
+    /// The established issuer custody's `custody=` digest, or `None` when none is
+    /// established or it does not read.
+    fn custody(&self) -> Option<String>;
+    /// This host's machine and boot, or `None` when either does not read.
+    fn boot(&self) -> Option<BootStamp>;
     fn recorded_operation(&self, id: &str) -> Result<bool, ()>;
     /// Commit permanent rejection only if this exact restart ID was never admitted.
     fn reject_unadmitted(&self, _prepare: &Prepare) -> Result<bool, ()> {
@@ -1481,6 +1490,32 @@ impl Kernel for System<'_> {
             let _ = request;
             false
         }
+    }
+    fn historical_closure(&self, prepare: &Prepare) -> Result<Closure, ()> {
+        #[cfg(unix)]
+        {
+            aterm_agent::harness::native_receipts::observe_closure(prepare).map_err(|_| ())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = prepare;
+            Err(())
+        }
+    }
+    fn custody(&self) -> Option<String> {
+        #[cfg(unix)]
+        {
+            aterm_agent::harness::native_receipts::custody()
+                .ok()
+                .flatten()
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+    fn boot(&self) -> Option<BootStamp> {
+        BootStamp::current()
     }
     fn account_admission(
         &self,
@@ -2390,6 +2425,19 @@ fn prepare_inner(
         }
         Some(left) if left > MAX_PREPARE_US => return DEADLINE.into(),
         Some(_) => {}
+    }
+    // A stamp is a fact this host vouches for by admitting it: its own machine and boot, its
+    // own established custody. A historical `lapsed` answer relies on that (`historical_prepare`).
+    if request
+        .boot
+        .as_ref()
+        .is_some_and(|stamp| kernel.boot().as_ref() != Some(stamp))
+        || request
+            .custody
+            .as_ref()
+            .is_some_and(|stamp| kernel.custody().as_ref() != Some(stamp))
+    {
+        return DENIED.into();
     }
     if let Err(refusal) = persist_noexec_predecessor(
         ctx,
@@ -4326,11 +4374,274 @@ fn serve_with_publication(
                     .account
                     .is_some()
             }))
-        && kernel.historical_noexec(&saved)
+        && let Some(answer) = historical(ctx, &saved, kernel)
     {
-        return NOEXEC.into();
+        return answer;
     }
     reply
+}
+
+/// The historical answer to a refused replay: a positive NoExec receipt, else, for a prepare,
+/// [`historical_prepare`]'s, which serves the exact prepare's NoExec record as one too.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHistoricalClosure",
+        action = "AnswerNoExec",
+        project = "aterm_gui::native_act::tests::historical_closure::Host::probe"
+    )
+)]
+fn historical(ctx: &crate::SessionCtx, saved: &Request, kernel: &dyn Kernel) -> Option<String> {
+    if kernel.historical_noexec(saved) {
+        return Some(NOEXEC.into());
+    }
+    match saved {
+        Request::Prepare(prepare) => historical_prepare(ctx, prepare, kernel),
+        _ => None,
+    }
+}
+
+/// `lapsed` for a refused restart prepare no exec grant was or can be issued under, from
+/// facts this host reads now; `None` keeps the refusal. It writes, reserves and admits
+/// nothing, and claims nothing about the old operation's other resources.
+///
+/// Only a cold or supported typed asked restart from the built-in harness qualifies (the
+/// caller's `historical_reader`), with no reservation, cancellation, account fence, renewal
+/// seal or unfinished operation for its id here. A private restart, its Codex renewal, a
+/// self-exec plan and an account relation keep the refusal. An issuer older than the
+/// journal granted without recording: an exact record proves an issuer that records, and an
+/// absence counts only for a stamped prepare, which no such issuer could parse.
+///
+/// The clock is read before the journal (one CLOCK_MONOTONIC per boot), then:
+/// 1. the exact prepare's NoExec is NOEXEC;
+/// 2. its seal with no possible execution is `lapsed` at any clock: a grant records
+///    possible execution, acknowledged, before it is delivered, and a seal is final;
+/// 3. its Prepared record read after the deadline is `lapsed`: a grant acknowledged before
+///    the read would show, and one acknowledged after it fails the delivery's own deadline
+///    check, while no record that late can start;
+/// 4. its absence read after the deadline from the journal instance its `custody=` stamp names
+///    is `lapsed`: every restart admission is recorded before it starts, and only a host that
+///    records admits a stamped prepare, while the stamp names that one journal by its first
+///    record (one enrolled again, or set aside and replaced, is another custody; a journal is
+///    never rolled back, the premise of every journal read);
+/// 5. a `boot=` stamp naming another boot of this machine makes the exact record (Prepared,
+///    possible execution or a seal), or an absence from the journal its `custody=` stamp
+///    names, `lapsed` at any clock:
+///    every process of that boot has ended, and no host of this boot admits the stamp;
+/// 6. anything else keeps the refusal: possible execution on this boot, another record of
+///    the id, an unreadable journal, a deadline still ahead, or an unstamped absence.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHistoricalClosure",
+        action = "ReadClock",
+        project = "aterm_gui::native_act::tests::historical_closure::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHistoricalClosure",
+        action = "ReadJournal",
+        project = "aterm_gui::native_act::tests::historical_closure::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHistoricalClosure",
+        action = "AnswerLapsed",
+        project = "aterm_gui::native_act::tests::historical_closure::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHistoricalClosure",
+        action = "AnswerBoot",
+        project = "aterm_gui::native_act::tests::historical_closure::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "StampBoot",
+        reason = "The harness stamps its prepare with this process's machine and boot, and prepare_inner admits no boot stamp but its own"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "StampCustody",
+        reason = "The harness stamps its prepare with its issuer journal's custody once the journal holds a record, and prepare_inner admits no custody stamp but its own"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "Legacy",
+        reason = "An issuer older than the journal granted restarts with no record, and only an unstamped prepare can name one"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "Record",
+        reason = "Admission appends the Prepare record and has it acknowledged before the operation starts"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "May",
+        reason = "An exec grant appends MayExecute, acknowledged, only after Prepared and before it is delivered"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "Deliver",
+        reason = "Delivery re-reads the monotonic clock after the append and replies state=execute only before the deadline; the launcher execs only on that reply"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "SealOpen",
+        reason = "A seal after Prepared reads as sealed with no possible execution, and nothing follows a seal"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "SealMay",
+        reason = "A seal after MayExecute reads as sealed after possible execution, and nothing follows a seal"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "NoExec",
+        reason = "A positive no-grant follows only Prepared, and nothing follows it"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "Expire",
+        reason = "The boot's monotonic clock, which every process of the boot reads, passes the deadline"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "Crash",
+        reason = "The issuing host epoch ends: a crash, a quit or an in-place update exec"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "ChildExits",
+        reason = "The grantee the launcher exec'd exits"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "Reboot",
+        reason = "The machine boots again, which ends every process of the old boot"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "Move",
+        reason = "A process that finds a lab-marked vault sets the whole vault folder aside, or the journal is removed and enrolled again under the same identity; the custody after either is another journal instance, with another first record"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "Fresh",
+        reason = "The harness ends its lapsed record and plans afresh (native_restart::lapsed, bound by NativeRetirementDebt)"
+    )
+)]
+fn historical_prepare(
+    ctx: &crate::SessionCtx,
+    prepare: &Prepare,
+    kernel: &dyn Kernel,
+) -> Option<String> {
+    if !matches!(prepare.plan, NativePlan::Restart { .. })
+        || !matches!(
+            prepare.constructor(),
+            Constructor::ColdRestart | Constructor::AskedUpgrade | Constructor::AskedRelaunch
+        )
+        || (prepare.asked.is_some() && !asked_upgrade::shape(prepare))
+    {
+        return None;
+    }
+    let clock_us = kernel.clock().now_us()?;
+    let unfinished = {
+        let table = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if table.reservations.contains_key(&prepare.id)
+            || table.cancelled.contains_key(&prepare.id)
+            || table.account_fences.contains_key(&prepare.id)
+            || table.renewal_seals.contains_key(&prepare.id)
+        {
+            return None;
+        }
+        table.by_id.get(&prepare.id).cloned()
+    };
+    if unfinished.is_some_and(|operation| {
+        !matches!(
+            operation.lock().unwrap_or_else(|p| p.into_inner()).phase,
+            Phase::Completed(_)
+        )
+    }) {
+        return None;
+    }
+    let closure = kernel.historical_closure(prepare).ok()?;
+    let expired = clock_us >= prepare.deadline_us;
+    let other_boot = prepare.boot.as_ref().is_some_and(|stamp| {
+        kernel
+            .boot()
+            .is_some_and(|here| here.host == stamp.host && here.boot != stamp.boot)
+    });
+    let lapsed = match closure {
+        Closure::Exact(Recorded::NoExec) => return Some(NOEXEC.into()),
+        Closure::Exact(Recorded::Sealed { may_execute: false }) => true,
+        Closure::Exact(Recorded::Prepared) => expired || other_boot,
+        Closure::Exact(Recorded::MayExecute | Recorded::Sealed { may_execute: true }) => other_boot,
+        Closure::Absent(custody) => {
+            prepare.custody.is_some() && custody == prepare.custody && (expired || other_boot)
+        }
+        Closure::Other => false,
+    };
+    if lapsed {
+        aterm_agent::harness::native_act::lapsed_reply(&prepare.id)
+    } else {
+        None
+    }
 }
 
 fn serve_request(

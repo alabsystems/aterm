@@ -74,6 +74,8 @@ fn fixture() -> Predecessor {
             forward: Box::new(command.clone()),
             rollback: Some(Box::new(command)),
         },
+        boot: None,
+        custody: None,
     };
     let binding = Binding {
         id: prepare.id.clone(),

@@ -1335,6 +1335,7 @@ fn counted_reader(pid: u32) -> Named {
             kind: kind.to_owned(),
         },
         wrapper,
+        codegen_requested: None,
     })
 }
 
@@ -1433,6 +1434,7 @@ fn a_compilers_span_is_its_reads_and_its_wrapper_the_one_before_it() {
                 kind: "aterm_gui lib".to_owned(),
             },
             wrapper: pid >= 10,
+            codegen_requested: Some(pid >= 10),
         })
     }
     let m = |pid: u32, cpu_s: u64, footprint: u64| aterm_sysprobe::MemberUsage {
@@ -1457,6 +1459,11 @@ fn a_compilers_span_is_its_reads_and_its_wrapper_the_one_before_it() {
     assert_eq!(spans.len(), 1, "{spans:?}");
     let s = &spans[0];
     assert_eq!(s.unit.kind, "aterm_gui lib");
+    assert_eq!(
+        s.codegen_requested,
+        Some(false),
+        "the compiler's output, not its wrapper's"
+    );
     let queued = s.queued_at_unix_ms.expect("its wrapper was read");
     assert_eq!(s.started_at_unix_ms - queued, 2_000);
     assert_eq!(s.ended_at_unix_ms - s.started_at_unix_ms, 3_000);
@@ -1505,6 +1512,7 @@ fn the_wrapper_is_the_process_running_this_executable() {
                 kind: "aterm_gui lib".to_owned(),
             },
             wrapper,
+            codegen_requested: None,
         })
     };
     let mut wrapped = vec!["/bin/verify"];
@@ -1522,6 +1530,59 @@ fn the_wrapper_is_the_process_running_this_executable() {
         read("/bin/cargo", &["cargo", "build"], Some("/bin/verify")),
         Named::Nothing
     );
+}
+
+/// A host library and a checked target library have the same unit name. Their explicit
+/// output requests distinguish them; missing or hidden requests remain unknown.
+#[test]
+fn compiler_output_separates_host_codegen_from_checked_metadata() {
+    for (args, expected) in [
+        (vec!["--emit=dep-info,metadata"], Some(false)),
+        (vec!["--emit", "metadata=/tmp/meta"], Some(false)),
+        (vec!["--emit=mir"], Some(false)),
+        (vec!["--emit=dep-info,metadata,link"], Some(true)),
+        (
+            vec!["--emit=metadata", "--emit", "obj=/tmp/object"],
+            Some(true),
+        ),
+        (vec!["--emit=llvm-ir"], Some(true)),
+        (vec!["--emit=llvm-bc"], Some(true)),
+        (vec!["--emit=asm"], Some(true)),
+        (vec!["--emit=metadata", "--", "--emit=link"], Some(false)),
+        (vec!["--emit=metadata", "@flags"], None),
+        (vec!["--emit=unknown"], None),
+        (vec!["--emit="], None),
+        (vec!["--emit"], None),
+        (vec!["-Clink-arg=something"], None),
+        (vec![], None),
+    ] {
+        let args: Vec<_> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(compiler_codegen_requested(&args), expected, "{args:?}");
+    }
+    let read = |emit| {
+        let buf = procargs(
+            "/bin/tippy-driver",
+            &[
+                "tippy-driver",
+                "--crate-name",
+                "dep",
+                "--crate-type",
+                "lib",
+                emit,
+            ],
+            &["CARGO_PKG_NAME=dep"],
+        );
+        let args = aterm_sysprobe::procargs::parse(&buf).expect("process arguments");
+        let Named::Unit(read) = named(&args, None) else {
+            panic!("a compiler unit")
+        };
+        read
+    };
+    let metadata = read("--emit=dep-info,metadata");
+    let linked = read("--emit=dep-info,metadata,link");
+    assert_eq!(metadata.unit, linked.unit);
+    assert_eq!(metadata.codegen_requested, Some(false));
+    assert_eq!(linked.codegen_requested, Some(true));
 }
 
 /// A COMMAND LINE NAMES ITS UNIT by `--crate-name`, `--test` or `--crate-type`, and

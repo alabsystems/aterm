@@ -85,8 +85,8 @@ pub fn scratch_root() -> Option<&'static Path> {
     }
 }
 
-/// This test binary's short root, `/tmp/aterm-tu-<uid>/<pid>-<stamp>`, made at the first call
-/// and removed at exit as [`scratch_root`]'s is: a place for a Unix socket whose path must fit
+/// This test binary's short root, `/tmp/aterm-tu-<uid>.noindex/<pid>-<stamp>`, made at the first
+/// call and removed at exit as [`scratch_root`]'s is: a place for a Unix socket whose path must fit
 /// `sun_path` (104 bytes on macOS), which a root under the test `TMPDIR` does not. `None` in any
 /// other program, and off unix.
 #[must_use]
@@ -208,7 +208,7 @@ fn canonical(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
-/// `<temp>/aterm-tu-<uid>`, made `0700` or adopted when it is already this user's own
+/// `<temp>/aterm-tu-<uid>.noindex`, made `0700` or adopted when it is already this user's own
 /// ([`adoptable`]); `None` when it is not, or cannot be made.
 #[cfg(debug_assertions)]
 fn roots_dir(temp: &Path) -> Option<PathBuf> {
@@ -217,7 +217,7 @@ fn roots_dir(temp: &Path) -> Option<PathBuf> {
     let me = unsafe { libc::getuid() };
     #[cfg(not(unix))]
     let me = 0;
-    let roots = temp.join(format!("aterm-tu-{me}"));
+    let roots = temp.join(format!("aterm-tu-{me}.noindex"));
     match make_private(&roots) {
         Ok(()) => Some(roots),
         Err(made) if made.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -496,6 +496,10 @@ mod tests {
         let root = scratch_root().expect("this test binary's root");
         let roots = root.parent().expect("a directory of roots");
         assert_eq!(roots.parent(), Some(std::env::temp_dir().as_path()));
+        assert_eq!(
+            roots.extension().and_then(|ext| ext.to_str()),
+            Some("noindex")
+        );
         let name = root.file_name().and_then(|n| n.to_str()).expect("a name");
         assert_eq!(owner_pid(name), Some(std::process::id()));
         assert!(root.is_dir(), "made at first use");
@@ -868,7 +872,7 @@ mod tests {
         let case = |name: &str| {
             let temp = scratch.path().join(name);
             std::fs::create_dir(&temp).expect("a temp dir");
-            let roots = temp.join(format!("aterm-tu-{me}"));
+            let roots = temp.join(format!("aterm-tu-{me}.noindex"));
             (temp, roots)
         };
         let chmod = |path: &Path, mode| {

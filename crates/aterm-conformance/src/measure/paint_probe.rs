@@ -134,6 +134,7 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
 
 /// Log [`WARM_ROW`]'s findings without judging a measured row; return first-exec unavailability.
 fn warm(rig: &Rig) -> Result<(), CouldNotRun> {
+    let started = Instant::now();
     super::instance::first_exec(&rig.aterm)?;
     let outcome = Scratch::new("atpaint").map_or_else(
         |e| format!("no scratch world: {e}"),
@@ -153,7 +154,10 @@ fn warm(rig: &Rig) -> Result<(), CouldNotRun> {
             )
         },
     );
-    eprintln!("measure warm-up: paint — a take that decides nothing ({outcome})");
+    eprintln!(
+        "measure warm-up: paint — a take that decides nothing ({outcome}); seconds={:.6}",
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -189,9 +193,12 @@ fn run_take(
     sampler: &Sampler,
     budget: Budget,
 ) -> Result<Take, CouldNotRun> {
+    let started = Instant::now();
     let world = World::prepare(root, &config_head(row))
         .map_err(|e| CouldNotRun::Refused(format!("cannot lay out the scratch world: {e}")))?;
     let inst = Instance::launch(&rig.aterm, &world, budget)?;
+    let launch_s = started.elapsed().as_secs_f64();
+    let staged = Instant::now();
     let ctl = &inst.ctl;
     if let Some(split) = row.split {
         stage_split(ctl, split)?;
@@ -207,12 +214,16 @@ fn run_take(
     if row.capture == Capture::UnpinnedUnfocused {
         fence_focus_out(ctl)?;
     }
+    let staging_s = staged.elapsed().as_secs_f64();
+    let captured = Instant::now();
     let capture = match row.capture {
         Capture::PinnedVideo => capture_video(ctl, row, sampler)?,
         Capture::UnpinnedFocused | Capture::UnpinnedUnfocused => {
             capture_burst(&inst, row, sampler)?
         }
     };
+    let capture_s = captured.elapsed().as_secs_f64();
+    let scanned = Instant::now();
     let metrics = ctl.ok(&["metrics"])?;
     let backend = field(&metrics, "backend")
         .ok_or_else(|| {
@@ -247,6 +258,11 @@ fn run_take(
     };
     let shape = judge(row, &ledger, &scan)?;
     let typed_gap_ms = typed_gaps(&capture.frames_dir, &capture.typed_shots);
+    eprintln!(
+        "measure setup: paint scene={:?} launch_s={launch_s:.6} staging_s={staging_s:.6} capture_s={capture_s:.6} scan_s={:.6}",
+        row.scene,
+        scanned.elapsed().as_secs_f64()
+    );
     Ok(Take {
         backend,
         scan,

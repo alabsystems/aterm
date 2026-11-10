@@ -141,7 +141,7 @@ fn live_of(pid: u32) -> Option<(PathBuf, Live)> {
         cwd: aterm_sysprobe::process_cwd(pid),
         twin: None,
         managed_launch: atpkg::store::resolve_configured()
-            .and_then(|layout| atpkg::managed_launch::Hints::capture(&layout, &args)),
+            .and_then(|layout| atpkg::managed_launch::Hints::capture_for_pid(&layout, &args, pid)),
     };
     let home = codex_home_of(
         live.codex_home.as_deref(),

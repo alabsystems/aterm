@@ -90,6 +90,8 @@ fn laid_out(phase: ImagePhase) -> (St, Prepare) {
             cold: None,
             rollback: Some(Box::new(back.clone())),
         },
+        boot: None,
+        custody: None,
     };
     let active = if phase == ImagePhase::Forward {
         &command

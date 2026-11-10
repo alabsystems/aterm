@@ -110,6 +110,10 @@ fn a_non_home_warm_grant_wakes_a_sync_to_release_prepared_execution() {
             }
         };
         store.save(&state).unwrap();
+        if cli == Cli::Claude {
+            let held = store.acquire().unwrap();
+            store.retire_source_held(&held, now).unwrap();
+        }
         assert!(!due(), "settled control {cli:?}");
         state.prepared_accounts.insert(row.label.clone());
         store.save(&state).unwrap();

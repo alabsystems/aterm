@@ -45,9 +45,23 @@ impl App {
             )
             .map_err(|error| format!("Allocation split could not open: {error:?}"))?;
         } else {
-            let existing = self.windows.get(&wid).and_then(|window| window.tab_set.tabs().iter().find_map(|tab| {
-                tab.root.leaves().into_iter().find_map(|view| matches!(self.view_store.get(view), Some(View::Native(native)) if native.instance == instance).then_some((tab.id, view)))
-            }));
+            let existing = self.windows.get(&wid).and_then(|window| {
+                window.tab_set.tabs().iter().find_map(|tab| {
+                    let mut found = None;
+                    tab.root.any_leaf(&mut |&view| {
+                        if matches!(
+                            self.view_store.get(view),
+                            Some(View::Native(native)) if native.instance == instance
+                        ) {
+                            found = Some((tab.id, view));
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    found
+                })
+            });
             let (tab, view) = match existing {
                 Some(found) => found,
                 None => self
@@ -122,13 +136,24 @@ impl App {
             self.vitals.snapshot.clone(),
             self.vitals.sampled_at,
         );
-        let visible: Vec<_> = self.windows.iter().filter(|(_, window)| !window.occluded)
-            .flat_map(|(wid, window)| window.tab_set.active().into_iter().flat_map(move |tab| {
-                tab.root.leaves().into_iter().filter(move |view| !tab.zoomed || tab.focus == *view)
-                    .map(move |view| (*wid, view))
-            }))
-            .filter(|(_, view)| matches!(self.view_store.get(*view), Some(View::Native(native)) if native.instance == instance))
-            .collect();
+        let mut visible = Vec::new();
+        for (&wid, window) in &self.windows {
+            if window.occluded {
+                continue;
+            }
+            if let Some(tab) = window.tab_set.active() {
+                tab.root.visit(&mut |&view| {
+                    if (!tab.zoomed || tab.focus == view)
+                        && matches!(
+                            self.view_store.get(view),
+                            Some(View::Native(native)) if native.instance == instance
+                        )
+                    {
+                        visible.push((wid, view));
+                    }
+                });
+            }
+        }
         for (wid, view) in visible {
             self.invalidate_native_view_cache(wid, view, DamageRegion::All);
             if let Some(window) = self.windows.get(&wid) {

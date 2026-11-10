@@ -564,12 +564,31 @@ fn restored_again(step: &str, outcome: &Outcome) -> bool {
     matches!(outcome, Outcome::NotYet(_) | Outcome::Busy) && !step.starts_with("failed:")
 }
 
-/// [`restored_again`] within [`RESTORED_TRIES`].
+/// The steps of a restored relaunch that waits on its record's native operation: one the
+/// ended host kept, which the replay answers once its deadline (at most a crash plan's 120 s
+/// after its prepare, so before this host started plus 120 s) has passed (`native-lapsed`, after
+/// which the next pass plans afresh), or the fresh one whose outcome is pending. Each is tried
+/// past [`RESTORED_TRIES`] until it has waited [`relaunch::STALE_S`], as a typed line's resume is:
+/// the attempt budget alone would end the relaunch before the kept operation can lapse.
+const RESTORED_NATIVE_WAITS: [&str; 3] = [
+    "wait:native-unresolved-operation",
+    "wait:native-lapsed",
+    "wait:native-outcome",
+];
+
+/// Whether `step` is one that is tried until stale ([`RESTORED_NATIVE_WAITS`], or a typed
+/// line's resume).
+fn restored_until_stale(step: &str) -> bool {
+    step == "wait:resume" || RESTORED_NATIVE_WAITS.contains(&step)
+}
+
+/// [`restored_again`] within [`RESTORED_TRIES`], or, for a step tried until stale
+/// ([`restored_until_stale`]), until it has been `waiting` [`relaunch::STALE_S`].
 fn restored_retry(step: &str, outcome: &Outcome, tried: u32, waiting: Duration) -> bool {
     restored_again(step, outcome)
         && (matches!(outcome, Outcome::Busy)
             || tried < RESTORED_TRIES
-            || (step == "wait:resume" && waiting < Duration::from_secs(relaunch::STALE_S)))
+            || (restored_until_stale(step) && waiting < Duration::from_secs(relaunch::STALE_S)))
 }
 
 /// One agent a cold restore hands the host ([`HostHandle::relaunch_restored`]).
@@ -595,6 +614,8 @@ struct RestoredAttempt {
     pause: Duration,
     tried: u32,
     resume_wait_since: Option<Instant>,
+    /// When it first waited on its record's native operation ([`RESTORED_NATIVE_WAITS`]).
+    native_wait_since: Option<Instant>,
     acting: bool,
     agent_seen: bool,
     carried: bool,
@@ -14285,6 +14306,7 @@ fn queue_restored_guarded(
                         pause: RESTORED_FIRST_PAUSE,
                         tried: 0,
                         resume_wait_since: None,
+                        native_wait_since: None,
                         acting: false,
                         agent_seen: false,
                         carried: false,
@@ -14683,12 +14705,14 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
         return;
     }
     let now = Instant::now();
-    if step == "wait:resume" {
-        attempt.resume_wait_since.get_or_insert(now);
-    }
-    let waiting = attempt
-        .resume_wait_since
-        .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+    let since = if step == "wait:resume" {
+        Some(*attempt.resume_wait_since.get_or_insert(now))
+    } else if RESTORED_NATIVE_WAITS.contains(&step.as_str()) {
+        Some(*attempt.native_wait_since.get_or_insert(now))
+    } else {
+        None
+    };
+    let waiting = since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
     if restored_retry(&step, &last, attempt.tried, waiting) {
         attempt.due = now + back_off;
         attempt.pause = (attempt.pause * 2).min(RESTORED_MAX_PAUSE);
@@ -15132,6 +15156,7 @@ fn restored_landing_ends(
             attempt.landed = false;
             attempt.in_flight_only = false;
             attempt.resume_wait_since = None;
+            attempt.native_wait_since = None;
             attempt.due = now + back_off;
             attempt.pause = (attempt.pause * 2).min(RESTORED_MAX_PAUSE);
             LandingEnd::Keep(attempt)
@@ -23094,6 +23119,7 @@ fn sheet_said(seat: &AccountSeat) -> Vec<aterm_agent::harness::accounts_sync::Sh
         .map(|dir| {
             aterm_agent::harness::accounts_sync::sheet_conflicts(
                 &seat.home,
+                &seat.state,
                 &dir.join("aterm.toml"),
             )
         })

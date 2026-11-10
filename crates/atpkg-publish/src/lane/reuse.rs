@@ -53,10 +53,31 @@ pub fn stage(ctx: &Ctx, packages: &[PathBuf], packer: &dyn Packer) -> Result<Vec
     }
     let state = LaneState::of(LaneKind::Linux, &ctx.state_dir);
     state.ensure()?;
-    let _guard = match state.try_lock()? {
+    let guard = match state.try_lock()? {
         Lock::Held(guard) => guard,
         Lock::Busy => return Err(Error::refused("another Linux lane owns its staging state")),
     };
+    let mut staged = false;
+    let result = stage_locked(ctx, packages, packer, &state, &mut staged);
+    drop(guard);
+    // A watcher may have covered its first wake while a later input still held
+    // the lock. Emit the completion event after releasing it, including on error.
+    if staged && let Err(error) = state.notify_ready() {
+        if result.is_ok() {
+            return Err(error);
+        }
+        eprintln!("atpkg-publish: staged work notification also failed: {error}");
+    }
+    result
+}
+
+fn stage_locked(
+    ctx: &Ctx,
+    packages: &[PathBuf],
+    packer: &dyn Packer,
+    state: &LaneState,
+    staged_any: &mut bool,
+) -> Result<Vec<PathBuf>> {
     let scratch = crate::channel::Scratch::new("reuse-linux-packages")?;
     let (number, head) = quad::fetch_head(ctx, &ctx.index_slug(), &scratch.path().join("head"))?;
     state.check_index(number)?;
@@ -216,6 +237,10 @@ pub fn stage(ctx: &Ctx, packages: &[PathBuf], packer: &dyn Packer) -> Result<Vec
             }
             base = merged;
             outputs.insert(staged.clone());
+            *staged_any = true;
+            // A later package may refuse while this qualified stage remains.
+            // Persist its wake before advancing, under the same lane lock.
+            state.notify_ready()?;
         }
     }
     Ok(outputs.into_iter().collect())

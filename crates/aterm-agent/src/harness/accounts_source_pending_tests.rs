@@ -21,7 +21,12 @@ fn a_configured_key_excludes_default_pool_beside_named_roster() {
         fs::write(bed.config.join(FLEET_ROSTER_FILE), "opt_in='named'\n[[account]]\nlabel='chosen'\nemail='chosen@example.test'\nmachines=['m16']\n").unwrap();
         bed.secret(super::super::super::ai_pool::AI_POOL_FILE, "invalid pool");
         let roster = bed.roster(Cli::Claude);
-        let origin = fleet_origin(Some(&bed.home), Some(&bed.aterm_toml()), &roster);
+        let origin = fleet_origin(
+            &accounts::Store::at(&bed.state),
+            Some(&bed.home),
+            Some(&bed.aterm_toml()),
+            &roster,
+        );
         let result =
             sync_accounts_for_init_with(&bed.home, &bed.state, &roster, NOW, || {}, &|_, _| {
                 panic!("local input is captured")
@@ -325,7 +330,12 @@ fn pending_registry_does_not_promote_an_automatic_file_into_an_explicit_source()
             &bed.home, &bed.state, &roster, NOW
         ));
         assert!(matches!(
-            fleet_origin(Some(&bed.home), Some(&bed.aterm_toml()), &roster),
+            fleet_origin(
+                &accounts::Store::at(&bed.state),
+                Some(&bed.home),
+                Some(&bed.aterm_toml()),
+                &roster
+            ),
             FleetOrigin::AlabPending(_)
         ));
         let expected = lab_chosen(Cli::Claude, &roster, &bed.aterm_toml()).unwrap_err();

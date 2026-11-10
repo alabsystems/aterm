@@ -104,6 +104,11 @@ pub(crate) fn clock_round(
     [ra, rb]
 }
 
+/// A public foundation's members hold every epoch of its history, before and after a rotation,
+/// and a history ask keeps none of their keys in its session: it asks whether each opens
+/// (`Bootstrap::holds_histories`), not for its key.
+/// NEGATIVE CONTROL: `Session::history_needs` keeping each `historicals` answer it was given in
+/// `history` fails the second assertion.
 #[test]
 fn a_public_foundation_never_requests_a_historical_epoch_key() {
     let lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);
@@ -113,6 +118,10 @@ fn a_public_foundation_never_requests_a_historical_epoch_key() {
             let session = Session::open(&bootstrap).unwrap();
             let (needs, next) = session.history_needs(None, 16).unwrap();
             assert!(needs.is_empty());
+            assert!(
+                session.history.borrow().is_empty(),
+                "a history ask keeps no key"
+            );
             assert!(next.is_some());
             assert_ne!(next, Some(bootstrap.trust().genesis));
             assert!(session.history_needs(next, 16).unwrap().0.is_empty());

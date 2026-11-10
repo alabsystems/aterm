@@ -695,6 +695,17 @@ const OFFER_PAST: f32 = 1e-5;
 
 const FADE_IN: f32 = 0.30;
 const FADE_OUT: f32 = 0.45;
+/// How long (s) the frame takes the body off the glass once the wall's law hides it with its box
+/// on the line's letters or the caret ([`PetBrain::cut_on_the_letters`]): three frames at 60 Hz,
+/// drawn at three quarters, a half and a quarter of the fade's alpha, and off in the fourth. The
+/// fewest that still read as a fade: its steps span about 64 ms, longer than the eye's temporal
+/// summation at a screen's light (about 50 ms), where two steps of a third (48 ms) or one of a
+/// half (32 ms) are seen as one step, a pop. And at the writing's 20 keys a second it ends as the
+/// next key's letter reaches the art: typed on without a pause or a run of spaces into the margin
+/// of a full page's last row, the line met the art's ink in none of those three frames on 13 x 29
+/// and 11 x 28 px cells, and would have from a fourth at two blank cells or fewer (the trail
+/// gallery's `last-row`, Linux arm64, 2026-11-09).
+const FADE_OFF_THE_LETTERS: f32 = 0.064;
 
 const BREATH_WINDOW: f32 = 10.0;
 
@@ -1581,7 +1592,7 @@ struct PendingTrick {
 /// ([`PetBrain::set_old_path`]): each control names the one law its test
 /// guards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u64)]
+#[repr(u128)]
 pub enum OldPath {
     /// It watches a program its submit started from beside the line
     /// ([`PetBrain::watching_from_the_line`]); reverted, it drops onto the
@@ -1981,11 +1992,17 @@ pub enum OldPath {
     /// letters and the caret for the gap, and followed the caret from there onto the letters
     /// (ATERM-KI-1107-4).
     GapIsTheLines = 1 << 63,
+    /// A body the wall's law hides ([`Self::NoSeatHidesTheBody`]) is drawn off the glass within
+    /// [`FADE_OFF_THE_LETTERS`] of the tick its box meets the line's letters or the caret
+    /// ([`PetBrain::cut_on_the_letters`]), while its fade, which every law reads, runs on;
+    /// reverted, it lay over them for the whole fade ([`FADE_OUT`]), 28 frames at 60 Hz on a full
+    /// page's last row (ATERM-KI-1107-4).
+    LettersCutTheFade = 1 << 64,
 }
 
 impl OldPath {
     /// Every law.
-    pub const EVERY: [Self; 64] = [
+    pub const EVERY: [Self; 65] = [
         Self::WatchFromTheLine,
         Self::FirstKeysAhead,
         Self::LookAheadAtTopSpeed,
@@ -2050,14 +2067,15 @@ impl OldPath {
         Self::NewScreenSettlesFirst,
         Self::FitWaitsForTheFeet,
         Self::GapIsTheLines,
+        Self::LettersCutTheFade,
     ];
     /// Every law's bit ([`PetBrain::set_old_paths`], a test seam, so only where it is built).
     #[cfg(any(test, debug_assertions))]
-    const ALL: u64 = {
+    const ALL: u128 = {
         let mut all = 0;
         let mut k = 0;
         while k < Self::EVERY.len() {
-            all |= Self::EVERY[k] as u64;
+            all |= Self::EVERY[k] as u128;
             k += 1;
         }
         all
@@ -2368,6 +2386,14 @@ pub struct PetBrain {
     /// ([`PetBrain::unseated_return`]). An Enter on a page's last row scrolls the line away and
     /// leaves the caret on that row: there the hide ends at the next line's first such stand.
     unseated: Option<u16>,
+    /// The share of the body the frame draws while the wall's law hides it
+    /// ([`PetBrain::cut_on_the_letters`]): all of it (1) but where the hide's box met the line's
+    /// letters or the caret, falling to none over [`FADE_OFF_THE_LETTERS`] from there, and
+    /// lifting as the body fades back in where the hide ends before the fade has run out.
+    wall_cut: f32,
+    /// Whether the wall's cut falls: the box met the line's letters or the caret while the hide
+    /// held.
+    wall_cut_falls: bool,
     /// When (brain clock) the writing last wrapped the caret back to a line's start
     /// ([`PetBrain::writing_wrapped`]): the bound that follows it is the writing's own.
     writing_wrap: Option<f64>,
@@ -2664,7 +2690,7 @@ pub struct PetBrain {
     letter_step_rearms: bool,
     /// A test's negative controls, a bit a law ([`Self::set_old_path`]).
     #[cfg(any(test, debug_assertions))]
-    old_paths: u64,
+    old_paths: u128,
     /// The host is presenting a frame the program has not finished ([`Self::note_repainting`]).
     repainting: bool,
     last_drawn: [f32; PET_DEPARTURES_MAX],
@@ -2762,6 +2788,8 @@ impl PetBrain {
             wrap_back: false,
             wrap_ahead: None,
             unseated: None,
+            wall_cut: 1.0,
+            wall_cut_falls: false,
             writing_wrap: None,
             launch_running: false,
             launch_brisk: false,
@@ -6561,9 +6589,9 @@ impl PetBrain {
     #[inline]
     pub const fn set_old_path(&mut self, law: OldPath, old: bool) {
         if old {
-            self.old_paths |= law as u64;
+            self.old_paths |= law as u128;
         } else {
-            self.old_paths &= !(law as u64);
+            self.old_paths &= !(law as u128);
         }
     }
 
@@ -6571,7 +6599,7 @@ impl PetBrain {
     #[inline]
     const fn old_path(&self, law: OldPath) -> bool {
         #[cfg(any(test, debug_assertions))]
-        let old = self.old_paths & law as u64 != 0;
+        let old = self.old_paths & law as u128 != 0;
         #[cfg(not(any(test, debug_assertions)))]
         let old = {
             let _ = law;
@@ -6971,7 +6999,9 @@ impl PetBrain {
         if let Some(frame) = self.tick_console_resident(sense, width, (dt, move_dt)) {
             return frame;
         }
+        let caret = sense.caret;
         let (sense, seat_back) = self.unseated_sense(sense, width);
+        self.cut_on_the_letters(caret, &sense, width, move_dt);
         let was_invisible = self.alpha <= 0.0;
         let Some((cr, cc)) = sense.caret else {
             self.stroke.sample(sense.now, None, width);
@@ -9834,6 +9864,7 @@ impl PetBrain {
         if !self.console_observation_incoherent()
             && sense.caret.is_some()
             && frame.alpha == 0
+            && self.wall_cut >= 1.0
             && self.needs_frames()
         {
             self.alpha = 1.0;
@@ -13087,6 +13118,16 @@ impl PetBrain {
         self.keep_stretch_off_caret(&mut frame, &sense);
         self.keep_stretch_off_letters(&mut frame, &sense, width);
         self.veil_over_letters(&mut frame, sense);
+        if self.wall_cut < 1.0 {
+            frame.alpha = (f32::from(frame.alpha) * self.wall_cut).round() as u8;
+            frame.lane_alpha = (f32::from(frame.lane_alpha) * self.wall_cut).round() as u8;
+        }
+        // The fade has run out on whatever path the tick took: the cut is spent, and the body
+        // comes back whole from its fade-in.
+        if self.alpha <= 0.0 {
+            self.wall_cut = 1.0;
+            self.wall_cut_falls = false;
+        }
         const INV_255: f32 = 1.0 / 255.0;
         self.last_presence = f32::from(frame.alpha) * INV_255;
         self.last_stance = Stance::of(&frame);
@@ -13552,6 +13593,78 @@ impl PetBrain {
         } else {
             Some(((col, r), None))
         }
+    }
+
+    /// THE LETTERS CUT THE WALL'S FADE. Where the wall holds no seat ([`Self::wall_seat`]) the
+    /// tick hides the caret and the body fades out where it stands ([`FADE_OUT`]), and the line's
+    /// letters keep coming under it: on a full page's last row its box lay on them for the whole
+    /// fade, 28 frames at 60 Hz at an alpha falling from just under full, its art on up to 161 px
+    /// of their ink and in the caret's cell where the line ran to the grid's end (the trail
+    /// gallery's `last-row`, the cat and the dog on dark, Linux arm64, 2026-11-09). So from the
+    /// tick the box the body draws at rest where it stands ([`Self::rest_box_meets_the_line`])
+    /// meets a lettered cell of its row or the caret's cell while the hide holds, the frame draws a
+    /// share of the body that falls to none over [`FADE_OFF_THE_LETTERS`] ([`Self::emit`]). A hide
+    /// whose box meets neither keeps the whole fade.
+    ///
+    /// The cut is the frame's, not the fade's: the fade runs on under it, and every law that reads
+    /// the fade reads it as before. The body comes back where and when it did (its return waits on
+    /// the fade's end, [`Self::unseated_return`]), and a wrap that takes the caret to the next row
+    /// while the fade runs still bounds from the wall: Claude Code's composer wraps the writing 37
+    /// to 87 ms past such a hide's first frame, the cut run out before some of those wraps, and
+    /// each was a bound (Linux arm64, 2026-11-09). There the cut lifts as the body fades back in
+    /// ([`FADE_IN`]); once the fade has run out the body is off the glass and the cut is spent. A
+    /// program's cursor hide does not hold a body the cut takes off at its seat on the letters
+    /// ([`Self::tick_console_resident`]).
+    /// Reverted by [`OldPath::LettersCutTheFade`].
+    #[inline]
+    fn cut_on_the_letters(
+        &mut self,
+        caret: Option<(u16, u16)>,
+        sense: &PetSense,
+        width: f32,
+        move_dt: f32,
+    ) {
+        if self.unseated.is_none() || self.alpha <= 0.0 || self.old_path(OldPath::LettersCutTheFade)
+        {
+            self.lift_the_wall_cut(move_dt);
+            return;
+        }
+        if !self.wall_cut_falls
+            && let Some(caret) = caret
+            && self.rest_box_meets_the_line(caret, sense, width)
+        {
+            self.wall_cut_falls = true;
+        }
+        if self.wall_cut_falls {
+            self.wall_cut = (self.wall_cut - move_dt * (1.0 / FADE_OFF_THE_LETTERS)).max(0.0);
+        }
+    }
+
+    /// The wall's cut in a tick its hide does not hold ([`Self::cut_on_the_letters`]): the hide
+    /// ended (or the console's resident drew the tick, [`Self::tick_console_resident`]), it lifts
+    /// as the body fades back in ([`FADE_IN`]); the fade run out, or its law reverted, it is spent.
+    #[inline]
+    fn lift_the_wall_cut(&mut self, move_dt: f32) {
+        self.wall_cut_falls = false;
+        self.wall_cut = if self.alpha <= 0.0 || self.old_path(OldPath::LettersCutTheFade) {
+            1.0
+        } else {
+            (self.wall_cut + move_dt * (1.0 / FADE_IN)).min(1.0)
+        };
+    }
+
+    /// Whether the box the body draws at rest where it stands ([`Self::rest_box_cols`]) meets a
+    /// lettered cell of its row or the caret's cell: `false` where the letter reader certifies
+    /// nothing there and the caret lies outside it.
+    #[inline]
+    fn rest_box_meets_the_line(&self, (cr, cc): (u16, u16), sense: &PetSense, width: f32) -> bool {
+        let cells = ((sense.cell_w, sense.cell_h), (sense.cols, sense.rows));
+        let Some((x0, x1)) = self.rest_box_cols((self.col, self.row), cells, width) else {
+            return false;
+        };
+        let caret = f32::from(cc);
+        ((f32::from(cr) - self.row).abs() < 0.5 && caret < x1 && caret + 1.0 > x0)
+            || matches!(self.observed_ink_in_span(self.row, x0, x1), Some(true))
     }
 
     /// Whether the head law keeps the box in its row this frame ([`Self::sunk`]): it draws the
@@ -15107,6 +15220,11 @@ impl PetBrain {
         }
         // Nor is the head law's sink or fit where it goes ([`Self::head_target`]).
         if (self.sink != self.sink_to || self.fit != self.fit_to) && self.alpha > 0.0 {
+            return true;
+        }
+        // Nor the wall's cut ([`Self::cut_on_the_letters`]): it lifts on past a fade-in that has
+        // brought the body back whole.
+        if self.wall_cut < 1.0 && self.alpha > 0.0 {
             return true;
         }
         if (self.letter_gone_since.is_some()

@@ -1420,6 +1420,10 @@ fn an_orphan_observes_retirement_before_applying_its_expired_clock() {
                         _ => "OK native-act state=unknown",
                     }
                     .into()
+                } else if line.contains(" native-act prepare ") && mode == "reconcile" {
+                    // Retirement replays the kept prepare first; a refused replay reconciles the
+                    // binding as before.
+                    "ERR native host epoch changed".into()
                 } else if line.contains(" native-act reconcile ") {
                     "OK native-act state=retired reason=no-exec-grant".into()
                 } else {
@@ -1465,16 +1469,75 @@ fn an_orphan_observes_retirement_before_applying_its_expired_clock() {
                 .count(),
             1
         );
-        assert_eq!(
-            requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|line| line.contains(" native-act reconcile "))
-                .count(),
-            usize::from(mode == "reconcile")
-        );
+        for verb in [" native-act prepare ", " native-act reconcile "] {
+            assert_eq!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|line| line.contains(verb))
+                    .count(),
+                usize::from(mode == "reconcile"),
+                "{verb}"
+            );
+        }
     }
+}
+
+/// The orphans sweep's retirement of an expired bound record replays its kept prepare first, and
+/// a later host's `lapsed` retires it: the record stops with nothing native left, never
+/// reconciling a binding no host holds.
+#[test]
+#[cfg(unix)]
+fn an_orphan_bound_to_a_lapsed_operation_retires_and_stops() {
+    let dir = scratch("lapsed-orphan");
+    let mut opts = drive(&dir);
+    let (socket, requests) =
+        crate::harness::fake_instance(&dir.join("lapsed.sock"), "lapsed-orphan", |line| {
+            if line == "version" {
+                "OK fixture".into()
+            } else if line.contains(" native-act query ") {
+                "OK native-act state=unknown".into()
+            } else if line.contains(" native-act prepare ") {
+                super::super::native_act::lapsed_reply(&"ab".repeat(16))
+                    .unwrap()
+                    .trim_end()
+                    .into()
+            } else {
+                panic!("a lapsed orphan's retirement dispatches nothing else: {line}")
+            }
+        });
+    opts.sock = Some(socket);
+    opts.token = Some(HarnessToken::new("lapsed-orphan"));
+    let mut st = St {
+        phase: Phase::Exiting { at_s: 1 },
+        tab: "retained-tab".into(),
+        native_coordination: true,
+        native: Some(super::super::native_act::Binding {
+            id: "ab".repeat(16),
+            capability: "cd".repeat(32),
+        }),
+        ..St::default()
+    };
+    retain_bound_preparation(&mut st);
+    crate::harness::native_restart::fixture::retain_cold(&mut st);
+    save_checked(&opts, SESSION, &st).unwrap();
+    let reports = orphans(&opts, &[], None);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].step, "failed:stale-exit");
+    let saved = load(&opts, SESSION).unwrap();
+    assert!(saved.native.is_none() && saved.native_prepare.is_empty());
+    assert!(!saved.native_retired_unissued);
+    assert_eq!(saved.phase, Phase::Failed("stale-exit".into()));
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(" native-act prepare "))
+            .count(),
+        1
+    );
 }
 
 #[test]

@@ -109,7 +109,7 @@ fn lane_record_with(
 }
 
 pub(crate) fn origin_slug(repo: &Path) -> Result<Slug, String> {
-    let mut command = crate::ledger::object_git(repo);
+    let mut command = crate::ledger::object_git(repo).map_err(|error| error.to_string())?;
     command.args(["remote", "get-url", "origin"]);
     let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
         &mut command,
@@ -313,7 +313,7 @@ impl Remote {
         }
         std::fs::create_dir(dest).map_err(|error| format!("create owned engine: {error}"))?;
         let local = |args: &[&str]| {
-            let mut cmd = crate::ledger::object_git(dest);
+            let mut cmd = crate::ledger::object_git(dest).map_err(|error| error.to_string())?;
             cmd.args(args);
             let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
                 &mut cmd,
@@ -544,7 +544,8 @@ impl Remote {
     /// Git here reads or updates local metadata only. The explicit checkout,
     /// scrubbed Git context and disabled hooks cannot select a remote transport.
     fn local(&self, args: &[&str]) -> Result<std::process::Output, String> {
-        let mut command = crate::ledger::object_git(&self.repo);
+        let mut command =
+            crate::ledger::object_git(&self.repo).map_err(|error| error.to_string())?;
         command.args(["-c", "core.hooksPath=/dev/null"]).args(args);
         let waiting_on = format!("local git {}", args.join(" "));
         aterm_uds::deadline::output_while_process_progressing_complete_stdout(
@@ -679,7 +680,8 @@ impl Remote {
             return Err("an exact release blob read needs an OID and a relative tree path".into());
         }
         let path = path.to_str().ok_or("release tree path is not UTF-8")?;
-        let mut command = crate::ledger::object_git(&self.repo);
+        let mut command =
+            crate::ledger::object_git(&self.repo).map_err(|error| error.to_string())?;
         command.args(["cat-file", "blob", &format!("{oid}:{path}")]);
         let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
             &mut command,

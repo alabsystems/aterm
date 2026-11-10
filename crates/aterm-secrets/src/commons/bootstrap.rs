@@ -2074,9 +2074,52 @@ impl Bootstrap {
         access: &super::roster::Access,
         bases: &[[u8; 32]],
     ) -> Vec<Result<super::roster::Historical>> {
-        let each = |error: Error| -> Vec<Result<super::roster::Historical>> {
-            bases.iter().map(|_| Err(error.clone())).collect()
-        };
+        self.each_historical(
+            journal,
+            access,
+            bases,
+            |history, basis| history.historical(basis),
+            |past| past,
+        )
+    }
+
+    /// Whether this device holds each of `bases`, in order: whether [`Bootstrap::historicals`]
+    /// answers it with a key, asked without one. A log-era epoch this device opened under the same
+    /// held records before is answered without its key unwrapped again, and a key unwrapped to
+    /// answer is neither kept nor given (`roster::Access::opens_from_lease`); a basis the log does
+    /// not open falls back as [`Bootstrap::historicals`] does. A repair round asks this of each
+    /// epoch of its history, sixteen a round (`aterm-db`'s `Session::history_needs`).
+    pub fn holds_histories(
+        &self,
+        journal: &Journal,
+        access: &super::roster::Access,
+        bases: &[[u8; 32]],
+    ) -> Vec<bool> {
+        self.each_historical(
+            journal,
+            access,
+            bases,
+            |history, basis| Ok(history.opens(basis)?.then_some(())),
+            |_| (),
+        )
+        .iter()
+        .map(Result::is_ok)
+        .collect()
+    }
+
+    /// [`Bootstrap::historicals`] answering each of `bases` as `from_log` reads it of the log's
+    /// history, and as `held` reads a [`super::roster::Historical`] the control journal or a
+    /// handoff opens where the log does not.
+    fn each_historical<T>(
+        &self,
+        journal: &Journal,
+        access: &super::roster::Access,
+        bases: &[[u8; 32]],
+        from_log: impl Fn(&super::roster::LogHistory<'_>, [u8; 32]) -> Result<Option<T>>,
+        held: impl Fn(super::roster::Historical) -> T,
+    ) -> Vec<Result<T>> {
+        let each =
+            |error: Error| -> Vec<Result<T>> { bases.iter().map(|_| Err(error.clone())).collect() };
         if bases.is_empty() {
             return Vec::new();
         }
@@ -2101,13 +2144,13 @@ impl Bootstrap {
                 .iter()
                 .map(|&basis| {
                     let from_log = match &history {
-                        Ok(Some(history)) => history.historical(basis),
+                        Ok(Some(history)) => from_log(history, basis),
                         Ok(None) => Ok(None),
                         Err(error) => Err((*error).clone()),
                     };
                     let native = match from_log {
                         Ok(Some(past)) => Ok(past),
-                        Ok(None) => access.historical(journal, identity, basis),
+                        Ok(None) => access.historical(journal, identity, basis).map(&held),
                         Err(error) => Err(error),
                     };
                     // A log-era Commons epoch this device holds no `Wrap` of (one from before it
@@ -2119,7 +2162,8 @@ impl Bootstrap {
                                 handoff.open_in(journal, access, identity, history)
                             }
                             _ => handoff.open(journal, access, identity),
-                        },
+                        }
+                        .map(&held),
                         None => Err(error),
                     })
                 })

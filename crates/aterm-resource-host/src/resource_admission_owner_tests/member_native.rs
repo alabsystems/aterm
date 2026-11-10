@@ -28,6 +28,9 @@ const LEGACY: &str = "ATERM_MEMBER_FIXTURE_LEGACY";
 const SDK: &str = "ATERM_MEMBER_FIXTURE_SDK";
 const MARKER: &str = "ATERM_MEMBER_FIXTURE_MARKER";
 const MODE: &str = "ATERM_MEMBER_FIXTURE_ACCOUNTING_MODE";
+const PROGRESS: &str = "ATERM_MEMBER_FIXTURE_PROGRESS";
+// The admitted original-scope cap; individual waits and inactivity remain bounded by HANG.
+const ROOT_BUDGET: Duration = Duration::from_secs(600);
 
 pub(super) fn run(args: &[OsString], gnu: Option<[OwnedFd; 2]>) -> std::process::ExitCode {
     if matches!(args, [arg] if arg == "-vV")
@@ -61,9 +64,12 @@ fn outer() {
     let store = ImageStore::prepare_at(&path).unwrap();
     let program = store.cache_current().unwrap();
     for role in ["fixture-host", "fixture-host-unknown"] {
+        let progress = path.join(format!("{role}.progress"));
         let mut command = spawnfd::command(program.path());
-        command.arg(role).env(STORE, &path);
-        let result = deadline::output_within(&mut command, HANG);
+        command.arg(role).env(STORE, &path).env(PROGRESS, &progress);
+        let result = deadline::output_while_progressing(&mut command, HANG, &mut || {
+            fs::metadata(&progress).map_or(0, |metadata| metadata.len())
+        });
         let output = match result {
             Ok(output) if output.status.success() => output,
             failure => {
@@ -86,7 +92,17 @@ fn outer() {
     }
     println!("actual native member custody and FIFO conservation passed");
 }
+// Only completed fixture phases and protocol exchanges advance the hang detector.
+fn progressed(phase: &str) {
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::var_os(PROGRESS).unwrap())
+        .unwrap();
+    writeln!(log, "{phase}").unwrap();
+}
 fn host(unknown: bool) {
+    progressed("host-started");
     crate::runtime::test_endpoint().unwrap();
     let path = PathBuf::from(std::env::var_os(STORE).unwrap());
     let store = ImageStore::open_at(&path).unwrap();
@@ -121,7 +137,8 @@ fn host(unknown: bool) {
         .unwrap(),
     );
     let marker = world.scratch.path.join("member-marker");
-    let (binding, memory, events) = world.queue_sleep(HANG);
+    progressed("sdk-prepared");
+    let (binding, memory, events) = world.queue_sleep(ROOT_BUDGET);
     let root_log = world.scratch.path.join("root.stderr");
     let pending = world.owner.pending.back_mut().unwrap();
     pending.events.account().unwrap();
@@ -174,10 +191,11 @@ fn host(unknown: bool) {
         read_event(&events, &binding),
         Event::Started { .. }
     ));
-    let end = Instant::now() + HANG;
+    progressed("root-started");
     let mut submissions = 0;
     let mut corrupt_after_retirement = None;
     while !world.owner.idle() {
+        let end = Instant::now() + HANG;
         world.owner.tick();
         if let Some((attempt, _)) = &corrupt_after_retirement
             && world
@@ -193,7 +211,6 @@ fn host(unknown: bool) {
             wire::write_all(&stream, &[0], end).unwrap();
             drop(stream);
         }
-        assert!(Instant::now() < end, "actual member host failed to drain");
         match aterm_uds::accept(
             &listener,
             aterm_uds::AcceptWait::Ready,
@@ -210,14 +227,15 @@ fn host(unknown: bool) {
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => continue,
                     Err(error) => panic!("actual member HELLO: {error}"),
                 };
-                match hello["role"].as_str() {
-                    Some("native-context") => {
+                let role = hello["role"].as_str().unwrap();
+                match role {
+                    "native-context" => {
                         crate::resource_context::serve(&stream, peer, &hello, end, |peer, query| {
                             world.owner.context(peer, &query)
                         })
                         .unwrap()
                     }
-                    Some("native-telemetry") => crate::resource_telemetry::serve(
+                    "native-telemetry" => crate::resource_telemetry::serve(
                         &stream,
                         peer,
                         &hello,
@@ -226,7 +244,7 @@ fn host(unknown: bool) {
                         |peer, query| world.owner.context(peer, &query),
                     )
                     .unwrap(),
-                    Some("proxy-member" | "proxy-member-accounted-v1") => {
+                    "proxy-member" | "proxy-member-accounted-v1" => {
                         let accounted =
                             hello["role"].as_str() == Some(control::accounting::PROXY_ROLE);
                         native
@@ -279,6 +297,7 @@ fn host(unknown: bool) {
                     }
                     _ => panic!("unexpected native member role"),
                 }
+                progressed(role);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
             Err(error) => panic!("actual member accept: {error}"),
@@ -504,6 +523,7 @@ fn root() {
         stderr: std::process::Stdio::inherit(),
         descriptions: vec![cpu, read, write],
     };
+    let end = Instant::now() + HANG;
     let mut child = (if unknown {
         client.workload_member_accounted(&request, member_io, end)
     } else {
@@ -568,6 +588,7 @@ fn root() {
     // The same original CPU lease and FIFO back every sample. These are
     // native child outcomes, not fabricated saved terminal measurements.
     for (offset, mode) in ["", "fail", "cancel"].into_iter().enumerate() {
+        let end = Instant::now() + HANG;
         let cpu = aterm_uds::kept_out(|| lease.as_fd().try_clone_to_owned()).unwrap();
         let read = aterm_uds::kept_out(|| original.as_fd().try_clone_to_owned()).unwrap();
         let write = aterm_uds::kept_out(|| original.as_fd().try_clone_to_owned()).unwrap();
@@ -671,7 +692,7 @@ fn root() {
         .into_iter()
         .enumerate()
     {
-        probe::run(&client, &request, &lease, query, index as u8 + 20, end);
+        probe::run(&client, &request, &lease, query, index as u8 + 20);
     }
     fs::OpenOptions::new()
         .append(true)

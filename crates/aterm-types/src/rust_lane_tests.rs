@@ -231,7 +231,8 @@ fn a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_tar
 
 #[test]
 fn file_beside_resolves_a_directory_the_way_the_shell_wrote_it() {
-    let root = std::env::temp_dir().join(format!("rust-lane-beside-{}", std::process::id()));
+    let scratch = crate::test_scratch_dir("beside");
+    let root = scratch.path();
     let home = root.join("home");
     let bin = home.join("tc/bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -277,7 +278,6 @@ fn file_beside_resolves_a_directory_the_way_the_shell_wrote_it() {
         None,
         None
     ));
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -549,8 +549,8 @@ fn a_pin_is_read_the_way_rustup_reads_it() {
     assert_eq!(channel_in("channel_x = \"y\"\n[toolchain]\n"), None);
     assert_eq!(channel_in(""), None);
 
-    let root = std::env::temp_dir().join(format!("aterm-rust-lane-pin-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let scratch = crate::test_scratch_dir("pin");
+    let root = scratch.path();
     let deep = root.join("crates").join("x").join("src");
     std::fs::create_dir_all(&deep).expect("mkdir");
     std::fs::write(
@@ -581,7 +581,6 @@ fn a_pin_is_read_the_way_rustup_reads_it() {
     assert!(is_trust_channel("trust"));
     assert!(is_trust_channel("trust-9192"));
     assert!(!is_trust_channel("1.97.1"));
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

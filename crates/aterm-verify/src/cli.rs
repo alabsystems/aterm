@@ -21,8 +21,8 @@ pub struct Args {
     /// `--bundle` narrow it to its halves ([`RELEASE_TREE`], [`RELEASE_BUNDLE`]), `--checks` to
     /// some of its checks; each is still a release's run of them.
     pub release: bool,
-    /// `--fail-fast`: the run's first proven red ends it, as it ends a release; a bare run keeps
-    /// its whole sweep.
+    /// `--fail-fast`: every first proven red ends the run, as it ends a release. Without it,
+    /// source/type preflight failures stop the run, while test failures keep the full sweep.
     pub fail_fast: bool,
     /// Repeatable tree sample: overlapping resources queue behind Ordinary work; Release can end it.
     pub background: bool,
@@ -538,6 +538,8 @@ Options:
       --fail-fast         end the run at its first failure, as release does:
                           what it stopped reads NOT RUN (a check that could
                           not run, its machine's fault, never ends it)
+                          source/type preflight failures always stop the run;
+                          without this flag, test failures keep the full sweep
       --admit <wait|now>  wait for room for the disk the run will write, for
                           each stage's memory before it starts (held until
                           it ends, beside other runs' claims), and for a
@@ -928,7 +930,7 @@ mod tests {
         assert_eq!(a.timeout, Some(None));
         assert_eq!(a.log.as_deref(), Some(std::path::Path::new("/tmp/x.log")));
         assert!(a.no_windows);
-        assert!(!a.fail_fast, "a bare run keeps its whole sweep");
+        assert!(!a.fail_fast, "test failures keep their whole sweep");
         assert!(ok(&["test", "--fail-fast"]).fail_fast);
         assert_eq!(a.base.as_deref(), Some("main"));
         assert_eq!(a.admit, aterm_capacity::Admit::Wait, "wait by default");

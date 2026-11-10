@@ -12,6 +12,7 @@ pub(crate) enum Arm {
     Fat1Lines,
     Fat16,
     Fat16Lines,
+    Thin16,
     Thin16Lines,
 }
 
@@ -28,6 +29,7 @@ impl Arm {
             Self::Fat1Lines => "fat1-lines",
             Self::Fat16 => "fat16",
             Self::Fat16Lines => "fat16-lines",
+            Self::Thin16 => "thin16",
             Self::Thin16Lines => "thin16-lines",
         }
     }
@@ -35,7 +37,7 @@ impl Arm {
         [
             (
                 "CARGO_PROFILE_RELEASE_LTO",
-                if self == Self::Thin16Lines {
+                if matches!(self, Self::Thin16 | Self::Thin16Lines) {
                     "thin"
                 } else {
                     "fat"
@@ -51,7 +53,7 @@ impl Arm {
             ),
             (
                 "CARGO_PROFILE_RELEASE_DEBUG",
-                if matches!(self, Self::Fat1 | Self::Fat16) {
+                if matches!(self, Self::Fat1 | Self::Fat16 | Self::Thin16) {
                     "1"
                 } else {
                     "line-tables-only"
@@ -98,6 +100,7 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
                     "fat1-lines" => Arm::Fat1Lines,
                     "fat16" => Arm::Fat16,
                     "fat16-lines" => Arm::Fat16Lines,
+                    "thin16" => Arm::Thin16,
                     "thin16-lines" => Arm::Thin16Lines,
                     _ => return Err(format!("unknown pilot arm {value}")),
                 };
@@ -549,6 +552,7 @@ fn validate(rows: &[aterm_json::Value]) -> Result<(), String> {
         let twin = match row["arm"].as_str() {
             Some("fat1-lines") => "fat1",
             Some("fat16-lines") => "fat16",
+            Some("thin16-lines") => "thin16",
             _ => continue,
         };
         if let Some(base) = rows
@@ -583,6 +587,7 @@ fn retained_root(cache: &Path, requested: &Path) -> Result<std::path::PathBuf, S
 fn run_tool(name: &str, args: &[&std::ffi::OsStr], lookup: bool) -> Result<String, String> {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("pilot-tool-")
+        .suffix(".noindex")
         .tempdir()
         .map_err(|e| e.to_string())?;
     let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("xcrun"))
@@ -1130,6 +1135,54 @@ mod tests {
         assert_ne!(Arm::Fat1.environment(), Arm::Fat1Lines.environment());
         assert_eq!(Arm::Fat1Lines.environment()[2].1, "line-tables-only");
         assert!(parse(["--arm", "unknown"].into_iter().map(str::to_owned)).is_err());
+    }
+    #[test]
+    fn thin_comparison_keeps_the_shipped_debug_information() {
+        let opts = parse(
+            ["--arm", "fat1", "--arm", "thin16"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            order(&opts),
+            vec![
+                (0, Arm::Fat1),
+                (0, Arm::Thin16),
+                (1, Arm::Thin16),
+                (1, Arm::Fat1)
+            ]
+        );
+        assert_eq!(
+            Arm::Thin16.environment(),
+            [
+                ("CARGO_PROFILE_RELEASE_LTO", "thin"),
+                ("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "16"),
+                ("CARGO_PROFILE_RELEASE_DEBUG", "1"),
+            ]
+        );
+        assert_eq!(Arm::Thin16.environment()[2], Arm::Fat1.environment()[2]);
+        assert_ne!(
+            Arm::Thin16.environment()[2],
+            Arm::Thin16Lines.environment()[2]
+        );
+    }
+    #[test]
+    fn thin_debug_twin_rejects_changed_code() {
+        let row = |arm: &str, code: &str| {
+            aterm_json::json!({
+                "arm": arm, "slice": "native", "sha256": arm,
+                "inspection": {"sections": code, "symbols": "same"}
+            })
+        };
+        let base = row("thin16", "same");
+        let lines = row("thin16-lines", "same");
+        let mut rows = vec![base.clone(), base, lines.clone(), lines];
+        assert!(validate(&rows).is_ok());
+        let changed = row("thin16-lines", "changed");
+        rows[2] = changed.clone();
+        rows[3] = changed;
+        assert!(validate(&rows).is_err());
     }
     #[test]
     fn identity_rejects_mutated_code_and_nonreproducible_binary() {

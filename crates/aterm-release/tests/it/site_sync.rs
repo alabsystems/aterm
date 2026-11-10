@@ -588,6 +588,7 @@ impl Lab {
     fn empty(site_root: &str) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("aterm-site-sync-")
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let root = dir.path().canonicalize().unwrap();

@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn selected_link_runs_the_chosen_app_without_changing_other_path_order() {
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::test_scratch_dir("cli-path");
         let home = root.path().join("home");
         let bin = home.join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();

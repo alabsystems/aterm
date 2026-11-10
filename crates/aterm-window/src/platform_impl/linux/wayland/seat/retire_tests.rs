@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use aterm_wayland::protocols::wayland::{wl_buffer, wl_shm, wl_shm_pool, wl_surface};
 
-use super::{TextInput, WinitPointer, RETIRE, RETIRE_TESTS};
+use super::{RetireTurned, TextInput, WinitPointer, RETIRE, RETIRE_TESTS};
 use crate::platform_impl::wayland::event_loop::EventLoop;
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::window::Window;
@@ -90,8 +90,8 @@ struct Outcome {
     reaped_by_the_loop: bool,
 }
 
-fn arm(lane: &Lane, retire: bool) -> Outcome {
-    RETIRE.store(retire, Ordering::SeqCst);
+fn arm(lane: &Lane, turned: &RetireTurned, retire: bool) -> Outcome {
+    turned.set(retire);
     let mut event_loop =
         EventLoop::<()>::on_display(Some(&lane.display)).expect("Mutter's display");
     let window = {
@@ -233,28 +233,36 @@ fn a_held_pointer_and_text_input_die_on_the_loop_s_thread() {
     let Some(lane) = lane() else {
         return;
     };
-    struct Restore {
-        _serial: std::sync::MutexGuard<'static, ()>,
-    }
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            RETIRE.store(true, Ordering::SeqCst);
-        }
-    }
-    let _restore =
-        Restore { _serial: RETIRE_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) };
-    let fixed = arm(&lane, true);
+    let turned = RetireTurned::take();
+    let fixed = arm(&lane, &turned, true);
     eprintln!("retired: {fixed:?}");
     assert_eq!(
         fixed,
         Outcome { pointer_after_holder: 1, text_input_after_holder: 1, reaped_by_the_loop: true },
         "the loop's reference outlived the holder's, and the loop destroyed both"
     );
-    let unfixed = arm(&lane, false);
+    let unfixed = arm(&lane, &turned, false);
     eprintln!("not retired: {unfixed:?}");
     assert_eq!(
         unfixed,
         Outcome { pointer_after_holder: 0, text_input_after_holder: 0, reaped_by_the_loop: false },
         "without the retire, the holder's thread destroyed both"
     );
+}
+
+#[test]
+fn a_turned_retire_holds_its_tests_lock_while_it_lives() {
+    let turned = RetireTurned::take();
+    turned.set(false);
+    assert!(
+        matches!(RETIRE_TESTS.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+        "a test turning the retire toggle holds the lock that serialises every other turn"
+    );
+    drop(turned);
+    let next = RetireTurned::take();
+    assert!(
+        RETIRE.load(Ordering::SeqCst),
+        "the turn before this one turned retirement back on before it let go"
+    );
+    drop(next);
 }

@@ -363,6 +363,7 @@ struct Dark {
     probe: Probe,
     gate: Option<Arc<ReadGate>>,
     failures: BTreeMap<String, String>,
+    probe_only: bool,
 }
 
 impl Dark {
@@ -372,6 +373,7 @@ impl Dark {
             probe,
             gate: None,
             failures: BTreeMap::new(),
+            probe_only: false,
         }
     }
 }
@@ -450,7 +452,7 @@ impl ReleaseHost for Dark {
             return Probe::Unknown(why.clone());
         }
         match &self.probe {
-            Probe::Unknown(_) => self.probe.clone(),
+            Probe::Unknown(_) if !self.probe_only => self.probe.clone(),
             _ => self.inner.fetch_public(slug, tag, asset, dest, cap),
         }
     }
@@ -459,6 +461,89 @@ impl ReleaseHost for Dark {
     }
     fn fetch_repo(&self, slug: &Slug, dir: &Path) -> std::result::Result<(), HostError> {
         self.inner.fetch_repo(slug, dir)
+    }
+}
+
+#[test]
+fn an_unknown_head_uses_the_signed_public_payload_without_staging_or_writes() {
+    let (mut rig, q) = setup("mirror-head-unknown", index());
+    ok(&rig, &q, false);
+    let before = rig.host.calls().len();
+    let mut host = Dark::new(rig.host.clone(), Probe::Unknown("HTTP 500".into()));
+    host.probe_only = true;
+    rig.route(Arc::new(host));
+    let (report, _) = ok(&rig, &q, false);
+    assert_eq!(report.skipped, ["atpkg-ay-8256"]);
+    let calls = &rig.host.calls()[before..];
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == &format!("fetch alabsystems/ay atpkg-ay-8256 {TARBALL}"))
+    );
+    assert!(
+        !calls.iter().any(|c| c.contains("alabsystems")
+            || c.starts_with("create")
+            || c.starts_with("upload")),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn an_unknown_head_cannot_accept_corrupt_or_truncated_public_payloads() {
+    for truncate in [false, true] {
+        let (mut rig, q) = setup("mirror-head-corrupt", index());
+        ok(&rig, &q, false);
+        let mut rel = rig.host.release_of(&public(), "atpkg-ay-8256").unwrap();
+        let bytes = rel.assets.get_mut(TARBALL).unwrap();
+        assert!(!bytes.is_empty());
+        if truncate {
+            bytes.pop();
+        } else {
+            bytes[0] ^= 1;
+        }
+        rig.host.put(&public(), "atpkg-ay-8256", rel);
+        let before = writes(&rig.host);
+        let mut host = Dark::new(rig.host.clone(), Probe::Unknown("HTTP 500".into()));
+        host.probe_only = true;
+        rig.route(Arc::new(host));
+        assert!(err(&rig, &q, false).contains("size or hash mismatch vs the signed manifest"));
+        assert_eq!(writes(&rig.host), before);
+    }
+}
+
+#[test]
+fn a_definitively_absent_head_does_not_fetch_the_payload() {
+    let (mut rig, q) = setup("mirror-head-absent", index());
+    ok(&rig, &q, false);
+    let before = rig.host.calls().len();
+    rig.route(Arc::new(Dark::new(rig.host.clone(), Probe::Absent)));
+    let (report, _) = ok(&rig, &q, true);
+    assert_eq!(report.planned.len(), 1);
+    assert!(
+        !rig.host.calls()[before..]
+            .iter()
+            .any(|c| c.starts_with("fetch") && c.ends_with(TARBALL))
+    );
+}
+
+#[test]
+fn an_unknown_head_does_not_make_a_private_or_draft_release_public() {
+    for private in [false, true] {
+        let (mut rig, q) = setup("mirror-head-private", index());
+        ok(&rig, &q, false);
+        if private {
+            rig.host.set_private(&public(), true);
+        } else {
+            let mut rel = rig.host.release_of(&public(), "atpkg-ay-8256").unwrap();
+            rel.draft = true;
+            rig.host.put(&public(), "atpkg-ay-8256", rel);
+        }
+        let before = writes(&rig.host);
+        let mut host = Dark::new(rig.host.clone(), Probe::Unknown("HTTP 500".into()));
+        host.probe_only = true;
+        rig.route(Arc::new(host));
+        assert!(err(&rig, &q, false).contains("exists but serves no pkg-ay-8256.toml"));
+        assert_eq!(writes(&rig.host), before);
     }
 }
 

@@ -552,6 +552,124 @@ mod live {
             .map(|p| super::super::birth_us(&p))
     }
 
+    fn ticket_wait(path: &Path, facts: &[crate::jobs::ProcFacts], now: u64) -> Option<Holder> {
+        let mut reader = std::fs::File::from(aterm_uds::nofollow::open_reader(path).ok()?);
+        waiting_ticket(path, &mut reader, facts, now)
+    }
+
+    #[test]
+    fn admission_ticket_requires_presampled_descriptor_birth_and_live_lease() {
+        use crate::jobs::{JobsReader, ReadReq};
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = Arc::new(aterm_tempfile::tempdir().expect("scratch"));
+        let root = dir.path().canonicalize().expect("real path");
+        let ticket = root.join("wait-1");
+        let mut holding = Holding::start(&dir, &ticket, false);
+        std::fs::set_permissions(&ticket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut reader = JobsReader::new();
+        let mut facts = reader.read_all_at(
+            &[ReadReq {
+                pid: holding.pid(),
+                fds: true,
+            }],
+            now_us(),
+        );
+        eprintln!(
+            "ticket meta={:?} facts={facts:?} native={:?} lease={:?}",
+            std::fs::symlink_metadata(&ticket),
+            kproc::record(holding.pid()),
+            super::super::live::locked(&std::fs::File::open(&ticket).unwrap())
+        );
+        assert_eq!(
+            ticket_wait(&ticket, &facts, now_us()).map(|h| h.pid),
+            Some(holding.pid())
+        );
+        let saved = facts[0].fds.take();
+        assert_eq!(
+            ticket_wait(&ticket, &facts, now_us()),
+            None,
+            "alive PID alone"
+        );
+        facts[0].fds = saved;
+        let birth = facts[0].start;
+        facts[0].start = Some(1);
+        assert_eq!(ticket_wait(&ticket, &facts, now_us()), None, "reused PID");
+        facts[0].start = birth;
+        let uid = facts[0].uid.take();
+        assert_eq!(ticket_wait(&ticket, &facts, now_us()), None, "unknown user");
+        facts[0].uid = uid;
+        std::fs::set_permissions(&ticket, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            ticket_wait(&ticket, &facts, now_us()),
+            None,
+            "foreign writable evidence"
+        );
+        std::fs::set_permissions(&ticket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let bytes = std::fs::read(&ticket).unwrap();
+        std::fs::write(&ticket, python_record(std::process::id(), &root, now_us())).unwrap();
+        let observer = reader.read_all_at(
+            &[ReadReq {
+                pid: std::process::id(),
+                fds: true,
+            }],
+            now_us(),
+        );
+        assert_eq!(
+            ticket_wait(&ticket, &observer, now_us()),
+            None,
+            "a foreign record cannot use the observer's newly opened ticket FD as evidence"
+        );
+        std::fs::write(&ticket, python_record(holding.pid(), &root, 0)).unwrap();
+        assert_eq!(
+            ticket_wait(&ticket, &facts, now_us()),
+            None,
+            "record predates this birth"
+        );
+        let mut missing: aterm_json::Value = aterm_json::from_slice(&bytes).unwrap();
+        missing.as_object_mut().unwrap().remove("cmd");
+        std::fs::write(&ticket, aterm_json::to_vec(&missing).unwrap()).unwrap();
+        assert_eq!(
+            ticket_wait(&ticket, &facts, now_us()),
+            None,
+            "not a canonical ticket record"
+        );
+        std::fs::write(&ticket, b"{").unwrap();
+        assert_eq!(ticket_wait(&ticket, &facts, now_us()), None, "malformed");
+        std::fs::write(&ticket, vec![b' '; RECORD_CAP + 1]).unwrap();
+        assert_eq!(ticket_wait(&ticket, &facts, now_us()), None, "oversized");
+        std::fs::write(&ticket, &bytes).unwrap();
+        let moved = root.join("original");
+        std::fs::rename(&ticket, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &ticket).unwrap();
+        assert_eq!(ticket_wait(&ticket, &facts, now_us()), None, "symlink");
+        std::fs::remove_file(&ticket).unwrap();
+        std::fs::write(&ticket, &bytes).unwrap();
+        std::fs::set_permissions(&ticket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            ticket_wait(&ticket, &facts, now_us()),
+            None,
+            "substituted unlocked inode"
+        );
+        std::fs::remove_file(&ticket).unwrap();
+        std::fs::rename(&moved, &ticket).unwrap();
+        let child = holding.child.0.as_mut().unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"u").unwrap();
+        until("the live holder released its lease", || {
+            ticket.with_extension("unlocked").is_file()
+        });
+        assert_eq!(
+            ticket_wait(&ticket, &facts, now_us()),
+            None,
+            "alive and open, but unlocked"
+        );
+        holding.end();
+        assert_eq!(
+            ticket_wait(&ticket, &facts, now_us()),
+            None,
+            "closed stale lease"
+        );
+    }
+
     /// Wait, under [`HANG`], until `done`.
     fn until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + HANG;
@@ -625,6 +743,15 @@ mod live {
             build
         });
         println!("\nheld");
+        if std::env::var_os(BUILD_ENV).is_none() {
+            let mut control = [0];
+            if std::io::stdin().read_exact(&mut control).is_ok() && control == *b"u" {
+                file.unlock()
+                    .expect("release the fixture lease while staying alive and open");
+                std::fs::write(slot.with_extension("unlocked"), b"unlocked").expect("unlock proof");
+                println!("\nunlocked");
+            }
+        }
         loop {
             std::thread::park();
         }
@@ -703,7 +830,7 @@ mod live {
             .env(SLOT_ENV, slot)
             .env_remove(BUILD_ENV)
             .current_dir(dir.path())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped());
             if build {
                 let (stop, far) = UnixStream::pair().expect("the build's stop authority");

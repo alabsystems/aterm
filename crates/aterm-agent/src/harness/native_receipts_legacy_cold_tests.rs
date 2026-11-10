@@ -70,6 +70,19 @@ fn a_legacy_cold_noexec_receipt_survives_route_normalization() {
         )
         .unwrap();
         drop(log);
+        // The closure reader matches the legacy digest; a stamped spelling never had one.
+        assert_eq!(
+            observe_closure_at(&paths, &prepare).unwrap(),
+            Closure::Exact(Recorded::Prepared)
+        );
+        let mut stamped = prepare.clone();
+        stamped.custody = custody_at(&paths).unwrap();
+        assert!(stamped.custody.is_some());
+        assert_eq!(Request::prepare(stamped.clone()).encode_legacy_cold(), None);
+        assert_eq!(
+            observe_closure_at(&paths, &stamped).unwrap(),
+            Closure::Other
+        );
         let (mut log, view) = open_existing(&paths, &key, LIMITS).unwrap();
         let expected = Observed {
             sequence: view.sequence,
@@ -97,10 +110,18 @@ fn a_legacy_cold_noexec_receipt_survives_route_normalization() {
                 recorded_ms: 18
             })
         );
+        assert_eq!(
+            observe_closure_at(&paths, &prepare).unwrap(),
+            Closure::Exact(Recorded::NoExec)
+        );
         let mut changed = prepare.clone();
         changed.deadline_us += 1;
         assert_eq!(observe_prepare_at(&paths, &changed).unwrap(), None);
         assert_eq!(observe_phase_at(&paths, &changed, &binding).unwrap(), None);
+        assert_eq!(
+            observe_closure_at(&paths, &changed).unwrap(),
+            Closure::Other
+        );
         let changes: &[fn(&mut ColdIntent)] = &[
             |cold| cold.login = Some("m3.1".into()),
             |cold| cold.home = None,

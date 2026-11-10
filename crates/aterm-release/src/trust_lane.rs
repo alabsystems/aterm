@@ -3873,6 +3873,7 @@ fn write_checkout_record(root: &Path, repo: &Path) -> std::io::Result<()> {
     }
     let scratch = aterm_tempfile::Builder::new()
         .prefix(".checkout-")
+        .suffix(".noindex")
         .tempdir_in(root)?;
     let at = scratch.path().join("record");
     let mut file = crate::durable::open_create_new(&at)?;
