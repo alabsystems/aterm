@@ -2565,10 +2565,19 @@ cargo_honours_pin() {
 # cc, ar and ld from it, and a root run's PATH may be the account's that ran
 # sudo; and the build, its git (aterm's build script's among them) and on
 # macOS its cc, run in root_build_env's environment.
+#
+# Both lanes stamp the binary with the commit it was built from (ATERM_STAMP=commit,
+# crates/aterm/build.rs: git's facts for this checkout, `-dirty` for a changed
+# tree), as `ship dev-app` stamps a dev bundle: unstamped, a source install says
+# `commit unknown` and build 0 in `aterm update identity` and its logs. Its
+# identity is the checkout's: a source build is no release and carries no index
+# hint, and a pin the caller's environment holds would name another commit, so
+# those inputs are unset (scrub).
 CARGO_UNVERIFIED_LANE="target.'cfg(trust_verify)'.rustflags=[\"-Ztrust-verify=off\"]"
 cargo_build_pinned() { # <root>
 	local rest=":$PATH"
 	local -a genv=()
+	local -a scrub=(-u ATERM_RELEASE_BUILD -u ATERM_STAMP_INDEX_HINT -u ATERM_BUILD_GIT_COMMIT -u ATERM_BUILD_GIT_COMMIT_FULL -u ATERM_BUILD_DEV_COMMITS)
 	if [[ "$(installer_uid)" == 0 ]]; then
 		rest="$(root_build_path)"
 		rest="${rest:+:$rest}"
@@ -2576,9 +2585,9 @@ cargo_build_pinned() { # <root>
 		genv=("${ROOT_BUILD_ENV[@]}")
 	fi
 	if [[ "${CARGO_LANE:-}" == store ]]; then
-		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN -u RUSTC -u CARGO_BUILD_RUSTC ${genv[@]+"${genv[@]}"} PATH="$(build_path_lead)$rest" "$CARGO_BIN" --unverified build --release -p aterm --bin aterm --target-dir "$1/target")
+		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN -u RUSTC -u CARGO_BUILD_RUSTC "${scrub[@]}" ${genv[@]+"${genv[@]}"} ATERM_STAMP=commit PATH="$(build_path_lead)$rest" "$CARGO_BIN" --unverified build --release -p aterm --bin aterm --target-dir "$1/target")
 	else
-		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN ${genv[@]+"${genv[@]}"} PATH="$(build_path_lead)$rest" "$CARGO_BIN" build --release -p aterm --bin aterm --target-dir "$1/target" --config "$CARGO_UNVERIFIED_LANE")
+		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN "${scrub[@]}" ${genv[@]+"${genv[@]}"} ATERM_STAMP=commit PATH="$(build_path_lead)$rest" "$CARGO_BIN" build --release -p aterm --bin aterm --target-dir "$1/target" --config "$CARGO_UNVERIFIED_LANE")
 	fi
 }
 # The rustup lane in the block above serves a tree whose pin names a stock channel,
