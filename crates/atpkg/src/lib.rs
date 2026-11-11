@@ -134,6 +134,9 @@ pub mod platform;
 pub mod prereq;
 /// Signed, leased prerequisites for builds and publication.
 pub mod prerequisite;
+/// Fresh producer-owned input lifetimes; no SDK/source validation or path adoption.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod private_input;
 /// Readings a doctor keeps between runs under keys that name what they depend on.
 pub mod probe_cache;
 pub mod progress;

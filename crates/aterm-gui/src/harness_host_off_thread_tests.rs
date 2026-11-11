@@ -356,12 +356,10 @@ fn a_restart_answers_the_claim_its_relaunch_said() {
             claim: RestartClaim::ALL[asks.fetch_add(1, Ordering::SeqCst) % RestartClaim::ALL.len()],
         });
     });
-    let fallback = Restart::Model {
-        to: "claude-sonnet-5-5".to_string(),
-    };
-    let ask = RestartAsk::of(&fallback, 0);
+    let why = Restart::Memory;
+    let ask = RestartAsk::of(&why, 0);
     let answers: Vec<Option<RestartAnswer>> = (0..RestartClaim::ALL.len())
-        .map(|_| IdleHost::restart(idle.as_ref(), &fallback, &ask))
+        .map(|_| IdleHost::restart(idle.as_ref(), &why, &ask))
         .collect();
     let said: Vec<Option<RestartAnswer>> = RestartClaim::ALL
         .into_iter()

@@ -471,6 +471,7 @@ pub(crate) const fn activity(reading: Reading) -> Activity {
 /// The owned installer child, including its retained result after an exit notification.
 pub(crate) struct Terminal {
     session: u64,
+    purpose: TerminalPurpose,
     finished: bool,
     recovered: bool,
     receipt: Option<receipt::Receipt>,
@@ -488,12 +489,23 @@ pub(crate) struct Terminal {
     stop_sent: bool,
 }
 
+#[derive(Clone, Copy)]
+enum TerminalPurpose {
+    Tools,
+    #[cfg(target_os = "macos")]
+    NameRule {
+        generation: u64,
+        origin: crate::tab_spawn::MenuOrigin,
+    },
+}
+
 impl Terminal {
     /// The tab `session`, its program running (`recovered`: adopted from an earlier aterm, with
     /// its `receipt`).
     const fn running(session: u64, recovered: bool, receipt: Option<receipt::Receipt>) -> Self {
         Self {
             session,
+            purpose: TerminalPurpose::Tools,
             finished: false,
             recovered,
             receipt,
@@ -503,6 +515,10 @@ impl Terminal {
             claim_owner: None,
             stop_sent: false,
         }
+    }
+
+    fn tools(&self) -> bool {
+        matches!(self.purpose, TerminalPurpose::Tools)
     }
 }
 
@@ -824,7 +840,111 @@ fn pressed_tab_then() -> crate::tab_spawn::TabSpawnThen {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn name_rule_tab_then(
+    generation: u64,
+    origin: crate::tab_spawn::MenuOrigin,
+) -> crate::tab_spawn::TabSpawnThen {
+    crate::tab_spawn::TabSpawnThen::Before {
+        check: Box::new(move |app, window| {
+            window == origin.window()
+                && app.machine_sets == generation
+                && origin.is_current(app)
+                && !app.headless
+                && !app.developer_tools_install_active()
+                && !app.access_dialog_up()
+                && app.reserve_access_dialog()
+        }),
+        then: Box::new(move |app, landed| {
+            match landed {
+                Ok(sid) => app.start_machine_name_authorization(&sid, generation, origin),
+                Err(why) => app.machine_name_authorization_finished(generation, Err(why)),
+            }
+            app.release_unused_access_dialog(std::time::Instant::now());
+        }),
+    }
+}
+
 impl App {
+    /// One explicit naming permission repair, in the real tab that owns its prompt.
+    /// The fixed nonroot command waits for GO before it may launch sudo. Spawn
+    /// success alone supplies no permission or naming publication authority.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn open_machine_name_authorization(&mut self, generation: u64) {
+        let origin = self
+            .frontmost_window
+            .and_then(|window| self.palette_menu_origin(window));
+        let Some(origin) = origin.filter(|origin| {
+            !self.headless
+                && self.gesture_unvouched().is_none()
+                && self.machine_sets == generation
+                && origin.is_current(self)
+                && !self.developer_tools_install_active()
+                && !self.access_dialog_up()
+        }) else {
+            self.machine_name_authorization_finished(generation,
+                Err("Name permission repair needs the window that requested it, with no other permission operation running".into()));
+            return;
+        };
+        let Some(exe) = own_aterm() else {
+            self.machine_name_authorization_finished(
+                generation,
+                Err("this application cannot name its own permission-repair program".into()),
+            );
+            return;
+        };
+        let args = ["machines", "here", "apply", "--plain", "--name-rule-only"];
+        let ask = crate::tab_spawn::SpawnAsk {
+            unasked: true,
+            exec_command: Some(tab_command_running(
+                std::iter::once(exe.into_os_string()).chain(args.map(std::ffi::OsString::from)),
+            )),
+            ..crate::tab_spawn::SpawnAsk::default()
+        };
+        let then = name_rule_tab_then(generation, origin);
+        let _act = crate::tab_marks::ActScope::gesture("name-permission");
+        self.open_off_loop(
+            origin.window(),
+            crate::tab_spawn::SpawnPlace::Tab,
+            ask,
+            then,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_machine_name_authorization(
+        &mut self,
+        sid: &str,
+        generation: u64,
+        origin: crate::tab_spawn::MenuOrigin,
+    ) {
+        let session = self
+            .store
+            .read()
+            .unwrap_or_else(|why| why.into_inner())
+            .by_sid(&aterm_session::SessionId::new(sid))
+            .map(|handle| handle.local_id);
+        let session = session.filter(|session| {
+            self.pool.get(*session).is_some_and(|child| {
+                child.pid == child.shell_identity.pid && child.ctx.self_id.as_str() == sid
+            })
+        });
+        let Some(session) = session else {
+            self.type_into_new_session(sid, TAB_STOP);
+            self.machine_name_authorization_finished(
+                generation,
+                Err("the permission tab's exact child could not be retained".into()),
+            );
+            return;
+        };
+        let mut terminal = Terminal::running(session, false, None);
+        terminal.purpose = TerminalPurpose::NameRule { generation, origin };
+        self.workstation_setup
+            .developer_tools_session
+            .push(terminal);
+        self.type_into_new_session(sid, aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO);
+    }
+
     /// Start the install in its landed tab `sid`, recording the tab first: even an immediate
     /// failure's exit must release the slot and leave its explanation in the tab. The tab takes
     /// its fixed title, which the page names, and its program its go line, once the tab's
@@ -1039,7 +1159,7 @@ impl App {
         for terminal in setup
             .developer_tools_session
             .iter_mut()
-            .filter(|terminal| !terminal.ended)
+            .filter(|terminal| terminal.tools() && !terminal.ended)
         {
             terminal.installer_seen |= activity == Activity::Installing;
             tab = tab.or(Some(if reading.apple_window {
@@ -1410,6 +1530,28 @@ impl App {
         };
         terminal.finished = true;
         terminal.ended = true;
+        #[cfg(target_os = "macos")]
+        if let TerminalPurpose::NameRule { generation, origin } = terminal.purpose {
+            let retained = origin.is_retained(self)
+                && self
+                    .windows_with_focused_session(session)
+                    .contains(&origin.window());
+            let result = if !retained {
+                Err("the window or content that requested name permission repair was closed or replaced".into())
+            } else {
+                match exit {
+                    Some(aterm_pty::ChildExit::Code(0)) => Ok(()),
+                    Some(status) => Err(format!(
+                        "name permission repair did not succeed ({status:?})"
+                    )),
+                    None => {
+                        Err("the name permission repair's terminal result is unavailable".into())
+                    }
+                }
+            };
+            self.machine_name_authorization_finished(generation, result);
+            return;
+        }
         let told = terminal.told;
         let claim_owner = terminal.claim_owner.clone();
         let recovered = terminal.recovered;
@@ -1597,6 +1739,17 @@ impl App {
 
     pub(crate) fn retire_developer_tools_install(&mut self, session: u64) {
         if self.finish_developer_tools_install(session) {
+            #[cfg(target_os = "macos")]
+            if let Some(TerminalPurpose::NameRule { generation, .. }) = self
+                .workstation_setup
+                .developer_tools_session
+                .iter()
+                .find(|terminal| terminal.session == session && !terminal.ended)
+                .map(|terminal| terminal.purpose)
+            {
+                self.machine_name_authorization_finished(generation,
+                    Err("the name permission repair tab closed before a successful result was collected".into()));
+            }
             self.workstation_setup
                 .developer_tools_session
                 .retain(|terminal| terminal.session != session);
@@ -1610,6 +1763,7 @@ impl App {
             .workstation_setup
             .developer_tools_session
             .iter()
+            .filter(|terminal| terminal.tools())
             .collect();
         sessions.sort_by_key(|terminal| terminal.finished);
         sessions.into_iter().find_map(|terminal| {

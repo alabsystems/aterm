@@ -17,12 +17,16 @@ pub struct Args {
     /// The checks to run, in [`CHECKS`] order, without repeats.
     pub checks: Vec<Check>,
     /// `release` was named: whole workspace, `--app` exactly when `measure` runs, a skip is exit
-    /// 3, and its first proven red ends the run ([`crate::sched::Halt`]). `--tree` and
+    /// 3, and its first proven red ends the run except for the complete tree sweep
+    /// ([`Self::tree_only`], [`crate::sched::Halt`]). `--tree` and
     /// `--bundle` narrow it to its halves ([`RELEASE_TREE`], [`RELEASE_BUNDLE`]), `--checks` to
     /// some of its checks; each is still a release's run of them.
     pub release: bool,
-    /// `--fail-fast`: every first proven red ends the run, as it ends a release. Without it,
-    /// source/type preflight failures stop the run, while test failures keep the full sweep.
+    /// `release --tree` without `--bundle`: finish every check before returning a red,
+    /// unless `--fail-fast` explicitly requests cancellation.
+    pub tree_only: bool,
+    /// `--fail-fast`: every first proven red ends the run, as it ends other release runs. Without it,
+    /// ordinary source/type preflight failures stop the run, while test failures keep the sweep.
     pub fail_fast: bool,
     /// Repeatable tree sample: overlapping resources queue behind Ordinary work; Release can end it.
     pub background: bool,
@@ -238,6 +242,7 @@ where
     }
     a.release = words.contains(&Word::Release);
     // A help parse is Ok whatever `--checks` names, so its checks fall back to the whole release.
+    a.tree_only = tree && !bundle;
     let release = release_checks(tree, bundle, &listed);
     let mut wanted: Vec<Check> = Vec::new();
     for w in &words {
@@ -527,15 +532,15 @@ Options:
                           test (--compile-only: what release's test stage compiles)
       --cursor-pacing     with measure --app: run only the GUI pacing burst
       --no-windows        skip each stage that opens a window (a named skip)
-      --tree              with release: only its tree half
+      --tree              with release: its complete tree sweep (unless --fail-fast)
       --bundle            with release: only its bundle half (--app)
       --checks <a,b,..>   with release: only these of its checks (a resume),
                           each as the release runs it
-      --fail-fast         end the run at its first failure, as release does:
+      --fail-fast         end the run at its first failure:
                           what it stopped reads NOT RUN (a check that could
                           not run, its machine's fault, never ends it)
-                          source/type preflight failures always stop the run;
-                          without this flag, test failures keep the full sweep
+                          ordinary source/type preflight failures stop the run;
+                          release --tree otherwise completes its full sweep
       --admit <wait|now>  wait for room for the disk the run will write, for
                           each stage's memory before it starts (held until
                           it ends, beside other runs' claims), and for a

@@ -805,8 +805,6 @@ fn a_composed_profile_reads_every_allowlisted_field() {
     );
     assert_eq!(p.credits, Credits::On);
     assert_eq!(p.fable, FablePlan::Included);
-    assert_eq!(p.consented, ["fable", "nimbus"]);
-    assert_eq!(p.credits_only, Some(vec!["nimbus".to_string()]));
     let usage = p.usage.expect("the cached body names this account");
     assert_eq!(usage.fetched_at_ms, 1_792_050_000_000);
     type Row<'a> = (&'a str, Option<&'a str>, Option<u16>, Option<i64>);
@@ -1532,23 +1530,6 @@ fn the_file_read_is_the_one_claude_code_picks() {
     std::fs::write(&legacy, "{}").expect("legacy");
     assert_eq!(effective(&plain, None, false), plain);
     assert_eq!(effective(&plain, None, true), custom);
-
-    assert!(effective_for_billing(&plain, Some(&records), Selection::Standard).is_err());
-    std::fs::remove_file(&legacy).expect("remove billing legacy");
-    assert_eq!(
-        effective_for_billing(&plain, Some(&records), Selection::Standard).expect("standard"),
-        plain
-    );
-    assert_eq!(
-        effective_for_billing(&plain, Some(&records), Selection::CustomOauth).expect("custom"),
-        custom
-    );
-    assert!(effective_for_billing(&plain, Some(&records), Selection::Unknown).is_err());
-    assert!(effective_for_billing(&plain, None, Selection::Standard).is_err());
-    std::os::unix::fs::symlink(".config.json", &legacy).expect("owned selector cycle");
-    assert!(effective_for_billing(&plain, Some(&records), Selection::Standard).is_err());
-    std::fs::remove_file(&legacy).expect("remove selector cycle");
-    std::fs::write(&legacy, "{}").expect("restore legacy control");
 
     let subscription = r#"{"oauthAccount":{"organizationType":"claude_max"}}"#;
     let console = r#"{"oauthAccount":{"organizationType":"api_console"}}"#;

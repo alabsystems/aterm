@@ -258,7 +258,7 @@ pub(crate) fn write<'a>(
         ),
     };
     let text = aterm_json::to_string(&doc).map_err(|e| std::io::Error::other(e.to_string()))?;
-    aterm_agent::harness::upgrade_models::write_atomic(path, &text)
+    aterm_agent::harness::atomic_write::write_atomic(path, &text)
 }
 
 #[cfg(test)]

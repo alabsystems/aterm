@@ -71,6 +71,21 @@ const ANCHOR: &str = "anchor";
 const ASTREAM: &str = "astream";
 const CHECKPOINT: &str = "checkpoint";
 
+mod read_guard;
+pub use read_guard::ReadGuard;
+
+fn validate_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || name.len() > 32
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return Err(io::Error::other("invalid journal name"));
+    }
+    Ok(())
+}
+
 struct Layout {
     name: String,
     anchor: String,
@@ -82,12 +97,8 @@ struct Layout {
 }
 impl Layout {
     fn new(name: &str, anchor: &[u8], limits: Limits) -> io::Result<Self> {
-        if name.is_empty()
-            || name.len() > 32
-            || !name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-            || anchor.is_empty()
+        validate_name(name)?;
+        if anchor.is_empty()
             || anchor.len() > 4096
             || limits.records == 0
             || limits.record_bytes == 0

@@ -36,28 +36,5 @@ impl Encoding for Limb {
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-    #[test]
-    fn roundtrip() {
-        for value in [0, 1, 255, 256, Word::MAX / 2, Word::MAX] {
-            let a = Limb(value);
-            assert_eq!(a, Limb::from_be_bytes(a.to_be_bytes()));
-            assert_eq!(a, Limb::from_le_bytes(a.to_le_bytes()));
-        }
-    }
-
-    #[test]
-    fn reverse() {
-        for value in [0, 1, 255, 256, Word::MAX / 2, Word::MAX] {
-            let a = Limb(value);
-            let mut bytes = a.to_be_bytes();
-            bytes.reverse();
-            assert_eq!(a, Limb::from_le_bytes(bytes));
-
-            let mut bytes = a.to_le_bytes();
-            bytes.reverse();
-            assert_eq!(a, Limb::from_be_bytes(bytes));
-        }
-    }
-}
+#[path = "encoding_test_tests.rs"]
+mod test;

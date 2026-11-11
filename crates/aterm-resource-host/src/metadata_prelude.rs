@@ -14,10 +14,16 @@ use std::{
 
 #[path = "metadata_prelude/plan.rs"]
 mod plan;
-use plan::ExecPlan;
+use plan::{ExecPlan, Seal};
 
 const VERB: &str = "__resource-metadata-exec-v1";
 const MAX_PLAN: usize = 65536;
+
+fn loader_environment(key: &OsStr) -> bool {
+    atpkg::shim_env::NEVER_SET_PREFIXES
+        .iter()
+        .any(|prefix| key.as_bytes().starts_with(prefix.as_bytes()))
+}
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "metadata_prelude/footprint_tests.rs"]
@@ -93,6 +99,7 @@ fn install() -> io::Result<()> {
 }
 
 pub(super) struct Owner {
+    seal: Seal,
     channel: CtlStream,
     child_channel: Option<OwnedFd>,
     target: i32,
@@ -100,6 +107,7 @@ pub(super) struct Owner {
     arg0: Option<OsString>,
     arguments: Vec<OsString>,
     cwd: OsString,
+    final_loader_environment: Vec<(Vec<u8>, Vec<u8>)>,
     footprint_mib: Option<u32>,
     payload: Vec<u8>,
     written: usize,
@@ -108,6 +116,8 @@ pub(super) struct Owner {
     ready: bool,
     original: Option<process::Lineage>,
     retirement: Option<NoForkTarget>,
+    #[cfg(all(test, target_os = "macos"))]
+    prepared_target: Option<PreparedTarget>,
     deadline: Instant,
 }
 
@@ -124,11 +134,82 @@ impl NoForkTarget {
             && group == pid as i32
     }
 }
+
+// Qualification-only transfer of the SAME acknowledged final-exec hold. It
+// owns no Child and cannot reconstruct one, create a grant, or survive restart.
+#[cfg(all(test, target_os = "macos"))]
+pub(super) struct PreparedTarget {
+    original: process::Lineage,
+    footprint_mib: u32,
+    state: TransferState,
+    deadline: Instant,
+}
+#[cfg(all(test, target_os = "macos"))]
+enum TransferState {
+    Held,
+    ResumeAttempted,
+    Running,
+}
+#[cfg(all(test, target_os = "macos"))]
+impl PreparedTarget {
+    pub(super) fn lineage(&self) -> process::Lineage {
+        self.original
+    }
+    pub(super) fn configured_footprint_mib(&self) -> u32 {
+        self.footprint_mib
+    }
+    fn validate(&self, child: &mut spawnfd::Child) -> io::Result<()> {
+        alive(self.deadline)?;
+        if child.exited()?
+            || child.id() != self.original.identity.pid as u32
+            || process::read_lineage(child.id() as i32) != Some(self.original)
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
+    pub(super) fn resume(&mut self, child: &mut spawnfd::Child) -> io::Result<()> {
+        self.validate(child)?;
+        if !matches!(self.state, TransferState::Held) {
+            return Err(refused());
+        }
+        // An unknown native delivery cannot be offered again.
+        self.state = TransferState::ResumeAttempted;
+        child.resume()?;
+        self.state = TransferState::Running;
+        Ok(())
+    }
+    pub(super) fn sealed(self, child: &mut spawnfd::Child) -> io::Result<NoForkTarget> {
+        self.validate(child)?;
+        if !matches!(self.state, TransferState::Running) || !no_fork(child.id())? {
+            return Err(refused());
+        }
+        Ok(NoForkTarget {
+            original: self.original,
+        })
+    }
+}
 impl Owner {
     pub(super) fn new(
         command: &spawnfd::Command,
         targets: &[u32],
         deadline: Instant,
+    ) -> io::Result<(Self, spawnfd::Command)> {
+        Self::new_with_seal(command, targets, deadline, Seal::NoFork)
+    }
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn new_for_child_seal(
+        command: &spawnfd::Command,
+        targets: &[u32],
+        deadline: Instant,
+    ) -> io::Result<(Self, spawnfd::Command)> {
+        Self::new_with_seal(command, targets, deadline, Seal::Child)
+    }
+    fn new_with_seal(
+        command: &spawnfd::Command,
+        targets: &[u32],
+        deadline: Instant,
+        seal: Seal,
     ) -> io::Result<(Self, spawnfd::Command)> {
         #[cfg(target_os = "macos")]
         let footprint_mib = command
@@ -142,6 +223,13 @@ impl Owner {
         let (channel, child_channel) = aterm_uds::kept_out(CtlStream::pair)?;
         channel.set_nonblocking(true)?;
         let mut prelude = spawnfd::command(crate::runtime::inspector_program()?);
+        let final_loader_environment = command
+            .get_envs()
+            .filter(|(key, _)| loader_environment(key))
+            .filter_map(|(key, value)| {
+                value.map(|value| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
+            })
+            .collect();
         prelude
             .arg(VERB)
             .arg(format!("--control-fd={target}"))
@@ -149,6 +237,7 @@ impl Owner {
             .envs(
                 command
                     .get_envs()
+                    .filter(|(key, _)| !loader_environment(key))
                     .filter_map(|(key, value)| value.map(|value| (key, value))),
             )
             .current_dir(command.get_current_dir().ok_or_else(refused)?)
@@ -156,6 +245,7 @@ impl Owner {
             .start_suspended(true);
         Ok((
             Self {
+                seal,
                 channel,
                 child_channel: Some(child_channel.into()),
                 target,
@@ -167,6 +257,7 @@ impl Owner {
                     .ok_or_else(refused)?
                     .as_os_str()
                     .to_owned(),
+                final_loader_environment,
                 footprint_mib,
                 payload: Vec::new(),
                 written: 0,
@@ -175,6 +266,8 @@ impl Owner {
                 ready: false,
                 original: None,
                 retirement: None,
+                #[cfg(all(test, target_os = "macos"))]
+                prepared_target: None,
                 deadline,
             },
             prelude,
@@ -184,7 +277,11 @@ impl Owner {
         Ok((self.child_channel.take().ok_or_else(refused)?, self.target))
     }
     pub(super) fn configured(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
-        if !self.payload.is_empty() {
+        if !self.payload.is_empty()
+            || command
+                .get_envs()
+                .any(|(key, value)| loader_environment(key) && value.is_some())
+        {
             return Err(refused());
         }
         // Resource configuration is complete. A later requested policy replaces
@@ -205,6 +302,7 @@ impl Owner {
                 .0,
         };
         let plan = ExecPlan {
+            seal: self.seal,
             parent: peer,
             footprint_mib,
             command: trust_resource_controller::CommandSpec {
@@ -224,6 +322,7 @@ impl Owner {
                     .filter_map(|(key, value)| {
                         value.map(|value| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
                     })
+                    .chain(self.final_loader_environment.iter().cloned())
                     .collect(),
             },
             targets: command
@@ -330,7 +429,11 @@ impl Owner {
             || current.pgid != original.pgid
             || current.pgid != pid
             || unsafe { libc::getsid(pid as i32) } != pid as i32
-            || !no_fork(pid)?
+            || match self.seal {
+                Seal::NoFork => !no_fork(pid)?,
+                #[cfg(all(test, target_os = "macos"))]
+                Seal::Child => no_fork(pid)?,
+            }
         {
             return Err(refused_at(
                 "selected image birth, group or affirmative no-fork policy changed",
@@ -345,13 +448,28 @@ impl Owner {
         ) {
             return Err(refused_at("selected image stop was not acknowledged"));
         }
+        match self.seal {
+            Seal::NoFork => self.retirement = Some(NoForkTarget { original: current }),
+            #[cfg(all(test, target_os = "macos"))]
+            Seal::Child => {
+                self.prepared_target = Some(PreparedTarget {
+                    original: current,
+                    footprint_mib: self.footprint_mib.ok_or_else(refused)?,
+                    state: TransferState::Held,
+                    deadline: self.deadline,
+                });
+            }
+        }
         self.ready = true;
-        self.retirement = Some(NoForkTarget { original: current });
         Ok(true)
     }
 
     pub(super) fn take_retirement(&mut self) -> Option<NoForkTarget> {
         self.retirement.take()
+    }
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn take_prepared_target(&mut self) -> io::Result<PreparedTarget> {
+        self.prepared_target.take().ok_or_else(refused)
     }
 }
 
@@ -363,6 +481,8 @@ fn entry_at(args: &[OsString], started: Instant) -> Option<std::process::ExitCod
     if args.first().is_none_or(|word| word != VERB) {
         return None;
     }
+    #[cfg(all(test, target_os = "macos"))]
+    footprint_tests::observe_first_image_environment();
     let run = || -> io::Result<()> {
         if args.len() != 2 {
             return Err(refused());
@@ -432,9 +552,19 @@ fn entry_at(args: &[OsString], started: Instant) -> Option<std::process::ExitCod
             })
             .collect();
         command.inherit_exec_guards(guards)?;
-        install()?;
-        if !no_fork(std::process::id())? {
-            return Err(refused());
+        match plan.seal {
+            Seal::NoFork => {
+                install()?;
+                if !no_fork(std::process::id())? {
+                    return Err(refused());
+                }
+            }
+            #[cfg(all(test, target_os = "macos"))]
+            Seal::Child => {
+                if no_fork(std::process::id())? {
+                    return Err(refused());
+                }
+            }
         }
         if aterm_uds::fdpass::send_vectored(&channel, &[io::IoSlice::new(&[0x51])])? != 1 {
             return Err(refused());

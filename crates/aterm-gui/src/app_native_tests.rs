@@ -1605,6 +1605,7 @@ fn sole_worker_stamps_fifo_read_order_not_request_order() {
                 installed_unproven: false,
                 installable: None,
             },
+            |_, _| panic!("no boot-health request was queued"),
             |_| {},
             || drained_tx.send(()).unwrap(),
         );
@@ -1625,8 +1626,8 @@ fn sole_worker_stamps_fifo_read_order_not_request_order() {
 
     let later_request = enqueue(2);
     let earlier_request = enqueue(1);
-    let later_facts = later_request.recv().unwrap();
-    let earlier_facts = earlier_request.recv().unwrap();
+    let later_facts = later_request.recv().unwrap().unwrap();
+    let earlier_facts = earlier_request.recv().unwrap().unwrap();
     assert_eq!(later_facts._ticket.request_sequence(), 2);
     assert_eq!(later_facts.observation_sequence, 1);
     assert_eq!(earlier_facts._ticket.request_sequence(), 1);
@@ -1635,6 +1636,88 @@ fn sole_worker_stamps_fifo_read_order_not_request_order() {
     drained_rx.recv().unwrap();
     drop(sender);
     worker.join().unwrap();
+}
+
+#[test]
+fn failed_update_fact_reads_complete_and_leave_the_next_queued_read_intact() {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+    let (drained_tx, drained_rx) = std::sync::mpsc::sync_channel(4);
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        start_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap();
+        run_native_update_worker(
+            receiver,
+            |ticket, observation, _| {
+                if ticket.request_sequence() == 1 {
+                    panic!("injected facts read failure");
+                }
+                reconcile_facts(ticket.request_sequence(), observation, None)
+            },
+            |_, _| panic!("no boot-health request was queued"),
+            |_| {},
+            || drained_tx.send(()).unwrap(),
+        );
+    });
+    let enqueue = |request_sequence| {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(NativeUpdateWorkerRequest::Reconcile(
+                NativeUpdateReconcileRequest {
+                    ticket: NativeUpdateReconcileTicket { request_sequence },
+                    current_build: 10,
+                    destination: NativeUpdateFactDestination::Reply(reply),
+                },
+            ))
+            .unwrap();
+        result
+    };
+    let failed = enqueue(1);
+    let healthy = enqueue(2);
+    start_tx.send(()).unwrap();
+    let failure = failed
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("failed read must complete its request")
+        .unwrap_err();
+    assert_eq!(failure.ticket.request_sequence(), 1);
+    assert_eq!(failure.observation_sequence, 1);
+    let facts = healthy
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the next queued read must survive")
+        .unwrap();
+    assert_eq!(facts._ticket.request_sequence(), 2);
+    assert_eq!(facts.observation_sequence, 2);
+    for _ in 0..2 {
+        drained_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap();
+    }
+    drop(sender);
+    worker.join().unwrap();
+}
+
+#[test]
+fn failed_update_fact_reads_preserve_the_verified_stage() {
+    let mut app = App::headless_for_test();
+    let ticket = start(&mut app.native_updater_service);
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    app.finish_native_update_check(ticket, status(Some(build), 0));
+    let staged = app.native_updater_service.snapshot().staged.clone();
+    assert!(staged.is_some());
+    let revision = app.native_updater_service.snapshot().revision;
+    app.finish_native_update_observation(
+        NativeUpdateReconcilePurpose::Refresh,
+        Err(NativeUpdateReadFailure {
+            ticket: NativeUpdateReconcileTicket {
+                request_sequence: 2,
+            },
+            observation_sequence: 2,
+        }),
+    );
+    assert_eq!(app.native_updater_service.snapshot().staged, staged);
+    assert_eq!(app.native_updater_service.snapshot().revision, revision);
+    assert_eq!(app.last_native_update_reconcile_sequence, 0);
 }
 
 #[test]
@@ -1688,6 +1771,94 @@ fn updater_ui_snapshots_do_not_probe_ledgers_or_installed_bundle() {
     let _ = app.update_snapshot(false).projection();
     let after = UPDATE_FACT_PROBES_ON_THREAD.with(std::cell::Cell::get);
     assert_eq!(before, after, "UI projection invoked an updater disk probe");
+}
+
+#[test]
+fn a_panicked_boot_health_confirmation_reports_failure_and_keeps_the_worker() {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+    let (health_tx, health_rx) = std::sync::mpsc::sync_channel(2);
+    let (drained_tx, drained_rx) = std::sync::mpsc::sync_channel(3);
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        start_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap();
+        run_native_update_worker(
+            receiver,
+            |ticket, observation, _| reconcile_facts(ticket.request_sequence(), observation, None),
+            |build, witness| {
+                assert_eq!(witness, aterm_update::TrialWitness::Headless);
+                if build == 10 {
+                    panic!("injected boot-health failure");
+                }
+                assert_eq!(build, 11);
+                true
+            },
+            |confirmed| health_tx.send(confirmed).unwrap(),
+            || drained_tx.send(()).unwrap(),
+        );
+    });
+    sender
+        .send(NativeUpdateWorkerRequest::ConfirmBootHealth {
+            current_build: 10,
+            witness: aterm_update::TrialWitness::Headless,
+        })
+        .unwrap();
+    let (reply, facts) = std::sync::mpsc::sync_channel(1);
+    sender
+        .send(NativeUpdateWorkerRequest::Reconcile(
+            NativeUpdateReconcileRequest {
+                ticket: NativeUpdateReconcileTicket {
+                    request_sequence: 7,
+                },
+                current_build: 10,
+                destination: NativeUpdateFactDestination::Reply(reply),
+            },
+        ))
+        .unwrap();
+    sender
+        .send(NativeUpdateWorkerRequest::ConfirmBootHealth {
+            current_build: 11,
+            witness: aterm_update::TrialWitness::Headless,
+        })
+        .unwrap();
+    start_tx.send(()).unwrap();
+
+    let mut app = App::headless_for_test();
+    app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight;
+    let failed = health_rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .unwrap();
+    assert!(!failed);
+    app.finish_native_boot_health_confirmation(failed, std::time::Instant::now());
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Pending
+    );
+    assert!(app.boot_health_confirmation_retry_at.is_some());
+    let observed = facts
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed._ticket.request_sequence(), 7);
+    assert_eq!(observed.observation_sequence, 1);
+    let confirmed = health_rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .unwrap();
+    assert!(confirmed);
+    app.finish_native_boot_health_confirmation(confirmed, std::time::Instant::now());
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Confirmed
+    );
+    assert!(app.boot_health_confirmation_retry_at.is_none());
+    for _ in 0..3 {
+        drained_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap();
+    }
+    drop(sender);
+    worker.join().unwrap();
 }
 
 #[test]
@@ -2111,6 +2282,84 @@ fn idle_reconcile_park_never_materializes_a_destination_or_warning_path() {
 }
 
 #[test]
+fn a_pending_control_apply_reports_its_refusal_when_the_worker_cannot_restart() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    for through_refresh in [false, true] {
+        let model = aterm_models_update::native_update_worker_queue_model();
+        let mut state = model.init_state();
+        for action in ["OccupyWorker", "RequestApplyFull", "DisconnectWithPending"] {
+            assert!(model.fire(action, &mut state), "{action}");
+        }
+        let mut app = App::headless_for_test();
+        app.clear_messages_for_test();
+        let current = app.native_updater_service.snapshot().current_build;
+        aterm_update::record_apply_refusal(current, "prior refusal");
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender
+            .try_send(NativeUpdateWorkerRequest::ConfirmBootHealth {
+                current_build: current,
+                witness: aterm_update::TrialWitness::Headless,
+            })
+            .unwrap();
+        app.native_update_reconcile_worker = Some(sender);
+        let (reply, _result) = std::sync::mpsc::sync_channel(1);
+        assert!(app.request_native_update_reconcile_with(
+            NativeUpdateReconcilePurpose::ApplyControl,
+            |_| NativeUpdateFactDestination::Reply(reply),
+        ));
+        assert_eq!(
+            app.pending_native_update_reconcile_purpose,
+            Some(NativeUpdateReconcilePurpose::ApplyControl)
+        );
+        assert!(app.update_record_text().is_none());
+        drop(receiver);
+        let (reply, _result) = std::sync::mpsc::sync_channel(1);
+        app.control_apply_stale_retries = 2;
+        if through_refresh {
+            assert!(!app.request_native_update_reconcile_with(
+                NativeUpdateReconcilePurpose::Refresh,
+                |_| NativeUpdateFactDestination::Reply(reply),
+            ));
+            assert!(model.fire("RefreshPendingUnavailable", &mut state));
+        } else {
+            assert_eq!(
+                app.retry_pending_native_update_reconcile_with(|_| {
+                    NativeUpdateFactDestination::Reply(reply)
+                }),
+                NativeUpdateDispatch::Unavailable
+            );
+            assert!(model.fire("RestartPendingUnavailable", &mut state));
+        }
+        assert!(app.pending_native_update_reconcile_purpose.is_none());
+        assert_eq!(app.control_apply_stale_retries, 0);
+        assert_eq!(
+            i64::from(app.update_record_text().is_some()),
+            *state.get("failed_explicitly").unwrap()
+        );
+        assert!(model.check_invariant("AcceptedIntentHasAnOutcome", &state));
+        if through_refresh {
+            let mutant = aterm_spec::interp::with_buggy(&model, 2);
+            let mut lost = mutant.init_state();
+            for action in [
+                "OccupyWorker",
+                "RequestApplyFull",
+                "DisconnectWithPending",
+                "RefreshPendingUnavailable",
+            ] {
+                assert!(mutant.fire(action, &mut lost), "{action}");
+            }
+            assert!(!mutant.check_invariant("AcceptedIntentHasAnOutcome", &lost));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let report = aterm_update::apply_lane_report(current).unwrap();
+            assert!(!report.last_refusal.is_empty());
+            assert_ne!(report.last_refusal, "prior refusal");
+        }
+    }
+}
+
+#[test]
 fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let model = aterm_models_update::native_update_worker_queue_model();
@@ -2180,9 +2429,13 @@ fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect()
         panic!("the conformance request uses a reply destination");
     };
     reply
-        .send(reconcile_facts(request.ticket.request_sequence(), 1, None))
+        .send(Ok(reconcile_facts(
+            request.ticket.request_sequence(),
+            1,
+            None,
+        )))
         .unwrap();
-    app.finish_native_update_reconcile(observed.get().unwrap(), result.recv().unwrap());
+    app.finish_native_update_observation(observed.get().unwrap(), result.recv().unwrap());
     assert!(model.fire("ReduceCompletion", &mut state));
     assert_eq!(state.get("delivered"), Some(&1));
     assert!(model.check_invariant("NoSilentlyLostAcceptedIntent", &state));
@@ -2252,12 +2505,52 @@ fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect()
 }
 
 #[test]
+fn an_unavailable_boot_health_worker_keeps_a_bounded_retry_until_dispatch_succeeds() {
+    for outcome in [
+        NativeUpdateDispatch::Unavailable,
+        NativeUpdateDispatch::Saturated,
+    ] {
+        let mut app = App::headless_for_test();
+        let mut now = std::time::Instant::now();
+        app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight;
+        for _ in 0..12 {
+            app.note_boot_health_dispatch(outcome, now);
+            assert_eq!(
+                app.boot_health_confirmation,
+                crate::BootHealthConfirmation::Pending
+            );
+            let retry = app
+                .boot_health_confirmation_retry_at
+                .expect("retry retained");
+            assert!(retry >= now + crate::BOOT_HEALTH_RETRY_MIN);
+            assert!(retry <= now + crate::BOOT_HEALTH_RETRY_MAX);
+            assert_eq!(app.boot_health_retry_deadline(now), Some(retry));
+            now = retry;
+        }
+        app.note_boot_health_dispatch(NativeUpdateDispatch::Queued, now);
+        assert_eq!(
+            app.boot_health_confirmation,
+            crate::BootHealthConfirmation::InFlight
+        );
+        assert!(app.boot_health_confirmation_retry_at.is_none());
+        app.finish_native_boot_health_confirmation(true, now);
+        assert_eq!(
+            app.boot_health_confirmation_backoff,
+            crate::BOOT_HEALTH_RETRY_MIN
+        );
+    }
+}
+
+#[test]
 fn boot_health_failure_rearms_bounded_retry_then_success_closes_latch() {
     let mut app = App::headless_for_test();
     let now = std::time::Instant::now();
-    app.boot_health_confirmation_dispatched = true;
+    app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight;
     app.finish_native_boot_health_confirmation(false, now);
-    assert!(!app.boot_health_confirmation_dispatched);
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Pending
+    );
     let first = app
         .boot_health_confirmation_retry_at
         .expect("a failure re-arms a retry");
@@ -2274,10 +2567,109 @@ fn boot_health_failure_rearms_bounded_retry_then_success_closes_latch() {
     );
 
     app.finish_native_boot_health_confirmation(true, now);
-    assert!(app.boot_health_confirmation_dispatched);
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Confirmed
+    );
     assert!(app.boot_health_confirmation_retry_at.is_none());
     app.finish_native_boot_health_confirmation(false, now);
     assert_eq!(app.boot_health_confirmation_retry_at, Some(first));
+}
+
+#[test]
+fn boot_health_handlers_follow_the_confirmation_model() {
+    let model = aterm_models_update::native_update_boot_health_confirmation_model();
+    let now = std::time::Instant::now();
+    let mut pending = vec![model.init_state()];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(state) = pending.pop() {
+        if !seen.insert(state.clone()) {
+            continue;
+        }
+        let app_at_state = || {
+            let mut app = App::headless_for_test();
+            app.native_updater_service =
+                crate::native_updater_service::NativeUpdaterService::new(12, "1.0.12", true);
+            app.boot_health_confirmation = match state["state"] {
+                0 => crate::BootHealthConfirmation::Pending,
+                1 => crate::BootHealthConfirmation::InFlight,
+                2 => crate::BootHealthConfirmation::Confirmed,
+                other => panic!("unexpected health state {other}"),
+            };
+            app.boot_health_confirmation_retry_at =
+                (state["retry"] == 1).then_some(now + crate::BOOT_HEALTH_RETRY_MIN);
+            app
+        };
+        let mut app = app_at_state();
+        assert_eq!(
+            app.boot_health_guard_open(),
+            model.action_enabled("Queue", &state)
+        );
+        if state["applied"] == 0 {
+            // An already-current target makes reaching the apply poll observable
+            // by consuming the intent without launching an installer.
+            let build = app.native_updater_service.snapshot().current_build;
+            app.auto_apply_intent = Some(crate::AutoApplyIntent {
+                build,
+                dmg_sha256: [0xab; 32],
+                retry_at: now,
+                attempts: 0,
+                held: crate::native_update_lane_hold::NamedHold::default(),
+            });
+            app.try_pending_native_auto_apply(false);
+            assert_eq!(
+                app.auto_apply_intent.is_none(),
+                model.action_enabled("Apply", &state)
+            );
+        }
+        for action in &model.actions {
+            for next in model.successors(action.name, &state) {
+                let mut app = app_at_state();
+                match action.name {
+                    "Queue" => app.note_boot_health_dispatch(NativeUpdateDispatch::Queued, now),
+                    "Unavailable" => {
+                        app.note_boot_health_dispatch(NativeUpdateDispatch::Unavailable, now)
+                    }
+                    "Failure" => app.finish_native_boot_health_confirmation(false, now),
+                    "Confirm" => app.finish_native_boot_health_confirmation(true, now),
+                    "Apply" => {
+                        pending.push(next);
+                        continue;
+                    }
+                    other => panic!("unbound confirmation action {other}"),
+                }
+                let actual = match app.boot_health_confirmation {
+                    crate::BootHealthConfirmation::Pending => 0,
+                    crate::BootHealthConfirmation::InFlight => 1,
+                    crate::BootHealthConfirmation::Confirmed => 2,
+                };
+                assert_eq!(actual, next["state"], "{} from {state:?}", action.name);
+                assert_eq!(
+                    app.boot_health_confirmation_retry_at.is_some(),
+                    next["retry"] == 1
+                );
+                assert_eq!(i64::from(actual == 1), next["outstanding"]);
+                pending.push(next);
+            }
+        }
+    }
+    assert!(seen.len() > 3, "retry states must be reached");
+
+    for (dial, trace, law) in [
+        (1, ["Queue", "Apply"].as_slice(), "ConfirmedBeforeApply"),
+        (2, ["Unavailable"].as_slice(), "RetryAfterMiss"),
+        (3, ["Queue", "Queue"].as_slice(), "OneConfirmationInFlight"),
+    ] {
+        let buggy = aterm_spec::interp::with_buggy(&model, dial);
+        let mut state = buggy.init_state();
+        for action in trace {
+            assert!(buggy.fire(action, &mut state));
+        }
+        assert!(
+            !buggy.check_invariant(law, &state),
+            "negative control {dial}: {law}"
+        );
+    }
 }
 
 #[test]
@@ -2285,7 +2677,7 @@ fn automatic_apply_waits_for_boot_health_and_confirmation_releases_it_now() {
     let mut app = App::headless_for_test();
     app.native_updater_service =
         crate::native_updater_service::NativeUpdaterService::new(12, "1.0.12", true);
-    app.boot_health_confirmation_dispatched = false;
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Pending;
     let now = std::time::Instant::now();
     app.auto_apply_intent = Some(crate::AutoApplyIntent {
         build: 12,
@@ -2301,6 +2693,27 @@ fn automatic_apply_waits_for_boot_health_and_confirmation_releases_it_now() {
         "an unconfirmed build must not spend an automatic apply attempt"
     );
 
+    for _ in 0..2 {
+        app.note_boot_health_dispatch(NativeUpdateDispatch::Queued, now);
+        assert_eq!(
+            app.boot_health_confirmation,
+            crate::BootHealthConfirmation::InFlight
+        );
+        assert!(
+            !app.boot_health_guard_open(),
+            "one confirmation is already queued"
+        );
+        app.try_pending_native_auto_apply(false);
+        assert!(app.auto_apply_intent.is_some(), "queued is not confirmed");
+        app.finish_native_boot_health_confirmation(false, now);
+        app.try_pending_native_auto_apply(false);
+        assert!(
+            app.auto_apply_intent.is_some(),
+            "a failed confirmation releases nothing"
+        );
+    }
+
+    app.note_boot_health_dispatch(NativeUpdateDispatch::Queued, now);
     app.finish_native_boot_health_confirmation(true, now);
     assert!(
         app.auto_apply_intent.is_none(),
@@ -4213,7 +4626,7 @@ fn a_successors_startup_update_facts_survive_the_commit_wait() {
     failing.failing_kind = "manifest".to_string();
     let wake = crate::Wake::NativeUpdateReconcileFinished {
         purpose: NativeUpdateReconcilePurpose::Startup,
-        facts: reconcile_facts(1, 1, Some(failing)),
+        facts: Ok(reconcile_facts(1, 1, Some(failing))),
     };
     assert!(
         app.admit_wake_before_commit(wake).is_none(),
@@ -4230,7 +4643,7 @@ fn a_successors_startup_update_facts_survive_the_commit_wait() {
         let crate::Wake::NativeUpdateReconcileFinished { purpose, facts } = held else {
             panic!("only the update facts were held");
         };
-        app.finish_native_update_reconcile(purpose, facts);
+        app.finish_native_update_observation(purpose, facts);
     }
     assert_eq!(
         app.update_snapshot(false).projection().headline,
@@ -4247,6 +4660,51 @@ fn start(service: &mut NativeUpdaterService) -> UpdaterWorkTicket {
         CheckStart::Start(ticket) => ticket,
         other => panic!("expected updater work, got {other:?}"),
     }
+}
+
+#[test]
+fn a_panicked_manual_check_finishes_its_ticket_and_can_be_retried() {
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build;
+    let ticket = start(&mut app.native_updater_service);
+    let (sent, received) = std::sync::mpsc::channel();
+    let worker = crate::qos::spawn_lane_thread(
+        "update-check-unwind-test",
+        crate::qos::Role::Background,
+        move || {
+            let result = run_update_check(build, || panic!("private check input"));
+            sent.send((ticket, result)).unwrap();
+        },
+    )
+    .unwrap();
+    let (completed, result) = received
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("a panicked check must still report completion");
+    worker.join().unwrap();
+    assert_eq!(completed, ticket);
+    assert_eq!(result.current_build, build);
+    assert_eq!(result.failing_checks, 1);
+    assert_eq!(result.outcome, "update check worker panicked");
+    app.finish_native_update_check(completed, result);
+    assert!(app.native_updater_service.snapshot().active.is_none());
+    assert_eq!(
+        app.native_updater_service.snapshot().phase,
+        UpdaterPhase::Failed
+    );
+
+    let retry = start(&mut app.native_updater_service);
+    assert_ne!(retry, ticket);
+    let mut success = status(None, 0);
+    success.current_build = build;
+    success.checked_at = Some(42);
+    let result = run_update_check(build, || success);
+    assert_eq!(result.checked_at, Some(42));
+    app.finish_native_update_check(retry, result);
+    assert!(app.native_updater_service.snapshot().active.is_none());
+    assert_eq!(
+        app.native_updater_service.snapshot().phase,
+        UpdaterPhase::Idle
+    );
 }
 
 #[test]
@@ -5268,6 +5726,46 @@ fn a_failed_structural_resample_is_said_again_with_its_decision_row() {
                 .contains(&aterm_messages::Intent::ApplyUpdate { build: 11 })),
         "the stopped lane's decision row carries the press"
     );
+}
+
+#[test]
+fn updater_retry_deadlines_count_sleep_without_restarting_the_wait() {
+    use crate::native_update_auto_intent::ApplyPhase;
+
+    let mut app = App::headless_for_test();
+    let now = std::time::Instant::now();
+    let wall = std::time::SystemTime::now();
+    let wait = std::time::Duration::from_secs(60);
+    app.auto_apply_intent = Some(crate::AutoApplyIntent {
+        build: 11,
+        dmg_sha256: [1; 32],
+        retry_at: now + wait,
+        attempts: 2,
+        held: crate::native_update_lane_hold::NamedHold::default(),
+    });
+    app.boot_health_confirmation_retry_at = Some(now + wait);
+    app.anchor_auto_apply_ladder(11, now);
+    app.count_sleep_toward_update_deadlines(now, wall);
+
+    let half = wait / 2;
+    assert_eq!(
+        app.count_sleep_toward_update_deadlines(now, wall + half),
+        Some(half)
+    );
+    assert_eq!(app.auto_apply_intent.unwrap().retry_at, now + half);
+    assert_eq!(app.boot_health_confirmation_retry_at, Some(now + half));
+    assert_eq!(app.automatic_apply_phase(now), ApplyPhase::KeysOnly);
+
+    assert_eq!(app.count_sleep_toward_update_deadlines(now, wall), None);
+    assert_eq!(app.auto_apply_intent.unwrap().retry_at, now + half);
+    assert_eq!(app.boot_health_confirmation_retry_at, Some(now + half));
+    assert_eq!(app.automatic_apply_phase(now), ApplyPhase::KeysOnly);
+
+    app.count_sleep_toward_update_deadlines(now, wall + wait);
+    assert_eq!(app.auto_apply_intent.unwrap().retry_at, now);
+    assert_eq!(app.auto_apply_intent.unwrap().attempts, 2);
+    assert_eq!(app.boot_health_confirmation_retry_at, Some(now));
+    assert_eq!(app.automatic_apply_phase(now), ApplyPhase::Land);
 }
 
 #[test]

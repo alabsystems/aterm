@@ -10,6 +10,33 @@ use crate::scan_set::test_fixtures::disk_tree;
 
 const BASELINE: &str = "# Paths\nquokkaword\n";
 
+#[test]
+fn a_streamed_export_preserves_all_bytes_and_executable_permissions() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let target = root.path().join("nested/export");
+    let bytes: Vec<_> = (0..150_001).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&source, &bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o751)).unwrap();
+    }
+    write(&source, &target, None).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+    }
+    write(&source, &target, Some(b"transformed")).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"transformed");
+    assert_eq!(std::fs::read(&source).unwrap(), bytes);
+}
+
 /// NEGATIVE CONTROL: the same link to shipping contrib/README.md must stay green.
 /// Missing in dev stays informational, exactly as the engine's boundary-only guard.
 #[test]

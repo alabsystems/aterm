@@ -54,6 +54,7 @@ fn failure(error: Error) -> Failure {
     Failure {
         retry: error.retryable(),
         message: error.to_string(),
+        retry_at: None,
     }
 }
 

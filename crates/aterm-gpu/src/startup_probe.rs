@@ -57,13 +57,5 @@ pub fn leg_ns(leg: Leg) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Duration, slot_ns};
-
-    #[test]
-    fn slot_ns_avoids_the_sentinel_and_saturates() {
-        assert_eq!(slot_ns(Duration::ZERO), 1);
-        assert_eq!(slot_ns(Duration::from_nanos(7)), 7);
-        assert_eq!(slot_ns(Duration::MAX), u64::MAX);
-    }
-}
+#[path = "startup_probe_tests.rs"]
+mod tests;

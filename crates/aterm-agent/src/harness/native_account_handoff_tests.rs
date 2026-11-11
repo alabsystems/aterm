@@ -156,8 +156,6 @@ fn opts(path: &std::path::Path) -> Opts {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),

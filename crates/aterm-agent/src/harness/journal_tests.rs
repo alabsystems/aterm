@@ -42,6 +42,24 @@ fn roster() -> Roster {
     }
 }
 
+/// A driven renewal's ledger line, as it writes it ([`crate::harness::login_drive::Drove::why`]).
+fn renewal(
+    outcome: crate::harness::login_drive::Outcome,
+    host: Option<&str>,
+    flow: crate::ai::connector::Flow,
+) -> String {
+    crate::harness::login_drive::Drove {
+        outcome,
+        host: host.map(str::to_owned),
+    }
+    .why(flow)
+}
+
+/// Grok's sign-in's ledger line, as it writes it ([`crate::harness::grok_signin::ledger_line`]).
+fn grok(host: Option<&str>, word: &str) -> String {
+    crate::harness::grok_signin::ledger_line(host, word, "row(r) headless(h) person(p)")
+}
+
 fn keyed() -> State {
     let mut state = State::default();
     for (label, pk) in [("ann", ANN), ("bob", BOB)] {
@@ -204,8 +222,11 @@ fn scoped_keyers_restore_the_previous_lookup_after_nesting_and_unwind() {
 }
 
 /// `observe` keys each ledger row by its account's learned key and maps its kind (design §8):
-/// a rotation is a switch naming the account rotated to, a sign-in row is `sign-in-failed`
-/// whatever its reason line says, an auth word is `signed-out` or `auth`, a sample is nothing;
+/// a rotation is a switch naming the account rotated to, a failed sign-in row (an automatic one's,
+/// a driven renewal's or Grok's, each written by its writer's own function) is `sign-in-failed` with how
+/// it ended as one word and never its reason line, one that signed its row in is nothing (its
+/// `renewed` row notes it), and so is a step of one (a shared adoption or preparation begun, a
+/// person's browser window ending), an auth word is `signed-out` or `auth`, a sample is nothing;
 /// no note carries a word that is not one of the module's constants.
 /// NEGATIVE CONTROL: with `of_ledger` leaving `to` unset, the switch names no account:
 /// `` left: None right: Some(ac-fedcba9876543210) ``.
@@ -218,15 +239,79 @@ fn observe_keys_ledger_rows_and_maps_their_kinds() {
         Event::new(102, Kind::Auth, "bob").because("signed-out"),
         Event::new(103, Kind::Sample, "ann"),
         Event::new(104, Kind::Rotate, "unkeyed"),
+        Event::new(105, Kind::SignIn, "bob").because("auto signed-in: mailbox"),
+        Event::new(106, Kind::SignIn, "bob").because("auto no-route: profile(none)"),
+        Event::new(107, Kind::SignIn, "ann").because("a reason no ladder wrote"),
+        Event::new(108, Kind::SignIn, "ann")
+            .because(crate::harness::accounts::SHARED_ADOPTION_BEGUN),
+        Event::new(109, Kind::SignIn, "ann")
+            .because(crate::harness::accounts::SHARED_PREPARATION_BEGUN),
+        Event::new(110, Kind::SignIn, "bob").because(&crate::harness::browser_window::ledger_why(
+            "claude.ai",
+            crate::harness::browser_window::WindowEnd::Done,
+            "session-kept",
+        )),
+        Event::new(111, Kind::SignIn, "bob").because(&renewal(
+            crate::harness::login_drive::Outcome::BotCheck(String::new()),
+            Some("claude.ai"),
+            crate::ai::connector::Flow::Browser,
+        )),
+        Event::new(112, Kind::SignIn, "ann").because(&renewal(
+            crate::harness::login_drive::Outcome::Hung,
+            None,
+            crate::ai::connector::Flow::Device,
+        )),
+        Event::new(113, Kind::SignIn, "bob").because(&grok(Some("accounts.x.ai"), "signed-in")),
+        Event::new(114, Kind::SignIn, "bob")
+            .because(&grok(Some("accounts.x.ai"), "signed-in-elsewhere")),
+        Event::new(115, Kind::SignIn, "ann").because(&grok(None, "stopped")),
+        Event::new(116, Kind::SignIn, "ann").because(&grok(Some("accounts.x.ai"), "bot-check")),
+        // A page host that is the automatic form's word is still read as a renewal's.
+        Event::new(117, Kind::SignIn, "ann").because(&renewal(
+            crate::harness::login_drive::Outcome::OffPin,
+            Some("auto"),
+            crate::ai::connector::Flow::Browser,
+        )),
     ];
     let notes = observe(Cli::Claude, &state, &state, &mut events, 200);
     assert_eq!(events[0].pk.as_deref(), Some(ANN));
     assert_eq!(events[2].pk.as_deref(), Some(BOB));
     assert_eq!(events[4].pk, None, "an unkeyed account is not noted");
     let kinds: Vec<&str> = notes.iter().map(|n| n.kind).collect();
-    assert_eq!(kinds, ["switch", "sign-in-failed", "signed-out"]);
+    assert_eq!(
+        kinds,
+        [
+            "switch",
+            "sign-in-failed",
+            "signed-out",
+            "sign-in-failed",
+            "sign-in-failed",
+            "sign-in-failed",
+            "sign-in-failed",
+            "sign-in-failed",
+            "sign-in-failed",
+            "sign-in-failed"
+        ],
+        "a sign-in that signed its row in, or a step of one, is not a failure"
+    );
     assert_eq!(notes[0].to, Key::new(BOB));
-    assert_eq!(notes[1].why, None, "no reason line reaches the journal");
+    let whys: Vec<_> = notes.iter().map(|n| n.why).collect();
+    assert_eq!(
+        whys,
+        [
+            None,
+            Some("failed"),
+            None,
+            Some("no-route"),
+            None,
+            Some("blocked"),
+            Some("failed"),
+            Some("failed"),
+            Some("blocked"),
+            Some("failed")
+        ],
+        "how a sign-in ended, and no reason line, reaches the journal"
+    );
     for note in &notes {
         assert!(KINDS.contains(&note.kind));
         assert!(SOURCES.contains(&note.src));

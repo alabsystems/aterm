@@ -626,6 +626,50 @@ fn the_sidecar_round_trips_and_tolerates_what_it_does_not_know() {
 }
 
 #[test]
+fn fleet_turn_identity_survives_sidecar_and_adopted_ledger_without_reading_turn_text() {
+    let (term, turns) = session(10);
+    let actor = crate::session_store::ExitActor::fleet("m72 / remote=desk");
+    let by = TurnBy::from_wire(actor.as_wire());
+    assert!(matches!(by, TurnBy::Fleet(_)));
+    let mut turn = record(1, true, ArchMark::of(&term.lock().unwrap()));
+    turn.by = by.clone();
+    turn.text = "by=harness fleet:somebody-else".into();
+    *turns.lock().unwrap() = TurnLedger::default();
+    turns.lock().unwrap().push(turn);
+    let bytes = export(&[capture(&term, &turns, true)], ceiling())
+        .remove(0)
+        .1;
+    let mut carry = decode(&bytes).expect("actual exported sidecar");
+    let restored = adopted_ledger(Some(&mut carry));
+    let records: Vec<_> = restored.records().collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].by, by);
+    assert!(records[0].carried);
+    assert_eq!(records[0].text.as_ref(), "by=harness fleet:somebody-else");
+
+    let (crash, shed) = CrashLedger::of(&restored, 1).encode(|_| true).unwrap();
+    assert_eq!(shed, 0);
+    let crash = decode(&crash).expect("actual crash ledger bytes");
+    assert_eq!(crash.turns[0].by, by);
+
+    let mut wire: aterm_json::Value = aterm_json::from_slice(&bytes).unwrap();
+    let entries = wire.as_object_mut().unwrap().get_mut("turns").unwrap();
+    let first = &mut entries.as_array_mut().unwrap()[0];
+    let previous = first.as_object_mut().unwrap().insert(
+        "by".to_owned(),
+        aterm_json::Value::String("fleet:".to_owned()),
+    );
+    assert_eq!(
+        previous,
+        Some(aterm_json::Value::String(actor.as_wire().to_owned()))
+    );
+    let malformed = aterm_json::to_vec(&wire).unwrap();
+    let decoded = decode(&malformed).unwrap();
+    assert_eq!(decoded.turns[0].by, TurnBy::Unknown);
+    assert_eq!(decoded.turns[0].text, records[0].text);
+}
+
+#[test]
 fn the_stamp_names_exact_bytes() {
     let s = stamp(b"hello");
     assert!(s.starts_with("5 "));

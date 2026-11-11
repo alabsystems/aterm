@@ -442,11 +442,12 @@ fn a_read_dated_in_the_future_is_read_again() {
     assert_eq!(read.repos.len(), 1);
 }
 
-/// A [`read_home_in`] pass resolves `remote.origin.url` + `core.excludesFile` in one `git config`
-/// call, resolves `HEAD` + `origin/HEAD` + `origin/main` + `origin/master` in one `git
-/// for-each-ref` call, skips `rev-list --count` when `HEAD == main_head`, and passes the known
-/// `.git/index` path to [`work_status_in`]: a warm up-to-date checkout spawns 5 `git` processes
-/// instead of 11 (`103` vs `221` across the 21-checkout fixture).
+/// A [`read_home_in`] pass resolves `remote.origin.url` and local/global `core.excludesFile` scope
+/// in one `git config --show-scope` call, reads `.git/HEAD` directly to avoid `symbolic-ref`,
+/// resolves `HEAD` + `origin/HEAD` + `origin/main` + `origin/master` in one `git for-each-ref`
+/// call, skips `rev-list --count` when `HEAD == main_head`, and passes the known `.git/index` path
+/// to [`work_status_in`]: a warm up-to-date checkout spawns 3 `git` processes instead of 11 (`63`
+/// vs `221` across the 21-checkout fixture).
 #[test]
 fn home_repos_pass_avoids_redundant_git_spawns_across_checkouts() {
     let tmp = aterm_tempfile::tempdir().expect("tmp");
@@ -494,8 +495,8 @@ fn home_repos_pass_avoids_redundant_git_spawns_across_checkouts() {
     assert_eq!(warmed.named("lagging").and_then(|r| r.dirty), Some(true));
     assert_eq!(warmed.named("unpushed").and_then(|r| r.behind), None);
     assert_eq!(
-        cold_starts, 123,
-        "cold pass spawns 123 git processes (down from 241)"
+        cold_starts, 83,
+        "cold pass spawns 83 git processes (down from 123, originally 241)"
     );
 
     for _ in 0..3 {
@@ -503,8 +504,8 @@ fn home_repos_pass_avoids_redundant_git_spawns_across_checkouts() {
             read_home_in_counted(&home, &table, PROBE_LIMIT, &|| false).expect("warm pass");
         assert_eq!(found.repos, warmed.repos);
         assert_eq!(
-            warm_starts, 103,
-            "warm pass spawns 103 git processes across 21 checkouts (down from 221)"
+            warm_starts, 63,
+            "warm pass spawns 63 git processes across 21 checkouts (down from 103, originally 221)"
         );
     }
 
@@ -555,7 +556,55 @@ fn home_repos_pass_avoids_redundant_git_spawns_across_checkouts() {
         "repository-local core.excludesFile ignores secret.ignored"
     );
     assert_eq!(
-        edge_warm_starts, 6,
-        "--version + local_config + symbolic-ref + for-each-ref + rev-parse HEAD + status (global_excludes skipped)"
+        edge_warm_starts, 5,
+        "--version + local_config + for-each-ref + rev-parse HEAD + status (symbolic-ref and global_excludes skipped)"
+    );
+
+    // Global excludes via `~/.config/git/ignore` (`RepoExcludes::DefaultGlobal`: 0 extra git
+    // spawns) and via `~/.gitconfig` (`RepoExcludes::ConfiguredGlobal`: 1 `global_excludes` spawn
+    // for `--path` expansion), while a global `[remote "origin"]` never masquerades as a local
+    // checkout's origin.
+    scratch_git(&custom, &["checkout", "-q", "main"]);
+    scratch_git(&custom, &["config", "--unset", "core.excludesFile"]);
+    let xdg_git = edge_home.join(".config/git");
+    std::fs::create_dir_all(&xdg_git).expect("xdg git");
+    std::fs::write(xdg_git.join("ignore"), "*.ignored\n").expect("xdg ignore");
+    let _ = read_home_in_counted(&edge_home, &table, PROBE_LIMIT, &|| false)
+        .expect("default global cold after checkout");
+    let (default_global, default_global_starts) =
+        read_home_in_counted(&edge_home, &table, PROBE_LIMIT, &|| false)
+            .expect("default global warm");
+    assert_eq!(
+        default_global.named("custom").and_then(|r| r.dirty),
+        Some(false)
+    );
+    assert_eq!(
+        default_global_starts, 4,
+        "--version + local_config + for-each-ref + status (no symbolic-ref or global_excludes spawn)"
+    );
+    std::fs::remove_file(xdg_git.join("ignore")).expect("rm xdg ignore");
+    std::fs::write(edge_home.join("home.exclude"), "*.ignored\n").expect("home.exclude");
+    std::fs::write(
+        edge_home.join(".gitconfig"),
+        "[core]\n\texcludesFile = ~/home.exclude\n[remote \"origin\"]\n\turl = https://github.com/acme/ decoy.git\n",
+    )
+    .expect("gitconfig");
+    let decoy = edge_home.join("decoy");
+    std::fs::create_dir_all(&decoy).expect("decoy");
+    scratch_git(&decoy, &["init", "-q", "."]);
+    let (configured_global, configured_global_starts) =
+        read_home_in_counted(&edge_home, &table, PROBE_LIMIT, &|| false)
+            .expect("configured global warm");
+    assert_eq!(
+        configured_global.named("custom").and_then(|r| r.dirty),
+        Some(false)
+    );
+    assert!(
+        configured_global.named("decoy").is_none(),
+        "global remote.origin.url never counts as a checkout's own origin"
+    );
+    assert_eq!(
+        configured_global_starts, 6,
+        "--version + decoy(local_config) + custom(local_config + for-each-ref + global_excludes + status)"
     );
 }

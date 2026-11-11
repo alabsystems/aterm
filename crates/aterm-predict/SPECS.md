@@ -9,274 +9,6 @@ through Trust/Clean about the compiled function. §2 maps the tests of `src/lib.
 §0 defines the notation the statements share, §5 holds the open findings and the counterexamples the
 rows cite, and §6 orders the proofs.
 
-> Status 2026-10-15: this is the crate's migration worklist. Each spec below is proved
-> through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted. The one test in §4 that samples no spec can be deleted now. Nothing has been
-> proved yet.
->
-> 2026-10-16: two contracts changed, found by the safety theorem
-> (`tests/reconciled_view_safety.rs`, a seeded property test over a real engine): nothing is
-> armed behind a line terminator while the line's guesses are in flight (`predict-accept-decline`),
-> and a matching glyph proves a guess only when it is attributable (`reconcile-contract`, with
-> `Owed` below). The rows that state them, `queue-cap`'s test name and the §2 map are updated; three
-> regression tests are added there. The counts in this header predate them.
->
-> 2026-10-16, after review: `Owed` is per guess (`g.owed`, the newest owe from before it), a guess
-> retired without credit owes its own echo, every owe is dated by its press (the notes take `now`),
-> owed echoes travel in `LinkEstimate`, and a Backspace cancels a glyph declined since the newest guess
-> (`declined_tail`). The rows `predict-accept-decline`, `reconcile-contract`,
-> `submit-carries-proven-guesses`, `unmodelled-input-retires`, `backspace-pops-own` and
-> `link-estimate-swap` state them; §2 maps the eight tests that pin each owe site and change.
->
-> 2026-10-17, predictive editing phase 0: the safety theorem's link model is now the predictor's
-> own glitch window (never less than 250 ms), which a fixed 250 ms deadline had made vacuous on
-> every slower link (§5.9). It found that an expiry owed nothing and kept the epoch's proof (§5.10):
-> an expired guess now owes its key's echo and voids the proof of its epoch (`expiry-contract`,
-> `visibility-model-refinement`, the model's `Expire`). Each fix is a `Rule` the debug-only
-> `Predictor::disable_rule_for_test` seam switches off, and the theorem catches each one in its
-> clause at a named directed case. The theorem gains FRAME FIDELITY (every displayed frame equals the
-> screen its newest key settles to, every cell and the cursor, with a decoration rule) and
-> TIMELINESS (nothing on glass older than the window, or flushed), which found that a mid-line echo
-> proved its epoch (§5.11): a credited echo now proves only over a clean tail (`tail-guard`), read
-> against a row the press hands the predictor (`key-row-sample`, `KeySample`, `predict_glyph`), and
-> hosts observe through `Seen` (`seen-opacity`, `reconcile_seen`; `reconcile` is its wrapper).
-> A guess retired without credit now owes its own glyph (`typed-owes`, §5.12). Running the sweep over
-> forty seeds found that the guess after a Backspace that cancels our own guess anchored a cell off,
-> fixed with its named case (`backspace-pops-own`, `predict-placement`, §5.13), and a run typed back
-> into a wrapped line that re-proved (§5.14), whose rule (`tail-guard`: every guess of a run typed over
-> nothing or its own glyph) is pinned by unit tests only: that counterexample came from an insert
-> pushing the tail past the margin, which the harness then took out of scope, so the theorem carries no
-> evidence of it. The theorem's scope was corrected in four places it claimed too much (a key whose own
-> echo leaves the editor's model, a frame inside unprompted output, a frame on an unsettled base, a late
-> echo that landed under a later guess of the same epoch).
->
-> 2026-10-17, after review of phase 0: a far end that writes a mid-line glyph before the tail it shifts
-> proved on the frame between the two, so a standing proof not at the end of the line is re-read against
-> its run's snapshot at every reconcile and at the press that continues it (`standing-tail`, §5.15). A
-> matching glyph is an echo only with the real cursor past it (`reconcile-contract`, `Rule::CursorAdvance`,
-> §5.16): a run typed along an autosuggestion was credited before any echo and shrank the window the
-> theorem's link model judges lateness by; the theorem gains ATTRIBUTION, which holds every credit to
-> its own key's output. A run at the end of the line proves without a tail comparison, so an
-> autosuggestion drawn, changed or cleared beside it no longer darkens the keys after it (`tail-guard`,
-> `key-row-sample`: `tail_line_end`, `line_end_at`, `moved_tail_at`), and a head whose cell still holds
-> what its press saw there, the cursor on it, waits instead of flushing (a glyph typed onto a suggestion
-> it diverges from). A cancelled guess owes its glyph (`backspace-pops-own`, `Rule::CancelOwes`), a guess
-> of the current epoch retired without credit voids the epoch's proof (`Rule::UncreditedVoids`, §5.17),
-> an opaque blank is nothing to type over, and `wants_key_row` no longer asks the mode (a host that keeps
-> none asks `mode()`). The theorem's TIMELINESS gains a control for its window half, and its scope two
-> more corrections (a credit made while an earlier key's output is overdue, and one made while the line
-> editor has lost its column); with them the faithful predictor holds on sixty seeds of a world that now
-> also rewrites tails and draws suggestions.
->
-> 2026-10-17, predictive editing increment 2 (edits that move no cell): `←`, `→` and a Backspace at the end
-> of the text are armed by `predict_edit` as ops of a STATE CHAIN on the known line (`edit-key-routing`,
-> `edit-fold`, `edit-line-lifetime`), reconciled by whole states at the smallest match, with a net-null tail
-> owed and a part-way echo waited on (`edit-reconcile`), shown only once a motion of the epoch has echoed
-> (`edit-class-proof`, the model's abstract edit class), painted all or none with its own cursor
-> (`edit-overlay`), expiring whole (`edit-expiry`), every key in one custody (`edit-custody`). An arrow that
-> cannot be placed is declined with its pixels kept. The theorem's world gains four line editors (readline,
-> readline with ICH, zle, a cooked tty) and a cooked `cat`, edit keys routed through `predict_edit`, the
-> PROVENANCE oracle, ATOMICITY and CURSOR LOCALITY; every new rule but four is caught in its clause (the four
-> have no consequence in this world, §5.20). Eighty seeds then found a glyph-lane FIDELITY break the edit
-> lane made reachable: a run typed before an erase we did not place had landed was credited by the next
-> key's echo (`stale-anchor`, §5.18), and one more place the theorem's ATTRIBUTION scope claimed too much
-> (§5.19). Its landing on main (aae75887e5) added two guards, each with a regression: the R-ROW guards
-> compare `hi + 2 ≤ cols` with checked arithmetic, so no saturation at `u16::MAX` admits the last column
-> (`predict-accept-decline`), and with an erase pending a chain flushes when the SENTINEL cell one past
-> every state is not blank, before any state is matched (`edit-reconcile`).
->
-> 2026-10-20, predictive editing increment 2's hosts: the GUI and the web hand edit keys to `predict_edit`
-> and paint a chain from `overlay_frame` (`edit-overlay`: the overlay and its cursor in one borrow). Wiring
-> the web host found that a frame composed after an edit key and before any reconcile of its chain painted
-> the whole unchanged line as ghosts (a chain clears `seen` as it starts, and a cell it had not read counted
-> as different); such a cell is now taken as the line's verified base shows it, so that frame paints what
-> the state changes. A flush now clears the chain's cursor too (`Flush`, `edit-overlay`): a web host
-> asking `predict_overlay_cursor` after switching to `off` or a resize, before its next overlay, was
-> handed the flushed chain's. Main's `glitch_window_ewma_and_ghost_wire_codec_round_trip` was mapped nowhere;
-> it is mapped under `glitch-window`. Its SRTT-step twin (`ewma_srtt_step_us`) and its ghost wire codec
-> (`encode_predicted_ghost_wire_le`, `decode_predicted_ghost_wire_le`) had no caller and were deleted; the
-> integer twin of `glitch-window`'s W stays, and the test is now
-> `compute_glitch_window_ms_is_floored_backed_off_and_capped`.
->
-> 2026-10-20, after review of increment 2 (§5.21): the sweep run over more seeds than the committed one
-> found seven breaks, each now a named case of the theorem with its control, and this round's own sweep
-> of 800 seeds, run after their fixes, found five more. The predictor gains seven rules: a cursor advance
-> is an echo only as far as the run's echoes reach (`CursorReach`), a park in the last column counts only
-> at the end of the line (`ParkedAtTheEnd`), a chain is credited whole or not at all
-> (`ChainAttributedWhole`), an echo whose cell comes back opaque is no append and voids a standing proof
-> (`MarkedEcho`), the transit wait holds only a cursor inside the chain's text (`TransitReach`), an edit op
-> is credited only with no later key echoing (`EditOwedAfter`), and a space proves no line by itself
-> (`SpaceNeverProves`); `StaleAnchor` also asks the later keys a Backspace cancelled, a cancelled glyph's
-> typed owe is dated by the Backspace, a run started inside the known text proves nothing, a carried epoch's
-> proof is held to its tail and its mark while a carried guess is pending, and the theorem's decoration rule
-> counts a vacated blank under decoration the far end drew. The rows `reconcile-contract`,
-> `backspace-pops-own`, `stale-anchor`, `tail-guard`, `standing-tail` and `edit-reconcile`, and §0's
-> `Past`, `Attr` and `owe`, state them. No test of `src/lib.rs` was added or removed; one was rewritten
-> (`a_cancelled_glyph_anchors_the_next_on_its_cell`, its control on a repeated letter, since two spaces
-> now prove nothing) and five moved to presses that hand the row (the park needs the end of the line).
->
-> 2026-10-20, predictive editing increment 3 (edits that move the tail): a glyph typed inside the known
-> text, and a Backspace there, are SHIFTS, ops of a state chain whose states move the text right of the
-> cursor (`shift-ops`, `edit-fold`), each shown only once a shift of its kind has echoed telling itself
-> apart from an edit in place (`edit-class-proof`); a shift no edit in place can be told from leaves the
-> line unknown. A chain's overlay names each cell's kind (`GhostCell`: typed, moved from a column, vacated)
-> for aterm-core's span painter (`edit-overlay`). A chain on a line proven beside text past its end holds
-> that text where it was (`standing-tail` (d)). A glyph that makes its row reorder, or one typed on such a
-> row, is declined (`right-to-left-rows`). The theorem's world gains readline's overwrite mode, zle with an
-> autosuggestion plugin, a right-to-left letter and the SHIFT motif; two hundred seeds found two breaks
-> (§5.22, §5.23), and the same seeds hold after their fixes. Nine unit tests are added and one renamed. The
-> plan's tail adoption is not implemented: no evidence the predictor reads tells a tail from a suggestion
-> (§5.24).
->
-> 2026-10-20, after review of increment 3 (§5.25, §5.26): a shift's kind is proven, and a chain's
-> retirement credited, by the IN-PLACE WORLDS (`shift-ops`, `edit-reconcile`): the chain's keys folded
-> from the verified line with each unproven kind edited in place, as overwrite mode edits, which
-> replaces the per-op `Evident` test (a burst whose intermediate state no frame showed proved both kinds
-> on overwrite mode's echo) and refuses credit where an in-place world shows the screen with fewer keys
-> read (`Rule::InPlaceReadsFewer`). A glyph and a Backspace cancel only with no shift of an unproven
-> kind in flight (`backspace-pops-own`, `Rule::CancelsOnlyKnownShifts`). Every press that starts a chain
-> holds the standing proof to its row first, whatever is pending (`standing-tail` (b)). A declined
-> arrow and a key not modelled make a blank row no evidence of the line's end for a window
-> (`tail-guard`, `unmodelled-input-retires`). The run_inside guard is `Rule::InsideRunsNeverProve`. A
-> sweep of two thousand seeds then found two breaks on main before the increment, fixed with their
-> named cases: a proof stands only while its echo's cell holds its glyph (`standing-tail` (e),
-> `Rule::StandingGlyph`), and a cancelled glyph's erase owes its echo as a space
-> (`backspace-pops-own`, `Rule::CancelOwesItsBlank`), and run whole those cases found a state an
-> earlier op's echo shows part-way taken for a later state (`edit-reconcile`, `Rule::PartWayEchoes`);
-> and two places the theorem's world claimed too much: its unprompted right prompt and suggestion drawn
-> without the decoration tag, and its no-echo read redrawing the secret buffer. The edit-overlay row now
-> says what `seen` holds when a chain starts (its press's row, not nothing). Twelve unit tests are added.
->
-> 2026-10-20, predictive editing increment 4 (line-edge keys at an authenticated prompt): Home, End, Ctrl-A,
-> Ctrl-E and Delete are LEARNED keys, ops of a state chain placed only on a WITNESSED line, one started at the
-> very cell the shell's authenticated OSC 133 `B` names as its buffer's start (`line-edge-witness`,
-> `KeySample::input_start`, aterm-core's `Terminal::input_region_start`), and shown only once two credited
-> echoes of the key's canonical effect have taught its binding in the editor context (`learned-bindings`,
-> `EditorContext`, carried with the session in its `LinkEstimate`): until then each is a dark PROBE, and a
-> divergence or an expiry it heads unlearns it, two banning it. Ctrl-A and Ctrl-E under a Kitty mode that
-> sends them as `CSI u` are not modelled (R-KITTY), and End at the end of the text is declined with its
-> pixels kept (`Rule::EndRefusal`: an autosuggestion is accepted there). The rows `edit-key-routing`,
-> `edit-fold`, `edit-reconcile`, `edit-expiry`, `edit-class-proof`, `visibility-gate` and
-> `link-estimate-swap`, and §0's `Link`, `Vis` and the op list, state them. Nine unit tests are added.
-> The safety theorem's world gains aterm's shell integration (signed marks, the nonce gate on), three
-> keymaps, a shell re-executing under a new nonce, a forged mark, Kitty's mode pushed and popped, and a
-> program's prompt where the shell's stood; each new rule and four new host mutants are caught at named
-> cases, and on its seed FRAME FIDELITY compared 4813 whole frames (1568 before; the 1614 first written here was
-> no count any tree gives), 144 of them showing a learned key (180 frames showed one and held the chain's clauses;
-> the rest repeated a frame or fell out of the clause's scope).
-> A sweep of three hundred seeds then found two breaks, each a named case with its control: a line edge's
-> echo caught part-way (End reprints the line a cell at a time) matched a later `←` unread (`edit-reconcile`,
-> `Rule::PartWayEchoes`), and, on main before this increment, a zero-width mark a forced wrap carried onto
-> the next guess's cell left that guess painted plain where it settled marked (`seen-opacity`,
-> `reconcile-contract`, `Rule::OpaqueHead`). Three more were the world's own over-claims, corrected there (a
-> key read by a Kitty mode pushed after its press, a zero-width mark stepped over with `ESC [ 0 C`, an ICH
-> in front of a mark). Four hundred seeds after the fixes found no break. The model gains the witness and
-> the learned binding (`visibility-model-refinement`), bound by one conformance test.
->
-> 2026-10-20, after review of increment 4 (§5.27): a `B` vouches for the buffer it found empty, and only the
-> FIRST KEY typed after it meets that buffer (`line-edge-witness`, `prompt_gate`, `Rule::WitnessFirstKey`): a line
-> terminator pressed at an authenticated prompt opens the gate (`note_line_submit_at`, the prompt from aterm-core's
-> `Terminal::prompt_in_front`), every key shuts it, and a run started at the `B`'s cell is witnessed only as the
-> first key at another prompt (`KeySample::input_start` names its prompt, `InputStart`). aterm-core names a start
-> only where the `B` says it stands where the buffer starts (`aterm_input=start`), which zsh's, sent after zle drew a
-> line pre-filled from its buffer stack, does not. A control chord the keyboard mode escapes is refused whether
-> Kitty's `CSI u` or modifyOtherKeys level 2's `CSI 27` (R-KITTY, `KeySample::escaped_chords`). The model gains
-> the gate (`SubmitAtPrompt`, `WitnessIsTheFirstKey`). Four unit tests are added and one rewritten (it now tests
-> `reset_session` itself, DECCKM and the escaped chords as contexts).
->
-> 2026-10-20, the same review's sweep of two thousand seeds (§5.27 (e)–(i)): THE FLOOR (`standing-tail` (f),
-> `Rule::FloorBelow`, `KeySample::below`), DARK BEHIND A WAIT (`visibility-gate`, `Rule::DarkBehindAWait`), THE
-> CREDIT TAKEN BACK (`reconcile-contract`, `Rule::CreditTakenBack`) and the engine's wrap flag (`predict-placement`,
-> `Rule::EngineWrapFlag`, `KeySample::wrap_pending`) close five breaks found on main before the increment and one
-> its world made reachable; a sixth was the world's own (a prompt drawn over a wrapped line's row). A second sweep
-> (seed indices 0 to 2400) found three more: the floor beside a wrapped typed-ahead guess, an engine bug (a marked
-> blank lost from its row by EL, fixed in aterm-grid) and the world's zle erasing before a mark. A third
-> (the same indices) found one more, the floor excusing any text on a cell a wrapped guess names (§5.27 (m)): a
-> guess excuses its own glyph there now, never another; a fourth found none. Six unit tests are added and the Delete test rewritten to
-> show the shift; `CancelOwesItsBlank` keeps no clause of its own in the theorem now (§5.27 (g)).
->
-> 2026-10-20, predictive editing increment 5 (the measurement, `tests/editing_win.rs`, numbers in
-> `docs/DESIGN-predictive-editing-2026-10-20.md`): the region design's 300-line corpus, ported and checked
-> against its recorded size, typed through the safety theorem's world (`tests/common/world.rs`, now mounted
-> once by the suite for both files) over a split-read link, with the theorem's checker on for every variant
-> with every rule in force. It found that THE FIRST KEY's gate shut at every coordinate move, so no line was
-> witnessed at a shell on the bottom row, whose Enter scrolls the screen before the next prompt's first key
-> (11 of 300 lines witnessed at 1 to 160 ms, 10 at 320 ms and 7 at 600 ms, none after the screen filled,
-> signed, Adaptive): a move keeps the gate as it stood (`line-edge-witness`, `Rule::ScrollKeepsFirstKey`,
-> `a_scroll_after_a_line_terminator_keeps_the_first_key_s_gate`), and 282 of 300 are witnessed at 1 to
-> 160 ms, 260 at 320 ms and 153 at 600 ms (the measurement prints both, a run each, beside each other);
-> the theorem's committed sweep and a sweep of seed indices 0 to 2400 hold with it. `PredictEvents` gains
-> four counts that decide nothing (`ops_folded`, `flushes`, `epoch_ends`, `expiries`), which the
-> measurement reads as the cost and the churn; `ops_folded` counts the walk a press makes to place its key
-> (`placeable`) too. One unit test is added; the measurement's three tests are mapped in §2 and its corpus
-> check is in §4.
->
-> Its review (2026-10-20) found the formal model still said a scroll shuts the gate (its `Submit`, to which
-> the conformance binding mapped the rows moving): the model gains `RowsMoved`, which keeps it, and
-> `a_scroll_keeps_the_first_key_s_gate` binds it with `Rule::ScrollKeepsFirstKey` off as its control
-> (`visibility-model-refinement`, `reconcile-contract` (1)). Its sweep past seed index 2400 found three
-> breaks on main, none of the increment's making, each now a rule, a named case (`review_5_cases`) and a
-> unit test: the transit wait took any blank for an echo part-way, and zsh's `reset-prompt` redrawing the
-> prompt narrower had a chain painted twice (FRAME FIDELITY, seed index 2482, `Rule::TransitBlanks`,
-> `edit-reconcile`); a Delete's echo split on its step back stood the cursor on End's state, then Home's,
-> each credited unread (ATTRIBUTION, seed index 2748, `Rule::PartWayStepBack`, `edit-reconcile`); and a
-> Backspace cancelling a stale guess left its cell as a fresh anchor a cell right of the erase's return
-> (FIDELITY, seed index 3942, `Rule::StaleCancel`, `stale-anchor`). `Rule::CancelsOnlyKnownShifts` keeps no
-> clause of its own in the theorem since (`Rule::TransitBlanks` closes its named case too); its unit test
-> switches both off. The world's press reads a row for an edit key only with the edit lane on, as
-> aterm-gui does (`Sim::set_editing`), so the measurement's row cost of the glyph lane alone is 40.9 cells
-> a press, not 50.9. Three unit tests and one conformance test are added.
->
-> 2026-10-20, the comparison at 30, 100 and 250 ms (the docs' §3.1): the measurement gains those links and
-> counts mispredicted cells and their lifetimes. A cross-check driving the predictor at 3d4c211fbb, the
-> commit before the plan's first landing (feb341a9ea), through the measurement's world found `Baseline`
-> (every rule off) showing what that predictor never did: a glyph typed over text (`sudo ` after Home or
-> Ctrl-A) waited where it flushed, 22 wrong episodes at 80 ms, Adaptive, where it showed 9. The wait, added
-> beside a suggestion by the review of phase 0 (0376b47967), was the one change to what the glyph lane shows
-> that no rule switched off: it is `Rule::ScreenAsItWas` now (`reconcile-contract` (3)), keeping no clause,
-> and with it off `Baseline` prints every metric the cross-check printed, in all 64 of its runs. One unit
-> test is added.
->
-> 2026-10-20, a sweep over many seeds: the theorem over seed indices 0 to 199 of a second family
-> (`seed_index` in `tests/common/world.rs`: the committed seed xor `i` times `0xA24B_AED4_963E_E407`, not
-> the golden ratio the reviews swept) found FRAME FIDELITY broken at seed index 97, a break on main since
-> the review of phase 0 (0376b47967): an echo drawn over the glyph it shifted hid the tail its redraw was
-> still to write, and a run typed after it took a blank row for the line's end (§5.28). THE HIDDEN TAIL
-> (`Rule::CleanTailInFlight`, `tail-guard`, `key-row-sample`) closes it, with a named case
-> (`sweep_cases`) and a unit test; no number the measurement prints moved. The theorem now sweeps seed
-> indices 1 and 2 of that family in every run (`a_prediction_never_corrupts_the_reconciled_view_over_more_seeds`),
-> and the review's sweep over indices 0 to 999 is committed, ignored by default
-> (`…_over_a_thousand_seeds`).
->
-> 2026-10-20, residual 11 of the design (THE SCREEN AS IT WAS in `Always`): the wait painted a glyph typed
-> over the line's text, unshifted, until its echo, so over ssh `Always` showed more mispredicted cells than
-> the predictor before the plan (123 against 45 at 30 ms, 152 against 67 at 100 ms). Narrowed to runs at
-> the end of the line, it cost readline six keys at 250 ms in Adaptive: the wait also keeps a run typed a
-> round trip after Ctrl-K, whose glyphs land as appends once Ctrl-K's echo has erased the text their
-> presses read. So the wait stays, and DARK OVER TEXT (`Rule::DarkOverText`, `visibility-gate`,
-> `reconcile-contract` (3)) holds a guess waiting on the screen as it was where the line's end is not
-> known, and every guess after it, off the glass in every mode; the press of a run's first guess takes
-> the same decision on the row it read, for a host that composes a frame before it reconciles (the
-> web reconciles after output only). Every Adaptive line the measurement prints is unchanged, and so
-> are `Full`'s keys before echo in every run; `Always` shows fewer mispredicted cells and wrong
-> episodes than the predictor before the plan in every run (assertion 8, beside `Full` with the rule
-> off, `PaintedOverText`). `PredictEvents` gains `text_waits`, which the theorem floors. One unit test
-> is added and one rewritten (the wait it holds is off the glass now, so it counts what is pending);
-> `a_run_started_inside_the_text_proves_nothing`'s control, which paints at a press with no reconcile
-> between, switches the new rule off beside its own, a second guard against the same picture.
->
-> 2026-10-20, the review of DARK OVER TEXT: it decided on the head alone, so a run whose first glyph hid
-> nothing (typed on its own glyph, `sudo ` on the `s` of `systemctl`, or on a blank inside the line,
-> ` -C x` on the space of `git commit`) had the glyphs typed after it painted over the line's text, and
-> a hold ended with its guess's expiry (`xyz` on the `d` of `du -sh` showed `dyz-sh` a window after
-> `x`). The rule now decides on the run's first guess typed over text (`first_over_text`: its press
-> read a glyph other than its own there, with ¬tail_line_end), the head or not, held while its cell shows
-> a glyph its ghost would hide, one cell read a turn beyond the head's; and the hold passes to the guess
-> typed next when its guess expires (`expiry-contract`). Every Adaptive line the measurement prints, every
-> key count and every cost line is unchanged; `Always` shows fewer mispredicted cells in 32 runs
-> (`full` 525 against 529 at 250 ms signed from zle) and fewer wrong episodes in twelve of `phase0`'s.
-> Two unit tests are added, each failing before the change.
-
 Source: `crates/aterm-predict` (read only). As of 2026-10-28 `src/lib.rs` has 159 `#[test]` fns,
 `tests/conformance_visibility.rs` has 8, `tests/editing_win.rs` has 4, `tests/reconciled_view_safety.rs`
 has 7 and `tests/common/world.rs` has 1, for 179 in all (the 2026-10-15 recovery read 56 and 3). The
@@ -286,7 +18,7 @@ state, and the tests named in them ran.
 Result: **38 specs** cover **175 tests** (§2), plus **4 harness and oracle self-checks** (§4).
 
 Gap numbers refer to the gap table in
-the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 Gap 0 (an installed seal that publishes Clean rows) is a prerequisite for every spec, so the column
 lists it on every row. No spec here is blocked by gap 0 alone.
 
@@ -626,64 +358,13 @@ tests/reconciled_view_safety.rs	the_chain_painter_paints_all_or_none	edit-overla
 tests/reconciled_view_safety.rs	each_named_case_holds_and_catches_its_mutant	edit-fold	reconcile-contract, edit-reconcile, tail-guard, standing-tail
 ```
 
-## 3. Coverage
-
-- 179 live tests: 175 mapped across the 38 specs in §2, and 4 harness/oracle self-checks documented in §4
-  (the 2026-10-15 recovery: 59 read, 58 mapped to 19 specs, 1 deleted as §4 says).
-- In that recovery the biggest collapses were `predict-placement`, `echo-regime-latch`, `reconcile-contract`,
-  `no-unechoed-flash` and `link-estimate-swap` (7 primary tests each), then `expiry-contract` and
-  `unmodelled-input-retires` (4 each).
-- Gap histogram over the 19 specs of the 2026-10-15 recovery (the number of specs each gap blocks; a
-  spec counts once under every gap it lists). The sixteen added since list their gaps in their rows.
-
-| gap | specs blocked |
-|---|---|
-| 0 | 19 |
-| 1 | 19 |
-| 2 | 16 |
-| 3 | 13 |
-| 4 | 4 |
-| 5 | 11 |
-| 6 | 1 |
-| 7 | 11 |
-| 10 | 1 |
-| 11 | 1 |
-| 12 | 3 |
-| 13 | 12 |
-| f32 (no §7 row) | 4 |
-
-  Gaps 8, 9 and 14–17 block none of these specs directly. The crate has no fs, process, thread or
-  proc-macro code under test.
-
 ## 4. Tests that are not spec samples
-
-> Status 2026-10-15: the one test here, `unconfirmed_prediction_self_expires`, repeated
-> `expired_prediction_clears_next_deadline` and is deleted from `src/lib.rs`. That test in turn repeated
-> `expire_due_consumes_the_deadline_without_a_redraw` and `adaptive_local_tail_expires_without_a_visible_erase`
-> and is deleted too.
-
-> 2026-10-20: `tests/editing_win.rs::the_corpus_is_the_region_probe_s` samples no spec. It pins the
-> measurement's corpus generator to the region design's probe (6999 keys, the same lines per family), so
-> the measurement's numbers and the probe's are of one corpus; a proof of the crate retires nothing of it.
-> Likewise, `tests/common/world.rs::frame_text_reads_each_cell_as_cell_text`,
-> `tests/reconciled_view_safety.rs::the_checker_catches_every_mutant_host_in_its_clause` and
-> `tests/reconciled_view_safety.rs::every_rule_has_a_negative_control` are harness and oracle self-checks
-> for `tests/reconciled_view_safety.rs` (verifying `frame_text` against `cell_text`, checker sensitivity on
-> `MUTANT_HOSTS`, and negative-control coverage across `Rule::ALL`).
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **(Fixed 2026-10-28.) `expire_due` doc aligned with `now - born > window`.** `Predictor::expire_due`'s
-   doc now states "Expires guesses past their glitch window without composing a frame", matching
-   `Exp(P, now, g) ⇔ now.saturating_duration_since(g.born) > W(P)` (`next_deadline >= now`).
-2. **(Fixed 2026-10-28.) Stale alt-screen crate doc removed.** `predict_char*` arms guesses without an
-   alt-screen input and `reconcile(..., alt_screen = true, ...)` flushes them (`reconcile-contract` (2));
-   the overclaiming crate-level paragraph was pruned.
 3. **A restore test did not isolate its claim (deleted 2026-10-16).** The `proof_cell` mismatch
    rule alone kept its guess dark. `restoring_an_estimate_clears_the_outgoing_panes_pixels` pins the
    claim: after a restore, the outgoing pane's confirmation is gone.
-4. **(Fixed 2026-10-28.) Stale epoch-row comment removed.** The stale comment in
-   `fresh_line_resets_confirmation_no_leak` was removed; gating uses `proof_cell` plus epochs.
 5. **The model's Submit cannot express the submit carry.** The model's `Submit` sets
    `pending = 0, visible = 0`. But `note_line_submit` keeps pending guesses, and keeps a proven
    epoch's guesses visible (`grandfathered_epoch`). `every_epoch_boundary_is_the_models_submit` fires
@@ -691,16 +372,6 @@ tests/reconciled_view_safety.rs	each_named_case_holds_and_catches_its_mutant	edi
    carry that `submit_does_not_blank_the_tail_of_the_command_line` and
    `a_line_terminator_makes_what_follows_tentative` pin. `visibility-model-refinement` needs a Submit
    with a carried-pending branch before it can be stated truthfully.
-6. **(Fixed 2026-10-28.) Conformance negative control runs shipping code and model invariant.** In
-   `adaptive_fast_expiry_is_invisible_and_slow_echo_may_display`, the negative control now runs
-   `Predictor::new(PredictMode::Always)` on the identical fast-link trace and checks
-   `model.check_invariant` against a `visible = 1, slow = 0` mutant state.
-7. **(Fixed 2026-10-28.) Stale constant-250 ms floor crate doc removed.** With `srtt = Some` and
-   `expiry_backoff > 0`, the clamp floor is the backed-off probe (`500`, `1000` or `2000` ms) so the
-   window lies in `[250, 2000]` ms as `glitch-window` states.
-8. **(Fixed 2026-10-28.) Changing `cols` clears `deferred_wrap`.** Both `arm_glyph` and
-   `predict_edit` now clear `deferred_wrap` whenever `cols != grid_cols`, so a stale park reading at
-   an earlier width never wraps a glyph at the new width (`the_deferred_wrap_slot_is_not_a_free_cell`).
 9. **The safety theorem's link model was vacuous at RTT ≥ 250 ms (fixed 2026-10-17).** FIDELITY
    called an echo late when it arrived more than a fixed 250 ms after its key, so on every link
    slower than that (the links prediction is for) no displayed guess was ever compared with its
@@ -1056,31 +727,3 @@ tests/reconciled_view_safety.rs	each_named_case_holds_and_catches_its_mutant	edi
     name fail with the rule off. With the fix, seed indices 0 to 199 hold (71 s on 18 cores) and so do 0 to
     999. The theorem now sweeps seed indices 1 and 2 of the family in every run, beside index 0, and the
     review's sweep over 0 to 999 is a committed test ignored by default.
-
-## 6. Proof order (easiest high-value first)
-
-Every row needs gap 1 (struct, `Option` or `VecDeque` carriers) beside gap 0, and most need gap 2
-(`&mut self`/`&self` views). The order takes the smallest gap sets first and, among those, the specs
-that supply lemmas for later ones.
-
-1. **`link-estimate-swap`** (gaps 0, 1, 2, 4): field assignment on the `Copy` struct `LinkEstimate`
-   plus the composition take → reset_session → reset → flush, with no arithmetic and no loops. Its
-   `Flush` and `reset` lemmas serve almost every spec after it.
-2. **`submit-carries-proven-guesses`** (gaps 0, 1, 2): one `wrapping_add` and `Option` assignments. It
-   proves `EndEpoch`, on which clauses (c) and (d) of `no-unechoed-flash` rest.
-3. **`off-mode-inert`** (gaps 0–3), then **`unmodelled-input-retires`** and **`backspace-pops-own`**
-   (gaps 0–3 and 13), on the `Flush` lemma.
-4. **`glitch-window`** (gaps 0–3, 6, 12, 13, f32): no loops, only bounded shift, cast and clamp
-   arithmetic, so once a float model exists the bounds are an interval proof. It is the `W` lemma that
-   `expiry-contract` and the link specs cite.
-5. **`echo-regime-latch`**: `record_echo_regime` is straight-line saturating `u8` with `f32`
-   comparisons. Its `reconcile` half (one call per turn, on the first sample) waits for
-   `reconcile-contract`.
-
-Then `expiry-contract` and `visibility-gate` (loop gap 7), `predict-placement` and
-`predict-accept-decline`, and `reconcile-contract` (the higher-order `observe` closure, gaps 11 and 13).
-`no-unechoed-flash`, the password guarantee and the crate's most valuable spec, needs ghost history over
-a whole trace, so it follows the per-method contracts it is built from. `visibility-model-refinement`
-comes last: it needs gap 10 and the model fix of §5.5. `mode-parse` and `is-line-submit` are independent
-pure functions, cheap once gap 1 gives `&str`/`&[u8]` content models with a Unicode
-`is_control`/whitespace table.

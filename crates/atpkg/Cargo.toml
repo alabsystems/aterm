@@ -40,6 +40,7 @@ test = false
 dev-seams = ["aterm-update-core/dev-seams", "aterm-types/dev-seams"]
 
 [dependencies]
+agh = { workspace = true }
 # The crypto root for both signatures atpkg checks: Ed25519 over every signed index and
 # manifest (docs/TOOLCHAIN-PACKAGE-MANAGER.md S8/S13), and RSA-4096 PKCS#1 v1.5 over SHA-512
 # for a vendor's OpenPGP-signed digest document (`openpgp`,

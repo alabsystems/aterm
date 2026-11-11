@@ -156,11 +156,7 @@ fn rename_purpose(words: &[String]) -> Option<String> {
             field.as_str(),
             "ComputerName" | "LocalHostName" | "HostName"
         );
-    let own = std::env::current_exe().ok();
-    let batch = own.as_deref() == Some(std::path::Path::new(program))
-        && verb == "name"
-        && field == "apply-system";
-    if !scutil && !batch {
+    if !scutil {
         return None;
     }
     let number = aterm_types::machine_name::Number::parse(number).ok()?;
@@ -377,15 +373,6 @@ mod tests {
         ] {
             assert_eq!(rename_purpose(&args), None);
         }
-        let exe = std::env::current_exe()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert!(rename_purpose(&words(&[&exe, "name", "apply-system", "m59"])).is_some());
-        assert_eq!(
-            rename_purpose(&words(&["/tmp/aterm", "name", "apply-system", "m59"])),
-            None
-        );
     }
 
     #[test]

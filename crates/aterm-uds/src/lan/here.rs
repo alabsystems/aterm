@@ -6,7 +6,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
-use std::os::fd::{AsRawFd as _, RawFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use super::{ConnectOptions, UdpOptions};
@@ -177,9 +177,38 @@ pub fn dial_any(
     deadline: Instant,
     options: ConnectOptions,
 ) -> io::Result<(TcpStream, SocketAddr)> {
+    dial_any_cancelled(addrs, deadline, options, None)
+}
+
+/// Dial while this one-request control connection remains open. Readable extra request bytes
+/// also cancel: the peer may send nothing else before its socket answer. Resolution, if any,
+/// belongs to the caller and retains its own existing bound.
+/// # Errors
+/// As [`dial_any`], or `Interrupted` when the control connection ends or becomes readable.
+pub fn dial_any_while_open(
+    addrs: &[SocketAddr],
+    deadline: Instant,
+    options: ConnectOptions,
+    control: BorrowedFd<'_>,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    dial_any_cancelled(addrs, deadline, options, Some(control))
+}
+
+fn dial_any_cancelled(
+    addrs: &[SocketAddr],
+    deadline: Instant,
+    options: ConnectOptions,
+    cancel: Option<BorrowedFd<'_>>,
+) -> io::Result<(TcpStream, SocketAddr)> {
     let mut last = io::Error::new(io::ErrorKind::NotFound, "no address to dial");
     for addr in addrs {
-        match dial(addr, deadline, options) {
+        crate::ready::check_cancelled(cancel)?;
+        match crate::connect::tcp_until_cancelled(
+            addr,
+            deadline,
+            |stream| configure(stream.as_raw_fd(), addr, options),
+            cancel,
+        ) {
             Ok(stream) => return Ok((stream, *addr)),
             Err(error) => last = error,
         }

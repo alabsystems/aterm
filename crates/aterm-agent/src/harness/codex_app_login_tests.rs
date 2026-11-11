@@ -75,6 +75,19 @@ pub(in crate::harness) fn current_global_code_fixture(
     predecessor: bool,
     env: &crate::harness::cli::Env,
 ) -> crate::harness::codex_grant_owner::CaptureOutcome {
+    current_global_login_fixture(artifact, prepared, scope, cut, supported, predecessor, env).1
+}
+
+#[cfg(unix)]
+pub(in crate::harness) fn current_global_login_fixture(
+    artifact: &crate::harness::codex_enrollment::Artifact,
+    prepared: crate::harness::codex_grant_owner::PreparedGrant,
+    scope: &crate::harness::account_work::Scope,
+    cut: Option<EnrollmentCut>,
+    supported: bool,
+    predecessor: bool,
+    env: &crate::harness::cli::Env,
+) -> (Drove, crate::harness::codex_grant_owner::CaptureOutcome) {
     let now = env.now;
     let turn = prepared
         .native_scope()
@@ -161,7 +174,7 @@ pub(in crate::harness) fn current_global_code_fixture(
         work: Some(scope),
         now,
     };
-    let (_, outcome) = with_code_contact(&contact, || {
+    let (result, outcome) = with_code_contact(&contact, || {
         exchange.persist_capturing_inner(
             Some("actual-current-code-fixture-owner"),
             Some(prepared),
@@ -170,7 +183,14 @@ pub(in crate::harness) fn current_global_code_fixture(
         )
     });
     assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
-    outcome.expect("actual sender retains the response")
+    let drove = Drove {
+        outcome: match result {
+            Ok(email) => Outcome::SignedIn { email, page: false },
+            Err(_) => Outcome::Unverified("isolated code fixture retained its response".into()),
+        },
+        host: None,
+    };
+    (drove, outcome.expect("actual sender retains the response"))
 }
 
 // Synthetic journal metadata for low-level credential guards only. This does not
@@ -5519,7 +5539,7 @@ fn a_refresh_response_a_failed_publication_left_is_published_by_the_next_read() 
         .as_object_mut()
         .expect("journal object")
         .remove("refresh_token_digest");
-    super::super::upgrade_models::write_atomic(
+    super::super::atomic_write::write_atomic(
         &beside_auth(&home, JOURNAL_SUFFIX),
         &aterm_json::to_string(&legacy).expect("legacy JSON"),
     )

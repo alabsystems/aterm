@@ -212,6 +212,120 @@ fn rfc3339_delta_round_trips_and_fails_closed() {
     );
 }
 use super::*;
+
+/// Stop the writer without unwinding at each disk boundary. These are inert
+/// bundle directories: signature and boot admission have separate tests.
+#[test]
+fn killed_apply_writer_keeps_old_bytes_and_releases_its_lock_at_every_boundary() {
+    use std::os::unix::process::ExitStatusExt as _;
+    const CHILD_ROOT: &str = "ATERM_TEST_APPLY_CUT_ROOT";
+    const CHILD_CUT: &str = "ATERM_TEST_APPLY_CUT";
+    const CUTS: [&str; 7] = [
+        "ready", "prepared", "probe", "armed", "swapped", "receipt", "retired",
+    ];
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = PathBuf::from(root);
+        let s = Staging {
+            apply_lock: root.join("apply.lock"),
+            stage_lock: root.join("stage.lock"),
+            download: root.join("download"),
+            staged_app: root.join("staged/aterm.app"),
+            ready: root.join("ready.toml"),
+            status: root.join("status.toml"),
+            root: root.clone(),
+        };
+        let cut = std::env::var(CHILD_CUT).unwrap();
+        let stop = |at: &str| {
+            if at == cut {
+                std::fs::write(root.join("reached"), at).unwrap();
+                aterm_uds::process::kill_self_now();
+            }
+        };
+        let _lock = FileLock::acquire(&s.apply_lock).unwrap();
+        let installed = root.join("Applications/aterm.app");
+        let ready = Ready::read(&s.ready).unwrap();
+        stop("ready");
+        let prepared = prepare_fixed_swap_candidate(
+            &s,
+            &installed,
+            &ready,
+            10,
+            (11, ready.commit.as_deref().unwrap()),
+        )
+        .unwrap();
+        stop("prepared");
+        UnprovenCandidate {
+            bundle: prepared.fixed.clone(),
+            started: ProbeClock::now(),
+        }
+        .record(&s)
+        .unwrap();
+        stop("probe");
+        UnprovenCandidate::clear(&s);
+        let _sentinel = prepare_trial(&s, &ready, &installed).unwrap();
+        stop("armed");
+        swap_fixed_candidate(&prepared, &installed, Flush::Durable).unwrap();
+        stop("swapped");
+        crate::manifest::InstalledReceipt::record(
+            &s.installed_receipt(),
+            11,
+            ready.commit.as_deref().unwrap(),
+            &ready.dmg_sha256,
+            Flush::Durable,
+        )
+        .unwrap();
+        stop("receipt");
+        s.retire_published();
+        stop("retired");
+        panic!("unknown cut {cut}");
+    }
+    for (index, cut) in CUTS.into_iter().enumerate() {
+        let (s, root) = temp_staging();
+        write_ready(&s, 11);
+        make_app(&s.staged_app, "NEW");
+        let installed = root.join("Applications/aterm.app");
+        make_app(&installed, "OLD");
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        command.args(["--exact", "install::tests::killed_apply_writer_keeps_old_bytes_and_releases_its_lock_at_every_boundary", "--nocapture"])
+            .env(CHILD_ROOT, &root).env(CHILD_CUT, cut);
+        let output =
+            aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+                .unwrap();
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGKILL),
+            "{cut}: {output:?}"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("reached")).unwrap(), cut);
+        let _lock = FileLock::acquire_within(&s.apply_lock, std::time::Duration::ZERO).unwrap();
+        let fixed = rollback_path(&installed);
+        if index < 4 {
+            assert_eq!(read_id(&installed), "OLD", "{cut}");
+            assert_eq!(
+                read_id(if index == 0 { &s.staged_app } else { &fixed }),
+                "NEW",
+                "{cut}"
+            );
+        } else {
+            assert_eq!(read_id(&installed), "NEW", "{cut}");
+            assert_eq!(read_id(&fixed), "OLD", "{cut}");
+            assert!(
+                trial_authorizes_candidate(&s, 11, "0123456789abcdef0123456789abcdef01234567"),
+                "{cut}"
+            );
+            // Exercise the inverse exchange on the exact files the killed writer left.
+            restore_rollback(&fixed, &installed, Flush::Durable).unwrap();
+            assert_eq!(read_id(&installed), "OLD", "{cut}");
+        }
+        assert_eq!(
+            boot_sentinel(&s).read_state().is_some(),
+            index >= 3,
+            "{cut}"
+        );
+        assert_eq!(s.installed_receipt().exists(), index >= 5, "{cut}");
+        assert_eq!(s.ready.exists(), index < 6, "{cut}");
+    }
+}
 use std::sync::atomic::{AtomicU32, Ordering};
 
 fn temp_staging() -> (crate::paths::ScratchStaging, std::path::PathBuf) {

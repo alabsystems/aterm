@@ -93,6 +93,7 @@ fn real_steps(real: &mut Real, s: &State) -> BTreeSet<&'static str> {
         return steps;
     }
     let app = real.app(lane, s["handed"] == 1);
+    app.handoff_degraded = s["blocked"] == 1;
     let draining = s["queued"] == 1 && s["draining"] == 1;
     app.pending_restore =
         (s["queued"] == 1 && !draining).then(|| crate::restore::RestoreManifest::new(Vec::new()));
@@ -152,8 +153,10 @@ fn real_steps(real: &mut Real, s: &State) -> BTreeSet<&'static str> {
     steps
 }
 
-const APP_STEPS: [(&str, &str); 10] = [
+const APP_STEPS: [(&str, &str); 12] = [
     ("RebuildAtAttach", "RebuildAtAttach"),
+    ("RebuildWithLostWindow", "RebuildAtAttach"),
+    ("RebuildWithUnnoticedLoss", "RebuildAtAttach"),
     ("LeaveResume", "LeaveResume"),
     ("RebuildAtPark", "RebuildAtPark"),
     ("RebuildSliceAtPark", "SliceAtPark"),
@@ -243,4 +246,48 @@ fn negative_control_the_buggy_family_disagrees_with_the_shipping_code() {
             "the shipping code must refuse the mutant's {step}: {disagreements:?}"
         );
     }
+}
+
+#[test]
+fn a_lost_restore_window_matches_the_model_and_refuses_the_old_mutant() {
+    fn next(model: &Model, state: &State, action: &str) -> State {
+        let successors = model.successors(action, state);
+        assert_eq!(successors.len(), 1, "{action} from {state:?}");
+        successors[0].clone()
+    }
+    fn before_rebuild(model: &Model) -> State {
+        let mut state = model.init_state();
+        for action in ["Widen", "StartHandoff", "Attach0", "Present0"] {
+            state = next(model, &state, action);
+        }
+        state
+    }
+
+    let model = interp::with_buggy(&native_update_successor_attach_model(), 0);
+    let lost = next(&model, &before_rebuild(&model), "RebuildWithLostWindow");
+    let (mut real, _keep) = Real::new();
+    let failed = real.handoff.insert_logical_window(
+        crate::stub_session(real.handoff.next_session_id),
+        24,
+        80,
+    );
+    real.handoff.retire_unattached_restored_window(failed);
+    assert_eq!(
+        lost["extras"],
+        i64::from(real.handoff.windows.contains_key(&failed))
+    );
+    assert_eq!(
+        lost["blocked"],
+        i64::from(!real.handoff.restore_pass_handoff_lane())
+    );
+    let shipping = real_steps(&mut real, &lost);
+    assert_eq!(shipping, model_steps(&model, &lost));
+    assert!(!shipping.contains("Prove"));
+
+    let buggy = interp::with_buggy(&native_update_successor_attach_model(), 1);
+    let unnoticed = next(&buggy, &before_rebuild(&buggy), "RebuildWithUnnoticedLoss");
+    assert!(buggy.action_enabled("Prove", &unnoticed));
+    let proved = next(&buggy, &unnoticed, "Prove");
+    assert!(!buggy.check_invariant("ProofRetainsCompleteLayout", &proved));
+    assert_ne!(unnoticed["blocked"], lost["blocked"]);
 }

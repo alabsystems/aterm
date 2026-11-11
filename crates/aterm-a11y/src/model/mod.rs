@@ -720,19 +720,5 @@ pub trait DeactivationHandler {
 }
 
 #[cfg(test)]
-mod action_context_tests {
-    use super::ActionContext;
-
-    #[test]
-    fn native_review_identity_preserves_lifecycle_and_never_aliases_other_contexts() {
-        let review = ActionContext::native_review(u64::MAX, u64::MAX, 9);
-        let narrow = u64::from(u32::MAX);
-        assert_eq!(review, ActionContext::native_review(u64::MAX, u64::MAX, 9));
-        assert_ne!(review, ActionContext::native_review(narrow, u64::MAX, 9));
-        assert_ne!(review, ActionContext::native_review(u64::MAX, narrow, 9));
-        assert_ne!(review, ActionContext::new(u64::MAX, u64::MAX));
-        assert_ne!(review, ActionContext::native_review(u64::MAX, u64::MAX, 10));
-        assert_ne!(review, ActionContext::native_review(u64::MAX, 1, 9));
-        assert_ne!(review, ActionContext::tab(u64::MAX));
-    }
-}
+#[path = "mod_action_context_tests.rs"]
+mod action_context_tests;

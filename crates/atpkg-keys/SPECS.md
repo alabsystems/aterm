@@ -3,15 +3,6 @@
 
 # atpkg-keys: spec recovery from its 108 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 3 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts updated 2026-11-03 to
-> match the live test and spec tables.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each spec below is proved
-> through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted. Every test maps to a spec (§4). Nothing
-> has been deleted yet.
-
 Source: `crates/atpkg-keys` (read only). I read every `#[test]` in src/{lib 5, fsio 6, master 14,
 pins_edit 14, provision 31, roster_ops 9} and tests/{owner_to_client 8, paper_master_to_client 2,
 provision_cli 14, roster_redo_model 5} (= 108), plus the code each one reaches, including the parts
@@ -60,7 +51,7 @@ move to those crates' `SPECS.md` (§5.12).
   (`owner-client-roundtrip`, `provision-setup-join-e2e`) follows from its parts once they are proved.
   `(secondary only: …)` in `subsumes` marks a spec no test samples as primary: the general statement
   behind asserts in other tests.
-- Gaps are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7: 1 non-scalar carriers, 2
+- Gaps are the rows of `docs/TRUST-LANE.md` (Blocking gaps): 1 non-scalar carriers, 2
   `&self`/`&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5 quantified clauses, 7
   loops, 8 effects, 10 model refinement, 11 generics, 12 cross-crate citation, 13 threads/closures, 16
   soundness (relational reasoning).
@@ -118,52 +109,6 @@ client-install-accepts-iff-authorized	contract (belongs to atpkg)	atpkg::install
 client-selects-by-generation	contract (belongs to atpkg)	atpkg::resolve_verified_index	Among the acceptable candidates, resolve_verified_index chooses one with maximal roster_seq, ties broken by index_build. A higher index_build on an older generation never beats a newer generation.	owner_to_client::a_revoked_machine_cannot_outbid_the_generation_that_revokes_it	MEDIUM in isolation: iteration over Vec<Candidate>, lexicographic max, cross-crate	1, 4, 5, 7, 12
 client-floor-ratchets-on-observation	invariant (belongs to atpkg)	atpkg::install, atpkg::resolve_verified_index, atpkg::Floor	After any install or resolve call that admits a roster at sequence s, the durable floor ≥ s, whether or not anything installed. Later candidates with roster_seq below the floor are never selected. When the served set selects nothing, the store falls back to its cached last-trusted index.	owner_to_client::observing_a_revocation_is_durable_even_when_nothing_installs	HARD: fs-backed floor state, a two-state property across calls, cross-crate	1, 2, 4, 8, 12
 ```
-
-### Distribution by kind (44)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 30 | master-seed-decode, master-parse-contract, phrase-error-message, fingerprint-format, scrub-zeroes, secret-debug-redaction, keygen-pubkey-consistency, roster-add-contract, roster-revoke-contract, vet-key-contract, anchor-read-contract, anchor-append-contract, verify-members-contract, fsio-atomic-replace, fsio-owner-create-new, fsio-ensure-parent-dir, fsio-bounded-regular-read, provision-preflight-table, provision-verify-master, provision-load-roster-table, provision-plan-contract, provision-write-pins-cas, provision-write-rest-order, render-report-contract, cli-vet-args, cli-refusals-precede-prompt, cli-setup-ceremony, cli-join-ceremony, client-install-accepts-iff-authorized, client-selects-by-generation |
-| round-trip | 3 | master-base32-roundtrip, sign-verify-roundtrip, owner-client-roundtrip (composite) |
-| equivalence | 2 | master-identity-function, verify-signed-is-roster-chain |
-| invariant | 2 | roster-edits-preserve-validity, client-floor-ratchets-on-observation |
-| table-property | 2 | forever-admits, shipped-pins-readable |
-| refinement | 2 | roster-redo-refines-model, provision-setup-join-e2e (composite) |
-| no-panic/bounds | 1 | leading-ws-no-panic |
-| other | 2 | master-secret-noninterference (information flow), cli-master-source-is-tty (provenance) |
-
-### Blocking-gap histogram (44 specs)
-
-| gap | specs blocked |
-|---|---|
-| 0 (seal) | 44 (every spec) |
-| 1 non-scalar carriers | 41 |
-| 4 callee-ensures composition | 26 |
-| 8 effects | 26 |
-| 7 loops | 24 |
-| 12 cross-crate citation | 17 |
-| 3 E6 body widening | 16 |
-| 5 quantified clauses | 14 |
-| 2 `&self`/`&mut self` views | 11 |
-| 13 threads/closures | 4 |
-| 11 generics | 2 |
-| 16 soundness (relational) | 2 |
-| 10 model refinement | 1 |
-
-Only `master-seed-decode` (gaps 3, 5, 7), `master-base32-roundtrip` (3, 5, 7, 8) and
-`cli-refusals-precede-prompt` (4, 8) are free of gap 1. No spec is blocked by gap 0 alone.
-
-### Proof dependency order
-
-`master-seed-decode`, `master-base32-roundtrip` (pure core), `scrub-zeroes`, `phrase-error-message`,
-`vet-key-contract`, `fingerprint-format` → `master-parse-contract` → `master-identity-function`
-(assumed crypto) → `keygen-pubkey-consistency`, `sign-verify-roundtrip`, `verify-signed-is-roster-chain`
-→ `roster-add-contract`, `roster-revoke-contract` → `roster-edits-preserve-validity`, `forever-admits`;
-`leading-ws-no-panic` → `anchor-read-contract` → `verify-members-contract` → `anchor-append-contract`
-→ `shipped-pins-readable`; `fsio-*` (effects) → `provision-preflight-table`, `provision-verify-master`,
-`provision-load-roster-table` → `provision-plan-contract` → `provision-write-pins-cas`,
-`roster-redo-refines-model` → `provision-write-rest-order` → free composites (`provision-setup-join-e2e`,
-`owner-client-roundtrip`) → `render-report-contract`, `cli-*` → `master-secret-noninterference`.
 
 ## 2. Test → spec map (TSV)
 
@@ -283,31 +228,6 @@ tests/roster_redo_model.rs	stale_snapshot_and_clean_read_only_decisions_refine_t
 tests/roster_redo_model.rs	the_pre_redo_torn_pair_is_the_model_s_mutant_and_nothing_can_replay_it	roster-redo-refines-model	
 ```
 
-## 3. Coverage
-
-Dependencies: `master-seed-decode`, `master-base32-roundtrip` (pure core), `scrub-zeroes`,
-`phrase-error-message`, `vet-key-contract`, `fingerprint-format` → `master-parse-contract` →
-`master-identity-function` (assumed crypto) → `keygen-pubkey-consistency`, `sign-verify-roundtrip`,
-`verify-signed-is-roster-chain` → `roster-add-contract`, `roster-revoke-contract` →
-`roster-edits-preserve-validity`, `forever-admits`; `leading-ws-no-panic` → `anchor-read-contract` →
-`verify-members-contract` → `anchor-append-contract` → `shipped-pins-readable`; `fsio-*` (effects) →
-`provision-preflight-table`, `provision-verify-master`, `provision-load-roster-table` →
-`provision-plan-contract` → `provision-write-pins-cas`, `roster-redo-refines-model` →
-`provision-write-rest-order` → the composites (`provision-setup-join-e2e`, `owner-client-roundtrip`) →
-`render-report-contract`, `cli-*` → `master-secret-noninterference`.
-
-- 108 tests read. Every test maps to one of the 44 specs (0 non-spec samples left, §4).
-- The biggest collapses: `anchor-append-contract` (9 primary), `roster-redo-refines-model` (9),
-  `provision-preflight-table` (9), `roster-add-contract` (7), `master-parse-contract` and
-  `client-install-accepts-iff-authorized` (6 each).
-- Four specs have no primary test, only secondary ones: `phrase-error-message`, `fingerprint-format`,
-  `roster-edits-preserve-validity`, `forever-admits`. They are the general statements behind
-  assertions inside other tests; proving them is what lets those assertions go.
-- Two specs are free composites once their parts are proved: `provision-setup-join-e2e` (3 tests) and
-  `owner-client-roundtrip` (1).
-- 9 tests (`client-*`) sample `atpkg`/`aterm-update-core` properties; they retire when those crates'
-  specs are proved, and atpkg-keys keeps only the fixtures.
-
 ## 4. Tests that are not spec samples
 
 None left: `provision::a_broken_signature_target_leaves_the_roster_document_unchanged` now exercises
@@ -359,29 +279,3 @@ The numbers are the ones the rows cite.
     `home_path_from` in `src/provision.rs` refuses unset, empty, or `/` `HOME` values; the effect-order
     ceremony specs (`confirm_transcription` and verb orchestration in `src/main.rs`) still need the
     binary verified as a crate.
-
-## 6. The specs I would prove first (easiest, high value)
-
-No spec here is blocked by gap 0 alone: 41 of 44 need gap 1 (non-scalar carriers). Gap 0 itself is
-closed locally by seal `150efe4a` (PLAN §"Seal 150efe4a"), but that seal is not admitted to the
-machine's `trust` channel. The order below starts with the specs whose gaps are smallest and
-whose code is closest to scalar.
-
-1. **`master-seed-decode`** (`master::b32_decode(&[u8; 52]) -> [u8; 32]`). With spec 2 it is one of the two
-   gap-1-free specs over pure code: fixed arrays, shifts, a range `match` on `u8` (already admitted for E6
-   import by seal `150efe4a`), and one loop with an obvious invariant (`out = ⌊5j/8⌋`). Gaps 3, 5 and 7 are
-   needed. It retires the padding test and underlies every identity claim.
-2. **`master-base32-roundtrip`** (`master::b32_encode(&[u8; 32]) -> [u8; 52]`). With the RNG draw factored out,
-   only gaps 3, 5 and 7 remain on the pure core. It proves `B32dec ∘ B32enc = id`, so with spec 1 the whole
-   phrase codec is closed.
-3. **`vet-key-contract`** and **`phrase-error-message`**. Small `&str` predicates and message builders
-   (gaps 1 and 3, plus 5 and 7 for the byte scan). They are the cheapest gap-1 probes in this crate and
-   retire a test and two secondary asserts. `master-parse-contract` (6 tests) follows directly once gap 1
-   covers `&str` input and a fixed output array.
-
-Runner-up: `roster-add-contract` / `roster-revoke-contract` (8 tests together, pure `Vec<Machine>`
-logic), then `anchor-read-contract` → `anchor-append-contract` (12 tests together, pure string code).
-Then the effectful specs (`fsio-*`, `provision-*`, `roster-redo-refines-model`, `cli-*`), which wait on
-gap 8. Their pure cores (`transaction_half_is_known`, the preflight decision table over an abstract FS,
-`vet_args`) can be factored out and proved earlier. Last: `master-secret-noninterference` and
-`cli-master-source-is-tty`, which need relational information-flow reasoning (gap 16).

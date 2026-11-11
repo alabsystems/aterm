@@ -908,6 +908,13 @@ const OPTIONS: &[OptSpec] = &[
                each older epoch through a handoff",
     },
     OptSpec {
+        flag: "--large-table",
+        value: None,
+        lanes: &[Lane::CommonsQuiet],
+        help: "measure the explicit table holding 3,000 rows of 1 KB instead of one, which each of \
+               a round's store opens replays",
+    },
+    OptSpec {
         flag: "--sustained",
         value: None,
         lanes: &[Lane::CommonsQuiet],
@@ -1038,7 +1045,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Cli, String> {
     {
         return Err("`compare` needs --baseline PATH and --candidate PATH".to_string());
     }
-    let workloads: Vec<&str> = ["--catalog", "--long-log", "--late-joiner"]
+    let workloads: Vec<&str> = ["--catalog", "--long-log", "--late-joiner", "--large-table"]
         .into_iter()
         .filter(|flag| cli.options.contains_key(flag))
         .collect();
@@ -1367,6 +1374,7 @@ fn main(args: &[String]) -> ExitCode {
                 cli.options.contains_key("--catalog"),
                 cli.options.contains_key("--long-log"),
                 cli.options.contains_key("--late-joiner"),
+                cli.options.contains_key("--large-table"),
             ),
             #[cfg(not(unix))]
             Lane::CommonsQuiet => LaneRun::skip(
@@ -1715,6 +1723,10 @@ mod tests {
         let late = parse(&args("commons-quiet --late-joiner --sustained")).unwrap();
         assert!(late.options.contains_key("--late-joiner"));
         assert!(parse(&args("aos --late-joiner")).is_err());
+        let large = parse(&args("commons-quiet --large-table --sustained")).unwrap();
+        assert!(large.options.contains_key("--large-table"));
+        assert!(parse(&args("aos --large-table")).is_err());
+        assert!(parse(&args("commons-quiet --long-log --large-table")).is_err());
     }
 
     #[test]

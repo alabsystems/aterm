@@ -37,7 +37,8 @@ fn main() -> Result<(), String> {
                 mailbox_password: mailbox_password.as_deref(),
                 totp_secret: totp_secret.as_deref(),
             },
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         let messages = shared
             .lock()
             .map_err(|_| "Mail lock failed")?

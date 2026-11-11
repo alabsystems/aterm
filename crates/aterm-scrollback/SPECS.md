@@ -46,7 +46,7 @@ under `src/`. A test is deleted once Trust/Clean proves the spec that subsumes i
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (the primary-test count when the row
 was written; §2 lists the tests that remain), `difficulty` (Rust features the proof must handle),
-`blocking_gaps` (gap numbers from §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`; gap
+`blocking_gaps` (gap numbers from `docs/TRUST-LANE.md` (Blocking gaps); gap
 0, the seal that publishes Clean rows, is on every row).
 
 ```tsv
@@ -226,16 +226,6 @@ src/watermark_tests.rs	watermark_returns_to_green_after_budget_increase	store-wa
 src/watermark_tests.rs	watermark_visits_all_three_levels	store-watermark-invariant	
 ```
 
-## 3. Coverage
-
-- 121 live tests mapped in §2 across the 43 active specs (0 non-spec tests remain in §4; 341 original tests and 53 specs in the initial 2026-10-16 pre-prune snapshot).
-- The biggest collapses: `scrollback-refines-seq` (28 primary), `cold-tier-refines-seq` (15),
-  `storage-delegates` (14), `lz4-decode-classification` (13), `memory-accounting-exact` (12),
-  `iter-and-dense-walk-match-get-line` (11).
-- `hot-tier-deque`, `warm-tier-refines-seq` and `cold-tier-refines-seq` are the lemmas the store
-  refinement `scrollback-refines-seq` is built on. Once they hold, the store refinement (28 tests),
-  `iter-and-dense-walk-match-get-line` and `storage-delegates` follow by composition (gap 4).
-
 ## 4. Tests that are not spec samples
 
 Status (2026-10-16): deleted `line_memory_used`, `capabilities_track_the_built_features`, `display_messages_are_stable`, `watermark_default_is_green`, `watermark_compressible_data_stays_green_longer`, `scrollback_moves_between_threads_when_guarded_by_mutex`, `cell_failure_counting_works_through_mutex_across_threads`. Not yet deleted: `watermark_level_ord_is_green_yellow_red`, `scrollback_is_send_but_not_sync` (awaits its static assertion), and the move-to-bench rows.
@@ -260,28 +250,3 @@ deterministic `records_walked <= 50` `decode-work-bound`). Zero non-spec tests r
 4. **Resolved: `a_footprints_payload_leaves_the_byte_budget_when_its_rows_cross` now asserts both
    `budgeted_memory_used()` and `total_memory_used()` before and after crossing the compression horizon.**
 5. **Resolved: deleted uncalled `#[cfg(test)]` `HyperlinkSpan::width()`.**
-
-## 6. Proof order
-
-The smallest functions still need E6 widening (gap 3) for `saturating_*`, casts or enum matches,
-so the order starts there.
-
-1. **`link-ceiling-formula`** and **`threshold-bytes-bounds`** (gap 3). Blocked: the seal compiles
-   the crate (PM-1 does not refuse it) but E6 refuses `max_linked_record_bytes` and
-   `threshold_bytes` for unsigned `saturating_add`/`saturating_mul`, `u128` division and `min`,
-   and the casts, and the native clause lane does not lower method calls or casts.
-   `threshold-bytes-bounds` is a lemma of `store-watermark-invariant`.
-2. **`watermark-transition-table`**: state it on the free function `recompute_watermark` (gap 3)
-   first, then the `update_watermark_level` half (gap 2). It is the other lemma of
-   `store-watermark-invariant`.
-3. **`cell-attrs-codec-mask`** (gaps 1, 3): a `[u8; 10]` LE round-trip and one bit mask, the leaf
-   of every line codec spec.
-4. The scalar-state and short-loop specs: `warm-block-quarantine-fsm` (a `Cell<u8>` state
-   machine), `span-column-lookup`, `binary-search-counted` and `dec-string-decimal`.
-5. The codec cluster: `lz4-decode-classification`, `record-is-valid-mirrors-deserialize`,
-   `line-decode-total-capped`, `block-decode-total-bounded`, then the strict and stripping decoders
-   and the round-trips (gaps 1, 5, 7 and the `trust::skip` lifts).
-6. The tier refinements: `hot-tier-deque`, `warm-tier-refines-seq`, `cold-tier-refines-seq`.
-7. By composition over those (gap 4): `scrollback-refines-seq`, `tier-shape-invariant`,
-   `memory-accounting-exact`, `store-watermark-invariant`, `failure-atomicity`,
-   `store-corruption-semantics`, `iter-and-dense-walk-match-get-line`, `storage-delegates`.

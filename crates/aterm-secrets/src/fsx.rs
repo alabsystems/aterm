@@ -10,6 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, Per
 use std::path::Path;
 
 fn check_and_narrow_dir_fd(dir: &Path, dir_fd: &File) -> crate::Result<()> {
+    check_access_list(dir_fd, true).map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
     let meta = dir_fd
         .metadata()
         .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
@@ -44,6 +45,8 @@ fn owned_dir(dir: &Path, meta: &std::fs::Metadata) -> crate::Result<bool> {
 /// `dir` is missing, a link or no folder, another user's, or of another mode, which
 /// [`ensure_private_dir`] would make `0700`.
 pub(crate) fn private_dir_settled(dir: &Path) -> crate::Result<()> {
+    aterm_uds::private_file::check_private_dir(dir)
+        .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
     let meta = std::fs::symlink_metadata(dir)
         .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
     if meta.file_type().is_symlink() {
@@ -111,9 +114,24 @@ pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
             meta.uid()
         )));
     }
-    if meta.mode() & 0o7777 != 0o700 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+    aterm_uds::private_file::ensure_private_dir(dir)
+        .map(|_| ())
+        .map_err(|e| Error::new(format!("{}: {e}", dir.display())))
+}
+
+/// Mode repair cannot remove an extended ACL. Judge the retained descriptor
+/// before reads or writes; the caller supplies its own mode and owner policy.
+fn check_access_list(file: &File, directory: bool) -> io::Result<()> {
+    let verdict = if directory {
+        astream_sys::owner_private_dir(file)?
+    } else {
+        astream_sys::owner_private(file)?
+    };
+    if matches!(verdict, Err(astream_sys::NotPrivate::Acl)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "an access list (ACL) grants access beyond the file mode",
+        ));
     }
     Ok(())
 }
@@ -289,6 +307,7 @@ fn open_admitted(
             }
         }
         Admit::Private | Admit::Owned => {
+            check_access_list(&file, false).map_err(|e| refused(e.to_string()))?;
             if meta.uid() != euid() {
                 return Err(refused(format!(
                     "owned by uid {}, not this user",
@@ -525,6 +544,7 @@ pub(crate) fn open_lock(path: &Path) -> crate::Result<File> {
 /// # Errors
 /// The file cannot be examined, or it fails one of those checks.
 pub(crate) fn lock_metadata(file: &File, path: &Path) -> crate::Result<std::fs::Metadata> {
+    check_access_list(file, false).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
     let metadata = file
         .metadata()
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
@@ -695,15 +715,25 @@ pub(crate) fn lstat_in(
 /// look saw them; a miss reads and stamps afresh. A file that moved meanwhile moves the next
 /// glance's stamps, which read it again. Each check takes its own, or shares the one of a look at
 /// the vault it is judged through ([`crate::client::VaultLook`]: checks that stand for one moment
-/// of the vault, a table session's open and the checks its local batch makes at once after it);
+/// of the vault, a table session's open and the checks its local batch makes at once after it, and
+/// the checks a read batch whose session keeps the look makes through it);
 /// none outlives its check or its look, and a look that confirms a file stood still across a read
-/// is never taken from one.
-pub(crate) struct Glance(std::cell::RefCell<Vec<(std::path::PathBuf, Option<std::fs::Metadata>)>>);
+/// is never taken from one. A digest kept of what a glance saw is kept only where the file had
+/// settled when the glance began ([`digest_while_seen`]): a glance's `lstat` can be older than the
+/// ask it answers.
+pub(crate) struct Glance {
+    /// When this look began, before any `lstat` it took ([`asked_now`]).
+    began: std::time::SystemTime,
+    seen: std::cell::RefCell<Vec<(std::path::PathBuf, Option<std::fs::Metadata>)>>,
+}
 
 impl Glance {
-    /// A look that has taken nothing yet.
-    pub(crate) const fn new() -> Self {
-        Self(std::cell::RefCell::new(Vec::new()))
+    /// A look that has taken nothing yet, begun now.
+    pub(crate) fn new() -> Self {
+        Self {
+            began: asked_now(),
+            seen: std::cell::RefCell::new(Vec::new()),
+        }
     }
 
     /// The `lstat` of `path` this look took first, `None` where nothing was there; taken now
@@ -718,11 +748,13 @@ impl Glance {
             let at = at.as_os_str().as_encoded_bytes();
             at.len() == bytes.len() && at.iter().rev().eq(bytes.iter().rev())
         };
-        if let Some((_, meta)) = self.0.borrow().iter().find(|(at, _)| same(at)) {
+        if let Some((_, meta)) = self.seen.borrow().iter().find(|(at, _)| same(at)) {
             return Ok(meta.clone());
         }
         let meta = lstat_in(None, path)?;
-        self.0.borrow_mut().push((path.to_path_buf(), meta.clone()));
+        self.seen
+            .borrow_mut()
+            .push((path.to_path_buf(), meta.clone()));
         Ok(meta)
     }
 }
@@ -792,7 +824,9 @@ impl Reader {
 
 /// The digest `reader` gives of the file at `path`, kept for that reader while one `lstat` of
 /// `path` ([`Seen`]) shows what it showed before the read that gave it, when the file the read
-/// opened was the one that `lstat` saw and had stood [`SETTLED_NS`] unchanged.
+/// opened was the one that `lstat` saw and had stood [`SETTLED_NS`] unchanged when that `lstat`
+/// was taken: at the ask, or, where the caller's check looks through a glance, when the glance
+/// began, before it took any `lstat` ([`Glance`]), which may be well before the ask.
 ///
 /// The opened file's `fstat` ([`FileStamp`]) shows the `lstat`'s device, inode, length and change
 /// times, so its owner, mode and link count are the ones seen: a `chmod`, `chown` or link moves
@@ -813,7 +847,7 @@ fn digest_while_seen(
     reader: Reader,
     glance: Option<&Glance>,
 ) -> crate::Result<Option<[u8; 32]>> {
-    let now = std::time::SystemTime::now();
+    let now = asked_now();
     #[cfg(not(test))]
     {
         static DIGESTS: KeptDigests = std::sync::Mutex::new(std::collections::VecDeque::new());
@@ -823,15 +857,17 @@ fn digest_while_seen(
     }
     #[cfg(test)]
     THREAD_DIGESTS.with(|kept| {
-        digest_while_seen_in(
-            kept,
-            glance,
-            now + ASKED_LATER.get(),
-            path,
-            reader,
-            |path| reader.digest(path),
-        )
+        digest_while_seen_in(kept, glance, now, path, reader, |path| reader.digest(path))
     })
+}
+
+/// The time a kept digest's settled rule judges an ask, or the start of a glance, by: the clock,
+/// and in a test as much later as this thread's [`as_if_later`] puts it.
+fn asked_now() -> std::time::SystemTime {
+    let now = std::time::SystemTime::now();
+    #[cfg(test)]
+    let now = now + ASKED_LATER.get();
+    now
 }
 
 #[cfg(test)]
@@ -840,14 +876,15 @@ std::thread_local! {
     /// another's.
     static THREAD_DIGESTS: KeptDigests =
         const { std::sync::Mutex::new(std::collections::VecDeque::new()) };
-    /// How much later than the clock this thread's asks of [`digest_while_seen`] are
-    /// ([`as_if_later`]).
+    /// How much later than the clock this thread's asks of [`digest_while_seen`], and the glances
+    /// it begins, are ([`as_if_later`]).
     static ASKED_LATER: std::cell::Cell<std::time::Duration> =
         const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
 
-/// Run `f` with each digest this thread asks ([`digest_while_seen`]) asked `by` later than the
-/// clock: a test's files have stood settled ([`SETTLED_NS`]) without its waiting.
+/// Run `f` with each digest this thread asks ([`digest_while_seen`]), and each glance it begins
+/// ([`Glance::new`]), asked `by` later than the clock: a test's files have stood settled
+/// ([`SETTLED_NS`]) without its waiting.
 #[cfg(test)]
 pub(crate) fn as_if_later<T>(by: std::time::Duration, f: impl FnOnce() -> T) -> T {
     let was = ASKED_LATER.replace(by);
@@ -861,8 +898,9 @@ pub(crate) fn as_if_later<T>(by: std::time::Duration, f: impl FnOnce() -> T) -> 
 type KeptDigests =
     std::sync::Mutex<std::collections::VecDeque<(std::path::PathBuf, Reader, Seen, [u8; 32])>>;
 
-/// How long before a digest's ask its file must have last changed for the digest to be kept. A
-/// change made after the ask then takes a later time on a clock that ticks this coarsely or finer
+/// How long before a digest's witness was taken (its ask's `lstat`, or the start of the glance
+/// that took it) its file must have last changed for the digest to be kept. A change made after
+/// the witness then takes a later time on a clock that ticks this coarsely or finer
 /// (FAT's two seconds), so the file's [`Seen`] shows it, as git's index treats a file it stamped
 /// within its own tick as racily clean. Without it, a rewrite in place at the same length, or a
 /// new file given a freed inode, in one tick of a coarse clock would keep the stamp of the file
@@ -884,7 +922,8 @@ pub(crate) fn settled(seen: &Seen, now: std::time::SystemTime) -> bool {
 }
 
 /// [`digest_while_seen`] with its digests in `kept`, asked at `now`, reading with `read` what
-/// `reader` reads.
+/// `reader` reads: a fresh witness is judged settled as of `now`, taken before its `lstat`, and
+/// one `glance` took as of when the glance began.
 fn digest_while_seen_in(
     kept: &KeptDigests,
     glance: Option<&Glance>,
@@ -898,6 +937,7 @@ fn digest_while_seen_in(
     // A glance's look stands before the read: what is kept is kept only where the file the read
     // opened is the one it saw.
     let before = seen_if_present_in(glance, path)?;
+    let witnessed = glance.map_or(now, |glance| glance.began.min(now));
     if let Some(seen) = before
         && let Ok(kept) = kept.lock()
         && let Some((.., digest)) = kept
@@ -911,7 +951,7 @@ fn digest_while_seen_in(
     };
     if let Some(seen) = before
         && opened == seen.stamp
-        && settled(&seen, now)
+        && settled(&seen, witnessed)
         && let Ok(mut kept) = kept.lock()
     {
         kept.retain(|(at, by, ..)| !(at == path && *by == reader));
@@ -982,6 +1022,7 @@ pub fn append_at_with(
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .and_then(|mut file| {
+            check_access_list(&file, false)?;
             let metadata = file.metadata()?;
             if !metadata.file_type().is_file()
                 || metadata.uid() != euid()
@@ -1097,6 +1138,10 @@ fn write_atomic_stamped_after(
 #[cfg(test)]
 #[path = "fsx_stream_tests.rs"]
 mod stream_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "fsx_acl_tests.rs"]
+mod acl_tests;
 
 /// [`write_atomic`] for one of many files a pass writes: the temporary file's bytes ordered
 /// before its rename ([`aterm_durable::ordered`]) and no flush of the directory, which the
@@ -1585,6 +1630,67 @@ mod tests {
         write_atomic(&path, b"present", 0o600).unwrap();
         assert!(stamp_if_present(&path).unwrap().is_some());
         assert!(stamp_if_present(&path.join("cannot-be-a-child")).is_err());
+    }
+
+    /// A digest of what a glance saw is kept only where its file had settled ([`SETTLED_NS`]) when
+    /// the glance began, not merely by the ask: a glance's `lstat` can be older than the ask, and a
+    /// change between them in one tick of a coarse clock would leave its witness standing. A file
+    /// a glance began to look at a second after its last change is read again at each ask through
+    /// it, though the asks come two hours after the change; one a glance begun an hour after the
+    /// change saw is read once. Each time is taken from the file's own stamp, so neither depends
+    /// on how soon after the write the law runs.
+    /// NEGATIVE CONTROL (2026-11-10): judged settled as of the ask, the file a glance began to
+    /// look at a second after its change is read once (`a digest of what a glance saw before its
+    /// file settled`).
+    #[test]
+    fn a_glance_fed_digest_is_kept_only_where_its_file_had_settled_when_the_glance_began() {
+        const PRIVATE: Reader = Reader {
+            admit: Admit::Private,
+            max: 64,
+        };
+        let root = scratch();
+        let path = root.path().join("custody");
+        write_atomic(&path, b"custody", 0o600).unwrap();
+        let seen = seen_if_present(&path).unwrap().unwrap();
+        let changed = std::time::UNIX_EPOCH
+            + std::time::Duration::from_nanos(
+                u64::try_from(seen.stamp.mtime_ns.max(seen.stamp.ctime_ns)).unwrap(),
+            );
+        let after_it = |secs| changed + std::time::Duration::from_secs(secs);
+        let begun_after_it = |secs| Glance {
+            began: after_it(secs),
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let reads_through = |glance: &Glance| {
+            let kept = std::sync::Mutex::new(std::collections::VecDeque::new());
+            let reads = std::cell::Cell::new(0);
+            for _ in 0..2 {
+                digest_while_seen_in(
+                    &kept,
+                    Some(glance),
+                    after_it(7200),
+                    &path,
+                    PRIVATE,
+                    |path| {
+                        reads.set(reads.get() + 1);
+                        PRIVATE.digest(path)
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            }
+            reads.get()
+        };
+        assert_eq!(
+            reads_through(&begun_after_it(1)),
+            2,
+            "a digest of what a glance saw before its file settled"
+        );
+        assert_eq!(
+            reads_through(&begun_after_it(3600)),
+            1,
+            "CONTROL: a digest of what a glance begun after its file settled saw"
+        );
     }
 
     /// A digest is kept while its file stands ([`digest_while_seen`]): a settled file is read once

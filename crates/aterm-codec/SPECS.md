@@ -43,7 +43,7 @@ each test to its spec.
 - `JsonRef(s)`: the per-char map `'"'` → `\"`, `'\\'` → `\\`, `\n \r \t \b \f` by name, `is_active(c)`
   → `\u` plus 4 lowercase hex digits, every other char unchanged: the `#[cfg(test)]` `reference` fn in
   `src/json.rs` as a spec-only model.
-- **Gaps** (`blocking_gaps`) are the gap numbers of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+- **Gaps** (`blocking_gaps`) are the gap numbers of `docs/TRUST-LANE.md` (Blocking gaps)
   §7: 1 non-scalar carriers (`char`, slices, `String`, `Option`, structs), 2 `&self`/`&mut self` views,
   3 E6 body widening (casts, calls, loops, matches), 4 callee-ensures composition, 5 quantified
   clauses, 7 loops, 8 effects (`as_mut_vec`, `Read` sources), 10 model→code refinement, 11 generics
@@ -99,35 +99,6 @@ gzip-reader-refines-members	equivalence	inflate::stream::GzipReader::{new,read,b
 cell-style-parse	contract	cell::{parse_style,Attribute::{word,parse},attributes_of,token}	∀ line: parse_style(line) = Some(Style { fg, bg, dim, inverse, wide }) ⇔ stripping at most one trailing "\r\n" or '\n' leaves no '\r' or '\n' and body = "OK " ++ glyph ++ ' ' ++ fg ++ ' ' ++ bg ++ ' ' ++ attrs (++ " link=" ++ link)?, where glyph and any link are valid percent-tokens (ASCII graphic bytes with every '%' followed by two ASCII hex digits), is_hex(fg, 6) ∧ is_hex(bg, 6), and attrs is either "none" (empty set) or a non-empty ','-separated list of distinct Attribute::word tokens not containing both "wide" and "wide_cont"; then dim, inverse, and wide report membership of Dim, Inverse, and Wide. Extra fields (including "frame=open"), unknown attributes, duplicates, "none" beside another attribute, or wide+wide_cont return None.	src/cell.rs::complete_cell_styles_keep_dim_and_resolved_colours, src/cell.rs::a_cell_style_says_inverse_and_wide, src/cell.rs::incomplete_or_unknown_cell_styles_prove_neither_draft_nor_placeholder, src/cell.rs::a_cell_of_an_unfinished_frame_proves_nothing	&str strip_prefix/strip_suffix/split, u16 bitset duplicate/mutex check, while-let percent-token byte scan, hex::is_hex composition	1,3,4,5,7
 xml-escape	contract	xml::{escape,escape_into}	∀ text, out: escape_into(out, text) leaves out' = out ++ concat_{c ∈ text.chars()} X(c), where X('&') = "&amp;", X('<') = "&lt;", X('>') = "&gt;", X('"') = "&quot;", X('\'') = "&apos;", and X(c) = [c] otherwise; escape(text) = escape_into("", text).	src/xml.rs::escaping_covers_the_five_entities	&mut String push_str/push, text.chars() loop, 6-arm char match	1,2,5,7
 ```
-
-### Distribution by kind (40)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 20 | b64-encode-padded, b64-strict-canonical, b64-lenient-decode, hex-validate, hex-decode, pct-encode, pct-decode-total, fields-sink-spellings, tty-push-escape, tty-safe, huffman-new-kraft, huffman-walk-canonical, inflate-header-work, inflate-dynamic-table-completeness, inflate-output-cap, inflate-prefix-locality, zlib-framing, gzip-header-parse, cell-style-parse, xml-escape |
-| equivalence | 10 | fmt-digit-writers, hex-encode, json-escape-reference, tty-stream-split-invariance, crc32-reference, adler32-reference, root-table-agrees-with-walk, stream-deflate-refines-oneshot, stream-zlib-refines-prefix, gzip-reader-refines-members |
-| round-trip | 4 | b64-roundtrip, pct-roundtrip, pct-word-line, json-escape-inert-and-invertible |
-| refinement | 2 | bitreader-is-bitstream, inflate-refines-rfc1951 |
-| table-property | 2 | hex-digit-tables, tty-active-class |
-| no-panic/bounds | 1 | codec-no-panic |
-| other | 1 | crc32-fold (homomorphism) |
-
-### Blocking-gap histogram (gap → specs it blocks)
-
-| gap | specs | note |
-|---|---|---|
-| 0 | 40 | every spec (seal) |
-| 1 | 40 | every spec |
-| 2 | 23 | |
-| 3 | 10 | with 0 and 1, the only gaps on the two scalar specs |
-| 4 | 14 | |
-| 5 | 32 | |
-| 7 | 34 | |
-| 8 | 7 | `as_mut_vec`, `Read` sources |
-| 10 | 1 | `inflate-refines-rfc1951` |
-| 11 | 6 | generic `R: Read`, const-generic `block_loop` |
-| 12 | 2 | `crc32-reference`, `crc32-fold`: citing astream-wire's contract |
-| 13 | 2 | closures (`get_or_insert_with`, pump closures) |
 
 ## 2. Test → spec map (TSV)
 
@@ -194,13 +165,6 @@ tests/inflate_stream.rs	a_wrong_trailer_is_refused	gzip-reader-refines-members
 tests/inflate_stream.rs	zlib_streams_like_the_one_shot_prefix_form	stream-zlib-refines-prefix	zlib-framing
 ```
 
-## 3. Coverage
-
-`hex-digit-tables`, `hex-validate`, `pct-roundtrip`, `huffman-walk-canonical` and
-`inflate-prefix-locality` are lemmas under other specs. They, `b64-lenient-decode` and
-`adler32-reference` are sampled only under `also` in §2; `fmt-digit-writers`, `bitreader-is-bitstream`
-and `inflate-refines-rfc1951` by no test.
-
 ## 4. Tests that are not spec samples
 
 None. Three pieces of `#[cfg(test)]` scaffolding go once their spec is proved: the
@@ -219,27 +183,3 @@ escape fn in `src/json.rs` with `json-escape-reference` (it becomes the `JsonRef
    and `SafeStream::finish` handles trailing incomplete UTF-8 directly.
 4. **`DecodeError::InvalidLength` doc reconciled (resolved).** `b64-lenient-decode` and `src/base64.rs`
    agree on lenient stripped-body length reporting vs `decode_strict` canonical checking.
-
-## 6. Proof order (easiest high-value first)
-
-1. `tty-active-class` (gaps 1, 3): `is_active` is a straight-line `char as u32` range test and
-   `needs_escape` adds one call. It needs `char` as a clause carrier (gap 1) and the cast (gap 3);
-   every `tty`/`json` spec cites the class.
-2. `hex-digit-tables` (1, 3): a 16-arm literal `match` on `n & 0xF` and the range `match` of `nibble`,
-   decidable by evaluation; the lemma under `hex-encode`, `hex-validate` and `hex-decode`.
-3. The Adler-32 `NMAX` non-wrap bound as a closed Clean theorem, bound to `adler32-reference` once gaps
-   1, 2 and 7 land.
-4. One byte loop appending to a `String` each: `hex-validate`, `hex-encode`, `pct-encode`, `hex-decode`.
-5. base64: `b64-encode-padded` (gap 8 for `as_mut_vec`), `b64-lenient-decode`, `b64-strict-canonical`,
-   then `b64-roundtrip` (gap 4) and `fmt-digit-writers`.
-6. Text escaping, on the `Lossy` model: `tty-push-escape`, `pct-decode-total`, `pct-roundtrip`,
-   `json-escape-reference`, `json-escape-inert-and-invertible`, `tty-safe`,
-   `tty-stream-split-invariance`.
-7. DEFLATE: `bitreader-is-bitstream` → `huffman-new-kraft` → `huffman-walk-canonical` →
-   `root-table-agrees-with-walk` → `inflate-dynamic-table-completeness` → the `RFC1951` model and
-   `inflate-refines-rfc1951` → `inflate-output-cap`, `inflate-prefix-locality` → `zlib-framing`.
-   `inflate-header-work` follows the streams (8).
-   `codec-no-panic` follows from the strict lane's panic-freedom obligations.
-8. Streams last (gaps 8, 11, 13): `gzip-header-parse`, `stream-deflate-refines-oneshot`,
-   `stream-zlib-refines-prefix`, `gzip-reader-refines-members`, each reader's pure step factored out of
-   its `Read` shell first.

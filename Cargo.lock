@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.197.0"
+version = "0.198.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -344,6 +344,7 @@ dependencies = [
  "aterm-sysprobe",
  "aterm-tempfile",
  "aterm-types",
+ "aterm-uds",
  "aterm-zstd",
  "libc",
 ]
@@ -1406,6 +1407,7 @@ dependencies = [
  "aterm-selection",
  "aterm-session",
  "aterm-spec",
+ "aterm-tempfile",
  "aterm-types",
  "aterm-update",
  "aterm-vz",
@@ -1694,6 +1696,7 @@ dependencies = [
  "aterm-durable",
  "aterm-json",
  "aterm-messages",
+ "aterm-models-capacity",
  "aterm-models-release",
  "aterm-phase",
  "aterm-png",
@@ -1769,9 +1772,11 @@ dependencies = [
  "aterm-toolchain",
  "aterm-types",
  "aterm-uds",
+ "aterm-update-core",
  "atpkg",
  "jobserver_utils",
  "libc",
+ "ring",
  "trust-exec-policy",
  "trust-resource-controller",
  "trust-resource-provenance",
@@ -1848,6 +1853,7 @@ version = "0.0.0"
 dependencies = [
  "astream-aead",
  "astream-broker",
+ "astream-sys",
  "astream-wire",
  "aterm-codec",
  "aterm-db-core",
@@ -2389,6 +2395,7 @@ dependencies = [
 name = "atpkg"
 version = "0.0.0"
 dependencies = [
+ "agh",
  "agh-fake",
  "astream-sys",
  "aterm-brotli",

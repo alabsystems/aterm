@@ -3,22 +3,6 @@
 
 # aterm-pty: spec recovery from its 212 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 58 tests it
-> deleted are gone, and the spec rows no longer cite those tests.
-
-> Status 2026-10-29: reconciled with current `main` (212 `#[test]` functions across 59 specs; 0
-> non-spec tests remain). Each spec below is proved through Trust/Clean about the compiled Rust
-> function (pure const helpers in `src/lib.rs` already carry Trust proofs under `floors.tsv`), and
-> tests are retired only when their spec is proved in the same commit.
-
-> Status 2026-11-07, spec symbol scan: `exec-status-carrier-cloexec` names
-> `RACY_EXEC_STATUS_CARRIER_TOLD`, the said-once flag the count `RACY_EXEC_STATUS_CARRIERS` became
-> (e665e2038f), and says the fallback's stderr line is written once per process.
-> `openconsole-launch-and-health` names `windows::{resync_alt_screen,resync_alt_screen_carrying,start_one_leave}`
-> where it named `windows::leave_alt_screen` and `leave_turn`, which the code never had (since 008c27cae8), and
-> says what they refuse: `Unsupported` for a host that does not pass screen switches through, `ResourceBusy`
-> while the session's last leave client runs.
-
 Source: `crates/aterm-pty` (read only). Every `#[test]` (`src/console_host.rs` 2,
 `src/console_host/policy.rs` 15, `src/input_release.rs` 5, `src/lib.rs` 11, `src/unix_shell.rs` 6,
 `src/unix_tests.rs` 41, `src/unix_shell_identity_tests.rs` 7,
@@ -93,7 +77,7 @@ and `windows-shell-name-pure`), or audit §7 gains a new row for a Trust Windows
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
 `difficulty (Rust features the proof must handle)`, `blocking_gaps`
-(`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7 row numbers, plus `W`). Gap 0 (a seal that
+(`docs/TRUST-LANE.md` (Blocking gaps) row numbers, plus `W`). Gap 0 (a seal that
 publishes Clean rows) blocks every spec and is listed on each one.
 
 ```tsv
@@ -160,60 +144,6 @@ windows-drain-available	contract	windows::drain_available, read	Under A-win, ∀
 windows-programs-outside-job	contract	windows::outside_job::{end_once, select}, console_guard::below (Unread::LeftOut), hangup, close_master, waiter, end_programs_outside_jobs	Under A-win, ∀ spawned session s (s.job ≠ 0): the first of hangup(s.pid), close_master(s.master), the waiter's wake (the shell's exit or the close event, before it closes the pseudoconsole) and end_programs_outside_jobs() (each session in the registry) terminates, before it returns and on its own thread, exactly the processes X reached from s's first process P0 by a chain P0, P1, …, Pn = X in one Toolhelp snapshot where each Pi (i ≥ 1) opens with PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, its kernel-kept parent (NtQueryInformationProcess) is the snapshot's Pi−1, start(Pi) ≥ start(Pi−1) (start(P0) read through the session's own handle), and s.job does not hold X (a failed IsProcessInJob counts as held); each handle is held from its open to the end, so every Pi−1 still names the process vouched for. Nothing else is touched: no process older than P0, none outside its tree, none an adopted session (job = 0) runs. Later asks of the same session do nothing, and one made while it runs returns after it (outside_job_ended, a Mutex held across the sweep). select(root, root_born, tree, open, held) is that set over injected lookups: below(root, tree, born, LeftOut) with born(root) = root_born and born(p) = open(p).born when open(p).parent = tree's parent of p, else None (left out with its subtree), minus the processes held says the job holds.	outside_job::the_programs_below_the_shell_outside_its_job_are_taken, outside_job::a_pid_reused_after_the_snapshot_is_left_with_its_tree, outside_job::an_orphan_of_an_earlier_holder_of_the_shells_pid_is_left, outside_job::a_process_that_cannot_be_opened_is_left_with_its_tree, outside_job::a_close_ends_the_programs_the_shell_runs_outside_its_job, outside_job::a_shell_that_exits_ends_the_programs_it_runs_outside_its_job, outside_job::a_quit_ends_the_programs_every_shell_runs_outside_its_job, console_guard::the_strict_walk_leaves_out_what_it_cannot_vouch_for	generic H; RefCell<HashMap> captured by an impl Fn closure passed by value; Toolhelp/OpenProcess/NtQueryInformationProcess/IsProcessInJob/TerminateProcess FFI; a Mutex<bool> held across an effectful call; a cfg(test) thread_local job seam (JOB_LETS_GO); cfg(windows)	0,1,4,7,8,13,W
 windows-createprocess-axiom	axiom	(platform) CreateProcessW lpApplicationName; cited by windows::spawn_shell_with_pid and the shell validator	A-win axiom, not a theorem about aterm code: CreateProcessW(lpApplicationName = p) succeeds iff p is a full path (either separator) to an existing executable image or batch file (.cmd/.bat by full path runs). No default extension is appended (…\\cmd fails ERROR_FILE_NOT_FOUND); no PATH search ("cmd.exe" fails); a '"' in p fails ERROR_INVALID_NAME; %VAR% is never expanded. It belongs in the platform lane's PlatformSpec so the specs above can cite it; the test stays only as a host probe that validates the axiom.	shell::create_process_application_name_contract	OS FFI behavior only	0,8,W
 ```
-
-### Distribution by kind (59)
-
-| kind | count |
-|---|---|
-| contract | 48 |
-| refinement | 4 |
-| table-property | 2 |
-| invariant | 2 |
-| equivalence | 1 |
-| round-trip | 1 |
-| axiom | 1 |
-
-### Gap histogram (specs blocked by each gap)
-
-| gap | specs |
-|---|---|
-| 0 | 59 |
-| 1 | 39 |
-| 2 | 13 |
-| 3 | 9 |
-| 4 | 11 |
-| 5 | 11 |
-| 7 | 24 |
-| 8 | 40 |
-| 10 | 2 |
-| 11 | 1 |
-| 12 | 7 |
-| 13 | 16 |
-| W | 20 |
-
-No spec is blocked only by gap 0. The nearest are `winsize-pixels` (0, 3), `resize-signal-encode`
-(0, 3, W), `pty-pure-const-helpers`, `write-step-classify` and `fifo-dir-in` (0, 1, 3),
-`spawn-locale-resolve` (0, 1, 5) and `ptsname-r-error` (0, 1, 8, with errno as the only effect).
-Gap 8 (effects) blocks the most specs: every effectful shell waits on the platform lane once its
-pure core is out.
-
-### Proof dependency order
-
-- `pty-pure-const-helpers` → `tty-echo-decode`, `shell-identity-verify`, `hangup-shell-target`.
-- `utf8-locale-codeset` → `spawn-locale-resolve` → (`child-env-build`) → `child-ctype-always-utf8`.
-- `write-step-classify` → `write-all-no-silent-drop`.
-- `winsize-pixels` → `winsize-applied` → `spawn-kit-pool`, `spawn-child-process-shape`.
-- `exec-failure-message`, `exec-status-verdict`, `wait-readable-briefly`, `exec-status-carrier-cloexec`
-  → `spawn-fail-closed`.
-- `open-ptmx-redrive` → `pty-pair-contract` → `fd-flag-ops`, `spawn-termios`, `spawn-child-process-shape`.
-- `unix-shell-selection` → `spawn-child-process-shape`, `spawn-fail-closed`.
-- `shell-identity-verify` → `hangup-shell-target`, `reap-schedule` → `reap-grace-accounting`.
-- `wake-pipe` → `read-or-wake-outcome`, `drain-gather-policy`.
-- `input-tail-tracker`, `handshake-scan`, `guard-record-constants`, `console-guard-client-and-tree`
-  → `resize-guard-write-protocol`, `console-host-choice-and-policy`, `openconsole-launch-and-health`
-  → `conpty-session-lifecycle` (h)–(j), `windows-programs-outside-job`.
-- `windows-shell-name-pure` → `windows-shell-resolution` → `windows-spawn-target`.
-- `resize-signal-encode` → `windows-session-registry` (d).
 
 ## 2. Test → spec map (TSV)
 
@@ -452,25 +382,7 @@ tests/windows_smoke.rs	hangup_ends_an_interactive_shell_with_eof	conpty-session-
 tests/windows_smoke.rs	focus_boost_actuates_shell_priority_and_restores	conpty-session-lifecycle	
 ```
 
-## 3. Coverage
-
-- 212 tests originally read across 59 specs (0 non-spec tests remain; §4). After subsequent additions, §1–§2 hold 61 specs and 223 mapped test rows, and the crate currently has 243 live `#[test]` functions in the tree.
-- The biggest collapses: `resize-guard-write-protocol` (23), `console-host-choice-and-policy` (17), `openconsole-launch-and-health` (17), `console-guard-client-and-tree` (13), `conpty-session-lifecycle` (12), `child-env-build` (10), `drain-gather-policy` (9), `windows-session-registry` (8), `windows-programs-outside-job` (8), `msvcrt-cmdline-roundtrip` (7), `unix-shell-selection` (7), `windows-shell-resolution` (7).
-- 98 tests map to specs that need no Windows lane; 116 map to the 18 `W` specs.
-- Several tests measure the OS more than aterm (see §5.5). They are mapped to the spec that cites the
-  axiom they measure; proving that spec retires the aterm half, and the axiom half moves to the
-  platform lane's axiom-validation probes rather than staying a unit test.
-
 ## 4. Tests that are not spec samples
-
-> Status 2026-10-16: `restore_ctrl_c_processing_is_callable_and_idempotent` is deleted; the other three rows are still open.
->
-> Status 2026-10-17: `building_the_status_channel_never_kills_a_concurrent_forks_child` and
-> `inlined_sandbox_exec_path_matches_policy_crate` are deleted too, and their rows are gone.
->
-> Status 2026-10-28: `a_dropped_running_child_is_reaped_and_a_dropped_std_one_is_not` is relocated into
-> `aterm-uds` (`src/spawnfd_command_tests.rs::a_dropped_handle_of_an_exited_child_leaves_no_zombie`
-> under `child-handle-reap-once`) and deleted here; no non-spec tests remain.
 
 Every regression-style test I found (the confstr/libnotify fork hang aside) is an instance of one of
 the general specs above.
@@ -484,27 +396,3 @@ the general specs above.
 5. **OS measurements posing as unit tests.** `src/windows/shell.rs::create_process_application_name_contract` mostly measures the OS. Its statement is an A-win axiom (gap 8). No proof about compiled Rust discharges it; it becomes the platform lane's axiom-validation probe.
 6. ~~**`build_command_line`'s round trip has an unstated precondition.**~~ Fixed: `src/cmdline_units.rs` factors out the platform-neutral UTF-16 core (`build_command_line_units`, `append_argv0_units`, `append_quoted_units`, `build_env_block_units`), quotes `argv[0]` with literal backslashes instead of doubling trailing backslashes inside quotes, documents the `'"' ∉ argv[0]` precondition on `build_command_line`, and verifies round-trip parsing against a reference `crt_parse` oracle on every host.
 7. ~~**`SANDBOX_EXEC_PATH` is kept twice.**~~ Fixed: both `aterm-pty` (`src/unix.rs`) and `aterm-containment` (`src/sbpl.rs`) derive `SANDBOX_EXEC_PATH` at compile time from the single `aterm_uds::os_path!("sandbox-exec")` row in `aterm_uds::host::TOOLS`.
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone, so the order prefers the smallest gap sets, then pure cores that
-unlock the most tests.
-
-1. **`winsize-pixels`** (0, 3). Scalar: a let-else, a widening multiply and a saturating `try_from`. An
-   `omega`-class proof once E6 admits casts and `Option` match. It is also the arithmetic half of
-   `winsize-applied`.
-2. **`write-step-classify`** (0, 1, 3). A three-way enum result over `(isize, bool)`. It is the
-   decision `write-all-no-silent-drop` composes.
-3. **`fifo-dir-in`** and **`ptsname-r-error`** (0, 1, 3 / 0, 1, 8). Tiny; `ptsname-r-error` needs only
-   an errno ghost, and §5.3's empty-`TMPDIR` and trailing-slash handling is already in place.
-4. **`resize-signal-encode`** (0, 3, W). Clamp, casts and `to_le_bytes`; retires 3 tests. It needs refactor
-   (f)'s move to native code or a Windows lane.
-5. **`utf8-locale-codeset`** then **`spawn-locale-resolve`** (0, 1, 3, 5, 7 / 0, 1, 5). `&str`/`Option`
-   code; with `child-env-build` they make `child-ctype-always-utf8` a composition and replace the 64-shape
-   conformance loop.
-6. **`input-tail-tracker`** (0, 1, 3, 7, W). The step table is finite, so (b) is decidable by evaluation;
-   then **`handshake-scan`** and **`resize-guard-write-protocol`** (9 tests), all after refactor (f).
-7. **`open-ptmx-redrive`** (0, 1, 4, 7, 8, 13), over the injected `open` closure plus an errno ghost.
-8. **`child-env-build`** (5 tests). Needs `Vec`/`OsString` content models and the `impl Iterator`
-   generic; it is `#[trust::skip]` today.
-9. The pure cores (a)-(e), then everything else, which waits on gap 8 (effects).

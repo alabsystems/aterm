@@ -313,12 +313,15 @@ fn folds(ctx: &Ctx, wanted: &[StageId]) -> bool {
     ctx.checkers_in_tests && ctx.scope.is_workspace() && wanted.contains(&StageId::TestCompile)
 }
 
-/// Planned stages for `ctx.checks` ([`wanted`]) in declared order, each with the memory it claims
+/// Planned stages for `ctx.checks` ([`wanted`]), with source and type preflight first,
+/// each with the memory it claims
 /// by the run's book ([`StageSpec::mem`]): none for a named skip ([`named_skip`]), which starts
 /// nothing.
 #[must_use]
 pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let wanted = wanted(ctx);
+    // Pooling bounds resource use but does not replace early-error ordering.
+    let pooled = ctx.pool.is_some() && !ctx.background;
     let v: Vec<StageSpec> = declared(&ctx.scope)
         .into_iter()
         .filter(|s| wanted.contains(&s.id))
@@ -331,8 +334,8 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         .map(|b| (b.records(), b.plain_records()));
     let mut planned = Vec::with_capacity(v.len());
     for mut s in v {
-        // Source guards and the all-target lint expose errors before test code generation.
-        // Keep these dependencies explicit: an unmanaged run may use parallel target lanes.
+        // Source guards and lint expose errors before test code generation, including
+        // when a shared pool could otherwise give the compile every CPU token.
         for prerequisite in [
             StageId::Formatting,
             StageId::Census,
@@ -386,9 +389,9 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         planned.push(s);
     }
     for s in &mut planned {
-        // Independent build/test lanes would each spend the same CPU grant.
-        // Keep every stage and its bounds, but let a managed run spend it once.
-        if ctx.env.build_slot_held.is_some() || ctx.background {
+        // Unpooled independent lanes would each spend the managed CPU grant. Background
+        // plans also retain their existing one-stage policy.
+        if (ctx.env.build_slot_held.is_some() && !pooled) || ctx.background {
             s.exclusive = true;
         }
     }
@@ -1016,7 +1019,7 @@ mod tests {
     }
 
     /// A run that measures memory plans each stage's claim from its book: the test compile its
-    /// kept peak and margin, the lint (never measured) the cold figure, the test run (whose
+    /// kept peak and margin, the lint with no retained row the cold figure, the test run (whose
     /// dispatcher claims each schedule's concurrent peak) and the formatter (which touches no
     /// target directory) nothing.
     /// NEGATIVE CONTROL: a run that measures nothing plans no claim for any stage.
@@ -1370,6 +1373,35 @@ mod tests {
                 assert_eq!(got, want, "{checks:?}, app {app}");
             }
         }
+    }
+
+    /// The pooled release must retain the same early-error boundary as an unpooled run.
+    /// NEGATIVE CONTROL: with every preflight complete, code generation is admitted.
+    #[cfg(unix)]
+    #[test]
+    fn pooled_codegen_waits_for_every_preflight() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let pool = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 4).unwrap();
+        let c = ctx(&RELEASE, Scope::workspace()).with_pool(Some(pool));
+        let p = plan(&c);
+        let compile = p.iter().position(|s| s.id == StageId::TestCompile).unwrap();
+        let mut done = vec![false; p.len()];
+        for id in [
+            StageId::Formatting,
+            StageId::Census,
+            StageId::ExportScan,
+            StageId::Tippy,
+        ] {
+            let Some(index) = p.iter().position(|s| s.id == id) else {
+                continue;
+            };
+            assert!(
+                !crate::sched::ready(&p, &done, &done, 0, compile, u64::MAX),
+                "code generation can delay a preflight red at {id:?}"
+            );
+            done[index] = true;
+        }
+        assert!(crate::sched::ready(&p, &done, &done, 0, compile, u64::MAX));
     }
 
     #[test]

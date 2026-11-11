@@ -226,14 +226,25 @@ fn plist_short_version(app_root: &Path) -> Option<String> {
 pub fn usual_app_locations() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let brew = std::env::var_os("HOMEBREW_PREFIX").map(PathBuf::from);
-    app_locations(home.as_deref(), brew.as_deref())
+    let install_dir = std::env::var_os("ATERM_INSTALL_DIR").map(PathBuf::from);
+    app_locations(home.as_deref(), brew.as_deref(), install_dir.as_deref())
 }
 
 #[cfg(target_os = "macos")]
-fn app_locations(home: Option<&Path>, homebrew_prefix: Option<&Path>) -> Vec<PathBuf> {
+fn app_locations(
+    home: Option<&Path>,
+    homebrew_prefix: Option<&Path>,
+    install_dir: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut out = vec![PathBuf::from("/Applications/aterm.app")];
     if let Some(home) = home {
         out.push(home.join("Applications").join("aterm.app"));
+    }
+    if let Some(dir) = install_dir.filter(|d| !d.as_os_str().is_empty()) {
+        let app = dir.join("aterm.app");
+        if !out.iter().any(|p| p == &app) {
+            out.push(app);
+        }
     }
     let mut prefixes = vec![PathBuf::from("/opt/homebrew"), PathBuf::from("/usr/local")];
     if let Some(prefix) = homebrew_prefix
@@ -242,7 +253,10 @@ fn app_locations(home: Option<&Path>, homebrew_prefix: Option<&Path>) -> Vec<Pat
         prefixes.push(prefix.to_path_buf());
     }
     for prefix in prefixes {
-        out.extend(caskroom_bundles(&prefix.join("Caskroom").join("aterm")));
+        let caskroom = prefix.join("Caskroom");
+        for token in ["aterm", "alab"] {
+            out.extend(caskroom_bundles(&caskroom.join(token)));
+        }
     }
     out
 }
@@ -469,17 +483,53 @@ mod tests {
             }
             assert_eq!(caskroom_bundles(&crowded).len(), MAX_CASKROOM_ENTRIES);
 
+            let alab_cask = root
+                .join("Caskroom")
+                .join("alab")
+                .join("0.62.0")
+                .join("aterm.app");
+            make_bundle(&alab_cask, Some(&version_plist("0.62.0")));
+            let custom_install = root.join("custom-install");
+            let custom_app = custom_install.join("aterm.app");
+            make_bundle(&custom_app, Some(&version_plist("0.63.0")));
+
             let home = root.join("home");
-            let places = app_locations(Some(&home), Some(&root));
+            let places = app_locations(Some(&home), Some(&root), Some(&custom_install));
             assert_eq!(places[0], Path::new("/Applications/aterm.app"));
             assert_eq!(places[1], home.join("Applications").join("aterm.app"));
+            assert_eq!(places[2], custom_app);
             assert!(
-                places.contains(&older) && places.contains(&newer),
+                places.contains(&older) && places.contains(&newer) && places.contains(&alab_cask),
                 "{places:?}"
             );
-            let defaults = app_locations(None, None);
-            let repeated = app_locations(None, Some(Path::new("/opt/homebrew")));
+            let running_exe = make_bundle(
+                &root.join("Applications").join("aterm.app"),
+                Some(&version_plist("0.64.0")),
+            );
+            let surveyed = survey(&running_exe, &places);
+            assert!(
+                surveyed.others.contains(&OtherCopy {
+                    path: custom_app,
+                    version: Some("0.63.0".to_string()),
+                }),
+                "{surveyed:?}"
+            );
+            assert!(
+                surveyed.others.contains(&OtherCopy {
+                    path: alab_cask,
+                    version: Some("0.62.0".to_string()),
+                }),
+                "{surveyed:?}"
+            );
+            let defaults = app_locations(None, None, None);
+            let repeated = app_locations(
+                None,
+                Some(Path::new("/opt/homebrew")),
+                Some(Path::new("/Applications")),
+            );
+            let empty_install = app_locations(None, None, Some(Path::new("")));
             assert_eq!(defaults, repeated);
+            assert_eq!(defaults, empty_install);
             let _ = std::fs::remove_dir_all(root);
         }
     }

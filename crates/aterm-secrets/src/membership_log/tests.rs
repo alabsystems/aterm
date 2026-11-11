@@ -260,7 +260,8 @@ fn malformed_records_are_refused_before_any_log_sees_them() {
     for bad in ["", "a\nb", &"n".repeat(MAX_NAME + 1)] {
         assert!(draft(name(bad)).sign(&A.seed(), A.incarnation()).is_err());
     }
-    for bad in ["m0", "m01", "x4", "m", "m123456", "m4-3fa2"] {
+    assert!(is_label("m0"));
+    for bad in ["m01", "x4", "m", "m123456", "m4-3fa2"] {
         let body = Body::Admit {
             entrant: X.entrant(bad),
             evidence: Evidence::Manual,

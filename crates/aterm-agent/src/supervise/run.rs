@@ -32,9 +32,9 @@ use super::policy::reset::{
 use super::policy::sleeps::{FirstLook, SleepBook, SleepStamp};
 use super::policy::turn_end::{
     AccountAdvice, AccountBad, AccountPoint, AgentResumed, Composer, FirstRead, GaveUp,
-    ModelSwitch, PERSON_TYPING, ProbeGate, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY,
-    RULE_LIMIT_RESUME, RULE_OUTAGE_RESUME, Reach, TurnEndAction, TurnEndReading, TurnEndState,
-    TurnEndTiming, WaitKind, is_continue_rule, said_mark,
+    PERSON_TYPING, ProbeGate, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_LIMIT_RESUME,
+    RULE_OUTAGE_RESUME, Reach, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming,
+    WaitKind, is_continue_rule, said_mark,
 };
 use super::prompt::{
     CancelEffect, Prompt, PromptKind, PromptV2, parse_prompt, prompt_box_first_row, prompt_box_span,
@@ -368,13 +368,6 @@ pub struct HostStep {
     pub typed: Option<super::policy::turn_end::HostTurn>,
     /// Whether this step repeats the previous wait at the same point.
     pub repeat: bool,
-}
-
-/// The word a host step's [`HostStep::line`] names its step by (`<what> step=<word>`, as the
-/// window's host spells it).
-fn host_step_word(line: &str) -> Option<&str> {
-    line.split_whitespace()
-        .find_map(|w| w.strip_prefix("step="))
 }
 
 /// Turn-end policy context offered to [`IdleHost::at_idle_on`] at an idle point.
@@ -1492,7 +1485,7 @@ fn journaled_hold(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Opt
                     .and_then(|s| s.split_once(' '))
                     .filter(|_| rec.phase == "-")
                     .and_then(|(until, why)| {
-                        let until = crate::harness::upgrade_models::parse_utc(until)?;
+                        let until = crate::harness::unix_time::parse_utc(until)?;
                         let until_ms = i64::try_from(until).ok()?.checked_mul(1000)?;
                         Some((
                             rec.t,
@@ -5341,7 +5334,6 @@ impl<'a, C: Ctl> Session<'a, C> {
         {
             self.restart_floor = self.restart_floor.max(newest);
         }
-        self.seed_model_switch_in(body, older);
         if let Some(journal) = journal.as_deref() {
             self.seed_open_move_in(journal);
         }
@@ -7812,7 +7804,7 @@ impl<C: Ctl> Session<'_, C> {
         };
         if let Some((line, kind)) = stepped {
             review.note(&format!("HOST seq={} background {line}", screen.seq));
-            self.host_turn(kind, screen.seq);
+            self.host_turn(kind);
             self.hold_line(screen.seq, cfg, review);
             *since = None;
             line_gone = Some(Guard::HostLine);
@@ -7834,7 +7826,7 @@ impl<C: Ctl> Session<'_, C> {
                         self.cruise_carry.host_typed();
                         self.turn_end.fact_typed();
                     }
-                    kind => self.host_turn(kind, screen.seq),
+                    kind => self.host_turn(kind),
                 }
                 self.hold_line(screen.seq, cfg, review);
                 *since = None;
@@ -7905,23 +7897,9 @@ impl<C: Ctl> Session<'_, C> {
             (_, _, Some(w)) if w.kind.reads_limited() => Some(w.reset.as_deref()),
             _ => None,
         };
-        let agy_rotation_due = match reading.program {
-            Program::Agy => {
-                (limit_wall || self.limit.is_some())
-                    && !self.fx.replay_lacks_host_door("host.upgrade_due")
-                    && host.upgrade_due()
-            }
-            Program::Claude
-            | Program::Codex
-            | Program::Grok
-            | Program::Kimi
-            | Program::Muse
-            | Program::Generic => false,
-        };
         let spent = (limit_wall || self.limit.is_some())
             && (self.turn_end.account_resume_owed()
-                || self.limit_spent(Some(host.as_ref()), notice)
-                || agy_rotation_due);
+                || self.limit_spent(Some(host.as_ref()), notice));
         // A RELAUNCH'S CARRY-ON RESTS AT THE QUESTION ITS RESUME DRAWS: a conversation that ended
         // on a question comes back on it. Nothing else of the host's steps there.
         let carry_only = (point.phase == Phase::Question || reading.phase == Phase::Question)
@@ -8008,11 +7986,8 @@ impl<C: Ctl> Session<'_, C> {
                 if step.moved {
                     self.turn_end.host_moved();
                 }
-                if host_step_word(&step.line).is_some_and(crate::harness::upgrade_drive::started) {
-                    self.turn_end.harness_started();
-                }
                 if let Some(kind) = step.typed {
-                    self.host_turn(kind, point.screen.seq);
+                    self.host_turn(kind);
                 }
                 if step.typed.is_some() || step.moved {
                     self.hold_point(&point.screen, true, Some(&opts.policy), review);

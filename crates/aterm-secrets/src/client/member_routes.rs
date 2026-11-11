@@ -10,6 +10,7 @@ use super::{
     MemberArrivals, MembersAsked, Paths, ask_members_if_due, ask_members_pause, swarm_lets,
 };
 use crate::converge::{Last, RunnerRetry};
+use aterm_uds::stop::Stop;
 use std::os::fd::BorrowedFd;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -251,24 +252,26 @@ fn broker_arrived(
     }
 }
 
-struct Ending<'a>(&'a AtomicBool);
+/// Ends the worker as `while_hearing` leaves, a panic included: its stop wakes the worker's
+/// wait (its bell) and its retry's rest (a sleep on it).
+struct Ending<'a>(&'a Stop);
 
 impl Drop for Ending<'_> {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.0.set();
     }
 }
 
 struct Notice<'a> {
     finishing: &'a AtomicBool,
-    ending: &'a AtomicBool,
+    ending: &'a Stop,
     project: &'a (dyn Fn(ProjectionEvent) + Sync),
 }
 
 impl Drop for Notice<'_> {
     fn drop(&mut self) {
         self.finishing.store(true, Ordering::Release);
-        if !self.ending.load(Ordering::Acquire) {
+        if !self.ending.is_set() {
             // A failed notification must not double-panic during an unwind.
             let _ = catch_unwind(AssertUnwindSafe(|| (self.project)(ProjectionEvent::Ended)));
         }
@@ -411,9 +414,9 @@ impl<C: Changes> Listener<C> {
         ask: &(dyn Fn(&Paths) -> crate::Result<usize> + Sync),
         log: &(dyn Fn(&str) + Sync),
         project: &(dyn Fn(ProjectionEvent) + Sync),
-        ending: &AtomicBool,
+        ending: &Stop,
     ) -> std::io::Result<()> {
-        if ending.load(Ordering::Acquire) {
+        if ending.is_set() {
             return Ok(());
         }
         let callbacks = super::ASK_MEMBERS.get();
@@ -436,7 +439,7 @@ impl<C: Changes> Listener<C> {
             self.broker.wait_for(wait)
         };
         let route = {
-            let fds = self
+            let mut fds = self
                 .arrivals
                 .source
                 .as_ref()
@@ -448,20 +451,19 @@ impl<C: Changes> Listener<C> {
                 ));
             }
             #[cfg(target_os = "macos")]
-            let fds = {
-                let mut fds = fds;
-                if let Some(broker) = self.broker.watch_fd() {
-                    fds.push(broker);
-                }
-                fds
-            };
+            if let Some(broker) = self.broker.watch_fd() {
+                fds.push(broker);
+            }
+            // The stop's bell ends a wait that polls it as the subscriber ends. A bell this process
+            // cannot make fails the round, which rests on the stop and retries.
+            fds.push(ending.bell()?);
             self.changed.wait(wait, &fds)
         };
         #[cfg(target_os = "macos")]
         let broker_ready = before | broker_arrived(&mut self.broker, &mut self.broker_error, log);
         #[cfg(not(target_os = "macos"))]
         let broker_ready = false;
-        if ending.load(Ordering::Acquire) {
+        if ending.is_set() {
             return Ok(());
         }
         let asking = callbacks.is_some() && self.asking(paths, members, log);
@@ -517,8 +519,7 @@ impl<C: Changes> Listener<C> {
         {
             return Ok(());
         }
-        if !ending.load(Ordering::Acquire)
-            && swarm_lets(&mut self.switch, &mut self.held, "member discovery", log)
+        if !ending.is_set() && swarm_lets(&mut self.switch, &mut self.held, "member discovery", log)
         {
             if forced {
                 members.at = None;
@@ -547,8 +548,8 @@ struct Owner<'scope> {
 }
 
 impl<'scope> Owner<'scope> {
-    fn finish(&mut self, ending: &AtomicBool) -> bool {
-        ending.store(true, Ordering::Release);
+    fn finish(&mut self, ending: &Stop) -> bool {
+        ending.set();
         self.worker
             .take()
             .is_none_or(|worker| worker.join().is_ok())
@@ -615,21 +616,24 @@ fn elapsed(clock: Instant) -> u64 {
     u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Run `round` until `ending` is set, resting on the stop through each retry's whole pause after
+/// a round that failed or panicked: a rest ends at its retry or as the worker ends, never at a
+/// look of its own.
 fn retry_rounds(
     clock: Instant,
-    ending: &AtomicBool,
+    ending: &Stop,
     log: &(dyn Fn(&str) + Sync),
     mut round: impl FnMut() -> std::io::Result<()>,
     mut reset: impl FnMut(),
 ) {
     let mut retry = RunnerRetry::default();
     let mut last_error = None;
-    while !ending.load(Ordering::Acquire) {
+    while !ending.is_set() {
         if let Some(left) = retry
             .remaining(elapsed(clock))
             .filter(|left| !left.is_zero())
         {
-            std::thread::sleep(left.min(LOOK));
+            ending.sleep(left);
             continue;
         }
         retry.started();
@@ -666,7 +670,7 @@ pub(super) fn while_hearing<T>(
     changed: impl Changes,
     run: impl FnOnce(&mut dyn FnMut() -> Status) -> T,
 ) -> T {
-    let ending = AtomicBool::new(false);
+    let ending = Stop::new();
     let listener = Mutex::new(Listener::new(paths, changed));
     let clock = Instant::now();
     std::thread::scope(|scope| {
@@ -677,46 +681,42 @@ pub(super) fn while_hearing<T>(
         let mut maintain = || {
             let finishing = Arc::clone(&owner.finishing);
             let listening = owner
-                .maintain_with(
-                    elapsed(clock),
-                    ending.load(Ordering::Acquire),
-                    |recovering| {
-                        std::thread::Builder::new()
-                            .name("vault-member-routes".into())
-                            .spawn_scoped(scope, move || {
-                                let _notice = Notice {
-                                    finishing: &finishing,
-                                    ending,
-                                    project,
-                                };
-                                if recovering {
+                .maintain_with(elapsed(clock), ending.is_set(), |recovering| {
+                    std::thread::Builder::new()
+                        .name("vault-member-routes".into())
+                        .spawn_scoped(scope, move || {
+                            let _notice = Notice {
+                                finishing: &finishing,
+                                ending,
+                                project,
+                            };
+                            if recovering {
+                                listener
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .reset(paths);
+                                listener.clear_poison();
+                            }
+                            retry_rounds(
+                                clock,
+                                ending,
+                                log,
+                                || {
+                                    listener
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .round(paths, members, ask, log, project, ending)
+                                },
+                                || {
                                     listener
                                         .lock()
                                         .unwrap_or_else(PoisonError::into_inner)
                                         .reset(paths);
                                     listener.clear_poison();
-                                }
-                                retry_rounds(
-                                    clock,
-                                    ending,
-                                    log,
-                                    || {
-                                        listener
-                                            .lock()
-                                            .unwrap_or_else(PoisonError::into_inner)
-                                            .round(paths, members, ask, log, project, ending)
-                                    },
-                                    || {
-                                        listener
-                                            .lock()
-                                            .unwrap_or_else(PoisonError::into_inner)
-                                            .reset(paths);
-                                        listener.clear_poison();
-                                    },
-                                );
-                            })
-                    },
-                )
+                                },
+                            );
+                        })
+                })
                 .unwrap_or_else(|error| {
                     log(&format!(
                         "member readiness listener waits: {error}; subscriber rounds keep observing"
@@ -760,7 +760,7 @@ mod wait_tests {
     #[test]
     fn refused_or_ended_listeners_keep_one_retry_and_do_not_restart_after_ending() {
         let bell = crate::wake::Bell::default();
-        let ending = AtomicBool::new(false);
+        let ending = Stop::new();
         let project = |event| {
             assert!(matches!(event, ProjectionEvent::Ended));
             bell.ring(crate::wake::Wake::Listener);
@@ -996,7 +996,7 @@ mod wait_tests {
                         &|_| panic!("this edge is already covered by the fresh ask"),
                         &|_| {},
                         &|_| panic!("no new observation is due"),
-                        &AtomicBool::new(false),
+                        &Stop::new(),
                     )
                     .unwrap();
                 let asked = members.lock().unwrap();
@@ -1139,6 +1139,88 @@ mod tests {
             observed <= paced(ran),
             "{observed} looks in {ran:?} at the observer's pace"
         );
+    }
+
+    /// The worker ends as its subscriber does: the stop's bell ends the wait under way, which
+    /// would otherwise run to its deadline ([`HANG`] detects a wait no bell ended).
+    #[test]
+    fn an_ending_subscriber_ends_the_wait_under_way() {
+        struct Waits {
+            waiting: std::sync::mpsc::Sender<()>,
+            rung: Arc<AtomicBool>,
+        }
+        impl Changes for Waits {
+            fn wait(&mut self, _most: Duration, also: &[BorrowedFd<'_>]) -> bool {
+                let _ = self.waiting.send(());
+                let rung = aterm_uds::ready::any_until(also, Instant::now() + HANG)
+                    .is_ok_and(|ready| !ready.is_empty());
+                self.rung.store(rung, Ordering::SeqCst);
+                false
+            }
+        }
+        let home = aterm_tempfile::tempdir().expect("home");
+        let paths = Paths::locate_for_home(home.path());
+        let members = Mutex::new(MembersAsked::default());
+        let (waiting, waits) = std::sync::mpsc::channel();
+        let rung = Arc::new(AtomicBool::new(false));
+        let changes = Waits {
+            waiting,
+            rung: Arc::clone(&rung),
+        };
+        aterm_uds::lan::seam_here(
+            aterm_uds::lan::Seam {
+                socket: Some(home.path().join("absent-broker.sock")),
+                ..aterm_uds::lan::Seam::default()
+            },
+            || {
+                while_hearing(
+                    &paths,
+                    &members,
+                    &|_: &Paths| Ok(0),
+                    &|_| {},
+                    &|_| {},
+                    changes,
+                    |_: &mut dyn FnMut() -> Status| {
+                        waits.recv_timeout(HANG).expect("the worker waits");
+                    },
+                );
+            },
+        );
+        assert!(
+            rung.load(Ordering::SeqCst),
+            "the subscriber's end did not end the worker's wait"
+        );
+    }
+
+    /// A round that fails rests on the worker's stop, and the stop ends the rest ([`HANG`] detects
+    /// a rest taken anywhere but on the stop). That the rest runs the retry's whole pause in one
+    /// sleep is `retry_rounds`' own code; this test does not time it.
+    #[test]
+    fn a_failed_round_rests_on_the_stop() {
+        let ending = Stop::new();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                retry_rounds(
+                    Instant::now(),
+                    &ending,
+                    &|_| {},
+                    || Err(std::io::Error::other("injected source failure")),
+                    || {},
+                );
+            });
+            // Set on the way out, a failed assertion's included, so the scope's join ends.
+            let ends = Ending(&ending);
+            let began = Instant::now();
+            while ending.entered() == 0 {
+                assert!(
+                    began.elapsed() < HANG,
+                    "the failed round never rested on the stop"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(ends);
+            worker.join().expect("the worker ends with its stop");
+        });
     }
 
     /// Answer the first hello at `listener` as a broker does ([`HANG`] detects a worker that

@@ -8,6 +8,10 @@
 //! window's `idle_rest_secs` and any `aterm.toml` lines of its own; the arms take turns press by
 //! press, each round of them reversed after the last, so a drift in the Mac's load falls on every
 //! arm alike.
+//! `--fixed-order` instead repeats the given order (A B A B for two equal arms).
+//! `--key-shape press|built` selects the existing `hwkey` event constructor explicitly; the
+//! default is `press`. Before warm-up, the lane raises its private terminal and observes native
+//! focus. These gates do not establish that a posted event arrived: booking still must follow.
 //! A press waits out its quiet (`--min-quiet`, then until `trail status` says the pet sleeps
 //! deeply and the window rests exactly when its arm rests it, then a random `--settle` more, so
 //! the key meets the resting window's 5 s reading at any phase), reads the load, the memory
@@ -38,7 +42,7 @@ use crate::{Fail, Res, stop};
 
 const USAGE: &str = "usage: first-key [--aterm PATH] [--arm NAME=REST:PRESSES[:burst]]... \
      [--arm-toml NAME=LINE]... [--min-quiet SECS] [--settle LO..HI] [--no-pet] [--toml LINE]... \
-     [--seed N] --out DIR\n       \
+     [--seed N] [--fixed-order] [--key-shape press|built] --out DIR\n       \
      first-key summarize PRESSES.TSV...";
 
 /// The columns of `presses.tsv`, in order.
@@ -377,6 +381,12 @@ pub fn summarize(rows: &[Row]) -> String {
                 "  input {label} {:+.2} ms (95% bootstrap {lo:+.2} .. {hi:+.2})",
                 rank(&input, q) - rank(&b_input, q)
             );
+            let (lo, hi) = bootstrap_diff(&present, &b_present, q, 10_000, &mut rng);
+            let _ = writeln!(
+                out,
+                "  present {label} {:+.2} ms (95% bootstrap {lo:+.2} .. {hi:+.2})",
+                rank(&present, q) - rank(&b_present, q)
+            );
         }
         let _ = writeln!(
             out,
@@ -409,6 +419,8 @@ struct Opts {
     toml: Vec<String>,
     seed: u64,
     out: PathBuf,
+    fixed_order: bool,
+    key_shape: String,
 }
 
 fn parse(args: &[String]) -> Result<Opts, Fail> {
@@ -455,6 +467,11 @@ fn parse(args: &[String]) -> Result<Opts, Fail> {
         }
     };
     let pet = !take_flag(&mut a, "--no-pet");
+    let fixed_order = take_flag(&mut a, "--fixed-order");
+    let key_shape = take_value(&mut a, "--key-shape")?.unwrap_or_else(|| "press".into());
+    if !matches!(key_shape.as_str(), "press" | "built") {
+        return Err(Fail::usage("--key-shape takes press or built"));
+    }
     let toml = take_values(&mut a, "--toml")?;
     let seed = take_value(&mut a, "--seed")?
         .map(|s| s.parse::<u64>())
@@ -479,6 +496,8 @@ fn parse(args: &[String]) -> Result<Opts, Fail> {
         toml,
         seed,
         out,
+        fixed_order,
+        key_shape,
     })
 }
 
@@ -576,8 +595,8 @@ fn booked(
             return Err(Fail::exit(
                 3,
                 format!(
-                    "first-key: press {press} ({}): its key {keys} was never booked in a minute",
-                    arm.name
+                    "first-key: press {press} ({}): its key {keys} was never booked in a minute; last metrics: {raw}",
+                    arm.name,
                 ),
             ));
         }
@@ -615,6 +634,7 @@ fn ticks_ms(ticks: u64) -> f64 {
 }
 
 fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
+    let key_request = format!("hwkey a shape={}", o.key_shape);
     let first = o.arms.first().ok_or_else(|| Fail::usage(USAGE))?;
     let mut config_now = config(o, first);
     let world = World::new(&config_now)?;
@@ -656,12 +676,50 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
     );
     let _ = ctl(&inst, &["await", "idle", "3000", "timeout=60000"]);
     let mut conn = inst.connect().map_err(|e| Fail::exit(3, e))?;
+    // A posted NSEvent is not evidence that the window received it. Select and raise only
+    // this private world's terminal, then observe native focus before sending a warm-up key.
+    let roster = call(&mut conn, "sessions")?;
+    let target = crate::instance::terminal_selector(&roster)
+        .ok_or_else(|| Fail::exit(3, "first-key: no private terminal to raise"))?;
+    call(
+        &mut conn,
+        &format!("raise {}", target.trim_start_matches('@')),
+    )?;
+    let focus_deadline = stop::deadline_after(Duration::from_secs(60));
+    loop {
+        let focus = call(&mut conn, "native-focus")?;
+        if fields(&focus).get("key").is_some_and(|key| key == "1") {
+            crate::util::write_fresh(&o.out.join("native-focus.txt"), &focus)
+                .map_err(|e| e.to_string())?;
+            break;
+        }
+        if Instant::now() >= focus_deadline {
+            crate::util::write_fresh(&o.out.join("native-focus.txt"), &focus)
+                .map_err(|e| e.to_string())?;
+            return Err(Fail::exit(
+                3,
+                format!("first-key: native focus unavailable: {focus}"),
+            ));
+        }
+        stop::sleep(Duration::from_millis(20))?;
+    }
     // A warm-up press: an instance's first key pays its own first-use costs.
-    call(&mut conn, "hwkey a")?;
+    call(&mut conn, &key_request)?;
     stop::sleep(Duration::from_millis(600))?;
     ctl(&inst, &["key", "ctrl+u"])?;
 
-    let order = schedule(&o.arms);
+    let order = if o.fixed_order {
+        (0..o.arms.iter().map(|a| a.presses).max().unwrap_or(0))
+            .flat_map(|round| {
+                o.arms
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(i, arm)| (round < arm.presses).then_some(i))
+            })
+            .collect()
+    } else {
+        schedule(&o.arms)
+    };
     let raw_dir = o.out.join("raw");
     std::fs::create_dir_all(&raw_dir)
         .map_err(|e| format!("cannot make {}: {e}", raw_dir.display()))?;
@@ -736,7 +794,7 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
         call(&mut conn, "metrics reset")?;
         let quiet = last_key.elapsed();
         let t0 = Instant::now();
-        call(&mut conn, "hwkey a")?;
+        call(&mut conn, &key_request)?;
         last_key = t0;
         let get = |f: &std::collections::BTreeMap<String, String>, k: &str| {
             num(f, k).map_or_else(|| "nan".to_string(), |v| format!("{v}"))
@@ -753,7 +811,7 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
             for key in 1..=4 {
                 at += Duration::from_secs_f64(rng.between(0.100, 0.250));
                 stop::sleep(at.saturating_sub(t0.elapsed()))?;
-                call(&mut conn, "hwkey a")?;
+                call(&mut conn, &key_request)?;
                 let (k, _) = booked(&mut conn, key, press, arm)?;
                 burst_keys.push((
                     get(&k, "last_input_present_ms"),

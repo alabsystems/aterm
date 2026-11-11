@@ -32,7 +32,7 @@ test to its rows. The statements come from reading the code.
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary ones are in
 §2), `rust_features` (what the proof must handle), `blocking_gaps` (rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7, plus `U`). Gap `U` is no audit row: a model
+`docs/TRUST-LANE.md` (Blocking gaps), plus `U`). Gap `U` is no audit row: a model
 of unwinding and destructors (panic edges as outcomes with a post-state, `Drop` glue,
 `drop_in_place`, the Ledger). Every row lists gap 0 (the installed seal publishes no Lean-discharged
 row) and gap 11 (both containers are generic in `T` and const-generic in `N`, so a proof at one
@@ -98,16 +98,6 @@ tests/panic_drop_parity.rs	small_vec_into_iter_drop_drops_each_element_once_when
 tests/panic_drop_parity.rs	array_vec_retain_drops_each_element_once_when_a_rejected_destructor_panics	av-retain-unwind	av-bulk-drop-exactly-once
 ```
 
-## 3. Coverage
-
-- All 29 live `#[test]` functions across `src/array_vec.rs` (5), `src/small_vec.rs` (3),
-  `tests/arrayvec_differential.rs` (11), and `tests/panic_drop_parity.rs` (10) are mapped in §2.
-- `av-accessors`, `av-push` and `sv-representation` subsume no test (`-`); later
-  rows build on them. `av-retain` has no primary test either: it is the non-panicking base case that
-  `av-retain-unwind` extends.
-- `av-refines-bounded-vec` is what the whole differential file samples: once it is proved, the
-  per-op parity tests in `tests/arrayvec_differential.rs` have no remaining job.
-
 ## 4. Tests that are not spec samples
 
 None: `src/lib.rs::alloc_const_helpers_round_trip` and
@@ -137,26 +127,3 @@ None: `src/lib.rs::alloc_const_helpers_round_trip` and
 5. **Forgotten `Drain` clause sampled (resolved 2026-10-27).**
    `src/array_vec.rs::test_drain_forget_keeps_unyielded_elements` now checks `av-drain`'s
    `mem::forget` retention and drop-count clause.
-
-## 6. Proof order (easiest high-value first)
-
-Gaps 1 and 11 block every row, so the first step is gap 11 (per-definition proofs of generic fns)
-with a struct carrier for `ArrayVec { buf, len }`, length-only at first. Then:
-
-1. **`capacity-error-contract`**: safe code with no `&mut`, loops or unsafe; `element`/`simplify`
-   are moves, and Display/Debug write constant strings that need only a Formatter model.
-2. **`av-accessors`**: `&self` scalar reads and one `saturating_sub`. Its length half needs only a
-   length-only carrier, and it fixes `len ≤ N`, the core conjunct of `Inv_AV`.
-3. **`av-push`** without its panic clause: `push` and `try_push` are not `trust::skip`, and the `Ok`
-   branch is one `MaybeUninit` write plus a length step under `len < N`. It is the first content
-   obligation for gap 1; the overflow clause waits on gap `U`.
-4. **`av-slice-view`**: the one unsafe fact (`from_raw_parts(buf, len)` is `Seq v`) every later spec
-   reads, and this crate's pilot for gap 8.
-5. **`av-bulk-drop-exactly-once`** and **`sv-drop-exactly-once`**: they share `drop_initialized` and
-   the "lower len, then drop the slice" shape, so one gap `U` model covers both (the into-iter clause
-   of `sv-drop-exactly-once` also needs `sv-into-iter`).
-6. ArrayVec: `av-into-inner`, `av-drain`, `av-into-iter`, then the loop and closure specs
-   (`av-retain`, `av-extend-overflow`, `av-clone-from`; gaps 7 and 13), the unwind variants
-   (`av-drain-unwind`, `av-retain-unwind`), and last the conjunction `av-refines-bounded-vec`.
-7. SmallVec: `Inv_SV` → `sv-representation` (the spill preserves `Seq`) → `sv-seq-contracts` →
-   `sv-into-iter`.

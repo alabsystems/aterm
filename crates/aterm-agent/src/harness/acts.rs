@@ -900,7 +900,7 @@ mod tests {
     use crate::supervise::policy::question::RULE_ANSWER_RECOMMENDED;
     use crate::supervise::policy::turn_end::{
         RULE_ACCOUNT, RULE_ANSWER, RULE_CONSENT, RULE_HOST_TURN, RULE_LOGIN, RULE_MEMORY_RESTART,
-        RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, RULE_USAGE_PROBE,
+        RULE_USAGE_PROBE,
     };
 
     fn family(act: Act) -> Counter {
@@ -1024,8 +1024,8 @@ mod tests {
         for rule in [
             RULE_LOGIN,
             RULE_CONSENT,
-            RULE_MODEL_FALLBACK,
-            RULE_MODEL_RESTORE,
+            "model-fallback@v1",
+            "model-restore@v1",
             RULE_ACCOUNT,
             RULE_MEMORY_RESTART,
             "model-wind-down@v1",

@@ -24,7 +24,7 @@ Each row states a property of `crates/aterm-log/src/lib.rs`, recovered from its 
 - **Linearizable**: calls into `aterm_log::env` from different threads take effect atomically in
   some total order, because each holds `ENV_LOCK`. It says nothing about `getenv` calls outside the
   module.
-- `blocking_gaps`: gap numbers from §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap
+- `blocking_gaps`: gap numbers from `docs/TRUST-LANE.md` (Blocking gaps). Gap
   0 (a seal that publishes Clean rows) is a prerequisite for every spec and is listed only where it
   is the only blocker.
 
@@ -73,16 +73,6 @@ tests/log_gate.rs	log_gate_and_record_accessors_hold_across_filters_and_logger_d
 
 In `src/lib.rs`, the first 9 rows are `mod tests` and the next 4 are `mod env_tests`.
 
-## 3. Coverage
-
-- All 15 live `#[test]` functions across `src/lib.rs` (13), `src/words.rs` (1) and
-  `tests/log_gate.rs` (1) map to the 11 specs in §1; none is outside a spec (§4).
-- `should-rotate-threshold` is already proved on `should_rotate`, so its unit test is retired.
-- The biggest collapse is `sanitize-record` (4 primary), followed by `env-scoped-restore` (3
-  primary) and `log-gate` (2 primary).
-- `record-accessors` has no separate primary test; it is sampled alongside `log-gate` by
-  `tests/log_gate.rs::log_gate_and_record_accessors_hold_across_filters_and_logger_decisions`.
-
 ## 4. Tests that are not spec samples
 
 None.
@@ -108,17 +98,3 @@ None.
    U+3000 padding.
 5. **Env tests retargeted onto `std::env::var_os` (resolved 2026-10-28).** Deleted `#[cfg(test)]`
    `env::read` and retargeted all four `env_tests` onto `std::env::var_os`.
-
-## 6. Proof order
-
-1. **`record-cap-by-level`** and **`level-severity-order`** (gaps 1, 3): finite enum tables,
-   decidable by evaluation. `record-cap-by-level` is the lemma `sanitize-record` needs for
-   `sanitize_record_for`.
-2. **`sanitize-record`** (gaps 1, 3, 4, 5, 7): the highest-value spec, guarding every log record
-   against control-char injection and unbounded size. It needs `&str`/`Cow` carriers, a `chars()`
-   loop invariant, and composition with `record_cap`.
-3. **`level-filter-parse`**, then **`level-display-names`** (it composes with parse for the round
-   trip), then **`record-accessors`** (gap 2).
-4. **Effects last**: `env-mutators`, `env-scoped-restore` and `log-gate` wait on gaps 8, 11 and 13.
-   A spec over an abstract `Env` map can be stated now; proving the real bodies needs the platform
-   lane.

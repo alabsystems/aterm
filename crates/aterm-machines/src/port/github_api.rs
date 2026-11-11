@@ -51,10 +51,11 @@ fn client(token: &Secret) -> Result<GithubBuilder, String> {
 }
 
 pub(super) fn read(token: &Secret, endpoint: &str) -> Result<GithubResponse, GithubError> {
-    read_with(
-        &client(token).map_err(GithubError::other)?.build(),
-        endpoint,
-    )
+    let mut builder = client(token).map_err(GithubError::other)?;
+    if let Some(dirs) = agh::config::Dirs::from_env() {
+        builder = builder.rate_book(agh::rate::RateBook::at(dirs.rate()));
+    }
+    read_with(&builder.build(), endpoint)
 }
 
 /// What kind of failure agh's classified error is, for a reader that words it for a

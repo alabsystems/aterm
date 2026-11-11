@@ -18,6 +18,8 @@ name = "aterm-census"
 path = "src/main.rs"
 
 [dependencies]
+# Export materialization stages new files without APFS cloning source inodes.
+aterm-tempfile = { workspace = true }
 # Only aterm's own std-only crates, so the censuses still run offline and build
 # in seconds: the regex engine (no dependencies of its own), which runs the
 # export's grep -E rows over decoded test captures (capture-privacy) and the
@@ -39,10 +41,6 @@ aterm-stamp = { workspace = true }
 # SHA-256, which keys the census memo (the code that judges, each file a unit read, and the
 # record's seal, `memo`) and fingerprints a reader's captured inputs (`inputs`).
 aterm-digest = { workspace = true }
-
-[dev-dependencies]
-# The checkout the tests read, named when they run (`manifest_dir`); std-only too.
-aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

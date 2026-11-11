@@ -45,16 +45,49 @@ fn num(n: u32) -> Number {
 fn name(n: u32, nick: Option<&str>) -> RenameTo {
     RenameTo::Name(NameTo {
         num: num(n),
-        nick: nick.map(|nick| Nickname::parse(nick).expect("a nickname")),
+        nick: nick.map(|nick| Nickname::parse(nick).expect("a name")),
     })
 }
 
 fn nick(word: &str) -> RenameTo {
-    RenameTo::Nick(Nickname::parse(word).expect("a nickname"))
+    RenameTo::Nick(Nickname::parse(word).expect("a name"))
 }
 
 #[test]
-fn the_fields_keep_nickname_case_and_an_emptied_field_keeps_what_is_held() {
+fn the_numeric_id_field_distinguishes_zero_from_no_assignment() {
+    let unassigned = read("unnumbered", "Heron");
+    assert_eq!(unassigned.number_text(), "");
+    assert_eq!(
+        rename_to(&typed("0"), &left("Heron"), &unassigned),
+        Ok(name(0, None))
+    );
+    let zero = read("m0", "Heron");
+    assert_eq!(zero.number_text(), "0");
+    assert_eq!(
+        rename_to(&typed("0"), &typed(" blue\t HERON "), &zero),
+        Ok(nick("blue HERON"))
+    );
+    assert!(rename_to(&typed("-1"), &left("Heron"), &zero).is_err());
+}
+
+#[test]
+fn an_automatic_display_name_can_be_saved_in_lowercase() {
+    let (_root, preview) = preview();
+    let held = Held::of_read(&preview);
+    let lower = preview.name().nick.as_str();
+    assert_ne!(held.word, lower);
+    assert_eq!(
+        rename_to(
+            &left(held.number_text()),
+            &Field::at(lower.to_owned(), Some(held.word.clone())),
+            &held
+        ),
+        Ok(nick(lower))
+    );
+}
+
+#[test]
+fn the_fields_keep_name_case_and_an_emptied_field_keeps_what_is_held() {
     let held = read("m184", "Linnet");
     assert_eq!(
         rename_to(&typed("  m86 "), &typed(" Kestrel "), &held),
@@ -81,7 +114,7 @@ fn the_fields_keep_nickname_case_and_an_emptied_field_keeps_what_is_held() {
         assert_eq!(
             rename_to(&number, &typed("Puffin"), &held),
             Ok(nick("Puffin")),
-            "a nickname alone keeps the number: {number:?}"
+            "a name alone keeps the number: {number:?}"
         );
     }
 }
@@ -89,7 +122,7 @@ fn the_fields_keep_nickname_case_and_an_emptied_field_keeps_what_is_held() {
 #[test]
 fn the_fields_refuse_what_is_no_name_and_ask_nothing_of_what_was_left_alone() {
     let held = read("m184", "Linnet");
-    for number in ["m0", "m086", "x", "m1234567"] {
+    for number in ["-1", "m086", "x", "m1234567"] {
         assert!(
             rename_to(&typed(number), &typed("Linnet2"), &held).is_err(),
             "{number:?}"
@@ -115,9 +148,9 @@ fn the_fields_refuse_what_is_no_name_and_ask_nothing_of_what_was_left_alone() {
             "{number:?} {word:?}"
         );
     }
-    // An unnumbered Mac's nickname alone keeps its unnumbered identity.
-    let unnumbered = read("m0", "Linnet");
-    for number in [left("m0"), typed("m0")] {
+    // An unnumbered Mac's name alone keeps its unnumbered identity.
+    let unnumbered = read("unnumbered", "Linnet");
+    for number in [left(""), typed("")] {
         assert_eq!(
             rename_to(&number, &left("Linnet"), &unnumbered),
             Ok(RenameTo::Keep)
@@ -130,24 +163,29 @@ fn the_fields_refuse_what_is_no_name_and_ask_nothing_of_what_was_left_alone() {
     let (_root, preview) = preview();
     let snapshot = Snapshot::read(preview);
     assert_eq!(
-        line(&snapshot, &unnumbered, &left("m0"), &left("Linnet")),
+        line(&snapshot, &unnumbered, &left("unnumbered"), &left("Linnet")),
         Line {
             text: "This Mac has no number yet. Type one, such as m8.".to_owned(),
             renames: true,
         }
     );
     assert_eq!(
-        line(&snapshot, &unnumbered, &left("m0"), &typed("Puffin")),
+        line(
+            &snapshot,
+            &unnumbered,
+            &left("unnumbered"),
+            &typed("Puffin")
+        ),
         Line {
-            text: "This Mac has no number yet; Save makes its nickname Puffin.".to_owned(),
+            text: "This Mac has no number yet; Save makes its name Puffin.".to_owned(),
             renames: true,
         }
     );
     assert_eq!(
         line(
             &Snapshot::Reading,
-            &shown("m0", "Linnet"),
-            &left("m0"),
+            &shown("unnumbered", "Linnet"),
+            &left("unnumbered"),
             &left("Linnet")
         )
         .text,
@@ -157,13 +195,13 @@ fn the_fields_refuse_what_is_no_name_and_ask_nothing_of_what_was_left_alone() {
     assert_eq!(
         line(
             &Snapshot::Reading,
-            &shown("m0", "Linnet"),
-            &left("m0"),
+            &shown("unnumbered", "Linnet"),
+            &left("unnumbered"),
             &typed("Puffin")
         )
         .text,
-        "Save keeps this Mac's number and makes its nickname Puffin.",
-        "nor does a nickname alone"
+        "Save keeps this Mac's number and makes its name Puffin.",
+        "nor does a name alone"
     );
 }
 
@@ -196,7 +234,7 @@ fn each_field_follows_the_read_on_its_own() {
     );
     let mut agrees = left("m7");
     assert!(!agrees.follow("m7"));
-    // A nickname set a moment before lands with the read while the person types a number: the
+    // A name set a moment before lands with the read while the person types a number: the
     // untouched Nickname follows it, so Rename keeps it.
     let mut number = Field::at("m87".to_owned(), Some("m7".to_owned()));
     let mut word = left("Heron");
@@ -204,8 +242,8 @@ fn each_field_follows_the_read_on_its_own() {
     assert!(!number.follow(&fresh.name));
     assert!(word.follow(&fresh.word));
     assert_eq!(rename_to(&number, &word, &fresh), Ok(name(87, None)));
-    // A number set a moment before lands while the person types a nickname: the untouched
-    // Number follows it, so Rename sets the nickname alone.
+    // A number set a moment before lands while the person types a name: the untouched
+    // Number follows it, so Rename sets the name alone.
     let mut number = left("m7");
     let word = Field::at("Puffin".to_owned(), Some("Heron".to_owned()));
     let fresh = read("m87", "Heron");
@@ -240,7 +278,7 @@ fn a_typed_field_is_judged_against_the_read_once_it_lands() {
     assert_eq!(
         rename_to(&left("m90"), &word, &fresh),
         Ok(nick("Heron")),
-        "the outdated nickname typed back is asked for"
+        "the outdated name typed back is asked for"
     );
 }
 
@@ -388,7 +426,7 @@ fn rename_is_unavailable_only_while_the_fields_or_the_read_refuse() {
     assert_eq!(
         line(&unread, &stale, &left("m7"), &left(&word)).text,
         "This Mac's name could not be read here (the books are unread). Type a number or \
-         nickname; Save checks it.",
+         name; Save checks it.",
         "an untouched form says nothing of a view the failed read could not check"
     );
 
@@ -465,7 +503,7 @@ fn a_number_the_vault_could_not_judge_is_left_for_the_set_to_check() {
     );
     assert_eq!(
         line(&snapshot, &held, &left("m7"), &typed("Kestrel")).text,
-        "Save keeps this Mac's number and makes its nickname Kestrel."
+        "Save keeps this Mac's number and makes its name Kestrel."
     );
 }
 
@@ -490,4 +528,65 @@ fn a_read_reaches_only_the_press_that_asked_for_it() {
         "a read after its press ended"
     );
     assert!(slot.is_none());
+}
+
+#[test]
+fn discovery_updates_status_without_rebasing_edits_or_reaching_another_panel() {
+    struct Inert;
+    impl aterm_agent::machine_name::publish::SystemNames for Inert {
+        fn read(&self) -> [Option<String>; 3] {
+            [None, None, None]
+        }
+        fn apply(
+            &self,
+            _: &std::path::Path,
+            _: &std::path::Path,
+            _: &aterm_types::machine_name::GeneratedNames,
+        ) -> Result<(), String> {
+            panic!("discovery cannot publish a name")
+        }
+    }
+    let (root, preview) = preview();
+    let held = Held::of_read(&preview);
+    let status = NamingStatus::read(
+        root.path(),
+        &root.path().join("aterm.toml"),
+        preview.name(),
+        &Inert,
+    )
+    .with_fleet_membership(aterm_agent::machine_name::InFleet::Out);
+    let number = typed("86");
+    let nick = typed("Blue Heron");
+    let mut slot = Some((2, Snapshot::named(preview, status)));
+    let before = request(&slot.as_ref().unwrap().1, &held, &number, &nick).unwrap();
+    assert!(
+        line(&slot.as_ref().unwrap().1, &held, &number, &nick)
+            .text
+            .contains("discovering")
+    );
+    assert!(!keep_discovery(&mut slot, 1, Ok(true)));
+    assert!(keep_discovery(&mut slot, 2, Ok(true)));
+    assert_eq!(
+        request(&slot.as_ref().unwrap().1, &held, &number, &nick).unwrap(),
+        before
+    );
+    assert!(
+        line(&slot.as_ref().unwrap().1, &held, &number, &nick)
+            .text
+            .contains("Available fleets: ALab")
+    );
+    assert!(keep_discovery(&mut slot, 2, Ok(false)));
+    assert!(
+        line(&slot.as_ref().unwrap().1, &held, &number, &nick)
+            .text
+            .contains("none discovered")
+    );
+    assert!(keep_discovery(&mut slot, 2, Err("offline".into())));
+    assert!(
+        line(&slot.as_ref().unwrap().1, &held, &number, &nick)
+            .text
+            .contains("discovery unavailable")
+    );
+    close(&mut slot, 2);
+    assert!(!keep_discovery(&mut slot, 2, Ok(true)));
 }

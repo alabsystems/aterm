@@ -118,7 +118,7 @@ This worklist associates audit contracts with test samples. Its map is a migrati
 record, not a live executable-test census; the title retains the original audit's scope.
 Paths in this file are relative to `crates/aterm-link` unless they start with `crates/` or
 `docs/`. Gap numbers are the rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 ## 0. Notation used in the statements
 
@@ -152,7 +152,7 @@ Paths in this file are relative to `crates/aterm-link` unless they start with `c
   clock, bus, verb-lane, state-dir and entropy seams of `src/fx.rs`. Their effectful shells wait on
   gap 8; their pure cores (classification, routing, commit floor, cursor rules, receipt gate) are
   factored out first.
-- **Gaps** (`blocking_gaps`) are the gap numbers of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+- **Gaps** (`blocking_gaps`) are the gap numbers of `docs/TRUST-LANE.md` (Blocking gaps)
   §7: 1 non-scalar carriers, 2 `&self`/`&mut self` views, 3 E6 body widening, 4 callee-ensures
   composition, 5 quantified clauses, 7 loops, 8 effects, 9 the proc-macro boundary, 10 model→code
   refinement, 11 generics, 12 cross-crate theorem citation, 13 threads, async and closures. Gap 0 (a
@@ -322,60 +322,6 @@ mesh-one-writer	invariant	bridge::Bridge::{attach_broker, next_seq, publish_at},
 mesh-topics-to-holders	invariant	bridge::Bridge::say_held_topics, federate::{topics_face, topics_body, topics_of, plan, Lane::Say, say_group}, aterm_mesh::presence::{PresenceRow::{encode, decode}, row_topics}, aterm_mesh::Mesh::holders, aterm_mesh::mail::{held_topics, MailLinks::pass}	∀ execution with the mesh on (§11 C3): M's bridge writes the set of topics its sessions hold on /f/alab/pub/<M>/node/topics when an attach starts and whenever the set changes, and at no other time; M's node service names the newest such set in M's presence row (each topic in its grammar, in order, once, at most TOPICS_MAX; a reader refuses any other list, RowError::Topic). Every Mac N ≠ M whose newest row of M names a topic counts M a holder (never itself), and runs one push of its own topic broadcasts (/f/alab/pub/<N>/*/say/>) to each holder that is a member, following say_group(N, M), committed past a broadcast only once M's log acknowledged it; a Mac whose row names none, or that is no member, gets no push and holds none of N's broadcasts.	src/bridge_federate_tests.rs::the_bridge_names_the_topics_its_sessions_hold_on_its_nodes_face, src/federate_tests.rs::a_topic_broadcast_goes_one_hop_to_the_macs_that_hold_a_topic, src/federate_tests.rs::a_topics_face_reads_back_as_the_topics_it_names, src/federate_tests.rs::the_plan_pushes_only_to_members_this_mac_wrote_to, crates/aterm-mesh/src/presence.rs::a_rows_topics_are_written_in_order_and_read_strictly, crates/aterm-mesh/src/tests/presence.rs::a_mac_whose_row_names_a_topic_is_a_holder_on_the_others, crates/aterm-mesh/src/tests/bus.rs::held_topics_are_what_this_macs_newest_topics_record_names	threads, astream federation mirror mode, cross-crate presence rows and mesh links	1,2,3,5,7,8,12,13
 mesh-fleet-wide-halts	invariant	halt::{Ask::{parse, render}, Said::{parse, render}, Halts::{apply, lift_here, lift_gone, due, carry, render, parse}, carried_id, fresh_id}, bridge::Bridge::{take_halt_ask, said_ask, say_unsaid_asks, say_halt, take_halt_record, apply_said, answer_halt, halt_owed_now, resay_due_halts, refresh_halt_gone, attach_mesh_halts, move_old_halts, read_old_halt_rows, retire_old_halt_rows, standing_reason}, federate::{halt_lanes, Lane::Halts, RoutesConfig::seats, seal_as_node, peer_ring, Handoff::gone}, subject::{halt_ask, parse_halt_ask, halt_subject, parse_halt_origin}, person::{parse, mesh_halt, lift}, aterm_mesh::mail::{handoff_of, MailLinks::pass}	∀ execution with the mesh on (§11 C4) over Macs M_1..M_k: a halt is a record on /f/alab/halt/<M>, which only M's bridge writes (its node ring's rw,p=M:/f/alab/halt/M), sealed with M's node key, naming a halt id, the person who asked it and on|off; it is said only for a request on /f/alab/fleet/<h>/halts, which only person h's ring writes (an a- ring writes no fleet/ subject), and a record naming any principal but an h- person applies to nothing. Each Mac relays every halt record its bus.log holds to every other member (relay mode, origin-checked by the destination against the members' keys; a record the destination does not take yet is held while this Mac's log seats its origin), and a Mac the log took out relays none, so with each pair of members connected through Macs that host a bus.log every member's bridge applies every member's halt, whatever links the overlay holds. A Mac says each halt it said again every RESAY_MS (under bus.log's seven days) while it stands here or was lifted here alone, and within OFF_RESAY_SPAN_MS of the lift each halt-off its person asked and that of each of its halts lifted for every Mac, so a Mac away while a record went round hears it when back; a Mac that lifted a halt for every Mac answers its origin saying the halt again under a newer stamp (the origin's clock) with the halt-off, at most every RESAY_MS. While the log has it in, a Mac holding another Mac's halt whose newest saying is STALE_MS (RESAY_MS and a day) old asks for it on its halt subject (state=ask, which no request asks and which raises, lifts and keeps nothing where it is heard), again every RESAY_MS while it stands, and a Mac that lifted that halt for every Mac answers the ask with the halt-off, at most every RESAY_MS, so a halt-off reaches a Mac back from however long away, every log having given it up, once a Mac that lifted the halt is up. A request or record that cannot be said with the link up waits on a back-off (one minute doubling to an hour), the bridge attached. A Mac's bridge holds its sessions iff some applied halt stands; a halt-off lifts exactly the id it names, from any current member's person, on every Mac, or with scope=here on its own Mac alone, said to no other, and a halt-off for every Mac after it is still said; an id lifted here is kept among the last LIFTED_MAX lifted, never dropped by age, and never stands again, whatever order, how late or how often its records come, so a replayed halt-off lifts no later halt. Every halt whose origin the membership log removed, or whose key a Node record retired (the hand-off's gone lines, which name no member; a removed Mac's own hand-off names it gone), lifts on every Mac, the removed one included, once, and nothing such an origin said applies on another Mac; a removed Mac's person still halts that Mac alone. A Mac whose log's newest /f/<F>/fleet/<h>/halt row says on before the upgrade (or, with no row kept, whose bridge held one) carries it, once, under carried_id(node, F, h), keeps the move, says it on its halt subject and only then retires the old rows; one withdrawn on the log while the bridge was down is not carried, so the halt stands after the upgrade and a halt-off naming that id lifts it; with the mesh off nothing of this runs.	src/bridge_halt_tests.rs::an_agent_cannot_halt, src/bridge_halt_tests.rs::a_replayed_halt_off_does_not_lift_a_later_halt, src/bridge_halt_tests.rs::a_halt_off_lifts_on_every_mac, src/bridge_halt_tests.rs::a_halt_off_from_another_members_person_lifts_it, src/bridge_halt_tests.rs::removing_or_rotating_the_origin_lifts_its_halts_on_every_mac, src/bridge_halt_tests.rs::a_halt_under_the_old_subject_holds_after_the_upgrade_and_its_id_lifts_it, src/bridge_halt_tests.rs::a_halt_off_here_lifts_it_on_that_mac_alone, src/bridge_halt_tests.rs::a_mac_that_lifted_a_halt_for_every_mac_answers_its_origin_saying_it_again, src/bridge_halt_tests.rs::a_halt_off_reaches_a_mac_back_from_however_long_away, src/bridge_halt_tests.rs::a_mac_says_its_halt_and_its_halt_off_again_on_their_clock, src/bridge_halt_tests.rs::a_relay_holds_a_halt_the_far_end_does_not_take_yet, src/bridge_halt_tests.rs::a_request_that_cannot_be_said_waits_and_the_bridge_stays_attached, src/halt_tests.rs::an_agents_record_halts_nothing, src/halt_tests.rs::a_replayed_halt_off_does_not_lift_a_later_halt, src/halt_tests.rs::a_halt_off_from_another_members_person_lifts_it, src/halt_tests.rs::a_gone_origins_halts_lift_and_what_it_said_is_refused, src/halt_tests.rs::a_lifted_id_is_never_raised_again_in_any_order, src/halt_tests.rs::a_halt_off_after_a_lift_here_lifts_it_for_every_mac, src/halt_tests.rs::a_halt_said_again_after_a_lift_for_every_mac_is_answered, src/halt_tests.rs::a_mac_says_its_records_again_after_resay_ms_and_its_offs_within_the_span, src/halt_tests.rs::a_stale_halt_is_asked_about_and_a_mac_that_lifted_it_answers, src/halt_tests.rs::a_halt_said_again_is_told_apart_on_its_origins_clock, src/halt_tests.rs::a_mac_the_log_took_out_lifts_its_own_halts_once, src/halt_tests.rs::the_origin_says_again_its_halts_lifted_here_and_the_halt_offs_of_its_halts, src/halt_tests.rs::the_newest_standing_halt_names_the_reason, src/halt_tests.rs::the_state_file_round_trips_and_a_damaged_line_costs_only_itself, src/halt_tests.rs::requests_and_records_read_back_and_malformed_ones_are_nothing, src/halt_tests.rs::a_carried_id_is_stable_and_distinct, src/halt_tests.rs::the_halt_subjects_name_a_person_and_a_node, src/federate_tests.rs::the_halts_go_to_every_member_but_this_mac, crates/aterm-mesh/src/mail.rs::the_hand_off_names_each_removed_and_rotated_node_gone_and_no_member, crates/aterm-mesh/src/mail.rs::a_removed_mac_names_itself_gone	threads, astream federation relay mode and origin signatures, durable state files, cross-crate hand-off and membership standings	1,2,3,5,7,8,12,13
 ```
-
-### Distribution by kind (156)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 113 | trust-of-address, render-safe-one-line, parse-in-positional, parse-halt-human-row, glance-row-shape, glance-fields-bounded, presence-phase-closed-set, presence-tokens-shape, presence-clamp-and-meta, presence-slot-due, ctl-request-refuses-misframing, ctl-reply-framing, ctl-adopt-checks-socket, bridge-lanes-cloexec, secret-file-private, describe-names-path-once, reconnect-backoff, debug-redacts-secrets, connect-deadline-both-directions, parse-lifetime, node-id-shape, label-from-root-cksum, plist-location, toml-config-edit, config-write-through-link-under-lock, write-atomic-no-follow, rendezvous-fill-defaults, argv-safe-word, undo-command, running-bridge, supervisor-last-word, instance-token-read-per-connection, retire-refusal-and-ghosts, retired-body, fabric-cli-grammar, bridge-command-parse, bridge-list, launchctl-and-lsof-parsing, listener-pid, replaced-build-detection, fill-inbox-counts, last-hold-of-timeline, traffic-classification, clock-and-age-format, warnings-iff-unhealthy, overdue-asks, join-sessions-and-nodes, report-render-no-body, refused-retire-event, readable-faces, tail-faces-offset-order, broker-probe-classification, fleet-halts-read, exe-replacement-settled, ls-row-columns, token-file-no-follow, notify-selector-spelling, notify-selector-hit, notify-one-line, notify-rate-flag, notify-budget-window, notify-journal, notify-argv, notify-handoff-rendezvous, person-argv, person-of-cap-files, person-halt-gate, person-inbox-snapshot-commit, log-replaced-judge, state-bounded-tables, state-durable-reservations, forget-log-offsets, bridge-lock-exclusive, mailbox-priority-order, mailbox-flow-control, mailbox-wakeup, expired-span-text, incarnation-adoption, presence-mark, forged-self-window, deliver-verdict-tokens, via-chain-bounds, link-report-on-change, link-reason-token, halt-reason-token, encode-bounded, fetched-lines-chunking, outbox-drain-parse, bridge-roster-parse, status-batch-rows, status-batch-no-fanout, say-frontier-checkpoint, carried-elsewhere, hostname-token, fleet-halt-newest-wins, inbox-seen-floor, receipt-gate, receipt-lane, fetch-at-offset, silent-subscription-closes, deadline-expiry, status-doctor-cli, broker-poison-exit, broker-health-facts, torn-state-set-aside, bridge-standby-wakes-on-release, roster-count-look, bus-log-at-rest, cap-file-private, presence-gen-without-a-screen-read, wait-tally, mesh-routing-fails-closed, person-post-sealed |
-| invariant | 21 | ctl-loss-latch, notify-cursor-per-log, state-monotone-watermarks, mailbox-generation-fence, per-sid-maps-pruned, halt-kept-across-logs, publication-exactly-once, log-identity-isolation, fleet-halt-barrier, inbox-delivery-accounting, broadcast-topic-delivery, attribution-routing-trust, subject-budget, node-identity-and-lifecycle, presence-row-content, notify-need-rise, fabric-brief-derived-close, mesh-mail-one-hop, mesh-one-writer, mesh-topics-to-holders, mesh-fleet-wide-halts |
-| round-trip | 6 | body-encode-decode-roundtrip, presence-mode-spelling, broker-job-text, rendezvous-roundtrip, json-string-escape, state-record-codecs |
-| refinement | 10 | notify-exactly-once-execution, wait-ack-answers, say-replay-fair-budget, reconnect-wait-refines-backoff-model, idle-deadline-arm, topic-sampling-refines-announcement-model, provisioning-transactional, incarnation-lease, reader-resume, bridge-round-exactly-once |
-| table-property | 2 | node-and-person-grants, fix-for-every-warning |
-| property | 1 | fabric-simulation |
-| no-panic | 1 | body-decode-total-closed |
-| equivalence | 2 | toml-readers, sim-broker-differential |
-
-### Blocking-gap histogram
-
-How many of the 156 specs each gap blocks. A spec is counted once per gap it lists. Gap 0 blocks
-all of them.
-
-| gap | specs blocked |
-|---|---|
-| 0 | 156 (all) |
-| 1 | 128 |
-| 2 | 61 |
-| 3 | 131 |
-| 4 | 20 |
-| 5 | 98 |
-| 7 | 95 |
-| 8 | 85 |
-| 9 | 3 |
-| 10 | 18 |
-| 11 | 13 |
-| 12 | 70 |
-| 13 | 36 |
-
-### Proof dependency order
-
-Pure codecs and guards (`body-*`, `render-*`, `parse-in-positional`, `parse-halt-human-row`,
-`glance-*`, `presence-*`, `state-record-codecs`, `parse-lifetime`,
-`expired-span-text`, `encode-bounded`, `forged-self-window`, `incarnation-adoption`,
-`deliver-verdict-tokens`, `link-*`, `notify-one-line`, `notify-selector-*`) → `mailbox-*`
-(`Queues` is pure behind the `Mutex`) → parsers over larger grammars (`ctl-reply-framing`,
-`status-batch-rows`, `bridge-roster-parse`, `outbox-drain-parse`, `fetched-lines-chunking`,
-`toml-config-edit`, `fabric-cli-grammar`) → report functions (`warnings-iff-unhealthy`,
-`overdue-asks`, `join-sessions-and-nodes`) → the pure cores of the receipt and halt rules
-(`receipt-gate`, `receipt-lane`, `log-replaced-judge`, `halt-kept-across-logs`,
-`fleet-halt-newest-wins`) → model refinements (`say-replay-fair-budget`,
-`reconnect-wait-refines-backoff-model`, `idle-deadline-arm`,
-`topic-sampling-refines-announcement-model`) → protocol invariants
-(`publication-exactly-once`, `log-identity-isolation`, `fleet-halt-barrier`,
-`inbox-delivery-accounting`, `broadcast-topic-delivery`, `attribution-routing-trust`,
-`deadline-expiry`, `subject-budget`, `node-identity-and-lifecycle`, `presence-row-content`,
-`notify-exactly-once-execution`, `provisioning-transactional`, `wait-ack-answers`) →
-whole-CLI contracts (`status-doctor-cli`).
 
 ### Merges made when combining the two recovery passes
 
@@ -1145,14 +1091,6 @@ crates/aterm-mesh/src/mail.rs	the_hand_off_names_each_removed_and_rotated_node_g
 crates/aterm-mesh/src/mail.rs	a_removed_mac_names_itself_gone	mesh-fleet-wide-halts	
 ```
 
-## 3. Coverage
-
-§2 does not map every test in the crate. The protocol specs (`attribution-routing-trust`,
-`provisioning-transactional`, `node-identity-and-lifecycle`, `inbox-delivery-accounting`,
-`broadcast-topic-delivery`, `notify-exactly-once-execution`, `publication-exactly-once`,
-`fleet-halt-barrier`) and `status-doctor-cli` are the primary spec of most world tests and come last
-in the proof order, so most of the world suite stays until gaps 8, 10 and 13 close.
-
 ## 4. Tests that are not spec samples
 
 | test | why | action |
@@ -1201,36 +1139,3 @@ in the proof order, so most of the world suite stays until gaps 8, 10 and 13 clo
 9. **Resolved — explicit three-way `UncertainJournal` enum.** `assert_uncertain_in_flight_waits`
     in `bridge.rs` now dispatches exhaustively over `UncertainJournal::{Listing, Entry, Damaged}`
     instead of string fallback branches.
-
-## 6. Proof order
-
-None of the 139 specs is blocked by gap 0 alone. Every one needs at least a non-scalar carrier
-(gap 1), a `&self` view (gap 2) or E6 widening (gap 3). The cheapest ones need only gaps 1 and 3, or
-2 and 3, with no effects, loops or cross-crate calls (`forged-self-window` adds gap 11 for `BTreeSet<u64>`):
-
-1. **`incarnation-adoption`** (`adoptable`, `presence_inc`, `next_incarnation`).
-   `next_incarnation` is `u64` arithmetic with `checked_add`, `max` and a bound, an
-   `omega`-class proof once E6 admits `checked_add`/`max` (gap 3). `adoptable` is an
-   `Option<u64>` match (gap 1, `Option` carrier). It retires 2 tests, and it is the arithmetic
-   that keeps an attach inside the will space, which `node-identity-and-lifecycle` relies on.
-2. **`log-replaced-judge`** (`LogWitness::replaced_by`, `Bridge::judge_log`).
-   `replaced_by` is a `u64` compare plus an `Option<LogIdentity>` equality (gaps 1 and 3).
-   `judge_log` adds one `&self` read (gap 2). It is the primary spec of 2 tests (one unit, one world) and is the
-   decision every log-switch clause of `log-identity-isolation`, `halt-kept-across-logs` and
-   `receipt-gate` (23 tests between them) is conditioned on.
-3. **`trust-of-address`** together with **`expired-span-text`** and **`forged-self-window`**.
-   - `trust_of` is a `starts_with` on `&str` returning a `&'static str`.
-   - `span_of` is `u64` div/mod into `format!`.
-   - `forged_self` is a `BTreeSet` membership plus `first()`.
-
-   Each is a first test of the `&str`/`String`/`BTreeSet` carriers (gap 1) on a body small
-   enough for E6. `trust_of` is the security label every delivered record carries
-   (`attribution-routing-trust`, `traffic-classification`).
-
-Runner-up: **`notify-rate-flag`** (§5.1). It is a small parser with one checked multiplication,
-total and panic-free now that `checked_mul` is in place.
-
-After those come the pure string codecs with the most tests behind them: `render-safe-one-line`
-(3), `body-encode-decode-roundtrip` (4), `glance-fields-bounded` (4), `state-record-codecs` (6) and
-`ctl-reply-framing` (4). Each needs gaps 1, 3, 5 and 7 (carriers, widening, quantifiers, loops) and
-mostly gap 12 for the shared grammar. Closing gap 1 plus gap 7 unblocks most of this tier at once.

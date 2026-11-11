@@ -42,15 +42,5 @@ pub(crate) fn push_hex4(out: &mut String, v: u16) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn push_hex4_matches_format() {
-        for v in [0u16, 1, 0xf, 0x10, 0xabc, 0x1234, 0xffff] {
-            let mut s = String::new();
-            push_hex4(&mut s, v);
-            assert_eq!(s, format!("{v:04x}"));
-        }
-    }
-}
+#[path = "trust_fmt_tests.rs"]
+mod tests;

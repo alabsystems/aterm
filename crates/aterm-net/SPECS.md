@@ -3,43 +3,6 @@
 
 # aterm-net: spec recovery from its unit tests
 
-> Status 2026-10-16: this is `aterm-net`'s migration worklist. Each of the 12 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted. The one test in §4 that samples no spec was rewritten on 2026-10-27 as a one-minute hang
-> detector. No test has been deleted yet.
->
-> Since the recovery pass (2026-10-16, the merge of the sessions-as-subagents work): the network
-> drive left this crate (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §7) — `drive.rs` with
-> its dial, launch-nonce pin, roster and probe, and `lib.rs`'s capability handshake
-> (`channel_bind`, `present_capability`, `verify_capability`, `RemoteEndpoint`). Thirteen specs
-> went with them (`channel-bind-verify`, `auth-line-roundtrip`, `read-line-bounded`,
-> `capability-handshake`, `endpoint-matches`, `roster-nonce`, `observe-launch-nonce`,
-> `dial-pin-gate-fail-closed`, `dial-wire-order`, `listener-dial-after-grant`,
-> `unauth-outcome-classification`, `serve-event-trail`, `connect-probe`), and their tests with
-> them. The listener slots and the handshake watchdog moved to `slots.rs`, shared by the fleet
-> listener (`fleet.rs::serve`), and their tests to `slots.rs` and `fleet.rs`; the specs below
-> name them there. The rest of `fleet.rs` and `fleet_member.rs` is newer than the pass and has no
-> specs here yet, but for the issuer's book (`fleet-book`, added with it: S11 of the owner-surfaces
-> design, 2026-10-16; every member's book since F17 of the fluid-swarm design), whose six tests
-> are in §2. The drive's half-close relay, `tls::relay`, went
-> after it, with its one test of its own
-> (`graceful_local_eof_half_closes_without_killing_the_request_direction`): the fleet's
-> `tls::relay_answers` is the one relay, and `relay-duplex-fidelity` is restated for it, its other
-> tests moved onto it.
-
-> Status 2026-11-07: `listener-readiness` names `aterm_uds::deadline::poll_timeout_ms` where it named
-> `slots.rs::poll_timeout_millis`: 29350f128b moved that conversion to `aterm_uds`, and 6acb6aeb5f
-> folded it into `deadline::poll_timeout_ms`, the one poll timeout both listener arms call.
-
-> Status 2026-11-07, the qualified-path pass: §0's pure-core note named
-> `slots.rs::poll_timeout_millis_parts` and `poll_timeout_millis`, both gone from this crate since
-> 29350f128b, which dropped the parts core and moved the conversion to `aterm_uds` (6acb6aeb5f then
-> folded it into `deadline::poll_timeout_ms`); it now says the poll timeout is
-> `aterm_uds::deadline::poll_timeout_ms`, over a `Duration`, with no integer core here, and keeps its
-> `source_of` clause. §2 drops `slots::poll_timeout_millis_rounds_up_and_saturates`, which went with
-> the parts core (the row cites aterm-uds's two `poll_timeout_ms` tests), and §6's first step proves
-> `poll_timeout_ms` where it lives.
-
 Source: `crates/aterm-net` (read only). The pass read every `#[test]` (`src/lib.rs` 4, `src/tls.rs` 8,
 `src/drive.rs` 29 = 41), plus the production code each one reaches. Nothing was compiled or run.
 The claims below come from reading the code.
@@ -83,7 +46,7 @@ Result: **12 specs**, covering **26 mapped spec-sample tests** in §2 (plus **1 
 (`tls::`, `slots::`, `fleet::` = `src/{tls,slots,fleet}.rs`, `fleet_member::` =
 `src/fleet_member_tests.rs`; secondary tests are in §2). `difficulty` is what the proof must
 handle. `blocking gaps` are the rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7; gap 0 (a seal that publishes Clean rows)
+`docs/TRUST-LANE.md` (Blocking gaps); gap 0 (a seal that publishes Clean rows)
 blocks every row.
 
 ```tsv
@@ -101,45 +64,6 @@ pinned-cert-verifier	contract	tls.rs::PinnedServerVerifier::verify_server_cert, 
 fleet-book	contract	fleet_member.rs::{serve_book,fetch_book,judge,copies_of,with_copies,merge_book,read_issuer_book,holds_issuer_book,HeldBook::keep_issuer_book,read_peers}	serve_book(s, dir, node) writes one answer, whether or not dir holds CODE_FILE (F17: every member shares its book): when node() = Ok(n) with is_node_id(n) and read_peers(dir) = Ok(b), "OK k node=n" (then " more=m" when it holds a fleet seed) then the k first entries of F, one Peer::line each, k ≤ PEERS_MAX being the most whose lines leave TRAILER_MAX of REPLY_MAX free, then m ≤ TRAILER_LINES_MAX trailer lines within TRAILER_MAX, the seed's words (book_reply), F being the member's own signed entry when serve_book_at is given one naming n, then the entries of b with via ∈ {Joined, Manual, Issuer} naming no node n, in b's order, an Issuer entry served as Joined; otherwise "ERR BOOK_NOT_NOW [node=n ]why", node= present iff node() gave a node id. An ERR BOOK_NONE comes only from an aterm before 0.146 that holds no code. fetch_book(t, …) = Ok(book) only for an OK head whose node= is t.node when t.node is Some, book.peers being the first-hand lines that parse among the k after the head, book.seed the one seed among the m after them (none of two; up to TRAILER_READ_MAX read); an ERR head gives NoBook (word BOOK_NONE) or NotNow (any other word), each with the answering address and the node it named; a NO op handshake gives Older(address). judge(r, found, want, may_ask): Refused(x) iff r = Err(x), x ∈ {Older, NoBook} and x is the issuer's (its node = want, or it named none and came from found); Kept for NotNow from the issuer, OtherNode, Unreached, and any refusal not the issuer's unless may_ask ∧ found = Some(a) ∧ a ≠ its address, which gives AskAt(a); Book(b) iff r = Ok(b). copies_of(book, own): every element has via = IssuerBook, none has node own or book.node, pairwise distinct by node, none that names no node at the Peer::same_place of an element before it, at most PEERS_MAX, in book.peers' order. with_copies(b, c): b is a prefix of the result, each appended element is from c in order, shares no node with an element before it and, when it names no node, no place (Peer::same_place) with one, and the result is at most max(|b|, PEERS_MAX) long. merge_book(b, f, own) = with_copies(b without IssuerBook entries, copies_of(f, own)). read_issuer_book(dir, n) after keep_issuer_book(Some((n, c))) of a HeldBook of dir = the IssuerBook elements of c, at most PEERS_MAX; = [] when the file's head names another node, a later line is no IssuerBook peer, or the file is missing or not private. read_peers never returns an IssuerBook entry. holds_issuer_book(dir, n) ⇔ dir holds ISSUER_BOOK_FILE, private, whose first line is the head naming n, however few copies follow (an empty copy is a book that came).	fleet_member::every_member_serves_its_book_with_or_without_a_code, fleet_member::a_merge_replaces_the_copy_whole_dedupes_and_is_bounded, fleet_member::a_copy_of_the_issuers_book_yields_to_the_machines_own_entries, fleet_member::a_copy_is_read_only_beside_the_issuer_it_came_from, fleet_member::a_machine_at_the_issuers_old_address_never_speaks_for_the_issuer (its judge half), fleet_member::an_issuer_that_cannot_share_its_book_now_leaves_the_copy (its judge half)	Vec/String/Option/enum carriers (Peer, Book, BookUnread), iterator chains with closures, an io::Write sink, std::fs through read_private/write_private (effects); the judge half of the two read_whole tests stands on a TLS dial and the issuer seat's threads, which stay tests	0, 1, 3, 5, 7, 8, 13
 tls-exporter-agreement	contract	tls.rs::{accept,connect,server_config,client_config,init_crypto}, tls.rs::TlsTransport::exporter	accept and connect each return Ok only after the handshake completed (while is_handshaking { complete_io }) under TLS 1.3 only, and then set exporter = export_keying_material(EXPORTER_LEN bytes, EXPORTER_LABEL, context None) of their own connection. By the RFC 5705 axiom (rustls, trusted) the two ends of one session get equal exporters, and different sessions get different ones with overwhelming probability. |exporter()| = EXPORTER_LEN is given by the [u8; EXPORTER_LEN] type and needs no proof.	tls::tls_handshake_exporters_match	rustls ServerConnection/ClientConnection calls taken as axioms, Arc configs, a loop over complete_io on a TcpStream, a fixed-size array result, std::sync::Once	0, 7, 8, 12
 ```
-
-### Distribution by kind (12)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 8 | hex-decode-bounded, poll-timeout-ceil, listener-readiness, pick-displaced-rule, source-of-slash64, pinned-cert-verifier, fleet-book, tls-exporter-agreement |
-| refinement | 2 | serve-slots-refine-net-slot-displacement, relay-duplex-fidelity |
-| invariant | 1 | watchdog-claim-exactly-once |
-| other (temporal) | 1 | watchdog-deadline-safety-and-liveness |
-
-### Gap histogram (specs blocked by each gap)
-
-| gap | specs | |
-|---|---|---|
-| 0 | 12 | installed seal publishes no Clean row |
-| 1 | 6 | non-scalar carriers |
-| 2 | 4 | certified &self/&mut self views |
-| 3 | 6 | E6 body widening |
-| 4 | 1 | callee-ensures composition |
-| 5 | 3 | quantified clauses |
-| 7 | 7 | loops |
-| 8 | 8 | effects |
-| 10 | 4 | model→code refinement |
-| 11 | 2 | generics |
-| 12 | 4 | cross-crate citation |
-| 13 | 6 | threads, closures |
-
-No spec is blocked by gap 0 alone. The nearest are `poll-timeout-ceil` (0, 3) and `source-of-slash64`
-(0, 1, 3, 12). With the `u128` pure-core refactor in §0, `source-of-slash64` also drops gap 1 and needs only
-gap 3 (`&`/`!` on `u128`), plus gap 12 for citing std's `to_canonical`.
-
-### Proof dependency order
-
-`poll-timeout-ceil`, `source-of-slash64`, `hex-decode-bounded` → `tls-exporter-agreement`,
-`pinned-cert-verifier` (with trusted rustls/SHA-256 axioms) → `pick-displaced-rule` (pure core) →
-`watchdog-claim-exactly-once` → `watchdog-deadline-safety-and-liveness` →
-`serve-slots-refine-net-slot-displacement`, `listener-readiness` → `relay-duplex-fidelity` (last: three
-threads plus a rustls record-layer model). `fleet-book` stands apart: its pure halves (`copies_of`,
-`with_copies`, `judge`) first, then `serve_book` and the copy's file with the effects gap.
 
 ## 2. Test → spec map (TSV)
 
@@ -179,11 +103,6 @@ src/fleet_member_tests.rs	a_machine_at_the_issuers_old_address_never_speaks_for_
 src/fleet_member_tests.rs	an_issuer_that_cannot_share_its_book_now_leaves_the_copy	fleet-book	(its read_whole half stays a test)
 ```
 
-## 3. Coverage
-
-- §2 maps 29 tests (28 spec samples across the 12 specs in §1 + 1 non-spec hang detector in §4);
-  the crate currently holds 407 `#[test]` functions including newer `fleet` and `fleet_member` suites.
-
 ## 4. Tests that are not spec samples
 
 | test | why | action |
@@ -196,9 +115,6 @@ instance of one of the general specs above.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **(Fixed 2026-10-28.) Mislabelled test.** `tls::tls_handshake_exporters_match_and_a_wrong_pin_is_rejected`
-   is renamed to `tls::tls_handshake_exporters_match` and its tautological `[u8; 32]` length assertion is
-   removed; wrong-pin rejection lives in `tls::a_wrong_fingerprint_pin_rejects_the_handshake`.
 2. **(Fixed.) Tests on hosts without dual-stack loopback call `could_not_run`.**
    `slots::tests::dual_stack_listener` calls `aterm_spec::host::could_not_run` (rather than returning
    early after an `eprintln!`) when `[::]` cannot bind dual-stack, 127.0.0.1 or ::1 cannot reach it, or
@@ -210,33 +126,3 @@ instance of one of the general specs above.
    reaches upstream" rests on rustls dropping application data written after the client's own
    `send_close_notify`, not on `tls::relay_answers`. The relay half (no peer bytes after
    close_notify are delivered) needs the rustls record-layer axiom.
-4. **(Fixed 2026-10-28.) A test understated its spec.**
-   `slots::spurious_wakes_neither_shorten_nor_starve_the_watchdog_deadline` now asserts
-   `closed_after >= DEADLINE` (`1.0·DEADLINE`, matching `watchdog-deadline-safety-and-liveness`).
-5. **(Fixed 2026-10-28.) A timing lower bound on the OS timer, and platforms that disagreed.**
-   `slots::idle_listener_readiness_wait_is_bounded_without_spinning` no longer asserts an OS-timer lower
-   bound; `slots::poll_timeout_millis_rounds_up_and_saturates` directly samples `poll_timeout_millis_parts`,
-   and the Windows `wait_listener_readable` arm now loops on `Interrupted` with recomputed remaining time
-   just like the Unix arm (`listener-readiness`).
-6. **(Fixed 2026-10-28.) Model-only assertions inside a code test.** In
-   `tls::relay_round_trips_guarded_artifact_ack_before_request_half_close`, `assert_tls_buffered_relay_conformance`
-   now projects the observed pre-buffered plaintext count (`io.plaintext_bytes_to_read()`) and local service
-   receipt onto `tls_buffered_relay_model` transitions (`DrainBuffered` → `ServiceRecv` → `Done`) via
-   `validate_transition_tiered`.
-
-## 6. Proof order
-
-No row is blocked by gap 0 alone; the order prefers the fewest and smallest gaps.
-
-1. **`poll-timeout-ceil`**, in aterm-uds, where `deadline::poll_timeout_ms` is one `div_ceil` over
-   `Duration::as_nanos` and one `try_from` clamp: an `omega`-class proof needing only gap 3. It retires no
-   test here, but it is the "never a busy zero poll, never an infinite −1" half of `listener-readiness`.
-2. **`source-of-slash64`**, on a `u128` core plus the `to_canonical` case split. Bitwise `&`/`!` on
-   `u128` and one enum match (gap 3; gap 12 only for citing std's `to_canonical`). It retires
-   `slots::an_address_is_an_ipv4_address_or_an_ipv6_slash_64` and is the address lemma under
-   `pick-displaced-rule`.
-3. **`hex-decode-bounded`**. `hex_decode` is written for the Trust verifier and is already under the
-   crate's floor; it is the lemma under the fleet's proof-tag and key-file reads.
-4. **`pick-displaced-rule`**. A pure function over a slice, but it needs iterator chains and closures
-   (gaps 1, 3, 5, 7, 13). It retires 3 tests, two of them socket-and-thread tests that need dual-stack
-   loopback (§5.2).

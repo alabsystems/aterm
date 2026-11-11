@@ -3,25 +3,6 @@
 
 # aterm-lab: spec recovery from its unit tests
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 69 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes
-> are deleted. A test is deleted only when its primary spec and every spec in its `also` column
-> (§2) are Certified. No test has been deleted yet on a proof (Gemini CLI's composer test went
-> with the code it tested on 2026-10-24, §7). §7 adds the 21 tests of the agy lab and its
-> selftests (21 specs); 29 older tests are still unread (§7, last list).
->
-> 2026-10-16: `codex-captures` and its one spec (`codex-slash-login-verdict`) went with aterm's Codex
-> screen reader, which the captures fed; the counts below are the recovery's.
->
-> 2026-11-01: `link_notice` (held by `link_notice.rs::a_refused_link_is_told_once`,
-> `the_scratch_reads_tell_each_link_they_refuse_once` and `a_lab_a_test_started_tells_nothing`,
-> not yet a row): `sys::scratch_file`, `scratch_dir`, `scratch_remove` and `open_parent` hand a
-> path `O_NOFOLLOW_ANY` refused with `ELOOP` to `link_notice::refused`, and `scratch_dir` each link
-> its listing leaves out; armed by the lab's own verbs in an aterm session that no Cargo test
-> binary started (the lab's executable or an ancestor's), it tells the instance hosting it one
-> `appnotice proc lab refused <path>: …` line per path, within 2 s; unarmed (every test, and a lab
-> a test started), nothing.
-
 Source: `crates/aterm-lab` (read only). I read every `#[test]` (codex.rs 5, codex_proof.rs 1,
 door.rs 2, footers.rs 4, jail.rs 4, lab.rs 3, nudge.rs 6, paths.rs 3, probe.rs 3, procs.rs 3,
 protected.rs 1, pyjson.rs 3, record.rs 1, recorder.rs 1, relay.rs 1, restore.rs 1, run.rs 2,
@@ -55,7 +36,7 @@ about effects (fs, processes, sandbox profiles, sockets, local time) and wait on
   `(Kind ∈ {Prefix, Subpath, Literal}, path)`. `R(x)` = `fs::canonicalize(x)`.
 - **Fs model** = an abstract file system (inodes, link kinds, nlink, uid, mode, mtime).
   **Process model** = a kernel process table with exit events and reaping.
-- `blocking_gaps` are rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7:
+- `blocking_gaps` are rows of `docs/TRUST-LANE.md` (Blocking gaps):
   1 non-scalar carriers, 2 `&self`/`&mut` views, 3 E6 body widening, 5 quantified clauses,
   6 plain-Rust clause publication, 7 loops/iterators, 8 effects, 10 model refinement, 11 generics,
   12 cross-crate citation, 13 threads/closures/higher-order. Gap 0 (the seal) blocks every row; the
@@ -147,49 +128,6 @@ definition lives once, in `screen-idle-status`, and the footers row states only 
 regex equivalence. `kv` is defined once (`screen-kv-field`) and cited by `nudge-parse-resizes`.
 `stub-auth-label` is the one statement of the credential-label rule; `codex-auth-json-lab-jwt`
 composes it instead of restating it.
-
-### Distribution by kind (70)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 57 | every id not listed below |
-| refinement | 6 | launcher-argv, pyjson-dumps-refines-python, pyjson-py-float, stub-served-refines-handlers, util-utc-stamp, util-py-repr |
-| round-trip | 5 | codex-auth-json-lab-jwt, probe-op-codec-roundtrip, run-env-sh-roundtrip, util-shell-quote-unquote-roundtrip, util-b64url-roundtrip |
-| equivalence | 1 | footers-done-row-pattern |
-| table-property | 1 | probe-judge-table |
-
-### Gap histogram (specs blocked by each gap; gap 0 blocks all 70)
-
-| gap | specs |
-|---|---|
-| 1 non-scalar carriers | 69 (all but restore-since) |
-| 3 E6 body widening | 43 |
-| 5 quantified clauses | 55 |
-| 7 loops/iterators | 61 |
-| 2 `&self`/`&mut` views | 7 |
-| 6 plain-Rust publication | 4 |
-| 8 effects | 11 |
-| 10 model refinement | 7 |
-| 11 generics | 1 |
-| 12 cross-crate citation | 15 |
-| 13 threads/closures/higher-order | 9 |
-
-No spec is blocked by gap 0 alone. Gap 1 is the crate's real floor: every spec but one carries a
-`&str`, `String`, `Vec`, `Option` or a crate enum in its clause.
-
-### Proof dependency order
-
-Lexical predicates (`lexical-validators`, `paths-forgotten`, `protected-inside`, `recorder-logged`,
-`relay-parse-args`, `tripwire-argv`) → string utilities (`util-shell-quote-unquote-roundtrip`,
-`util-b64url-roundtrip`, `util-utc-stamp`, `util-one-line`, `util-py-repr`, `pyjson-py-float`) →
-`pyjson-dumps-refines-python`, `pyjson-merge-is-merge-patch` → `screen-*` and `screen-kv-field` →
-parsers built on them (`nudge-*`, `record-stream-framing`, `sampler-endpoints`, `stub-*` pure
-readers) → composites (`codex-auth-json-lab-jwt` needs b64url, pyjson, utc_stamp and
-`stub-auth-label`; `run-env-sh-roundtrip` and `launcher-argv` need the shell round trip;
-`scn-cycle-stats-judge` needs `screen-idle-status` and `screen-composer`; `scn-frame-line` needs
-`util-py-repr`) → fs/process specs (gap 8: `sys-*` first, then `util-keep-tree`,
-`restore-agents-of`, `paths-physical`, `jail-*`, `procs-reap-liveness`) →
-`stub-served-refines-handlers` last (gaps 8 + 13).
 
 ## 2. Test → spec map (TSV)
 
@@ -340,40 +278,12 @@ in a lab self-test on a real host.
     the shipped signatures and agent branches, and the remaining `screen.rs` composer tests are mapped
     in §2 and §7.
 
-## 6. Proof order
-
-For §1's rows: fewest gaps first, then value. Only `restore-since` lacks gap 1.
-
-1. **`restore-since`** (gaps 3, 6): one cast and a `{:.1}` float format, whose model
-   `pyjson-py-float` and `stub-rate-headers` reuse.
-2. **`probe-judge-table`** (gaps 1, 3): the sandbox probe's verdict table, where a wrong cell would
-   hide a jail leak. **`relay-parse-args`** (gaps 1, 3): slice patterns returning a borrowed tail.
-3. **`lab-managed-bin`** and **`util-utc-stamp`** (gaps 1, 3, 5): no loops; `util-utc-stamp` feeds
-   `codex-auth-json-lab-jwt`.
-4. The one-loop predicates (gaps 1, 5, 7): `lexical-validators`, `paths-forgotten` (which
-   credentials the lab's children never see), `recorder-logged` (no URL query is logged),
-   `util-one-line`, `screen-kv-field` and `screen-idle-status`.
-5. `lab-parse-launch`, `protected-inside` and `tripwire-argv`; the string utilities
-   (`util-shell-quote-unquote-roundtrip`,
-   `util-b64url-roundtrip`, `util-py-repr`, `pyjson-py-float`); then `pyjson-*` and `screen-*`; the
-   parsers built on them (`nudge-*`, `record-stream-framing`, `sampler-endpoints`, the pure
-   `stub-*` readers); and the composites (`codex-auth-json-lab-jwt`, `run-env-sh-roundtrip`,
-   `launcher-argv`, `scn-*`).
-6. Last, the gap-8 rows (`sys-*` first, then `util-keep-tree`, `restore-agents-of`,
-   `paths-physical`, `jail-*`, `procs-reap-liveness`, `footers-opts-parse`, `verbs-journal-line`)
-   and `stub-served-refines-handlers`.
-
-## 7. Added 2026-10-16: the agy tests (first written with Gemini CLI's)
+## 7. The agy tests (first written with Gemini CLI's)
 
 Twenty-two tests came with the Gemini CLI and agy lab (`gemini.rs`, `gemini_captures.rs`,
 `gemini_proof.rs`, `stub/gemini.rs` through `stub/tests.rs`, and one each in `lab.rs`,
 `screen.rs` and `sys.rs`), read the same way as §1: every one maps to a spec below, and none is
 outside a spec.
-
-> 2026-10-24: Gemini CLI support was removed (agy replaces it; `docs/DESIGN-remove-gemini-cli-2026-10-24.md`).
-> The modules are now `agy.rs`, `agy_captures.rs` and `agy_proof.rs`, the specs `agy-*`, and each
-> statement names agy alone. Gemini CLI's composer test went with its branch of `composer_row`,
-> so §7 holds 21 tests. The `stub-gemini-*` specs stay: they are the Gemini API's, which agy speaks.
 
 `composer_row` has its own branch for `"agy"` (`screen-composer-agy`), as it has for `"muse"` and
 `"codex"`, so `screen-composer`'s last clause ("`composer_row(other, s)`") holds only for
@@ -434,7 +344,7 @@ The selftest itself (`agy-selftest`) is not a unit test: like `selftest` and
 `codex-selftest` it runs the real agent in a lab, and its judges are the seven `agy-proof-*`
 specs.
 
-## 8. Added 2026-10-21: the open recorder's verdict
+## 8. The open recorder's verdict
 
 The four proofs that run an agent in a lab (`selftest`, `codex-selftest`, `agy-selftest`,
 `muse-selftest`) judge the open recorder through one function. `selftest` (Claude Code)
@@ -568,7 +478,7 @@ src/selftest.rs	a_member_table_that_was_not_read_says_why	jail-members-table
 (`src/spread.rs`). The tests in `tests/aos_search.rs` spawn the built `aterm-lab`, so their spec is
 an effect (gap 8). `src/bench_stats.rs` holds what `aos-gpu-bench`, `outlook_captures` and the swarm
 partition share. The distributed search (`aos-search --workers`, the worker verb and the runner
-`aos-workers-bench`; `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §11) was removed on 2026-11-04:
+`aos-workers-bench`) was removed on 2026-11-04:
 it gains no speed on one Mac that threads do not gain better (measured: 26.25 s on eight workers, 18.52 s on eight threads, 46.80 s serial, `docs/measured/aos-m5b-workers-2026-10-23.md`), and git history is the way back.
 
 ```tsv
@@ -594,13 +504,12 @@ src/bench_stats.rs	the_load_average_is_the_first_of_sysctls_three	bench-stats
 src/bench_stats.rs	the_median_the_span_and_the_valid_rounds	bench-stats	
 ```
 
-## 15. Added 2026-10-24: the shared-buffer inference measurement's runner (aos M5a)
+## 15. The shared-buffer inference measurement's runner (aos M5a)
 
-`aos-gpu-bench` (`src/aos_gpu_bench.rs`) runs design §12.9's pre-registered session over the release
+`aos-gpu-bench` (`src/aos_gpu_bench.rs`) runs the pre-registered session over the release
 harness `aterm-bench --example aos_gpu`: one child process per arm, spawned and stamped on
 `mach_absolute_time`, waited for by a blocking `waitid` (`sys::await_exit`) beside a deadline thread
-(`stop::sleep_unless`, woken by `stop::ring`). Design of record:
-`docs/DESIGN-aos-hosted-execution-2026-10-21.md` §12. The runner's effects (the spawn, `pmset`,
+(`stop::sleep_unless`, woken by `stop::ring`). The runner's effects (the spawn, `pmset`,
 `sysctl`, the GPU readings) are untested here, except `sys::await_exit`, which a child that stops
 itself tests; its pure core is tested over synthetic summaries in the harness's format, and every
 reading it makes of a run is written to `runs/{id}.runner` and read back. Read the same way as §1.
@@ -637,12 +546,12 @@ src/stop.rs	a_ring_after_done_ends_the_wait_and_the_deadline_ends_it_otherwise	s
 src/sys.rs	await_exit_waits_through_a_stop_and_a_continue_for_the_exit	sys-await-exit	
 ```
 
-## 16. Added 2026-10-24: the learner's verbs and the session runner (aos M6, stage D)
+## 16. The learner's verbs and the session runner (aos M6, stage D)
 
 `aos-learn` (`src/aos_learn.rs`) is M6's learner in the lab: the verbs `build`, `init`, `chain`,
 `train`, `rollback`, `verify` and `session` over aterm-effects' `m6`, and the files behind its
 `DurableLog` (`LabLog`) and `DurableStore` (`LabStore`). `aos-learn-bench` (`src/aos_learn_bench.rs`)
-is the session's runner. Design of record: `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §13; the
+is the session's runner. The
 state machines they drive are m6's, tested over memory in aterm-effects' `m6_tests.rs`. A whole
 session needs `M6_CHAIN_V1` (stage E) and the account's own home, so no test runs one, and the
 runner's spawn and watch are effects (gap 8); the files, the arguments, the summary and the gates
@@ -690,7 +599,7 @@ src/aos_learn_bench_tests.rs	the_record_claims_only_a_real_pairs_session_of_reco
 src/aos_learn_bench_tests.rs	the_runner_takes_its_flags_alone	aos-learn-bench-gates	
 ```
 
-## 17. Added 2026-10-25: an older lab's Gemini CLI tab
+## 17. An older lab's Gemini CLI tab
 
 The review of the Gemini CLI removal found that an `env.sh` an older aterm-lab wrote for a
 `lab gemini` tab (`AGENT=gemini`) read as Claude Code's: `Run::agent` falls back to `claude` for a
@@ -710,7 +619,7 @@ file	test	primary	also
 src/run.rs	an_older_labs_gemini_cli_tab_is_refused_never_read_as_claude	run-retired-agent-refused	
 ```
 
-## 18. Added 2026-10-25: `seamless`'s privacy leg, the carry
+## 18. `seamless`'s privacy leg, the carry
 
 `lab seamless` plants a sentinel (`QZP6SECRET<n>`) in each kind of text one instance holds, and the
 outgoing process copies every file its update writes before the successor can read one (the keep
@@ -736,7 +645,7 @@ src/seamless_carry.rs	a_sweep_that_read_no_planted_path_is_vacuous	seamless-carr
 src/seamless_carry.rs	the_index_is_read_with_each_file_beside_it	seamless-carry-sweep	
 ```
 
-## 19. Added 2026-10-25: the login a Claude Code capture's header names
+## 19. The login a Claude Code capture's header names
 
 Measuring Claude Code 2.1.310's lost logins needed labs with no `apiKeyHelper` (the key removed
 from the scratch settings) and with a dead scratch `.credentials.json`; `fixture_header` named
@@ -755,7 +664,7 @@ file	test	primary	also
 src/verbs.rs	a_header_names_the_login_the_lab_launched_with	verbs-claude-login	
 ```
 
-## 20. Added 2026-10-25: `claude-login-proof`, and the tab a lab verb reads
+## 20. `claude-login-proof`, and the tab a lab verb reads
 
 `claude-login-proof [tag]` reproduces the hand-run Claude Code 2.1.310 login E2E on a private
 headless instance built from this tree: the installed Claude Code on its default route (no
@@ -807,7 +716,7 @@ src/verbs.rs	a_verb_names_its_tab_by_sid_and_reads_the_active_one_otherwise	verb
 src/verbs.rs	a_header_names_the_route_the_tab_was_launched_on	verbs-claude-route	verbs-claude-login
 ```
 
-## 21. Added 2026-10-27: `claude-rotation-proof`, aterm moving the real Claude Code between accounts
+## 21. `claude-rotation-proof`, aterm moving the real Claude Code between accounts
 
 `claude-rotation-proof [tag]` runs the installed Claude Code on a private headless instance built
 from this tree, on the lab's stub, which the instance reads as Claude Code's default route only
@@ -880,7 +789,7 @@ src/claude_rotation_proof_tests.rs	the_control_holds_only_where_r1_failed_for_th
 src/claude_rotation_proof_tests.rs	the_verbs_exit_is_the_tables_and_under_the_control_the_control_rows	rotation-proof-control	
 ```
 
-## 22. Added 2026-10-28: `swarm partition`, the lab partition lane (fluid swarm F8)
+## 22. `swarm partition`, the lab partition lane (fluid swarm F8)
 
 `swarm partition [--one-url] [--writers both|a] [--minter-away] [--hold SECS] [--label WORD]` splits
 seven private headless aterms (a4 joined the fleet at a2, b4 at b2, and b3 joins at b1 during the
@@ -964,7 +873,7 @@ src/swarm_partition_accounts_tests.rs	a_use_with_no_claim_of_its_own_fails_claim
 src/swarm_partition_accounts_tests.rs	a_scenario_that_did_not_run_fails_its_checks	partition-accounts	
 ```
 
-## 23. Added 2026-10-30: `git-starts`, the git starts of one busy Mac
+## 23. `git-starts`, the git starts of one busy Mac
 
 `git-starts [--minutes N] [--every-ms M]` reads the Mac as it is and changes nothing: every M ms
 (100) it lists this uid's processes (`aterm_uds::holders::uid_pids`) and reads each pid new to the
@@ -1009,7 +918,7 @@ src/git_starts_tests.rs	an_agent_rows_folder_is_its_work_tree_else_its_cwd	git-s
 src/git_starts_tests.rs	the_read_summary_counts_starts_and_wall_time_per_read	git-starts-read	
 ```
 
-## 24. Added 2026-10-31: what aterm checked, on every surface (Autopilot v6 slice 9c)
+## 24. What aterm checked, on every surface (Autopilot v6 slice 9c)
 
 `forever`'s judge holds 9c's surfaces to the receipt 9b journals (`forever_checked.rs`): `status`'s
 four `landed_*` fields, the Done for you row's tip (L16, L17), the worker's `checked=` on `await
@@ -1036,7 +945,7 @@ src/forever_checked_tests.rs	the_workers_await_result_and_row_say_checked	checke
 src/forever_checked_tests.rs	the_landed_title_says_its_own_receipt	checked-title	
 ```
 
-## 25. Added 2026-10-31: the tether's verb
+## 25. The tether's verb
 
 Both of the lab's `main`s call `aterm_uds::tether::entry` before the `argv[0]` dispatch (the
 macOS one after the debug build's claim holder, as aterm's and atpkg's do), so a child the lab
@@ -1053,7 +962,7 @@ file	test	primary	also
 tests/tether_entry.rs	the_lab_serves_the_tether_verb	tether-verb-first	
 ```
 
-## 26. Added 2026-11-01: a letter judged by the ring round its strokes (round 27)
+## 26. A letter judged by the ring round its strokes (round 27)
 
 `trail-contrast`'s thresholds (`min_contrast`, `--min`, `--newest-min`) judge a glyph cell by its
 `local_contrast`, what a reader sees round each stroke, the one reading the letter guard keeps
@@ -1070,7 +979,7 @@ file	test	primary	also
 src/trail_contrast_tests.rs	a_light_away_from_the_strokes_leaves_the_letter_its_reading	trail-contrast-judged	
 ```
 
-## 27. Added 2026-11-03: what the effects did, apart from the page's own dim text
+## 27. What the effects did, apart from the page's own dim text
 
 `trail-contrast --lowered-min X` counts a glyph cell only where the effects took it down: its
 judged reading (§26) under X, and the same reading on its clean twin, `clean_local_contrast`, X or
@@ -1092,7 +1001,7 @@ src/trail_contrast_tests.rs	lowered_min_counts_only_the_glyphs_the_effects_took_
 src/trail_contrast_tests.rs	lowered_min_holds_a_glyph_at_the_bar_to_the_bar	trail-contrast-lowered	
 ```
 
-## 28. Added 2026-11-03: bounded regular-file reads in `util`
+## 28. Bounded regular-file reads in `util`
 
 `util::{open_regular_file, read_regular_file, read_regular_text}` open lab files with
 `O_NONBLOCK | O_CLOEXEC`, verify `fstat` is a regular file (`InvalidInput` on directories, FIFOs,
@@ -1109,7 +1018,7 @@ file	test	primary	also
 src/util.rs	read_regular_file_and_text_refuse_non_regular_entries	util-read-regular	
 ```
 
-## 29. Added 2026-11-04: the facts leg's pure readers (gap 23)
+## 29. The facts leg's pure readers (gap 23)
 
 `codex-alab-proof --facts-only` judges aterm's no-progress fact riding a real codex-alab's
 continuation by what it reads passively: codex-alab's journal of each read and ride, the model's
@@ -1137,7 +1046,7 @@ src/codex_alab_facts_proof.rs	messages_rows_are_read_by_their_decoded_words	fact
 src/codex_alab_model.rs	the_facts_leg_runs_its_two_calls_then_its_steps_and_tags_a_fact	facts-model-arms	
 ```
 
-## 30. Added 2026-11-01: `work-overlap`, the overlap fact live
+## 30. `work-overlap`, the overlap fact live
 
 `work-overlap [tag] [--keep]` brings up a headless lab of its own against the stub alone and lays a
 scratch world in the project folder's `.ubd/work-overlap.noindex`: a bare `origin.git` whose main
@@ -1165,7 +1074,7 @@ src/work_overlap_tests.rs	the_seconds_prompt_and_ledger_rows_are_read_where_ater
 src/work_overlap_tests.rs	a_survey_records_work_fields_are_read_by_sid	work-overlap-plan	
 ```
 
-## 31. Added 2026-11-07: the `claude` stand-in's statusLine, and line E's captures (glass S5c)
+## 31. The `claude` stand-in's statusLine, and line E's captures (glass S5c)
 
 `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §6 S5, §7. The `claude` stand-in
 (`fleet_fixture.rs`) runs the statusLine its `--settings` names as Claude Code 2.1.318 does and
@@ -1192,7 +1101,7 @@ src/outlook_captures.rs	the_seeds_are_synthetic_and_stay_in_their_world	outlook-
 src/outlook_captures.rs	the_tapped_scenes_hand_the_tap_the_stores_week	outlook-glass-seeds	
 ```
 
-## 32. Added 2026-11-08: case (c)'s Accounts card among the captures
+## 32. Case (c)'s Accounts card among the captures
 
 `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4, §7. The captures of scenes A–C showed the
 card's midnight ticks only on Autopilot Off's grey cards with `┄` ahead, so `outlook-captures`
@@ -1215,7 +1124,7 @@ src/outlook_captures.rs	scene_js_card_is_case_cs_its_marks_beside_its_ticks	outl
 src/outlook_captures.rs	a_card_is_shown_once_its_observer_has_read	outlook-card-scene-j	
 ```
 
-## 33. Added 2026-11-09: program outcomes across native handoffs
+## 33. Program outcomes across native handoffs
 
 The installer-handoff lab can keep two program workers running through its native
 replacements, then require the exact success and failure outcomes through the control API.

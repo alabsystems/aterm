@@ -486,8 +486,7 @@ fn a_codex_sessions_walls_get_words_that_name_no_vendor() {
         "You've hit your usage limit. Try again at 12:56 PM.",
     );
     usage.reset_at = Some(t);
-    let mut c = cfg();
-    c.model_fallback = None;
+    let c = cfg();
     for (program, wants) in [
         (Program::Codex, "the program's account"),
         (
@@ -610,7 +609,7 @@ fn a_cleared_goal_names_its_cause() {
 }
 
 #[test]
-fn a_bucket_no_reset_ends_is_an_exception_only_while_the_tab_cannot_switch() {
+fn a_bucket_no_reset_ends_is_an_exception_its_person_answers_with_a_model_of_their_own() {
     let t = t0();
     let fable = "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.";
     let kind = WallKind::ModelBucket { consent: false };
@@ -624,39 +623,25 @@ fn a_bucket_no_reset_ends_is_an_exception_only_while_the_tab_cannot_switch() {
         (ExceptionKind::Bucket, Urgency::Later)
     );
     assert!(
-        held.why.contains("running jobs") && held.why.contains("opus"),
+        held.why.starts_with("Fable ") && held.why.contains("does not end by itself"),
         "{held:?}"
     );
     assert!(
-        held.action.contains("/model") && held.action.contains("opus"),
+        held.action.contains("/model") && held.action.contains("another model"),
         "{held:?}"
     );
-    let none = SupervisorConfig {
-        model_fallback: None,
-        ..cfg()
-    };
-    let e = exception_for(&st, &r, &none, t + 61 * MIN).expect("no fallback");
-    assert!(e.why.contains("no other model"), "{e:?}");
-    assert!(e.action.contains("another model"), "{e:?}");
     let mut opus = walled(kind, "You've reached your Opus limit · run /usage-credits");
     opus.restartable = false;
     let mut st2 = TurnEndState::default();
     seen(&mut st2, &opus, t);
+    let unrestartable = exception_for(&st2, &opus, &cfg(), t + 61 * MIN).expect("held");
+    assert_eq!(unrestartable.kind, ExceptionKind::Bucket);
     assert!(
-        exception_for(&st2, &opus, &cfg(), t + 61 * MIN)
-            .is_some_and(|e| e.why.contains("no other model"))
+        unrestartable.why.starts_with("Opus ")
+            && unrestartable.why.contains("does not end by itself"),
+        "{unrestartable:?}"
     );
-    let mut switched = TurnEndState::default();
-    seen(&mut switched, &r, t);
-    switched.restarted(
-        &crate::supervise::policy::turn_end::Restart::Model {
-            to: "opus".to_string(),
-        },
-        true,
-        &r,
-        t,
-    );
-    assert_eq!(exception_for(&switched, &r, &cfg(), t + 61 * MIN), None);
+    assert_eq!(unrestartable.action, held.action);
     let mut named = walled(kind, "You've reached your Opus limit · resets 4pm");
     named.reset_at = Some(t + 300 * MIN);
     let mut st3 = TurnEndState::default();
@@ -672,8 +657,7 @@ fn a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile() {
         WallKind::UsageWeekly,
         WallKind::ModelBucket { consent: false },
     ] {
-        let mut cfg = cfg();
-        cfg.model_fallback = None;
+        let cfg = cfg();
         let said = "You've hit your weekly limit · resets 4pm";
         let mut r = walled(kind, said);
         r.reset_at = Some(t);

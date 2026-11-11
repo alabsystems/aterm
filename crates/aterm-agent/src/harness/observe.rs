@@ -21,7 +21,7 @@
 //! [`Observation::KeyOnly`]; a process routed past any account of its own is
 //! [`Observation::Routed`]; none of them changes the belief.
 
-use super::accounts::{AuthRoute, Cli, ProcessLogin, Reconciled, Roster, TokenEntry};
+use super::accounts::{AuthRoute, Cli, ProcessLogin, Reconciled, Roster, Row, TokenEntry};
 use super::journal::{
     self, LoginState, Note, ObservedCli, ObservedLogin, ObservedSrc, SeenWhy, Tab,
 };
@@ -192,6 +192,107 @@ pub fn claude(
             }
         }
     }
+}
+
+/// A login as a process started on it holds it: what its environment makes the roster believe
+/// ([`ProcessLogin`]) beside what its login file says ([`Observation`]). Every reader that asks
+/// which account a start, a place or a tab runs on takes one of these to
+/// [`super::accounts::reconcile`] ([`Login::reconciled`]); none reads the belief alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Login {
+    pub who: ProcessLogin,
+    pub seen: Observation,
+}
+
+impl Login {
+    /// The login a Claude Code process started with `env` (`KEY=value` entries) would run on,
+    /// for a user whose home is `user_home`: an empty `env` is a plain start, which reads the
+    /// default home's profile ([`claude`]). With no home nothing is observed.
+    #[must_use]
+    pub fn claude(env: &[String], user_home: Option<&Path>, roster: &Roster) -> Self {
+        let who = ProcessLogin::of_env(env.iter().filter_map(|entry| entry.split_once('=')));
+        let seen = user_home.map_or(Observation::Unread, |home| {
+            claude(env, home, who.route, Some(roster))
+        });
+        Self { who, seen }
+    }
+
+    /// The account this login runs on ([`super::accounts::reconcile`]).
+    #[must_use]
+    pub fn reconciled<'a>(&self, roster: &'a Roster) -> Reconciled<'a> {
+        super::accounts::reconcile(roster, &self.who, &self.seen)
+    }
+
+    /// The rows signed in on this Mac, `enrolled`, as this login's place really stands
+    /// (decision 6: a place is held by the account found there). Where its file names another
+    /// account than the row its environment names, that row's place holds no login of the row's
+    /// own, so no start lands on it; and the row the file does name is signed in here, in this
+    /// place, whatever its own directory holds.
+    #[must_use]
+    pub fn enrolled(&self, roster: &Roster, enrolled: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut out = enrolled.clone();
+        let reconciled = self.reconciled(roster);
+        if reconciled.disagrees()
+            && let Some(believed) = super::accounts::judged_label(roster, &self.who)
+        {
+            out.remove(believed);
+        }
+        if let Reconciled::Other(row) = reconciled {
+            out.insert(row.label.clone());
+        }
+        out
+    }
+
+    /// The name a person reads this login's account by ([`super::accounts::account_name`]).
+    #[must_use]
+    pub fn name(&self, roster: &Roster) -> Option<String> {
+        super::accounts::account_name(roster, &self.who, &self.seen)
+    }
+}
+
+/// One place on this Mac a CLI keeps a login: the default home, or a roster row's directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Place<'a> {
+    /// The roster row that names this place, the belief; `None` for the default home where no
+    /// row names it.
+    pub row: Option<&'a Row>,
+    /// The place as a process started on it holds it.
+    pub login: Login,
+}
+
+/// Every login place `roster` names for `cli` on this Mac, each as its file holds it now: the
+/// default home first where no row names it, then each row's. Claude Code's are read
+/// ([`Login::claude`], as a stored login: a place is a file); another CLI's has no observer yet
+/// and is [`Observation::Unread`], as every place is with no `user_home`.
+#[must_use]
+pub fn places<'a>(cli: Cli, roster: &'a Roster, user_home: Option<&Path>) -> Vec<Place<'a>> {
+    let place = |row: Option<&'a Row>| {
+        let dir = row
+            .and_then(|row| row.dir.as_deref())
+            .filter(|dir| !dir.is_empty());
+        let login = if cli == Cli::Claude {
+            let env: Vec<String> = dir
+                .map(|dir| format!("{}={dir}", super::accounts::LOGIN_ENV))
+                .into_iter()
+                .collect();
+            Login::claude(&env, user_home, roster)
+        } else {
+            Login {
+                who: ProcessLogin {
+                    login: dir.map(str::to_owned),
+                    default_home: true,
+                    route: AuthRoute::Stored,
+                },
+                seen: Observation::Unread,
+            }
+        };
+        Place { row, login }
+    };
+    let default = roster.row_for_login(None).is_none().then(|| place(None));
+    default
+        .into_iter()
+        .chain(roster.rows.iter().map(|row| place(Some(row))))
+        .collect()
 }
 
 /// A CLI process as its observer reads it: its argv, its kernel exec environment (`KEY=value`)
@@ -818,18 +919,31 @@ pub fn sighting_unpooled(
         default_home: true,
         route: AuthRoute::Stored,
     };
-    sighting(&Roster::default(), &who, seen, sightings, tab, harness, now)
+    sighting(
+        Some(&Roster::default()),
+        &who,
+        seen,
+        sightings,
+        tab,
+        harness,
+        now,
+    )
 }
 
 /// One pass's sighting of the tab `tab` whose process `who` runs and whose login file says
-/// `seen`, run by `harness`, at `now`: a `seen` note when one is due ([`Sightings::due`]), a
-/// `wrong-account` once per disagreement with the believed row, and for an account no row lists
-/// (whose session no local row records) a `session-start` keyed by the observed account, closed
-/// by a `session-end` when the tab moves to another account or ends ([`Sightings::end`]). Keys
-/// come from the installed journal sink; with none, no note is made.
+/// `seen`, run by `harness`, at `now`: a `seen` note when one is due ([`Sightings::due`]), and
+/// the login for the registry. These two need no roster: a Mac that lists no account, or whose
+/// roster could not be read (`roster` `None`), is sighted like any other.
+///
+/// Against a roster that was read: a `wrong-account` once per disagreement with the believed
+/// row, and for an account no row lists (whose session no local row records) a `session-start`
+/// keyed by the observed account, closed by a `session-end` when the tab moves to another
+/// account or ends ([`Sightings::end`]). An unread roster makes neither, since a row it would
+/// have named may record the session itself. Keys come from the installed journal sink; with
+/// none, no note is made.
 #[must_use]
 pub fn sighting(
-    roster: &Roster,
+    roster: Option<&Roster>,
     who: &ProcessLogin,
     seen: &Observation,
     sightings: &mut Sightings,
@@ -862,8 +976,9 @@ pub fn sighting(
             t,
         ));
     }
-    let reconciled = super::accounts::reconcile(roster, who, seen);
-    if reconciled.disagrees()
+    let reconciled = roster.map(|roster| (roster, super::accounts::reconcile(roster, who, seen)));
+    if let Some((roster, reconciled)) = &reconciled
+        && reconciled.disagrees()
         && let Some(believed) =
             super::accounts::judged_label(roster, who).and_then(|label| roster.row(label))
         && let Some(key) = key
@@ -879,15 +994,19 @@ pub fn sighting(
             t,
         ));
     }
-    let unlisted = matches!(reconciled, Reconciled::Unlisted(_));
+    // With no roster read, whether a row lists the account is not known: a session already
+    // open stays open while the tab stays on its account.
+    let unlisted = reconciled
+        .as_ref()
+        .map(|(_, reconciled)| matches!(reconciled, Reconciled::Unlisted(_)));
     if matches!(why, Some(SeenWhy::First | SeenWhy::Changed))
         && sightings
             .open
-            .is_some_and(|open| !unlisted || open.account != key)
+            .is_some_and(|open| unlisted == Some(false) || open.account != key)
     {
         out.notes.extend(sightings.close(t));
     }
-    if unlisted
+    if unlisted == Some(true)
         && sightings.open.is_none()
         && let Some(key) = key
     {

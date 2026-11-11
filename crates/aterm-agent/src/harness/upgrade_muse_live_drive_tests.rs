@@ -517,8 +517,6 @@ impl LiveRig {
             background: knobs.background,
             aterm_state: None,
             ask: true,
-            several_logins: false,
-            usage_credits: false,
             usage_tap: None,
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
             agents_off: Vec::new(),

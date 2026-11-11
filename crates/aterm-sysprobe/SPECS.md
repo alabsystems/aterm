@@ -3,210 +3,12 @@
 
 # aterm-sysprobe: spec recovery from its unit tests
 
-> Status 2026-10-16: this is the crate's migration worklist. Each spec below is proved through
-> Trust/Clean about the compiled Rust function, and then the tests it subsumes are deleted. Nothing has
-> been proved or deleted yet.
->
-> **Re-measured on Trust seal `150efe4a` (2026-10-16): `scaled-ticks-saturating` and `used-mib-of` stay
-> blocked; no test is deleted.** Both were written as `trust_contract_fn!` contracts citing a Clean
-> theorem over `trust_import_aterm_sysprobe__{ticks_to_ns,ticks_ns,used_mib_of}` and run through the
-> seal; the code was then restored byte for byte. Three blockers, each measured:
->
-> 1. **No kernel import is minted (gaps 1 and 3).** Every island was rejected with
->    `AutoBoundHeadOverApplied { name: "trust_import_aterm_sysprobe__<fn>", .. }`: E6 refused the body,
->    so the name is unbound. `TRUST_E6_DEBUG=1` names why: `admissible=false`, with the first deficit a
->    non-scalar local (gap 1): the `Result<u64, TryFromIntError>` of `u64::try_from` in `ticks_to_ns`
->    and `linux::ticks_ns`, and the `Option<u32>` return of `used_mib_of`. Behind it, gap 3: calls to
->    `From`/`TryFrom`/`unwrap_or`/`ok`/`saturating_{sub,mul}` are "not itself structurally certified",
->    and a reachable `Assert` (checked `*`, `/` by a guarded nonzero divisor, `>>`) fails structural
->    NoPanic. A probe (`$HOME/trust-land/seal-aterm-probe/sysprobe{,2}`) found no admissible form of the
->    division at all: guarded `/`, `wrapping_div`, `checked_div` and `u128::wrapping_mul` are each
->    refused; only `as` casts, comparisons, branches and `u64::wrapping_mul` are admitted.
-> 2. **The `ensures` predicate does not lower.** `result == (if .. { .. } else { .. })` with `u128::from`,
->    `min`, `as`, `try_from`, `saturating_*` is `SpecEnsuresUnparseable` (fail-closed Unknown).
-> 3. **Every fn of this crate on macOS fails the `contract:global-alloc-dealloc-panic-free` caller
->    contract**, because the macOS dependency `aterm-objc` holds `global_asm!`, which could define a
->    libc allocator symbol. This is not gap 1 or 3, and it blocks Certified for every row here on a
->    macOS host until Trust verifies that assembly or `aterm-objc` drops it.
-
-> 2026-10-23: `unix-diag-listeners` (the kernel's socket dump, `sock_diag(7)`'s `UNIX_DIAG`
-> records) replaces `net-unix-listening`: `/proc/net/unix`'s text let a socket name holding a
-> newline forge a row, and its parser and test are gone. Its four tests build every fixture from
-> literal numbers, never the parser's constants, in `src/linux_tests.rs`. The request and parser
-> sit beside the TCP round-trip reader in `src/linux.rs` and share its netlink framing
-> (`sock_diag_dump_request`, `nl_messages`, `nl_attributes`). The counts below were taken before.
->
-> The seal also confirms §5.1 on real code: `used_mib_of`'s two plain `+` are refuted
-> (`arithmetic_overflow_add failed`).
->
-> Later on 2026-10-16 the strain row was removed (CHANGELOG, `[Unreleased]`) and this crate was slimmed
-> to the readers other crates share: `process_cwd`, `process_path`, `group_memory`,
-> `physical_memory_mib`, `machine_memory`, `memory_pressure`, `MemoryLevel`, `swapped_kib` and
-> `SwapMeter`. The recovery had read 30 tests for 31 specs. Eighteen specs left with their code (the
-> Linux sampler and its process sweep, the macOS sampler and `Probe`, PSI, thermal zones, CPU ticks and
-> the naming of busy processes), as did three tests that sampled no spec. Three specs were narrowed to
-> what remains (`pressure-level-table`, `swapped-kib-counter`, and `meminfo-facts`, whose `MemInfo`
-> methods had served only the sampler). This file states the 13 specs that remain over the 12 tests
-> that remain. On 2026-10-17 `lone_group_leader` (and its Linux parser `stat_pgrp`) joined, for a
-> file citation's shell in front, with a spec and a test each: 15 specs over 14 tests. `scaled-ticks-saturating` left with the
-> sampler; the slimmed crate no longer depends on `aterm-objc`, so the re-measure's third blocker
-> (its `global_asm!`) no longer applies to the rows that remain.
->
-> On 2026-10-19 the system-awareness readers joined (`Probe::core_ticks`, `cpu_layout`, `memory_detail`,
-> `gpu`, `volume`; the pure `CoreTicks::{busy,total}`, `machine::{layout_of, dt_assignment,
-> conventional_assignment, memory_detail_of, percent_of, volume_of, c_path}`, `macos::{cores_of, le_u64,
-> cluster_kind}`, `linux::{proc_stat_cores, cpulist, memory_detail}` and `read_into`), with 19 tests in
-> `src/tests.rs` and the IOKit declaration probe in `tests/iokit_sdk.rs`. Their specs are not recovered
-> here yet; the tables below still state the 15 specs over the 14 tests that predate them (the volume
-> tests, which joined on 2026-10-17 with `volumes`, are not recovered either).
->
-> Later on 2026-10-19 the job probe joined (`jobs`: `JobsReader`, the macOS arm through libproc and
-> `sysctl(KERN_PROC_PID)`, the Linux arm under a root; the pure `jobs::darwin` layout decoders, the
-> `jobs::linux` parsers, `tail_allowed`, `tail_has_lf`), and the sweep gained group, uid, state and the
-> session and terminal flags, a zombie's row coming from `kinfo_proc`. Its 16 tests are in
-> `src/jobs/tests.rs` (13 run on every host or every Unix; 3 need macOS and read the live host: this
-> process's own reading, both lanes' self-checks, a stopped and a zombie child) and the layout probe in
-> `tests/proc_info_sdk.rs` (a green run and its negative control). Their specs are not recovered here
-> yet either.
->
-> On 2026-10-20 the Stats Deck v2 readers joined: `net_links` (the macOS arm decoding
-> `NET_RT_IFLIST2` through the pure `iflist::{links_of, dl_name, kind_of_functional, link_kind,
-> read_growing}`, the Linux arm `linux::links_under` over the pure `linux::{net_dev, hex_flags,
-> link_up, speed_bps, sys_kind}`), the pure `counts_toward_machine` and `machine::kind_by_name`, `process_limits` (with the pure
-> `machine::{smaller, rlimit_ceiling}`) and `load_average`; the sweep gained each process's disk bytes
-> and `gpu` the driver's allocation and recovery count. Their tests are 6 in `src/iflist.rs` (every
-> host) and 9 in `src/tests.rs` (6 on every host, 3 that read the live host), and the layout probe in
-> `tests/iflist_sdk.rs` (a green run and its negative control). Their specs are not recovered here yet
-> either.
->
-> Later on 2026-10-20 `net_links_into` and `pid_counts` joined. `net_links_into` reads the links into a
-> buffer the caller keeps (the macOS arm's `iflist::read_growing` now reads into that buffer, the Linux
-> arm is `linux::links_under_into`, which replaced `linux::links_under`); `net_links` is a wrapper that
-> makes one per call. `pid_counts` counts the machine's processes and one user's: on macOS
-> `proc_listallpids` and `proc_listpids(PROC_RUID_ONLY)` through the pure
-> `machine::{pid_room, listed_count, owned_count}` (a uid that owns no process counts zero), on Linux
-> `/proc/loadavg`'s total through the pure `linux::loadavg_tasks` and `linux::Root::tasks`, on Windows
-> `K32GetPerformanceInfo`'s process count. Their tests are 1 more in `src/iflist.rs` (every host) and 3
-> more in `src/tests.rs` (on every host). Their specs are not recovered here yet either.
->
-> On 2026-10-20 `stdin_sharers` (the members of a group that read its leader's own input device: a
-> program an agent handed its terminal to, which a bare Ctrl-R/Ctrl-S then reaches) and its Linux
-> parser `linux::children` joined, with a spec and a test each: the tables below state 17 specs over
-> 16 tests.
->
-> On 2026-10-22 the program-check predicate joined the job probe (`docs/DESIGN-leftover-processes-2026-10-16.md`
-> §4.2): the pure `jobs::judge_start` over `StartFacts`, the one-shot `jobs::read_start` (a two-slot
-> `PROC_PIDLISTTHREADS`, then for a lone `0` only `PROC_PIDTBSDINFO`, `PROC_PIDARCHINFO`, `proc_pidpath`
-> and the mount table; `read_start_in` shares one table across many pids) with `at_start` and `now_us`,
-> `ProcFacts.start_facts` (read from the handles the probe's thread list already read, judged by
-> `ProcFacts::program_check`), and `darwin::archinfo_cputype` with the arch, `SSTOP` and
-> `PROC_FLAG_TRACED` rows of `jobs::darwin::SDK_ROWS`. A mount table cut at `MAX_MOUNTS` proves no
-> volume local (`local_at`, which `tail_allowed` shares). aterm-uds' `at_program_check`,
-> `thread_ran` and `held_programs` read through it. The specs `program-check-judge` and
-> `program-check-read` are stated in §1 and their six tests mapped in §2; the counts and histograms
-> were taken before.
->
-> On 2026-10-23 `jobs::linux::parse_stat` reads `tty_nr` as the kernel prints it, a C `int`: a
-> negative one (a pts minor of 2^19 or more sets the sign bit) is its 32 bits, and a field that is
-> neither an `int` nor a `u32` fails the line. Both had read as no terminal, which a caller judging
-> a terminal (aterm-uds' `procfs::lineage`, the sweep's `has_tty`) took for none
-> (`jobs::tests::a_stat_line_gives_every_field_past_any_command_name`). Its spec is not recovered
-> here yet.
->
-> On 2026-10-24 `gpu_driver` joined (`GpuDriver`: the accelerator entry's `CFBundleIdentifier` and
-> `IOSourceVersion`, read afresh per call; `None` off macOS), for Aos M5a's session record and its G3
-> driver check. Its live test is `tests::the_gpu_driver_names_itself_on_this_host` (macOS on Apple
-> silicon). Its spec is not recovered here yet.
-
 Source: `crates/aterm-sysprobe`. The recovered spec table below maps 49 `#[test]` functions across
 `src/tests.rs` (19), `src/jobs/tests.rs` (17), `src/procargs_tests.rs` (8) and `src/linux_tests.rs` (5),
 recounted from §2's rows on 2026-11-04. Nothing was compiled or run for this file; the claims come
 from reading the code.
 
 Result: **29 specs**, covering **49 tests**. Every mapped test is a spec sample (§4).
-
-> 2026-10-20: `procargs-parse` (the workspace's one `KERN_PROCARGS2` reader and parser,
-> `procargs`, which `kproc`, atpkg, aterm-gui and aterm-uds' `process` read through; aterm-uds
-> re-exports it) moved here from aterm-uds with its tests (`src/procargs_tests.rs`). The counts
-> below were taken before.
->
-> 2026-10-23: `vnode-terminal` (the one rule that calls a descriptor a terminal, which the job
-> probe's `FdKind::Device` and aterm-uds' `holders::fd_is_terminal` both read) joins §1 with the
-> vnode decoder's test. The counts below were taken before.
->
-> 2026-10-23, later: `vnode-terminal` is restated over `jobs::terminal_path`, the one list of
-> terminal device names both platforms' readers judge by (macOS's vnode path, Linux's `fd/<n>`
-> link), which now names the console, a pty master and a serial call-out line on both; the
-> `/proc` link test cites it too.
->
-> 2026-10-23, later still: `fresh-dylib` (the job probe's judge of a dylib a build just wrote,
-> `FdKind::File::fresh_dylib`, which the stuck engine's dylib heuristic reads) joins §1 with its
-> two tests, and the vnode decoder reads `vst_mtime` (a `jobs::darwin::SDK_ROWS` row). `AtStart`
-> lost its `word`: the engine's `StartWait::word` is the one a row prints.
->
-> 2026-10-24: `socket-settled` and `socket-read-gate` (when the job probe, and the lab's `lsof -i`
-> each second, may read another process's sockets: `PROC_PIDFDSOCKETINFO` drains a socket its
-> holder closes meanwhile) join §1 with their six tests. The counts below were taken before.
->
-> 2026-10-27: `group-usage-members` (`group_usage`, what each member of a process group used,
-> which aterm-verify's ceiling clock reads to leave out a check's wait for a core) and
-> `hid-idle-clock` (`hid_idle`, the time since the keyboard or mouse was last touched, which
-> decides whether verify clamps a compile to utility QoS) join §1 with a test each
-> (`docs/DESIGN-adaptive-build-2026-10-24.md`, CEILING-WAIT). The counts below were taken before.
->
-> 2026-10-29: `group-usage-members` gains each member's footprint now and its lifetime peak
-> (`ri_phys_footprint`, `ri_lifetime_max_phys_footprint`, from the same `proc_pid_rusage` read),
-> which aterm-verify books into the stage's memory meter (VERIFY-MEM), and the macOS sweep reads
-> each process's resident size (`ri_resident_size`, `ProcessReading::resident`; the Linux sweep
-> reads its `RssAnon` there, `linux::status_memory`), which the capacity ledger credits a
-> claim's tree with where it is below the footprint (VERIFY-MEM's honest room).
-> `available-mib-of` is unchanged: the ledger reads its own room from `memory_detail`
-> (aterm-capacity's `claimable`).
->
-> 2026-11-05: every rusage reader (the sweep, `group-memory-members`' footprint, the jobs
-> counters and `group-usage-members`) reads one record through `procs::imp::rusage`:
-> `RUSAGE_INFO_V6`, or `RUSAGE_INFO_V4` into the same record's prefix once the kernel refused V6
-> with `EINVAL` (`rusage::Flavor`, remembered for the process). Both rows are restated over it;
-> the fields they name sit in V4's prefix, so neither statement's values change
-> (`docs/DESIGN-stats-deck-flow-2026-11-02.md`, as built F3).
->
-> 2026-11-05: `StartFacts` carries a lone `0`'s fork (`start_us`, from the BSD record
-> `program-check-read` already reads), and `program-check-stranded` (`jobs::before_daemon` and
-> `jobs::stranded`: a held program whose check a read saw sent before the syspolicyd running now
-> started, which has run `STRANDED_AFTER_US` alone, its pool not full and no held program forked
-> since it started, sent that check to a daemon that is gone) joins §1 with its table test; the
-> start-suspended test reads the fork against the live daemon (aterm-uds'
-> `program_check::running`). A check is dated by when a read first saw its thread unrun
-> (`sent_by`), never by the fork, which an exec in the same pid keeps, and `STRANDED_AFTER_US` is
-> the bound on a first exec (10 min, aterm-uds' `FIRST_EXEC_HANG`), since a check queued for the
-> new daemon is answered by it. `jobs::HELD_CPU_NS` (20 ms, the CPU under which a reader of many
-> processes asks one's start) moved here from aterm-gui, which imports it. The counts below were
-> taken before.
->
-> 2026-11-06: one available memory. `MemoryDetail::available` is what the kernel can hand out
-> without paging, set by each OS reader: macOS counts it from its page queues (`mac-available`,
-> aterm-capacity's `claimable`, which moved here), Linux reads `MemAvailable`, Windows
-> `ullAvailPhys`. Memory used is `MemoryDetail::used` (`memory-used`). `machine_memory`,
-> `MachineMemory`, `available_mib_of`, `used_mib_of` and `clamp_physical_mib` are gone with their
-> rows and tests (`used-mib-of` and `available-mib-of` give way to `memory-used` and
-> `mac-available`; `memory-wire-codecs` keeps `GroupMemory`; `machine-memory-within-physical` is
-> restated over `memory_detail`), and `MemoryDetail::kernel_available_pct` is
-> `memorystatus_level_pct`, the kernel's own figure under its own name.
->
-> 2026-11-06: one idle predicate. `activity` (`activity-between`, `activity-member`) holds what a
-> process tree did between two reads of its members, keyed by pid and start, and whether that was
-> nothing (`Used::idle`): aterm-verify's `used_between` moved here with its test, and its stage
-> meter and aterm-lab's starting-child check read it, each with its own bound. aterm-toolchain's
-> `stall` does not: whether a lock or ledger holder makes progress (runnable a quarter of the time
-> or a MiB written a minute) is another quantity, which a holder that only keeps its books fails
-> though it is not idle. A member is one definition however it is read: `group_usage` reads
-> each member as `activity::member` of the row its usage record makes (`procs::imp::usage_row`,
-> which the sweep's live row takes too), its own CPU time and its disk reads and writes, so the
-> sweep's member no longer adds the reaped children's CPU time and the group's no longer adds
-> `ri_logical_writes` (`a_group_and_a_sweep_read_one_member_the_same`). On Linux
-> `linux::meminfo` is `linux::mem_total_kib`: the physical memory alone, which no longer needs a
-> `MemAvailable` (the available memory is `linux::memory_detail`'s); and a Mac's available memory
-> counts the speculative pages once (`mac-available`), not again inside the file-backed ones.
 
 ## 0. Notation used in the statements
 
@@ -224,7 +26,7 @@ Result: **29 specs**, covering **49 tests**. Every mapped test is a spec sample 
 - `Effects(...)` marks a statement about the OS (procfs, sysctl, libproc, Mach), provable only with
   a platform model (gap 8). Its pure core, stated in a row of its own where one exists, is the part
   to prove first.
-- `blocking_gaps` are rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (the
+- `blocking_gaps` are rows of `docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (the
   installed seal publishes no Lean-discharged row) is listed on every row. Gaps 6 (plain-Rust
   clause publication), 14 (the Clean elaborator) and 16 (soundness) apply to every row and are not
   listed.
@@ -282,26 +84,6 @@ socket-read-gate	other	jobs::macos::{fds,spawning,spawning_with,sockets_readable
 | other (effectful host facts) | 10 | process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader, stdin-sharers, group-usage-members, hid-idle-clock, program-check-read, socket-read-gate |
 
 Total: 15 + 1 + 1 + 1 + 1 + 10 = 29.
-
-### Gap histogram (number of the 29 specs each gap blocks)
-
-| gap | specs blocked |
-|---|---|
-| 0 | 29 |
-| 1 | 21 |
-| 2 | 2 |
-| 3 | 19 |
-| 4 | 3 |
-| 5 | 7 |
-| 7 | 13 |
-| 8 | 11 |
-| 11 | 1 |
-| 13 | 6 |
-
-Gaps 6, 9, 10, 12, 14, 15, 16 and 17 are not listed per spec. Gap 6 (plain-Rust clause publication) and
-gap 14 (Clean elaborator coverage) apply to every spec, depending on which lane discharges it, and gap 16
-(soundness) applies to every proof. No spec here cites another crate's types any more, so gap 12 blocks
-none.
 
 ## 2. Test → spec map (TSV)
 
@@ -365,27 +147,6 @@ src/procargs_tests.rs	a_record_past_what_the_kernel_hands_over_reads_as_nothing	
 src/procargs_tests.rs	a_reused_buffer_reads_a_record_whole_or_not_at_all	procargs-parse	
 ```
 
-## 3. Coverage
-
-- 49 tests mapped across `src/tests.rs` (19), `src/jobs/tests.rs` (17), `src/procargs_tests.rs` (8) and
-  `src/linux_tests.rs` (5). All 49 map to one of the 29 specs in §1.
-- One spec has no primary test of its own (`whole-lines-torn-tail-ignored`). It is sampled as a secondary
-  part of `every_proc_read_is_bounded_to_4_kib`, whose primary spec is `read-bounded-cap`. That test is
-  deleted only when both of its specs are proved.
-- Additional unrecovered test suites live in `src/tests.rs`, `src/jobs/tests.rs`, `src/coalitions_tests.rs`,
-  `src/cpu_hardware.rs`, `src/cpu_hardware_macos.rs`, `src/cpu_policy.rs`, `src/identity_tests.rs`,
-  `src/iflist.rs`, `src/kproc_tests.rs`, `src/linux_tests.rs`, `src/macos.rs`, `src/paths_tests.rs`,
-  `src/peb.rs`, `src/power.rs`, `src/procs.rs`, `src/slots_tests.rs`, `src/timeline_tests.rs`,
-  `src/volumes_tests.rs`, `src/windows_tests.rs` and `tests/{iflist,iokit,proc_info}_sdk.rs`.
-- Ten specs in §1 are `Effects(...)` rows (plus `read-bounded-cap` and the live `read`/`read_into` part of
-  `procargs-parse`); they retire only with a platform model (gap 8). Until then, the pure-core halves
-  can be proved and the host test can be cut down to the effectful part. The lone-group test exercises
-  its production pure census adapter, not libproc. The unsafe child-process fixture was removed because
-  its cleanup did not run on assertion failure and could signal a recycled group id. The stdin-sharers test
-  starts its `sleep`s through `spawnfd::command` and holds each in a guard that kills and reaps it by its
-  own unreaped pid, on a panic too, so it never signals a group. The `unix` test builds its
-  auxiliary vector from fixed pairs and reads nothing of the host.
-
 ## 4. Tests that are not spec samples
 
 None. The three the recovery found (`the_probe_can_move_to_its_thread`, `the_services_noun_is_the_platforms`
@@ -409,19 +170,3 @@ and the latency ceiling `a_reading_and_a_sweep_cost_milliseconds_not_more`) were
    spec bound.
 6. **Resolved — swap counter test checks monotonicity only.** `the_swap_counter_reads_on_this_host_and_never_runs_backwards`
    now asserts only `second >= first`, dropping the `< 1 GiB` host-load heuristic.
-
-## 6. Proof order
-
-1. The rows that need only gaps 0, 1 and 3: `memory-used`, `mac-available`,
-   `pressure-level-table`, `memory-wire-codecs`, `program-check-judge`, `fresh-dylib`, `vnode-terminal`,
-   `unix-listener-decode` and `unix-diag-listeners`. `memory-used` and `mac-available` are the
-   pure cores of `machine-memory-within-physical`.
-2. `swap-meter-rate`, once gap 2 (two-state `&mut self`) lands.
-3. The text parsers, which add gaps 5, 7 and (all but `procargs-parse`) 13: a shared WL/Key
-   lemma first, then `whole-lines-torn-tail-ignored`, `meminfo-facts`, `swap-pages-sum`,
-   `stat-pgrp`, `children-pids` and `procargs-parse`; `swap-pages-sum` also needs gap 4 and
-   `auxv-lookup` gap 11 (`as_chunks`' const generic).
-4. Last, the `Effects` rows, with a platform model (gap 8): `read-bounded-cap` (its loop core
-   earlier, with gaps 2 and 7), `process-cwd-path-own`, `group-memory-members`,
-   `machine-memory-within-physical`, `swapped-kib-counter`, `lone-group-leader`, `stdin-sharers`
-   and `program-check-read`.

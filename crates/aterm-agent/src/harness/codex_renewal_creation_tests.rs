@@ -43,7 +43,7 @@ fn run_case(state: &aterm_spec::interp::State, buggy: i64) -> (bool, bool) {
             write_immutable(&path, &other).unwrap();
         }
         3 => {
-            super::super::super::super::upgrade_models::write_atomic_mode(&path, "{", Some(0o600))
+            super::super::super::super::atomic_write::write_atomic_mode(&path, "{", Some(0o600))
                 .unwrap();
         }
         4 => {
@@ -63,7 +63,7 @@ fn run_case(state: &aterm_spec::interp::State, buggy: i64) -> (bool, bool) {
             std::fs::create_dir(&path).unwrap();
         }
         6 => {
-            super::super::super::super::upgrade_models::write_atomic_mode(
+            super::super::super::super::atomic_write::write_atomic_mode(
                 &path,
                 &"x".repeat(MAX_RECORD + 1),
                 Some(0o600),
@@ -87,7 +87,7 @@ fn run_case(state: &aterm_spec::interp::State, buggy: i64) -> (bool, bool) {
             },
         )
         .unwrap(),
-        2 => super::super::super::super::upgrade_models::write_atomic_mode(
+        2 => super::super::super::super::atomic_write::write_atomic_mode(
             &cancellation,
             "{",
             Some(0o600),

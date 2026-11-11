@@ -352,6 +352,111 @@ fn a_read_batchs_record_history_and_keys_are_judged_through_its_look() {
     );
 }
 
+/// A table-repair read batch's store opens hold its vault through the look its session keeps,
+/// which stands on the batch's own source read of the vault until the batch returns: a store open,
+/// of a lone record and of two replayed in a read batch, takes no source read of its own
+/// (`aterm_secrets::client::test_source_reads_held`), where a write batch's, whose look ended
+/// before its batch ran, takes one. Where the lock file the batch's source read holds was put away
+/// before its admission, the look holds nothing at the vault's path, and its store open takes a
+/// source read of the lock that stands there: no writer takes that lock while the open replays.
+/// NEGATIVE CONTROLS (2026-11-10): with `Session::local_source_reads` taking its own source read
+/// whatever look the session keeps, a read batch's store open takes one (`a read batch's store
+/// open's source reads`); with `Bootstrap::local_source_read_in` standing on a look whether or not
+/// it holds the lock at the vault's path, a writer takes the lock that stands there while the open
+/// replays (`a store open under a look on a lock put away`).
+#[test]
+fn a_read_batchs_store_opens_hold_its_vault_through_its_look() {
+    use std::{cell::Cell, rc::Rc};
+    let held = aterm_secrets::client::test_source_reads_held;
+    for records in [1, 2] {
+        let p = Pair::new(false, records);
+        let replica = p.replica(0);
+        let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
+        let round = replica.round(peer).unwrap();
+        let (read, count) = round
+            .local(peer, |session| {
+                let before = held();
+                let store = Store::observe(session, &p.paths[0], p.scope)?;
+                Ok((held() - before, store.inventory(session)?.count()))
+            })
+            .unwrap();
+        assert_eq!(count, records, "CONTROL: its records");
+        assert_eq!(
+            read, 0,
+            "a read batch's store open's source reads, of {records} records"
+        );
+        let written = round
+            .local_write(peer, |session| {
+                let before = held();
+                Store::observe(session, &p.paths[0], p.scope)?;
+                Ok(held() - before)
+            })
+            .unwrap();
+        assert_eq!(
+            written, 1,
+            "CONTROL: a write batch's store open takes its own source read, of {records} records"
+        );
+    }
+
+    let p = Pair::new(false, 1);
+    let replica = p.replica(0);
+    let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
+    let round = replica.round(peer).unwrap();
+    let dir = p.lab.paths[0].dir.clone();
+    let contender: Rc<std::cell::OnceCell<std::fs::File>> = Rc::default();
+    let _change = {
+        let (dir, contender) = (dir.clone(), contender.clone());
+        Change::install(0, move || {
+            let lock = dir.join(".lock");
+            let put_away = lock.with_extension("put-away");
+            std::fs::rename(&lock, &put_away).unwrap();
+            std::fs::copy(&put_away, &lock).unwrap();
+            let file = aterm_uds::private_file::open_private(&dir, ".lock")
+                .unwrap()
+                .0;
+            assert!(contender.set(file).is_ok());
+        })
+    };
+    let acquired = Rc::new(Cell::new(false));
+    let (read, count) = {
+        let (contender, acquired) = (contender.clone(), acquired.clone());
+        crate::table::store::with_replay_observer(
+            move || {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the contender must not take the vault's lock while a store replays"
+                )]
+                let attempt = contender.get().expect("the lock put away").try_lock();
+                match attempt {
+                    Ok(()) => acquired.set(true),
+                    Err(std::fs::TryLockError::WouldBlock) => {}
+                    Err(error) => panic!("vault contender failed: {error}"),
+                }
+            },
+            || {
+                round.local(peer, |session| {
+                    let before = held();
+                    let store = Store::observe(session, &p.paths[0], p.scope)?;
+                    Ok((held() - before, store.inventory(session)?.count()))
+                })
+            },
+        )
+        .unwrap()
+    };
+    if acquired.get() {
+        contender.get().unwrap().unlock().unwrap();
+    }
+    assert_eq!(count, 1, "CONTROL: its record");
+    assert!(
+        !acquired.get(),
+        "a store open under a look on a lock put away"
+    );
+    assert_eq!(
+        read, 1,
+        "a store open under a look on a lock put away takes its own source read"
+    );
+}
+
 /// Another of this Mac's rounds ingesting into `p`'s first table: a writer's commit, which overtakes
 /// an observer of that table it lands inside.
 fn overtaking_ingest(p: &Pair) -> impl Fn() + 'static {

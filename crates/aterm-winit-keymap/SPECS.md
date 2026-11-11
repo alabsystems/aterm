@@ -7,10 +7,6 @@ Each row of §1 is a spec to prove through Trust/Clean about the compiled Rust f
 `crates/aterm-winit-keymap/src/lib.rs`; the tests it subsumes are then deleted. §3 lists the tests
 no row cites.
 
-> Status 2026-10-16: the 8 specs below are the crate's migration worklist. Each is proved through
-> Trust/Clean about the compiled Rust function, then the tests it subsumes are deleted. Nothing has been
-> proved or deleted yet.
-
 Source: `crates/aterm-winit-keymap/src/lib.rs` (read only). All 12 `#[test]` fns are in the in-file
 `mod tests`. Production
 callers: `crates/aterm-gui/src/keymap.rs` (`map_logical_key`, `map_numpad_key`, `base_layout_key_for`),
@@ -52,7 +48,7 @@ carriers (foreign enums, `SmolStr`, `char`, `Option`) can be stated in a clause.
 
 `subsumes` names the primary tests (the rest are in §2), `difficulty` the Rust features the proof
 must handle, and `blocking gaps` rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 blocks every row and is not repeated
+`docs/TRUST-LANE.md` (Blocking gaps). Gap 0 blocks every row and is not repeated
 in them.
 
 ```tsv
@@ -66,33 +62,6 @@ physical-twin-involution	table-property	physical_modifier_twin	∀ (l,r)∈PAIRS
 base-layout-key-table	table-property	base_layout_key_for	∀ p:PK: p = Code(kc) ⇒ base_layout_key_for(p) = T_qwerty(kc); p = Unidentified(_) ⇒ None. Corollaries: every Some(c) has c ∈ 0x21..=0x7E (printable, non-space ASCII), never an uppercase letter or a shifted symbol; injective (47 codes to 47 distinct chars).	base_layout_key_is_us_qwerty	EASY once stateable: let-else and a ~47-arm match on a foreign #[non_exhaustive] enum into Option<char>; needs a char carrier.	1, 3, 5, 12
 layout-letter-twin-for	contract	layout_letter_twin_for, base_layout_key_for	∀ k:WK, p:PK: k = Character(s) ∧ single(s) = Some(c) ⇒ layout_letter_twin_for(k,p) = aterm_types::keyboard::layout_letter_twin(c, base_layout_key_for(p)) (cites base-layout-key-table and aterm-types kb-layout-letter-twin); otherwise (empty or multi-codepoint Character, Named, Dead, Unidentified) None.	layout_letter_twin_names_the_us_letter_under_a_non_latin_letter	MEDIUM: let-else on a SmolStr-carrying enum, two str::chars().next() calls with `?`, composition with base_layout_key_for and cross-crate layout_letter_twin.	1, 3, 4, 12
 ```
-
-### Distribution by kind (8)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 5 | logical-key-contract, numpad-location-gate, numpad-key-table, sided-modifier-contract, layout-letter-twin-for |
-| table-property | 3 | named-key-table, physical-twin-involution, base-layout-key-table |
-
-### Blocking-gap histogram (audit §7 number → specs it blocks)
-
-| gap | specs |
-|---|---|
-| 0 (installed seal) | 8 (prerequisite for all) |
-| 1 (non-scalar carriers: foreign enums, SmolStr, char, Option) | 8 |
-| 12 (cross-crate citation: `Key`/`NamedKey`/`layout_letter_twin` live in aterm-types, carriers in winit) | 8 |
-| 3 (E6 body widening: enum matches, calls) | 7 |
-| 5 (quantified clauses) | 3 |
-| 4 (callee-ensures composition) | 3 |
-
-No spec is blocked by gap 0 alone: every row needs gap 1 (foreign enum carriers) and gap 12.
-
-### Proof dependency order
-
-`named-key-table` → `logical-key-contract` → `numpad-key-table` (its clause 3 guard calls
-`map_logical_key`). `sided-modifier-contract`'s composition corollary cites `logical-key-contract`.
-`base-layout-key-table` + `aterm-types::kb-layout-letter-twin` → `layout-letter-twin-for`.
-`numpad-location-gate` and `physical-twin-involution` are independent.
 
 ## 2. Test → spec map (TSV)
 
@@ -134,21 +103,3 @@ None. All 12 `#[test]` functions in `src/lib.rs` map to one of the 8 specs above
    that winit's `KeyCode` has no sided `Meta` or `Hyper` variants, matching
    `physical-twin-involution`.
 3. **Resolved — `maps_function_keys_past_f12_and_media_keys` renamed and widened to `named_key_table_maps_every_category_and_rejects_unmapped`.** The history-pinning test name is replaced with a direct `T_named` category sample covering navigation, editing, lock/system, function (`F1..=F35`), media/audio, sided modifiers (`Left(m)`), and unmapped (`None`) variants under `named-key-table`.
-
-## 5. Proof order (easiest high-value first)
-
-No spec here is blocked by gap 0 alone; the cheapest are those needing only gaps 1 and 12 (plus 3).
-
-1. **`numpad-location-gate`** (gaps 1, 12). One early return on enum inequality; no gap 3, 4 or 5.
-   It retires 1 test and is the first clause of `map_numpad_key`, so it exercises the foreign-enum and
-   `&WK` carriers every other spec needs.
-2. **`sided-modifier-contract`** (gaps 1, 3, 12). A six-arm match on the engine's own `Key`; no
-   quantifier over a foreign enum and no `SmolStr`. Retires half of
-   `a_right_side_modifier_press_maps_to_its_right_variant`.
-3. **`base-layout-key-table`** and **`physical-twin-involution`** (gaps 1, 3, 5, 12). Pure finite
-   tables, decidable by enumeration once a foreign `#[non_exhaustive]` enum can be quantified over.
-4. **`named-key-table`** (gaps 1, 3, 5, 12). Same shape, larger table; retires 1 test and is the lemma
-   the two composed specs cite.
-5. **`logical-key-contract`**, **`layout-letter-twin-for`**, then **`numpad-key-table`** (gaps 1, 3, 4, 12). They need a `SmolStr`
-   UTF-8 model and callee-ensures composition; `numpad-key-table` retires the most tests (5) so comes
-   after `logical-key-contract`.

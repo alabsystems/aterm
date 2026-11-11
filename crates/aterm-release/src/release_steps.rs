@@ -292,6 +292,11 @@ fn dry_log_dir(temp: &Path, pid: u32, nth: u32) -> PathBuf {
     aterm_tempfile::quiet_in(temp).join(format!("aterm-release-dry-{pid}-{nth}.noindex"))
 }
 
+/// One cache identity for cutter preparation, its supervisor and its readers.
+pub(crate) fn cutter_cache_dir(release: &Path) -> PathBuf {
+    release.join(".ubd/cutter-cache")
+}
+
 type VerifyHalf = fn(
     &Real,
     &Candidate,
@@ -494,8 +499,15 @@ struct Pool {
     export: u32,
 }
 
-/// Completion follows the branch's drained child groups, including an unwinding branch.
-struct FinishShare<'a>(Option<&'a Pool>, usize);
+/// Completion follows the branch's drained child groups, including an unwinding branch. Return
+/// admission-barrier tokens before recovering the share: a token outside its FIFO still belongs
+/// to that branch, and reminting first would duplicate it.
+struct FinishShare<'pool, 'barrier> {
+    pool: Option<&'pool Pool>,
+    branch: usize,
+    admission_barrier:
+        &'barrier std::sync::Mutex<Option<aterm_capacity::InitialReservation<'pool>>>,
+}
 
 /// Establish a real allocation before a zero-token branch can reserve memory. Return the
 /// probe token before starting clients, which charge their own implicit tokens.
@@ -508,19 +520,24 @@ fn start_with_share<T>(
     Ok(start())
 }
 
-impl Drop for FinishShare<'_> {
+impl Drop for FinishShare<'_, '_> {
     fn drop(&mut self) {
-        if let Some(pool) = self.0 {
-            pool.jobs.finish(self.1);
+        self.admission_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(pool) = self.pool {
+            pool.jobs.finish(self.branch);
         }
     }
 }
 
 /// The qualify graph's pool at `path`: one Release core claim of every core, as `admit` answers
-/// it, isolated branch FIFOs and the export's reservation where `export` runs.
+/// it, isolated FIFOs only for the compiler branches in `branches`, and the export's reservation
+/// where export runs.
 fn qualify_pool(
     path: &Path,
-    export: bool,
+    branches: &[Branch],
     admit: impl FnOnce(aterm_capacity::Need) -> Result<aterm_capacity::Claim, aterm_capacity::Error>,
 ) -> Result<Pool, Refusal> {
     let claim = admit(
@@ -539,30 +556,42 @@ fn qualify_pool(
     // A run that died leaves its FIFO behind, and mkfifo never replaces one.
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(path.with_extension("tree.jobs"));
-    let jobs = aterm_capacity::BranchShares::new(path, slots, export_share(slots, export))
-        .map_err(|e| {
-            Refusal::new(
-                format!(
-                    "cannot make the qualify graph's jobserver at {}: {e} — nothing ran",
-                    path.display()
-                ),
-                format!("fix what it names, then {RELEASE_COMMAND}"),
-            )
-            .could_not_run()
-        })?;
+    let active = [
+        branches.contains(&Branch::Build),
+        branches.contains(&Branch::Tree),
+    ];
+    let export = export_share(
+        slots,
+        branches.contains(&Branch::Export),
+        active[0] || active[1],
+    );
+    let jobs = aterm_capacity::BranchShares::new(path, slots, export, active).map_err(|e| {
+        Refusal::new(
+            format!(
+                "cannot make the qualify graph's jobserver at {}: {e} — nothing ran",
+                path.display()
+            ),
+            format!("fix what it names, then {RELEASE_COMMAND}"),
+        )
+        .could_not_run()
+    })?;
     Ok(Pool {
         _claim: claim,
         jobs,
         slots,
-        export: export_share(slots, export),
+        export,
     })
 }
 
-/// The export's reservation: a quarter of the grant, at least one. On a one-slot host the
-/// export runs first, then tree, then build, keeping the same total allocation.
-pub(crate) fn export_share(slots: u32, export: bool) -> u32 {
+/// The export's reservation: the whole grant when it is the only branch, otherwise a quarter of
+/// the grant, at least one. On a one-slot host the export runs first, then a compiler branch,
+/// keeping the same total allocation.
+pub(crate) fn export_share(slots: u32, export: bool, compiler: bool) -> u32 {
     if !export {
         return 0;
+    }
+    if !compiler {
+        return slots;
     }
     if slots == 1 {
         return 1;
@@ -573,16 +602,18 @@ pub(crate) fn export_share(slots: u32, export: bool) -> u32 {
 /// The real backend's view the qualify graph's branches run on ([`Backend::branches`]).
 struct RealBranches<'a> {
     real: &'a Real,
+    /// Every non-export token, held before either compiler branch starts. The build can reserve
+    /// its slice memory and the tree can request lint memory without either starting Cargo. Held
+    /// lint restores the private shares; queued lint transfers the whole allocation to build.
+    admission_barrier: std::sync::Mutex<Option<aterm_capacity::InitialReservation<'a>>>,
     tree_index: TreeIndexHandoff,
 }
 
-/// The tree branch's resource admission and executable-index handoff. Lint's admission
-/// releases slice launch; completion releases waiters even when no stage ran. The index carries the
+/// The tree branch's one-way handoff to the fixture consumer. The index file itself carries the
 /// candidate, compiler and executable content identity; these bits distinguish "not written yet"
 /// from "the tree ended without usable evidence" without making the build compile beside it.
 #[derive(Default)]
-pub(crate) struct TreeIndexHandoff {
-    lint: std::sync::Mutex<Option<Result<PathBuf, String>>>,
+struct TreeIndexHandoff {
     expected: std::sync::atomic::AtomicBool,
     completion: std::sync::atomic::AtomicU8,
     bundle_finished: std::sync::atomic::AtomicBool,
@@ -590,7 +621,7 @@ pub(crate) struct TreeIndexHandoff {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum TreeIndexCompletion {
+enum TreeIndexCompletion {
     #[default]
     Pending = 0,
     /// The tree ended without a red; an absent index may use the bounded fallback compile.
@@ -600,51 +631,12 @@ pub(crate) enum TreeIndexCompletion {
 }
 
 impl TreeIndexHandoff {
-    pub(crate) fn expect_lint(&self, events: PathBuf) {
-        // Clear a resumed run's old signal synchronously, before either branch starts.
-        let prepared = crate::durable::write_atomic_durable(&events, b"", 0o600)
-            .map(|()| events)
-            .map_err(|e| format!("prepare lint admission events: {e}"));
-        *self
-            .lint
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prepared);
-    }
-
-    pub(crate) fn await_lint(
-        &self,
-        admitted: impl Fn(&Path) -> bool,
-        stopped: impl Fn() -> bool,
-        keep_build_after_test_red: impl Fn() -> bool,
-        mut wait: impl FnMut(),
-    ) -> Result<(), String> {
-        let gate = self
-            .lint
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let Some(gate) = gate else { return Ok(()) };
-        let events = gate?;
-        loop {
-            let completion = self.completion();
-            if stopped()
-                || (completion == TreeIndexCompletion::Stopped && !keep_build_after_test_red())
-            {
-                return Err("the tree stopped before slice launch".into());
-            }
-            if admitted(&events) || completion != TreeIndexCompletion::Pending {
-                return Ok(());
-            }
-            wait();
-        }
-    }
-
     fn expect(&self) {
         self.expected
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub(crate) fn finish(&self, completion: TreeIndexCompletion) {
+    fn finish(&self, completion: TreeIndexCompletion) {
         debug_assert_ne!(completion, TreeIndexCompletion::Pending);
         self.completion
             .store(completion as u8, std::sync::atomic::Ordering::SeqCst);
@@ -772,6 +764,20 @@ fn with_tree_index_completion(
     result
 }
 
+fn release_admission_barrier_to_build(
+    barrier: &std::sync::Mutex<Option<aterm_capacity::InitialReservation<'_>>>,
+) {
+    if let Some(reservation) = barrier
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+    {
+        reservation
+            .release_to_build()
+            .expect("an unchanged qualify admission reservation transfers to build");
+    }
+}
+
 impl Branches for RealBranches<'_> {
     fn keep_build_on_test_red(&self, c: &Candidate) -> bool {
         (self.real.build_inputs)()
@@ -800,12 +806,9 @@ impl Branches for RealBranches<'_> {
         self.tree_index.expect();
     }
 
-    fn expect_tree_lint(&self) {
-        self.tree_index
-            .expect_lint(self.branch_log(Branch::Tree).with_extension("events"));
-    }
-
     fn build_admitted(&self, ended: &dyn Fn() -> bool) {
+        let _timing = crate::cut_timing::Timer::parallel_parent()("qualify slice memory barrier")
+            .with_log(Some(&self.real.side_log(Step::Qualify, "admission")));
         // With no initial build token, neither slice can finish. Tree must run first even
         // when memory admits only one slice, so waiting for both memory claims would deadlock.
         if self
@@ -817,15 +820,31 @@ impl Branches for RealBranches<'_> {
             return;
         }
         let me = std::process::id();
-        while !ended() {
-            if interrupt::caught().is_some()
-                || slices_hold_memory(me)
-                || self.tree_index.bundle_is_finished()
-            {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
+        await_slice_memory_with_barrier(
+            &self.admission_barrier,
+            &|| ended() || interrupt::caught().is_some() || self.tree_index.bundle_is_finished(),
+            || slices_hold_memory(me),
+            || std::thread::sleep(std::time::Duration::from_secs(1)),
+        );
+    }
+
+    fn tree_admitted(&self, ended: &dyn Fn() -> bool) -> bool {
+        let _timing = crate::cut_timing::Timer::parallel_parent()("qualify tree memory barrier")
+            .with_log(Some(&self.real.side_log(Step::Qualify, "admission")));
+        let me = std::process::id();
+        await_tree_memory_with_barrier(
+            &self.admission_barrier,
+            &|| ended() || interrupt::caught().is_some(),
+            || tree_lint_claim(me),
+            || std::thread::sleep(std::time::Duration::from_secs(1)),
+        )
+    }
+
+    fn release_admission_barrier(&self) {
+        self.admission_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
     }
 
     fn export(
@@ -835,7 +854,11 @@ impl Branches for RealBranches<'_> {
         target: StageTarget,
         stop: &BranchStop,
     ) -> Result<Ran, Refusal> {
-        let _finished = FinishShare(self.real.pool.as_ref(), 2);
+        let _finished = FinishShare {
+            pool: self.real.pool.as_ref(),
+            branch: 2,
+            admission_barrier: &self.admission_barrier,
+        };
         let jobs = self
             .real
             .pool
@@ -854,22 +877,11 @@ impl Branches for RealBranches<'_> {
         work: BuildWork,
         stop: &BranchStop,
     ) -> Built {
-        let _finished = FinishShare(self.real.pool.as_ref(), 0);
-        if let Err(error) = self.tree_index.await_lint(
-            |path| {
-                crate::check_record::events(path)
-                    .is_ok_and(|events| events.whole() && events.lint_admitted)
-            },
-            || stop.fired() || interrupt::caught().is_some(),
-            || self.keep_build_on_test_red(c),
-            || std::thread::sleep(std::time::Duration::from_secs(1)),
-        ) {
-            let why = Refusal::new(error, format!("run {RELEASE_COMMAND} again")).could_not_run();
-            return Built {
-                artifact: work.bundle.then(|| Err(why.clone())),
-                fixtures: work.fixtures.then_some(Err(why)),
-            };
-        }
+        let _finished = FinishShare {
+            pool: self.real.pool.as_ref(),
+            branch: 0,
+            admission_barrier: &self.admission_barrier,
+        };
         let start = || {
             self.real
                 .build_branch(c, reserved, prover, work, &self.tree_index, stop)
@@ -911,7 +923,11 @@ impl Branches for RealBranches<'_> {
         stop: &BranchStop,
     ) -> Result<Ran, Refusal> {
         if run.half == crate::check_record::Half::Tree {
-            let _finished = FinishShare(self.real.pool.as_ref(), 1);
+            let _finished = FinishShare {
+                pool: self.real.pool.as_ref(),
+                branch: 1,
+                admission_barrier: &self.admission_barrier,
+            };
             with_tree_index_completion(&self.tree_index, stop, || {
                 (self.real.verify_half_op)(self.real, c, prover, run, artifact, stop)
             })
@@ -980,40 +996,380 @@ impl Branches for RealBranches<'_> {
 
 /// Both slices must have their claims before the tree can compete for memory. A build
 /// that fails or serializes on a smaller machine releases the wait by ending instead.
-pub(crate) fn slices_hold_memory(me: u32) -> bool {
-    let Some(records) = aterm_capacity::Ledger::user().and_then(|l| l.list().ok()) else {
-        return false;
-    };
-    let procs = interrupt::listing().unwrap_or_default();
-    let parent: std::collections::BTreeMap<i32, i32> =
-        procs.iter().map(|p| (p.pid, p.parent)).collect();
-    ["aarch64-apple-darwin", "x86_64-apple-darwin"]
-        .iter()
-        .all(|triple| {
-            records.iter().any(|r| {
-                r.held.is_some()
-                    && r.need.what == format!("release slice {triple}")
-                    && r.need.mem > 0
-                    && owns_process(me, r.pid, &parent)
-            })
-        })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SliceMemory {
+    Held,
+    /// One exclusive learning claim is held and the other is queued behind it or not yet
+    /// present. Let the build consume its tokens and finish both slices before tree starts.
+    Serial,
+    /// The held parent has the correct shape but its footprint book has grown.
+    StaleBudget,
+    Pending,
+    Unavailable,
 }
 
-/// Inline pilots hold their own slice claims; a cut's build child holds descendants'.
-/// Without a process read only the current process's ownership is known.
-fn owns_process(me: u32, pid: u32, parent: &std::collections::BTreeMap<i32, i32>) -> bool {
-    if pid == me {
-        return true;
-    }
-    let mut at = i32::try_from(pid).unwrap_or(0);
-    for _ in 0..64 {
-        match parent.get(&at) {
-            Some(&up) if u32::try_from(up).is_ok_and(|up| up == me) => return true,
-            Some(&up) if up > 1 => at = up,
-            _ => return false,
+/// Wait for the slice parent without making process inspection a liveness dependency. If the
+/// resource host cannot be read, release the token barrier and let the build finish before tree
+/// starts. `pause` is injected so the failure path has a deterministic negative control.
+fn await_slice_memory(
+    ended: &dyn Fn() -> bool,
+    mut observe: impl FnMut() -> SliceMemory,
+    mut release: impl FnMut(),
+    mut pause: impl FnMut(),
+) {
+    while !ended() {
+        let observe_reason = observe();
+        match observe_reason {
+            SliceMemory::Held => return,
+            SliceMemory::Pending => pause(),
+            SliceMemory::Serial | SliceMemory::Unavailable | SliceMemory::StaleBudget => {
+                if matches!(observe_reason, SliceMemory::StaleBudget) {
+                    eprintln!(
+                        "qualify: held slice budget is smaller than current footprint history; waiting for build with tree compiler tokens withheld"
+                    );
+                }
+                release();
+                while !ended() {
+                    pause();
+                }
+                return;
+            }
         }
     }
-    false
+}
+
+/// Production binding from the exact slice-memory observation to the private-FIFO transfer.
+/// Keeping the reservation in this seam makes the serial escape's token effect testable without
+/// constructing a release backend.
+fn await_slice_memory_with_barrier(
+    barrier: &std::sync::Mutex<Option<aterm_capacity::InitialReservation<'_>>>,
+    ended: &dyn Fn() -> bool,
+    observe: impl FnMut() -> SliceMemory,
+    pause: impl FnMut(),
+) {
+    await_slice_memory(
+        ended,
+        observe,
+        || release_admission_barrier_to_build(barrier),
+        pause,
+    );
+}
+
+fn slices_hold_memory(me: u32) -> SliceMemory {
+    let Some(ledger) = aterm_capacity::Ledger::user() else {
+        return SliceMemory::Unavailable;
+    };
+    let Ok(records) = ledger.list() else {
+        return SliceMemory::Unavailable;
+    };
+    let Some(procs) = interrupt::listing() else {
+        return SliceMemory::Unavailable;
+    };
+    slices_hold_memory_in(
+        me,
+        crate::slice_units::live_shared_floor(2),
+        &records,
+        &procs,
+    )
+}
+
+/// How the build branch has reserved the slice memory which the tree must fit around. A complete
+/// unit record has one shared parent. With incomplete history each slice learns under ALONE;
+/// where one is held and the other is queued or not yet present, the build must run serially
+/// before the tree. An exact but invalid row authorizes neither schedule.
+fn slices_hold_memory_in(
+    me: u32,
+    shared_minimum: u64,
+    records: &[aterm_capacity::Record],
+    procs: &[interrupt::Proc],
+) -> SliceMemory {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ClaimState {
+        Held,
+        Waiting,
+        Missing,
+        Invalid,
+    }
+
+    let parent: std::collections::BTreeMap<i32, i32> =
+        procs.iter().map(|p| (p.pid, p.parent)).collect();
+    let descends = |pid: u32| {
+        let mut at = i32::try_from(pid).unwrap_or(0);
+        for _ in 0..64 {
+            match parent.get(&at) {
+                Some(&up) if u32::try_from(up).is_ok_and(|up| up == me) => return true,
+                Some(&up) if up > 1 => at = up,
+                _ => return false,
+            }
+        }
+        false
+    };
+    let descendant = |what: &str, minimum: u64, exclusive: bool| {
+        let mut exact = false;
+        let mut valid = false;
+        for record in records
+            .iter()
+            .filter(|record| record.need.what == what && descends(record.pid))
+        {
+            exact = true;
+            if record.accounting != aterm_capacity::Accounting::Holder
+                || record.need.mem < minimum
+                || record.need.margin != 1
+                || record.need.rank != aterm_capacity::Rank::Release
+                || record.need.alone != exclusive
+                || record.held.is_some_and(|held| held.alone != exclusive)
+            {
+                continue;
+            }
+            valid = true;
+            if record.held.is_some() {
+                return ClaimState::Held;
+            }
+        }
+        if valid {
+            ClaimState::Waiting
+        } else if exact {
+            ClaimState::Invalid
+        } else {
+            ClaimState::Missing
+        }
+    };
+
+    const SHARED: &str = "release slice memory budget";
+    let serial_minimum = crate::slice_units::serial_parent_bytes(
+        shared_minimum.saturating_sub(2 * crate::slice_units::DRIVER),
+    );
+    match descendant(crate::slice_units::SERIAL_PARENT, serial_minimum, false) {
+        ClaimState::Held => return SliceMemory::Serial,
+        ClaimState::Waiting => return SliceMemory::Pending,
+        ClaimState::Invalid => {
+            return if descendant(
+                crate::slice_units::SERIAL_PARENT,
+                crate::slice_units::serial_parent_bytes(crate::slice_units::MIN_BUDGET),
+                false,
+            ) == ClaimState::Held
+            {
+                SliceMemory::StaleBudget
+            } else {
+                SliceMemory::Pending
+            };
+        }
+        ClaimState::Missing => {}
+    }
+    match descendant(SHARED, shared_minimum, false) {
+        ClaimState::Held => return SliceMemory::Held,
+        ClaimState::Waiting => return SliceMemory::Pending,
+        ClaimState::Missing => {}
+        ClaimState::Invalid => {
+            // Let the build's wrapper revalidate its admitted envelope. Keeping both FIFOs
+            // empty would prevent that check and strand the build behind its own barrier.
+            return if descendant(SHARED, crate::slice_units::MIN_SHARED, false) == ClaimState::Held
+            {
+                SliceMemory::StaleBudget
+            } else {
+                SliceMemory::Pending
+            };
+        }
+    }
+
+    let native = descendant(
+        "release slice aarch64-apple-darwin",
+        crate::slice_units::DRIVER,
+        true,
+    );
+    let compat = descendant(
+        "release slice x86_64-apple-darwin",
+        crate::slice_units::DRIVER,
+        true,
+    );
+    match (native, compat) {
+        (ClaimState::Held, ClaimState::Waiting | ClaimState::Missing)
+        | (ClaimState::Waiting | ClaimState::Missing, ClaimState::Held) => SliceMemory::Serial,
+        _ => SliceMemory::Pending,
+    }
+}
+
+/// The pooled release tree's whole-stage Tippy reservation. Branded Tippy deliberately removes
+/// outer compiler wrappers, so a driver-only claim would have no unit claims beneath it. The
+/// exact workspace label distinguishes this reservation from a later narrow lint, another
+/// release's row and queued lookalikes; the measured claim must retain the safe cold floor,
+/// cover its compiler descendants and carry Release rank.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TreeLintClaimShape {
+    pub(crate) label: String,
+    pub(crate) bytes: u64,
+}
+
+impl TreeLintClaimShape {
+    pub(crate) fn accepts(&self, bytes: u64) -> bool {
+        bytes >= self.bytes
+    }
+}
+
+pub(crate) fn tree_lint_claim_shapes() -> Option<[TreeLintClaimShape; 1]> {
+    let stage = aterm_verify::plan::declared(&aterm_verify::Scope::workspace())
+        .into_iter()
+        .find(|stage| stage.id == aterm_verify::plan::StageId::Tippy)?;
+    Some([TreeLintClaimShape {
+        label: format!("verify {}", stage.title),
+        bytes: aterm_verify::compile_width::TIPPY_CLAIM_FLOOR,
+    }])
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeLintObservation {
+    Claim(TreeLintClaim),
+    Missing,
+    Unavailable,
+}
+
+/// Wait for the tree's early claim. Once the slice parent is known held, an unread detector can
+/// safely release the CPU barrier: the private slice budget is already protected from tree
+/// claims. An immediate verifier admission failure ends the tree and reaches `ended`.
+fn await_tree_memory(
+    ended: &dyn Fn() -> bool,
+    mut observe: impl FnMut() -> TreeLintObservation,
+    mut serialize: impl FnMut(),
+    mut pause: impl FnMut(),
+) -> bool {
+    while !ended() {
+        match observe() {
+            TreeLintObservation::Claim(TreeLintClaim::Held) | TreeLintObservation::Unavailable => {
+                return true;
+            }
+            TreeLintObservation::Claim(TreeLintClaim::Waiting) => {
+                serialize();
+                return true;
+            }
+            TreeLintObservation::Claim(TreeLintClaim::Invalid) => {
+                // A malformed cold claim may reserve less than the compile can use. Keep build's
+                // private budget and stop the tree; reminting tokens to that claim after build
+                // drains would otherwise let an unbounded cold compile start.
+                serialize();
+                return false;
+            }
+            TreeLintObservation::Missing => pause(),
+        }
+    }
+    true
+}
+
+/// Production binding from a queued exact Tippy claim to the private-FIFO transfer.
+fn await_tree_memory_with_barrier(
+    barrier: &std::sync::Mutex<Option<aterm_capacity::InitialReservation<'_>>>,
+    ended: &dyn Fn() -> bool,
+    observe: impl FnMut() -> TreeLintObservation,
+    pause: impl FnMut(),
+) -> bool {
+    await_tree_memory(
+        ended,
+        observe,
+        || release_admission_barrier_to_build(barrier),
+        pause,
+    )
+}
+
+fn tree_lint_claim(me: u32) -> TreeLintObservation {
+    let Some(shapes) = tree_lint_claim_shapes() else {
+        return TreeLintObservation::Unavailable;
+    };
+    let Some(ledger) = aterm_capacity::Ledger::user() else {
+        return TreeLintObservation::Unavailable;
+    };
+    let Ok(records) = ledger.list() else {
+        return TreeLintObservation::Unavailable;
+    };
+    let Some(procs) = interrupt::listing() else {
+        return TreeLintObservation::Unavailable;
+    };
+    tree_lint_claim_in(me, &records, &procs, &shapes)
+        .map(TreeLintObservation::Claim)
+        .unwrap_or(TreeLintObservation::Missing)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TreeLintClaim {
+    /// The whole-lint claim stands beside the slice parent: one tree compiler may overlap build
+    /// under the build-first split.
+    Held,
+    /// The whole-lint claim is queued. Release CPU tokens so build can finish and
+    /// free its parent; lint remains bounded and then runs serially on a smaller host.
+    Waiting,
+    /// A descendant published the exact production label but not its memory shape, rank,
+    /// coverage or accounting. It cannot open concurrent tree work: transfer the bounded CPU
+    /// allocation to build and stop the tree before those tokens can be reminted to it.
+    Invalid,
+}
+
+fn tree_lint_claim_in(
+    me: u32,
+    records: &[aterm_capacity::Record],
+    procs: &[interrupt::Proc],
+    shapes: &[TreeLintClaimShape],
+) -> Option<TreeLintClaim> {
+    let parent: std::collections::BTreeMap<i32, i32> = procs
+        .iter()
+        .map(|process| (process.pid, process.parent))
+        .collect();
+    let descends = |pid: u32| {
+        let mut at = i32::try_from(pid).unwrap_or(0);
+        for _ in 0..64 {
+            match parent.get(&at) {
+                Some(&up) if u32::try_from(up).is_ok_and(|up| up == me) => return true,
+                Some(&up) if up > 1 => at = up,
+                _ => return false,
+            }
+        }
+        false
+    };
+    let mut outcome = None;
+    for record in records.iter().filter(|record| descends(record.pid)) {
+        let Some(this) = classify_tree_lint_claim(record, shapes) else {
+            continue;
+        };
+        // Duplicate live rows can briefly coexist while a process hands a claim on. Their file
+        // order is not policy: a held valid row dominates a queued one, and either dominates a
+        // malformed row with the same production label.
+        outcome = Some(stronger_tree_lint_claim(outcome, this));
+    }
+    outcome
+}
+
+pub(crate) fn classify_tree_lint_claim(
+    record: &aterm_capacity::Record,
+    shapes: &[TreeLintClaimShape],
+) -> Option<TreeLintClaim> {
+    let shape = shapes
+        .iter()
+        .find(|shape| record.need.what == shape.label)?;
+    Some(
+        if record.accounting == aterm_capacity::Accounting::Holder
+            && shape.accepts(record.need.mem)
+            && record.need.margin == 1
+            && record.need.rank == aterm_capacity::Rank::Release
+            && record.need.covers
+            && record.held.is_none_or(|held| !held.alone)
+        {
+            if record.held.is_some() {
+                TreeLintClaim::Held
+            } else {
+                TreeLintClaim::Waiting
+            }
+        } else {
+            TreeLintClaim::Invalid
+        },
+    )
+}
+
+pub(crate) const fn stronger_tree_lint_claim(
+    current: Option<TreeLintClaim>,
+    this: TreeLintClaim,
+) -> TreeLintClaim {
+    match (current, this) {
+        (Some(TreeLintClaim::Held), _) | (_, TreeLintClaim::Held) => TreeLintClaim::Held,
+        (Some(TreeLintClaim::Waiting), _) | (_, TreeLintClaim::Waiting) => TreeLintClaim::Waiting,
+        _ => TreeLintClaim::Invalid,
+    }
 }
 
 struct Forwarded {
@@ -1854,6 +2210,7 @@ impl Real {
             .as_ref()
             .map_or(-1, |(status, _)| status.code().unwrap_or(-1));
         if let Some(pumped) = pumped {
+            let _drain = crate::cut_timing::Timer::start(&log, "step child output drain");
             pumped.finish(drain);
         }
         drop(forwarded);
@@ -2735,7 +3092,7 @@ impl Real {
             let inputs = self.prepared_step1_handoff(commit, &cutter).unwrap_or(None);
             return Ok((cutter, inputs));
         }
-        let cache = self.release.join("cutter-cache");
+        let cache = cutter_cache_dir(&self.release);
         std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
@@ -3147,6 +3504,15 @@ impl Real {
 
     /// The export guards, `ship check --export`: the engine's own dry run, `pub stage aterm --dry-run --no-check --commit R --repo-path <scratch clone>`, every export guard `pub stage` runs (forbidden content, private references, gitleaks, the cargo metadata closure, README versions, dead links) in one pass, over a scratch clone of R (never this checkout's `publish/.out`, where a real stage's attestation waits for `pub publish`) and a [`Real::scratch_engine`] copy. The engine reads the public tier as the public does ([`public_reads`]), so those reads need no SSH key.
     pub(crate) fn export_gate(&mut self, scratch: &Scratch, r: &str) -> (Outcome, Option<PathBuf>) {
+        self.export_gate_with_check(scratch, r, None)
+    }
+
+    fn export_gate_with_check(
+        &mut self,
+        scratch: &Scratch,
+        r: &str,
+        check: Option<u32>,
+    ) -> (Outcome, Option<PathBuf>) {
         self.scanner_tools = None;
         let not_run = |why: Refusal| (Outcome::CouldNotRun(why), None);
         if let Err(why) = aterm_census::export::mainline::require(r, |args| {
@@ -3211,7 +3577,11 @@ impl Real {
         }
         let toolchain = self.metadata_toolchain();
         let pubbin = engine.join("bin/pub");
-        let (mut stage, handed) = match self.dry_run_command(&engine, r, &root, &reads, &agh) {
+        let command = match check {
+            None => self.dry_run_command(&engine, r, &root, &reads, &agh),
+            Some(_) => self.local_stage_command(&engine, r, &root, &reads, &agh, check),
+        };
+        let (mut stage, handed) = match command {
             Ok(command) => command,
             Err(why) => return not_run(why),
         };
@@ -3248,6 +3618,25 @@ impl Real {
         let _ = crate::durable::write_fresh(&log, format!("{handed}\n{text}"));
         let mut run = EngineRun::read(code, &text);
         let out = root.join("publish/.out");
+        if check.is_some() && code == 0 {
+            let attestation =
+                crate::gates::read_bounded_string(&out.join("attestation.json"), 16 << 20);
+            if !attestation
+                .as_ref()
+                .is_ok_and(|text| attestation_qualifies(text, r))
+            {
+                return not_run(Refusal::new(
+                    "the full local export returned success without a complete passing attestation",
+                    format!(
+                        "read {} before measuring this candidate again",
+                        log.display()
+                    ),
+                ));
+            }
+            if let Ok(text) = attestation {
+                let _ = crate::durable::write_fresh(&scratch.dir.join("attestation.json"), text);
+            }
+        }
         let export = out.join("export");
         for (name, at) in &mut run.failed {
             if let Some(report) = gitleaks_report(name) {
@@ -3279,6 +3668,18 @@ impl Real {
         reads: &[(String, std::ffi::OsString)],
         agh: &Path,
     ) -> Result<(Command, String), Refusal> {
+        self.local_stage_command(engine, r, root, reads, agh, None)
+    }
+
+    fn local_stage_command(
+        &self,
+        engine: &Path,
+        r: &str,
+        root: &Path,
+        reads: &[(String, std::ffi::OsString)],
+        agh: &Path,
+        check: Option<u32>,
+    ) -> Result<(Command, String), Refusal> {
         let mut stage = self.engine_child(engine, None)?;
         stage
             .env("PUBLICATION_ENGINE", engine)
@@ -3288,16 +3689,13 @@ impl Real {
                 rustup_dir().map_or_else(|_| publication_path(), |dir| path_with(&dir)),
             )
             .envs(reads.iter().map(|(key, value)| (key, value)))
-            .args([
-                "stage",
-                "aterm",
-                "--dry-run",
-                "--no-check",
-                "--commit",
-                r,
-                "--repo-path",
-            ])
-            .arg(root);
+            .args(["stage", "aterm", "--dry-run"]);
+        if let Some(jobs) = check {
+            stage.env("CARGO_BUILD_JOBS", jobs.max(1).to_string());
+        } else {
+            stage.arg("--no-check");
+        }
+        stage.args(["--commit", r, "--repo-path"]).arg(root);
         let handed = hand_transforms_cutter(&mut stage, r);
         Ok((stage, handed))
     }
@@ -3817,6 +4215,8 @@ impl Real {
         if !handoff.expected() {
             return Ok(());
         }
+        let _timing = crate::cut_timing::Timer::parallel_parent()("qualify fixture index wait")
+            .with_log(Some(&self.side_log(Step::Qualify, "build-fixtures")));
         let index = crate::fixtures::GeneratorIndex::new(&prover.bin.join("targo"), &self.repo)
             .map_err(|e| fixture_refusal(c, &e.to_string()))?;
         match await_tree_index(
@@ -4110,6 +4510,11 @@ impl Real {
         let built = artifact.as_ref().is_none_or(Result::is_ok);
         let fixtures = (work.fixtures && built && !stop.fired()).then(|| {
             let log = self.side_log(Step::Qualify, "build-fixtures");
+            if tree_index.expected()
+                && let Some(pool) = &self.pool
+            {
+                pool.jobs.serial_bundle_drained();
+            }
             (self.await_fixture_index_op)(self, c, prover, tree_index, stop).and_then(|()| {
                 (self.stage_fixtures_run_op)(
                     self,
@@ -5121,6 +5526,39 @@ pub fn audit_rows_merged(text: &str, kept: &[String]) -> String {
 pub(crate) struct Scratch {
     pub(crate) dir: PathBuf,
     pub(crate) cache: PathBuf,
+}
+
+/// Run the full export branch locally in owned scratch, including its public-clone check.
+/// The engine's dry run cannot stage or publish, and its audit rows are never pushed.
+pub(crate) fn measure_local_export(
+    repo: &Path,
+    root: &Path,
+    commit: &str,
+    jobs: u32,
+) -> Result<aterm_json::Value, String> {
+    std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let mut real = Real::new(repo, None, true, false)?;
+    real.logs = root.to_owned();
+    real.scratch_logs = false;
+    real.step = Step::Qualify;
+    let scratch = Scratch {
+        dir: root.to_owned(),
+        cache: root.join("cache"),
+    };
+    let started = std::time::Instant::now();
+    let (outcome, _) = real.export_gate_with_check(&scratch, commit, Some(jobs));
+    let success = matches!(outcome, Outcome::Pass(_));
+    let result = aterm_json::json!({
+        "kind":"local-full-export",
+        "success":success,
+        "wall_s":started.elapsed().as_secs_f64(),
+        "outcome":format!("{outcome:?}"),
+        "requested_jobs":jobs,
+        "staging_push":false,
+    });
+    crate::durable::write_fresh(&root.join("result.json"), result.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(result)
 }
 
 impl Scratch {
@@ -6431,7 +6869,7 @@ fn settle_post_claim_public_state(
     })
 }
 
-fn staged_covers_version(staged: &str, requested: &str) -> Result<bool, SupersedeCheck> {
+fn staged_ahead_of_version(staged: &str, requested: &str) -> Result<bool, SupersedeCheck> {
     let numbers = |version: &str| {
         version
             .split('.')
@@ -6444,7 +6882,7 @@ fn staged_covers_version(staged: &str, requested: &str) -> Result<bool, Supersed
                 ))
             })
     };
-    Ok(numbers(staged)? >= numbers(requested)?)
+    Ok(numbers(staged)? > numbers(requested)?)
 }
 
 impl SupersedeCheck {
@@ -6484,7 +6922,8 @@ fn line_commits(line: &Line) -> impl Iterator<Item = &str> {
 impl Real {
     /// Check every staging destination any tree on the retired line declared. A hop may change
     /// publication policy before qualify stages it, so neither the base nor head alone bounds
-    /// this append-only public surface.
+    /// this append-only surface. The same version can be appended again after retirement.
+    /// A later version still prevents staging from going backwards.
     fn supersede_staging_state(
         &mut self,
         previous: &Line,
@@ -6520,9 +6959,12 @@ impl Real {
                 .map_err(|error| SupersedeCheck::from(error.to_string()))?;
             let version = crate::publish::workspace_version(staged)
                 .map_err(|error| SupersedeCheck::from(error.to_string()))?;
-            let staged = staged_covers_version(&version, &line.version)?;
-            crate::line::require_unpublished([false, false, false, false, staged])
-                .map_err(SupersedeCheck::Present)?;
+            if staged_ahead_of_version(&version, &line.version)? {
+                return Err(SupersedeCheck::Present(format!(
+                    "staging has advanced to v{version}, beyond v{}",
+                    line.version
+                )));
+            }
         }
         Ok(())
     }
@@ -6544,7 +6986,7 @@ impl Real {
         }
         for channel in channels {
             let released = (self.release_exists)(&channel, tag).map_err(SupersedeCheck::from)?;
-            crate::line::require_unpublished([false, false, false, released, false])
+            crate::line::require_unpublished([false, false, false, released])
                 .map_err(SupersedeCheck::Present)?;
         }
         Ok(())
@@ -6600,8 +7042,9 @@ impl Real {
             self.fetch_engine_origin()
                 .map_err(SupersedeCheck::Unavailable)?;
         }
-        crate::line::verify(&self.git(), previous)
-            .map_err(|error| SupersedeCheck::from(error.to_string()))?;
+        // Retirement must also recover a hop whose old, tip-bound content proof expired.
+        // supersede verifies the replacement and the old head's ancestry. Publication
+        // checks below still cover every commit of the retired line.
         let ledger = self
             .git_out(&["show", "origin/main:RELEASES.ledger"])
             .ok_or_else(|| {
@@ -6633,7 +7076,7 @@ impl Real {
             || self
                 .cut_journal()
                 .is_some_and(|cut| cut.version == line.version);
-        crate::line::require_unpublished([tagged, ledgered, published, false, false])
+        crate::line::require_unpublished([tagged, ledgered, published, false])
             .map_err(SupersedeCheck::Present)?;
         self.supersede_release_state(previous, &tag)
     }
@@ -6954,6 +7397,16 @@ impl Real {
         let _timing =
             crate::cut_timing::Timer::start(&self.step_log(self.step), "commit-preflight");
         let mut blocks: Vec<Refusal> = Vec::new();
+        let transcript = self.transcript();
+        let log = self.step_log(self.step);
+        let notice = CommitGateNotice {
+            candidate: c,
+            step: self.step,
+            gate_dry: dry,
+            log: &log,
+            transcript: &transcript,
+        };
+        let mut report = |gate: &str, refusal: &Refusal| notice.emit(gate, refusal);
         let git = self.git();
         // Bracket remote readers, but never pay for an inputs seal before a cheap red.
         let tags = (!dry).then(|| {
@@ -6971,77 +7424,71 @@ impl Real {
                 Err(error) => Err(crate::ledger::Error::new(error.to_string())),
             };
         let (commit, version) = (c.commit.as_str(), c.version.as_str());
-        let gates: [(&str, crate::ledger::Result<()>); 4] = [
-            (
-                "changelog",
-                crate::cut_timing::measure("commit-gate changelog", || {
-                    crate::gates::changelog_gate_at(&git, commit, version).map(|_| ())
-                }),
-            ),
-            (
-                "harness versions",
-                crate::cut_timing::measure("commit-gate harness versions", || {
-                    with_origin(&|origin| {
-                        crate::gates::harness_versions_gate_at(&git, origin, commit, version)
-                            .map(|_| ())
-                    })
-                }),
-            ),
-            (
-                "handoff fixtures",
-                crate::cut_timing::measure("commit-gate handoff fixtures", || {
-                    with_origin(&|origin| {
-                        crate::gates::handoff_fixture_gate_at(&git, origin, commit, version)
-                            .map(|_| ())
-                    })
-                }),
-            ),
-            (
-                "handoff policy",
-                crate::cut_timing::measure("commit-gate handoff policy", || {
-                    with_origin(&|origin| {
-                        crate::gates::handoff_policy_gate_at(&git, origin, commit, version)
-                            .map(|_| ())
-                    })
-                }),
-            ),
-        ];
-        for (name, outcome) in gates {
-            if let Err(e) = outcome {
-                blocks.push(cut_refusal(name, &e.to_string()));
-            }
-        }
+        let _ = check_commit_gate("changelog", &mut blocks, &mut report, || {
+            crate::cut_timing::measure("commit-gate changelog", || {
+                crate::gates::changelog_gate_at(&git, commit, version).map(|_| ())
+            })
+            .map_err(|error| cut_refusal("changelog", &error.to_string()))
+        });
+        let _ = check_commit_gate("harness versions", &mut blocks, &mut report, || {
+            crate::cut_timing::measure("commit-gate harness versions", || {
+                with_origin(&|origin| {
+                    crate::gates::harness_versions_gate_at(&git, origin, commit, version)
+                        .map(|_| ())
+                })
+            })
+            .map_err(|error| cut_refusal("harness versions", &error.to_string()))
+        });
+        let _ = check_commit_gate("handoff fixtures", &mut blocks, &mut report, || {
+            crate::cut_timing::measure("commit-gate handoff fixtures", || {
+                with_origin(&|origin| {
+                    crate::gates::handoff_fixture_gate_at(&git, origin, commit, version).map(|_| ())
+                })
+            })
+            .map_err(|error| cut_refusal("handoff fixtures", &error.to_string()))
+        });
+        let _ = check_commit_gate("handoff policy", &mut blocks, &mut report, || {
+            crate::cut_timing::measure("commit-gate handoff policy", || {
+                with_origin(&|origin| {
+                    crate::gates::handoff_policy_gate_at(&git, origin, commit, version).map(|_| ())
+                })
+            })
+            .map_err(|error| cut_refusal("handoff policy", &error.to_string()))
+        });
         let checkout = if dry {
-            match self.candidate_checkout(commit) {
-                Ok(checkout) => Some(checkout),
-                Err(why) => {
-                    blocks.push(cut_refusal("R-tree locked metadata", &why).could_not_run());
-                    return blocks;
-                }
-            }
+            let Some(checkout) =
+                check_commit_gate("R-tree locked metadata", &mut blocks, &mut report, || {
+                    self.candidate_checkout(commit)
+                        .map_err(|why| cut_refusal("R-tree locked metadata", &why).could_not_run())
+                })
+            else {
+                return blocks;
+            };
+            Some(checkout)
         } else {
             None
         };
         let metadata_root = checkout
             .as_ref()
             .map_or(self.repo.as_path(), |(root, _)| root.as_path());
-        if let Err(error) = crate::cut_timing::measure("commit-gate locked metadata", || {
-            crate::gates::locked_metadata_gate(metadata_root)
-        }) {
-            let refusal = cut_refusal("locked metadata", &error.to_string());
-            blocks.push(match error {
-                crate::gates::LockedMetadataError::Unavailable(_) => refusal.could_not_run(),
-                crate::gates::LockedMetadataError::Lockfile(_) => refusal,
-            });
-        }
-        if let Err(why) =
+        let _ = check_commit_gate("locked metadata", &mut blocks, &mut report, || {
+            crate::cut_timing::measure("commit-gate locked metadata", || {
+                crate::gates::locked_metadata_gate(metadata_root)
+            })
+            .map_err(|error| {
+                let refusal = cut_refusal("locked metadata", &error.to_string());
+                match error {
+                    crate::gates::LockedMetadataError::Unavailable(_) => refusal.could_not_run(),
+                    crate::gates::LockedMetadataError::Lockfile(_) => refusal,
+                }
+            })
+        });
+        let _ = check_commit_gate("prerequisites", &mut blocks, &mut report, || {
             crate::cut_timing::measure("commit-gate prerequisites", || self.prepare_prerequisites())
-        {
-            blocks.push(why);
-        }
-        if let Err(why) = self.engine_readiness() {
-            blocks.push(why);
-        }
+        });
+        let _ = check_commit_gate("engine readiness", &mut blocks, &mut report, || {
+            self.engine_readiness()
+        });
         if blocks.is_empty()
             && let Some(tags) = tags
         {
@@ -7063,10 +7510,89 @@ impl Real {
                     .map_err(|e| e.to_string())
             })();
             if let Err(why) = record {
-                blocks.push(cut_refusal("commit gate record", &why).could_not_run());
+                let _ =
+                    check_commit_gate::<()>("commit gate record", &mut blocks, &mut report, || {
+                        Err(cut_refusal("commit gate record", &why).could_not_run())
+                    });
             }
         }
         blocks
+    }
+}
+
+/// Evaluate one actual gate before reporting its typed refusal and retaining it for the
+/// unchanged aggregate. Taking the evaluator, rather than its result, makes the order explicit.
+pub(crate) fn check_commit_gate<T>(
+    gate: &str,
+    blocks: &mut Vec<Refusal>,
+    report: &mut impl FnMut(&str, &Refusal),
+    evaluate: impl FnOnce() -> Result<T, Refusal>,
+) -> Option<T> {
+    match evaluate() {
+        Ok(value) => Some(value),
+        Err(refusal) => {
+            report(gate, &refusal);
+            blocks.push(refusal);
+            None
+        }
+    }
+}
+
+/// Informational context for a finding, never a stage completion or release permission.
+/// `gate_dry` is the backend gate mode; real prefreeze also uses that mode.
+pub(crate) struct CommitGateNotice<'a> {
+    pub(crate) candidate: &'a Candidate,
+    pub(crate) step: Step,
+    pub(crate) gate_dry: bool,
+    pub(crate) log: &'a Path,
+    pub(crate) transcript: &'a Path,
+}
+
+fn commit_gate_text(text: &str, chars: usize) -> (&str, bool) {
+    text.char_indices()
+        .nth(chars)
+        .map_or((text, false), |(end, _)| (&text[..end], true))
+}
+
+impl CommitGateNotice<'_> {
+    pub(crate) fn emit(&self, gate: &str, refusal: &Refusal) {
+        let event = self.event(gate, refusal);
+        // Same best-effort terminal/transcript path as existing release events. Reporting
+        // failure must not change the gate's verdict, aggregation or dry-run return behavior.
+        say_to(self.transcript, &format!("release-event: {event}"));
+    }
+
+    pub(crate) fn event(&self, gate: &str, refusal: &Refusal) -> aterm_json::Value {
+        let (detail, detail_cut) = commit_gate_text(&refusal.why, 2048);
+        let (remedy, remedy_cut) = commit_gate_text(&refusal.remedy, 1024);
+        let mut lines_cut = refusal.detail.len() > 4;
+        let lines: Vec<_> = refusal
+            .detail
+            .iter()
+            .take(4)
+            .map(|line| {
+                let (line, cut) = commit_gate_text(line, 512);
+                lines_cut |= cut;
+                line
+            })
+            .collect();
+        let (source, source_cut) = commit_gate_text(&self.candidate.commit, 128);
+        let (version, version_cut) = commit_gate_text(&self.candidate.version, 128);
+        let (gate, gate_cut) = commit_gate_text(gate, 128);
+        let log = self
+            .log
+            .to_str()
+            .filter(|path| !commit_gate_text(path, 2048).1);
+        aterm_json::json!({
+            "schema": 1, "event": "commit-gate-failed", "terminal": false,
+            "stage": self.step.name(), "gate": gate, "gate_dry": self.gate_dry,
+            "source": source, "version": version, "at_unix_s": now(), "log": log,
+            "outcome": if refusal.could_not_run { "NOT RUN" } else { "FAIL" },
+            "detail": detail, "remedy": remedy, "refusal_detail": lines,
+            "detail_truncated": detail_cut || remedy_cut || lines_cut,
+            "context_truncated": source_cut || version_cut || gate_cut,
+            "log_unavailable": log.is_none(),
+        })
     }
 }
 
@@ -7074,7 +7600,7 @@ fn cached_prefrozen_seal(real: &Real, commit: &str) -> Option<(String, PathBuf)>
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let cache = real.release.join("cutter-cache");
+    let cache = cutter_cache_dir(&real.release);
     let cutter = crate::release_tools::recorded_cutter(&cache, commit).ok()?;
     let seal = cutter.inputs?.seal;
     let path = (real.prefrozen_inputs)(&cache.join("state"), &seal)?;
@@ -8942,15 +9468,23 @@ impl Backend for Real {
         prover: &Prover,
         target: StageTarget,
     ) -> Result<Ran, Refusal> {
+        let _timing = crate::cut_timing::Timer::start(
+            &self.side_log(Step::Qualify, "serial-stage"),
+            "qualify serial export revalidation and staging",
+        );
         self.scanner_tools = None;
         self.engine_sync()?;
         self.prepare_scanner_tools(prover)?;
         self.export_run(c, prover, target, Step::Publish, None)
     }
 
-    fn qualify_begin(&mut self, prover: &Prover, export: bool) -> Result<String, Refusal> {
+    fn qualify_begin(&mut self, prover: &Prover, branches: &[Branch]) -> Result<String, Refusal> {
+        let _timing = crate::cut_timing::Timer::start(
+            &self.side_log(Step::Qualify, "preparation"),
+            "qualify preparation",
+        );
         self.pool = None;
-        if export {
+        if branches.contains(&Branch::Export) {
             // The export's engine and its scanner tools are made ready here, before any branch
             // starts, so every branch runs on `&self`.
             self.scanner_tools = None;
@@ -8958,7 +9492,11 @@ impl Backend for Real {
             self.prepare_scanner_tools(prover)?;
         }
         let path = self.logs.join("qualify.jobs");
-        let pool = qualify_pool(&path, export, |need| {
+        let _pool_timing = crate::cut_timing::Timer::start(
+            &self.side_log(Step::Qualify, "admission"),
+            "qualify core pool admission",
+        );
+        let pool = qualify_pool(&path, branches, |need| {
             aterm_capacity::admit(need, aterm_capacity::Admit::Wait)
         })?;
         let words = format!(
@@ -8985,13 +9523,21 @@ impl Backend for Real {
 
     fn branches(&mut self) -> Box<dyn Branches + '_> {
         let real = &*self;
+        let admission_barrier = real.pool.as_ref().map(|pool| {
+            pool.jobs
+                .reserve_initial()
+                .expect("new qualify branch pools own every non-export token before branches start")
+        });
         Box::new(RealBranches {
             real,
+            admission_barrier: std::sync::Mutex::new(admission_barrier),
             tree_index: TreeIndexHandoff::default(),
         })
     }
 
     fn publish_begin(&mut self, prover: &Prover) -> Result<(), Refusal> {
+        let _timing =
+            crate::cut_timing::Timer::start(&self.step_log(Step::Publish), "publish preparation");
         self.scanner_tools = None;
         self.engine_sync()?;
         self.prepare_scanner_tools(prover)?;
@@ -8999,6 +9545,10 @@ impl Backend for Real {
     }
 
     fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal> {
+        let _timing = crate::cut_timing::Timer::start(
+            &self.step_log(Step::Publish),
+            "source publication binding",
+        );
         let slug = self.slug();
         let tag = format!("v{}", c.version);
         let draft = crate::publish::journaled_draft(&self.repo.join("dist"), &c.version).map_err(
@@ -9048,10 +9598,13 @@ impl Backend for Real {
         candidate: &Candidate,
         reserved: Option<&Reservation>,
     ) -> Ran {
+        let log = self.step_log(Step::Cut);
+        let _wrapper = crate::cut_timing::Timer::start(&log, "cut wrapper total");
         match self.cut_command(args, prover) {
             Ok(mut cmd) => {
                 let real = &*self;
                 with_reader_prebuild(
+                    Some(&log),
                     move |stop| {
                         let started = std::time::Instant::now();
                         let log = real.logs.join("main-reader-prebuild.log");
@@ -9325,16 +9878,29 @@ fn with_reader_cargo<T>(
 }
 
 fn with_reader_prebuild(
+    log: Option<&Path>,
     prebuild: impl FnOnce(&BranchStop) + Send,
     cut: impl FnOnce() -> Ran,
 ) -> Ran {
     let stop = BranchStop::default();
+    let timing = crate::cut_timing::Timer::parallel_parent();
     std::thread::scope(|scope| {
-        scope.spawn(|| prebuild(&stop));
-        let verdict = cut();
+        let worker = scope.spawn(|| {
+            let _prebuild = timing("cut fixture prebuild").with_log(log);
+            prebuild(&stop)
+        });
+        let verdict = {
+            let _child = timing("cut child and drains").with_log(log);
+            cut()
+        };
         if verdict.code != 0 {
             stop.fire();
         }
+        let _join =
+            log.map(|log| crate::cut_timing::Timer::start(log, "cut fixture prebuild join"));
+        worker
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         verdict
     })
 }
@@ -9778,7 +10344,7 @@ fn prepare_cached_cutter(
     } else {
         tip.to_owned()
     };
-    let cache = real.release.join("cutter-cache");
+    let cache = cutter_cache_dir(&real.release);
     // The atomically published record binds an immutable, content-addressed executable.
     // Rechecking that binding and kept input seal needs no compiler checkout or lease.
     if let Some(cutter) = crate::release_tools::recorded_cutter(&cache, &tip)
@@ -9835,7 +10401,7 @@ fn supervise_prefreeze_in(
     executable: &Path,
 ) -> Result<(), String> {
     interrupt::install();
-    let cache = aterm_verify::engine::release_dir(repo).join("cutter-cache");
+    let cache = cutter_cache_dir(&aterm_verify::engine::release_dir(repo));
     std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
     let pid = std::process::id();
     let started = started_of(pid).ok_or("cannot identify pre-freeze supervisor")?;
@@ -10828,209 +11394,846 @@ pub(crate) mod dry_tools_tests;
 
 #[cfg(test)]
 mod tests {
+    /// A held shared slice budget in the build child's process tree opens the production tree
+    /// gate. One held exclusive learner plus its queued or not-yet-present sibling selects the
+    /// bounded serial escape.
+    /// NEGATIVE CONTROLS: queued shared, foreign, undersized, lower-ranked and non-accounting
+    /// rows do not authorize either schedule, and the old Pending answer for a held learner
+    /// would strand that slice behind the all-token barrier.
     #[test]
-    fn slice_claim_ownership_includes_the_pilot_and_excludes_other_workers() {
-        let parents = std::collections::BTreeMap::from([(7, 1), (8, 7), (9, 8), (100, 1)]);
-        assert!(super::owns_process(7, 7, &parents));
-        assert!(super::owns_process(7, 9, &parents));
-        assert!(!super::owns_process(7, 100, &parents));
-        assert!(super::owns_process(7, 7, &Default::default()));
-        assert!(!super::owns_process(7, 9, &Default::default()));
+    fn a_held_descendant_shared_slice_budget_opens_the_tree_gate() {
+        let record = |pid, what: &str, held: bool, mem: u64| aterm_capacity::Record {
+            accounting: aterm_capacity::Accounting::Holder,
+            pid,
+            start_ms: 1,
+            seq: 1,
+            checkout: String::new(),
+            need: aterm_capacity::Need::new(what)
+                .rank(aterm_capacity::Rank::Release)
+                .mem(mem)
+                .margin(1),
+            timing: aterm_capacity::TimingEvidence::default(),
+            held: held.then_some(aterm_capacity::Held {
+                admitted_ms: 2,
+                cores: 0,
+                alone: false,
+            }),
+            credit: Vec::new(),
+            wrote: None,
+            next_ms: None,
+        };
+        let learning = |pid, what: &str, held: bool, mem: u64| aterm_capacity::Record {
+            accounting: aterm_capacity::Accounting::Holder,
+            pid,
+            start_ms: 1,
+            seq: 1,
+            checkout: String::new(),
+            need: aterm_capacity::Need::new(what)
+                .rank(aterm_capacity::Rank::Release)
+                .mem(mem)
+                .margin(1)
+                .alone(),
+            timing: aterm_capacity::TimingEvidence::default(),
+            held: held.then_some(aterm_capacity::Held {
+                admitted_ms: 2,
+                cores: 0,
+                alone: true,
+            }),
+            credit: Vec::new(),
+            wrote: None,
+            next_ms: None,
+        };
+        let me = 10;
+        let child = crate::interrupt::Proc {
+            pid: 20,
+            parent: me,
+            pgid: 20,
+            name: "build".into(),
+        };
+        let foreign = crate::interrupt::Proc {
+            pid: 30,
+            parent: 1,
+            pgid: 30,
+            name: "other".into(),
+        };
+        for (held, bytes, expected) in [
+            (true, 40_u64 << 30, super::SliceMemory::Serial),
+            (false, 40_u64 << 30, super::SliceMemory::Pending),
+            (true, 35_u64 << 30, super::SliceMemory::StaleBudget),
+            (true, 1_u64 << 30, super::SliceMemory::Pending),
+        ] {
+            let packed = record(20, crate::slice_units::SERIAL_PARENT, held, bytes);
+            assert_eq!(
+                super::slices_hold_memory_in(
+                    u32::try_from(me).unwrap(),
+                    44_u64 << 30,
+                    &[packed],
+                    std::slice::from_ref(&child)
+                ),
+                expected
+            );
+        }
+        let shared = record(
+            20,
+            "release slice memory budget",
+            true,
+            crate::slice_units::MIN_SHARED,
+        );
+        assert_eq!(
+            super::slices_hold_memory_in(
+                u32::try_from(me).unwrap(),
+                crate::slice_units::MIN_SHARED,
+                std::slice::from_ref(&shared),
+                std::slice::from_ref(&child)
+            ),
+            super::SliceMemory::Held
+        );
+        let calibrated_minimum = 55 * (1_u64 << 30);
+        assert_eq!(
+            super::slices_hold_memory_in(
+                u32::try_from(me).unwrap(),
+                calibrated_minimum,
+                std::slice::from_ref(&shared),
+                std::slice::from_ref(&child),
+            ),
+            super::SliceMemory::StaleBudget,
+            "a held parent sized from an older book must release the barrier to build alone"
+        );
+        let calibrated = record(20, "release slice memory budget", true, calibrated_minimum);
+        assert_eq!(
+            super::slices_hold_memory_in(
+                u32::try_from(me).unwrap(),
+                calibrated_minimum,
+                std::slice::from_ref(&calibrated),
+                std::slice::from_ref(&child),
+            ),
+            super::SliceMemory::Held
+        );
+        for malformed in [
+            aterm_capacity::Record {
+                need: aterm_capacity::Need::new("release slice memory budget")
+                    .rank(aterm_capacity::Rank::Release)
+                    .mem(calibrated_minimum),
+                ..calibrated.clone()
+            },
+            aterm_capacity::Record {
+                held: calibrated.held.map(|held| aterm_capacity::Held {
+                    alone: true,
+                    ..held
+                }),
+                ..calibrated.clone()
+            },
+        ] {
+            assert_eq!(
+                super::slices_hold_memory_in(
+                    u32::try_from(me).unwrap(),
+                    calibrated_minimum,
+                    std::slice::from_ref(&malformed),
+                    std::slice::from_ref(&child),
+                ),
+                super::SliceMemory::Pending,
+                "a shared parent must carry the anti-ALONE margin and admission"
+            );
+        }
+        assert_eq!(
+            super::slices_hold_memory_in(
+                u32::try_from(me).unwrap(),
+                crate::slice_units::MIN_SHARED,
+                &[record(
+                    20,
+                    "release slice memory budget",
+                    false,
+                    crate::slice_units::MIN_SHARED,
+                )],
+                std::slice::from_ref(&child)
+            ),
+            super::SliceMemory::Pending,
+            "a queued shared parent has reserved no memory yet"
+        );
+        assert_eq!(
+            super::slices_hold_memory_in(
+                u32::try_from(me).unwrap(),
+                crate::slice_units::MIN_SHARED,
+                &[record(
+                    30,
+                    "release slice memory budget",
+                    true,
+                    crate::slice_units::MIN_SHARED,
+                )],
+                &[child.clone(), foreign]
+            ),
+            super::SliceMemory::Pending,
+            "another release's held budget cannot open this one's tree gate"
+        );
+        for mem in [calibrated_minimum - 1, 1] {
+            assert_eq!(
+                super::slices_hold_memory_in(
+                    u32::try_from(me).unwrap(),
+                    calibrated_minimum,
+                    &[record(20, "release slice memory budget", true, mem)],
+                    std::slice::from_ref(&child)
+                ),
+                if mem >= crate::slice_units::MIN_SHARED {
+                    super::SliceMemory::StaleBudget
+                } else {
+                    super::SliceMemory::Pending
+                },
+                "a shared-label claim below the production floor cannot open the tree gate"
+            );
+        }
+        assert_eq!(
+            super::slices_hold_memory_in(
+                u32::try_from(me).unwrap(),
+                crate::slice_units::MIN_SHARED,
+                &[aterm_capacity::Record {
+                    need: aterm_capacity::Need::new("release slice memory budget")
+                        .mem(crate::slice_units::MIN_SHARED),
+                    ..shared.clone()
+                }],
+                std::slice::from_ref(&child)
+            ),
+            super::SliceMemory::Pending,
+            "a lower-ranked lookalike cannot open the release tree gate"
+        );
+        assert_eq!(
+            super::slices_hold_memory_in(
+                u32::try_from(me).unwrap(),
+                crate::slice_units::MIN_SHARED,
+                &[aterm_capacity::Record {
+                    accounting: aterm_capacity::Accounting::Whole,
+                    ..shared.clone()
+                }],
+                std::slice::from_ref(&child)
+            ),
+            super::SliceMemory::Pending,
+            "a non-accounting lookalike cannot open the release tree gate"
+        );
+
+        let native = learning(
+            20,
+            "release slice aarch64-apple-darwin",
+            true,
+            crate::slice_units::DRIVER,
+        );
+        for malformed in [
+            record(
+                20,
+                "release slice aarch64-apple-darwin",
+                true,
+                crate::slice_units::DRIVER,
+            ),
+            aterm_capacity::Record {
+                held: native.held.map(|held| aterm_capacity::Held {
+                    alone: false,
+                    ..held
+                }),
+                ..native.clone()
+            },
+        ] {
+            assert_eq!(
+                super::slices_hold_memory_in(
+                    u32::try_from(me).unwrap(),
+                    crate::slice_units::MIN_SHARED,
+                    std::slice::from_ref(&malformed),
+                    std::slice::from_ref(&child),
+                ),
+                super::SliceMemory::Pending,
+                "a learning claim and its held state must both carry ALONE"
+            );
+        }
+        let held_and_missing = super::slices_hold_memory_in(
+            u32::try_from(me).unwrap(),
+            crate::slice_units::MIN_SHARED,
+            std::slice::from_ref(&native),
+            std::slice::from_ref(&child),
+        );
+        assert_eq!(
+            held_and_missing,
+            super::SliceMemory::Serial,
+            "an exact held learning claim cannot remain behind every compiler token when its sibling is absent"
+        );
+        let compat_waiting = learning(
+            20,
+            "release slice x86_64-apple-darwin",
+            false,
+            crate::slice_units::DRIVER,
+        );
+        let serial = super::slices_hold_memory_in(
+            u32::try_from(me).unwrap(),
+            crate::slice_units::MIN_SHARED,
+            &[native.clone(), compat_waiting],
+            std::slice::from_ref(&child),
+        );
+        assert_eq!(
+            serial,
+            super::SliceMemory::Serial,
+            "the held learner must receive its compiler tokens before its queued sibling can fit"
+        );
+
+        for escape in [held_and_missing, serial] {
+            let ended = std::cell::Cell::new(false);
+            let released = std::cell::Cell::new(false);
+            super::await_slice_memory(
+                &|| ended.get(),
+                || escape,
+                || released.set(true),
+                || {
+                    assert!(
+                        released.get(),
+                        "learning tokens return before its build wait"
+                    );
+                    ended.set(true);
+                },
+            );
+            assert!(ended.get(), "learning admission waits for build completion");
+        }
+
+        // Bind the production detector and wait ordering to QualifyFallbackAdmission. A
+        // Pending mutation never releases before the first pause; an early-return mutation
+        // leaves `ended` false; an early-tree mutation is disabled until both parents end.
+        let model = aterm_models_capacity::qualify_fallback_admission_model();
+        let mut state = model.init_state();
+        assert!(model.fire("NativeParentHolds", &mut state));
+        assert!(model.fire("CompatParentQueues", &mut state));
+        assert_eq!(
+            serial == super::SliceMemory::Serial,
+            model.action_enabled("SerialEscape", &state)
+        );
+        assert!(!model.action_enabled("TreeStarts", &state));
+        let ended = std::cell::Cell::new(false);
+        let released = std::cell::Cell::new(false);
+        let pauses = std::cell::Cell::new(0_u8);
+        super::await_slice_memory(
+            &|| ended.get(),
+            || serial,
+            || {
+                assert!(!released.replace(true));
+                assert!(model.fire("SerialEscape", &mut state));
+            },
+            || {
+                assert!(released.get(), "serial escape precedes its build wait");
+                pauses.set(pauses.get() + 1);
+                ended.set(true);
+            },
+        );
+        assert!(ended.get(), "admission returns only after build completion");
+        assert_eq!(pauses.get(), 1);
+        assert!(model.fire("NativeSliceEnds", &mut state));
+        assert!(model.fire("CompatParentHolds", &mut state));
+        assert!(!model.action_enabled("TreeStarts", &state));
+        assert!(model.fire("CompatSliceEnds", &mut state));
+        assert!(model.action_enabled("TreeStarts", &state));
+        assert!(model.fire("TreeStarts", &mut state));
+        assert_eq!(state["tree"], 1);
+        assert!(aterm_spec::interp::bmc(&model).is_ok());
+        assert!(
+            aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err(),
+            "KeepBarrier or TreeStartsEarly must break the fallback laws"
+        );
+        let compat = learning(
+            20,
+            "release slice x86_64-apple-darwin",
+            true,
+            crate::slice_units::DRIVER,
+        );
+        assert_eq!(
+            super::slices_hold_memory_in(
+                u32::try_from(me).unwrap(),
+                crate::slice_units::MIN_SHARED,
+                &[native.clone(), compat],
+                std::slice::from_ref(&child)
+            ),
+            super::SliceMemory::Pending,
+            "two held ALONE rows are not a valid state and cannot open the tree"
+        );
+        for (native_mem, compat_mem) in [
+            (crate::slice_units::DRIVER - 1, crate::slice_units::DRIVER),
+            (crate::slice_units::DRIVER, crate::slice_units::DRIVER - 1),
+        ] {
+            assert_eq!(
+                super::slices_hold_memory_in(
+                    u32::try_from(me).unwrap(),
+                    crate::slice_units::MIN_SHARED,
+                    &[
+                        learning(20, "release slice aarch64-apple-darwin", true, native_mem),
+                        learning(20, "release slice x86_64-apple-darwin", false, compat_mem),
+                    ],
+                    std::slice::from_ref(&child)
+                ),
+                super::SliceMemory::Pending,
+                "each exclusive learning claim must retain its driver envelope"
+            );
+        }
     }
 
-    /// Exercise the real admission gate against the recorded-peak model. A stale
-    /// admission cannot launch slices; an undersized claim cannot enter the model.
+    /// Only the verifier descendant's held, covering whole-stage Tippy reservation at or above
+    /// its safe floor opens the build-first compiler-token barrier. A queued valid row selects the
+    /// bounded serial escape. NEGATIVE CONTROLS: undersized, lower-ranked, marginless,
+    /// non-covering or ALONE exact rows refuse the tree after transferring its tokens to build;
+    /// foreign and merely similarly named rows authorize no path.
     #[test]
-    fn lint_admission_precedes_slices_and_refines_the_recorded_memory_model() {
-        use aterm_spec::interp::{bmc, with_buggy, with_consts};
-        let model = aterm_models_release::release_lint_memory_model();
-        assert!(bmc(&model).is_ok());
-        assert_eq!(
-            aterm_spec::interp::find_deadlock(&model, |s| s["lint"] == 2
-                && s["native"] == 2
-                && s["compat"] == 2),
-            None
-        );
-        // Bind the model's envelopes to the production unit claim chooser, using
-        // the fresh m112 peaks. This never changes a slice's actual claims.
-        let unit = aterm_verify::unitgraph::UnitName {
-            package: "aterm".into(),
-            kind: "aterm bin".into(),
+    fn only_an_exact_held_descendant_tippy_claim_opens_the_compiler_barrier() {
+        let shapes = super::tree_lint_claim_shapes().expect("release plan has Tippy");
+        let row = |pid, what: &str, held: bool, mem: u64| aterm_capacity::Record {
+            accounting: aterm_capacity::Accounting::Holder,
+            pid,
+            start_ms: 1,
+            seq: 1,
+            checkout: String::new(),
+            need: aterm_capacity::Need::new(what)
+                .rank(aterm_capacity::Rank::Release)
+                .mem(mem)
+                .margin(1)
+                .covers(),
+            timing: aterm_capacity::TimingEvidence::default(),
+            held: held.then_some(aterm_capacity::Held {
+                admitted_ms: 2,
+                cores: 0,
+                alone: false,
+            }),
+            credit: Vec::new(),
+            wrote: None,
+            next_ms: None,
         };
-        for (triple, peak, claim_const) in [
-            ("aarch64-apple-darwin", 46_219_853_824, "NativeClaim"),
-            ("x86_64-apple-darwin", 25_890_799_616, "CompatClaim"),
-        ] {
-            let mut records = aterm_capacity::book::Records::default();
-            records.push(crate::slice_units::key(triple, &unit), peak, 1);
-            let need = crate::slice_units::unit_need(triple, &records, &unit, 4 << 30);
-            assert!(need.mem >= peak);
-            let modeled = model
-                .consts
-                .iter()
-                .find(|(name, _)| *name == claim_const)
-                .unwrap()
-                .1;
-            assert_eq!(need.mem, u64::try_from(modeled).unwrap() << 20);
+        let me = 10_u32;
+        let verifier = crate::interrupt::Proc {
+            pid: 20,
+            parent: i32::try_from(me).unwrap(),
+            pgid: 20,
+            name: "aterm-verify".into(),
+        };
+        let foreign = crate::interrupt::Proc {
+            pid: 30,
+            parent: 1,
+            pgid: 30,
+            name: "aterm-verify".into(),
+        };
+        for shape in &shapes {
+            let valid = row(20, &shape.label, true, shape.bytes);
+            assert_eq!(
+                super::tree_lint_claim_in(
+                    me,
+                    std::slice::from_ref(&valid),
+                    std::slice::from_ref(&verifier),
+                    &shapes,
+                ),
+                Some(super::TreeLintClaim::Held)
+            );
+            assert_eq!(
+                super::tree_lint_claim_in(
+                    me,
+                    &[row(20, &shape.label, false, shape.bytes)],
+                    std::slice::from_ref(&verifier),
+                    &shapes,
+                ),
+                Some(super::TreeLintClaim::Waiting),
+                "a valid queued claim selects the bounded serial escape, not concurrent admission"
+            );
+            assert_eq!(
+                super::tree_lint_claim_in(
+                    me,
+                    &[row(20, &shape.label, true, shape.bytes - 1)],
+                    std::slice::from_ref(&verifier),
+                    &shapes,
+                ),
+                Some(super::TreeLintClaim::Invalid),
+                "an undersized {} claim must refuse the tree",
+                shape.label
+            );
         }
-        for mutant in [1, 2, 3] {
-            assert!(bmc(&with_buggy(&model, mutant)).is_err(), "mutant {mutant}");
+
+        let whole = &shapes[0];
+        for bytes in [0, whole.bytes - 1] {
+            assert_eq!(
+                super::tree_lint_claim_in(
+                    me,
+                    &[row(20, &whole.label, true, bytes)],
+                    std::slice::from_ref(&verifier),
+                    &shapes,
+                ),
+                Some(super::TreeLintClaim::Invalid),
+                "NEGATIVE CONTROL: a whole-stage Tippy claim below its measured floor is unsafe"
+            );
         }
-        let lint_claim_mib = aterm_capacity::peak_claim(26_452_845_576).div_ceil(1 << 20);
         assert_eq!(
-            model
-                .consts
-                .iter()
-                .find(|(name, _)| *name == "LintClaim")
-                .unwrap()
-                .1,
-            i64::try_from(lint_claim_mib).unwrap()
-        );
-        let small = with_consts(&model, &[("LintClaim", 1)]);
-        assert!(
-            small
-                .successors("LintAdmitted", &small.init_state())
-                .is_empty()
+            super::tree_lint_claim_in(
+                me,
+                &[row(20, &whole.label, true, whole.bytes + 1)],
+                std::slice::from_ref(&verifier),
+                &shapes,
+            ),
+            Some(super::TreeLintClaim::Held),
+            "a learned whole-stage claim may safely exceed its floor"
         );
 
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let path = dir.path().join("tree.events");
-        let event =
-            "verify-event: {\"schema\":1,\"event\":\"stage-admitted\",\"stage_id\":\"Tippy\"}\n";
-        std::fs::write(&path, event).unwrap();
-        let handoff = super::TreeIndexHandoff::default();
-        handoff.expect_lint(path.clone());
+        let valid = row(20, &whole.label, true, whole.bytes);
+        let similarly_named = row(20, "verify tippy lint (-p aterm)", true, whole.bytes);
         assert!(
-            !crate::check_record::events(&path).unwrap().lint_admitted,
-            "a previous run's event must be cleared before either branch starts"
+            super::tree_lint_claim_in(
+                me,
+                std::slice::from_ref(&similarly_named),
+                std::slice::from_ref(&verifier),
+                &shapes,
+            )
+            .is_none(),
+            "a merely similar label is not this release's claim"
         );
-        // Starting a stage or admitting another stage proves no lint admission.
-        for other in [
-            "verify-event: {\"schema\":1,\"event\":\"stage-started\",\"stage_id\":\"Tippy\"}\n",
-            "verify-event: {\"schema\":1,\"event\":\"stage-admitted\",\"stage_id\":\"TestCompile\"}\n",
+        for invalid in [
+            aterm_capacity::Record {
+                need: aterm_capacity::Need::new(&whole.label)
+                    .mem(whole.bytes)
+                    .covers(),
+                ..valid.clone()
+            },
+            aterm_capacity::Record {
+                need: aterm_capacity::Need::new(&whole.label)
+                    .rank(aterm_capacity::Rank::Release)
+                    .mem(whole.bytes),
+                ..valid.clone()
+            },
+            aterm_capacity::Record {
+                accounting: aterm_capacity::Accounting::Whole,
+                ..valid.clone()
+            },
+            aterm_capacity::Record {
+                need: aterm_capacity::Need::new(&whole.label)
+                    .rank(aterm_capacity::Rank::Release)
+                    .mem(whole.bytes)
+                    .covers(),
+                ..valid.clone()
+            },
+            aterm_capacity::Record {
+                held: Some(aterm_capacity::Held {
+                    admitted_ms: 2,
+                    cores: 0,
+                    alone: true,
+                }),
+                ..valid.clone()
+            },
         ] {
-            std::fs::write(&path, other).unwrap();
-            assert!(!crate::check_record::events(&path).unwrap().lint_admitted);
+            assert_eq!(
+                super::tree_lint_claim_in(
+                    me,
+                    std::slice::from_ref(&invalid),
+                    std::slice::from_ref(&verifier),
+                    &shapes,
+                ),
+                Some(super::TreeLintClaim::Invalid),
+                "invalid exact claim must refuse the tree: {invalid:?}"
+            );
         }
-        std::fs::write(&path, "").unwrap();
-        let state = std::cell::RefCell::new(model.init_state());
-        let polls = std::cell::Cell::new(0);
-        handoff
-            .await_lint(
-                |path| {
-                    crate::check_record::events(path).is_ok_and(|e| e.whole() && e.lint_admitted)
-                },
-                || false,
-                || false,
+
+        let waiting = row(20, &whole.label, false, whole.bytes);
+        for records in [
+            vec![waiting.clone(), valid.clone()],
+            vec![valid.clone(), waiting.clone()],
+        ] {
+            assert_eq!(
+                super::tree_lint_claim_in(me, &records, std::slice::from_ref(&verifier), &shapes,),
+                Some(super::TreeLintClaim::Held),
+                "a held duplicate dominates a queued duplicate in either file order"
+            );
+        }
+        let malformed = aterm_capacity::Record {
+            accounting: aterm_capacity::Accounting::Whole,
+            ..valid.clone()
+        };
+        for (dominant, expected) in [
+            (valid.clone(), super::TreeLintClaim::Held),
+            (waiting, super::TreeLintClaim::Waiting),
+        ] {
+            for records in [
+                vec![malformed.clone(), dominant.clone()],
+                vec![dominant.clone(), malformed.clone()],
+            ] {
+                assert_eq!(
+                    super::tree_lint_claim_in(
+                        me,
+                        &records,
+                        std::slice::from_ref(&verifier),
+                        &shapes,
+                    ),
+                    Some(expected),
+                    "NEGATIVE CONTROL: a valid duplicate dominates a malformed duplicate in \
+                     either file order"
+                );
+            }
+        }
+        assert!(
+            super::tree_lint_claim_in(
+                me,
+                &[row(30, &whole.label, true, whole.bytes)],
+                &[verifier, foreign],
+                &shapes,
+            )
+            .is_none(),
+            "another release's verifier cannot release this pool"
+        );
+
+        let model = aterm_models_capacity::qualify_memory_model();
+        let mut state = model.init_state();
+        assert!(model.fire("ParentAdmit", &mut state));
+        assert!(model.action_enabled("WholeLintAdmit", &state));
+        assert!(model.fire("WholeLintAdmit", &mut state));
+        assert!(model.action_enabled("TreeStarts", &state));
+        assert!(aterm_spec::interp::bmc(&model).is_ok());
+        assert!(
+            aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 2)).is_err(),
+            "NEGATIVE CONTROL: the old delayed-admission ordering must break its scheduling law"
+        );
+    }
+
+    /// Capacity inspection is never a liveness dependency of the all-token barrier. An unread
+    /// detector and held-plus-waiting learning claims both release the tokens and wait for build
+    /// completion before returning; an unread tree detector returns immediately because the
+    /// slice parent is already protected. NEGATIVE CONTROLS: treating either slice escape as
+    /// Pending reaches the injected pause before release, and returning before build completion
+    /// violates the final assertion.
+    #[test]
+    fn unread_admission_detectors_take_the_bounded_escape_without_deadlock() {
+        use std::cell::Cell;
+
+        for escape in [
+            super::SliceMemory::Unavailable,
+            super::SliceMemory::Serial,
+            super::SliceMemory::StaleBudget,
+        ] {
+            let build_ended = Cell::new(false);
+            let released = Cell::new(false);
+            let pauses = Cell::new(0_u8);
+            super::await_slice_memory(
+                &|| build_ended.get(),
+                || escape,
+                || released.set(true),
                 || {
-                    assert_eq!(
-                        polls.replace(1),
-                        0,
-                        "the gate must observe the admission on its next read"
-                    );
-                    assert!(
-                        model.successors("SlicesStart", &state.borrow()).is_empty(),
-                        "NEGATIVE CONTROL: no slice can overtake lint admission"
-                    );
-                    let next = model
-                        .successors("LintAdmitted", &state.borrow())
-                        .pop()
-                        .unwrap();
-                    *state.borrow_mut() = next;
-                    std::fs::write(&path, event).unwrap();
+                    assert!(released.get(), "tokens return before the serial build wait");
+                    pauses.set(pauses.get() + 1);
+                    build_ended.set(true);
                 },
+            );
+            assert!(released.get());
+            assert!(build_ended.get());
+            assert_eq!(pauses.get(), 1, "the serial escape waited for build end");
+        }
+
+        let tree_pauses = Cell::new(0_u8);
+        assert!(super::await_tree_memory(
+            &|| false,
+            || super::TreeLintObservation::Unavailable,
+            || panic!("an unread tree detector keeps the original branch shares"),
+            || tree_pauses.set(tree_pauses.get() + 1),
+        ));
+        assert_eq!(
+            tree_pauses.get(),
+            0,
+            "an unread tree detector cannot retain every compiler token"
+        );
+
+        for (claim, must_serialize, tree_may_run) in [
+            (super::TreeLintClaim::Held, false, true),
+            (super::TreeLintClaim::Waiting, true, true),
+            (super::TreeLintClaim::Invalid, true, false),
+        ] {
+            let serialized = Cell::new(false);
+            let admitted = super::await_tree_memory(
+                &|| false,
+                || super::TreeLintObservation::Claim(claim),
+                || serialized.set(true),
+                || panic!("an observed exact Tippy claim needs no further scan"),
+            );
+            assert_eq!(
+                serialized.get(),
+                must_serialize,
+                "a queued or malformed Tippy claim transfers every token to build"
+            );
+            assert_eq!(
+                admitted, tree_may_run,
+                "NEGATIVE CONTROL: a malformed envelope must stop the tree"
+            );
+        }
+    }
+
+    /// Bind both production admission seams to the real private FIFOs. NEGATIVE CONTROLS:
+    /// replacing the transfer with an ordinary barrier drop yields the initial 2/1 split;
+    /// replacing it with a no-op yields 0/0 while the reservation remains held.
+    #[test]
+    fn serial_admission_seams_transfer_the_exact_bounded_allocation_to_build() {
+        use std::cell::Cell;
+
+        fn drain(pool: &aterm_capacity::Jobserver) -> Vec<aterm_capacity::Token<'_>> {
+            let mut tokens = Vec::new();
+            while let Some(token) = pool.try_acquire().unwrap() {
+                tokens.push(token);
+            }
+            tokens
+        }
+
+        let assert_serial = |tree: bool| {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let shares = aterm_capacity::BranchShares::new(
+                &dir.path().join("qualify.jobs"),
+                4,
+                1,
+                [true, true],
             )
             .unwrap();
-        assert_eq!(
-            polls.get(),
-            1,
-            "without the gate, slices launch before the wait callback"
-        );
-        let mut state = state.into_inner();
-        for action in [
-            "SlicesStart",
-            "CompatRuns",
-            "LintEnds",
-            "CompatEnds",
-            "NativeRuns",
-            "NativeEnds",
-        ] {
-            let next = model.successors(action, &state).pop().unwrap();
-            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-                &model,
-                &[],
-                &state,
-                &next,
-                Some(action),
-                "qualify lint admission",
+            let barrier = std::sync::Mutex::new(Some(shares.reserve_initial().unwrap()));
+            if tree {
+                assert!(super::await_tree_memory_with_barrier(
+                    &barrier,
+                    &|| false,
+                    || super::TreeLintObservation::Claim(super::TreeLintClaim::Waiting),
+                    || panic!("an exact queued Tippy claim needs no further scan"),
+                ));
+            } else {
+                let ended = Cell::new(false);
+                super::await_slice_memory_with_barrier(
+                    &barrier,
+                    &|| ended.get(),
+                    || super::SliceMemory::Serial,
+                    || ended.set(true),
+                );
+                assert!(
+                    ended.get(),
+                    "slice serialization waits for build completion"
+                );
+            }
+            assert!(barrier.lock().unwrap().is_none());
+            let build = drain(shares.pool(false));
+            let tree = drain(shares.pool(true));
+            assert_eq!(
+                (build.len(), tree.len()),
+                (3, 0),
+                "serial escape transfers every non-export token to build"
             );
-            assert!(ok, "{action}: {why}");
-            state = next;
-        }
-        assert_eq!(state["held"], 0);
-        // The undersized mutant admits the native link beside lint, fitting its
-        // declared claims while exceeding the budget at the recorded lint peak.
-        let mutant = with_buggy(&model, 1);
-        let mut state = mutant.init_state();
-        for action in ["UndersizedLint", "SlicesStart", "NativeRuns"] {
-            state = mutant.successors(action, &state).pop().unwrap();
-        }
-        assert!(mutant.check_invariant("FitsMemory", &state));
-        assert!(!mutant.check_invariant("FitsRecordedMemory", &state));
-    }
+            drop((build, tree));
 
-    #[test]
-    fn an_ended_tree_releases_lint_waiters_without_starting_after_a_red() {
-        for (completion, keep_build, interrupted, succeeds) in [
-            (super::TreeIndexCompletion::Compile, false, false, true),
-            (super::TreeIndexCompletion::Stopped, false, false, false),
-            (super::TreeIndexCompletion::Stopped, true, false, true),
-            (super::TreeIndexCompletion::Stopped, true, true, false),
-        ] {
-            let dir = aterm_tempfile::tempdir().unwrap();
-            let handoff = super::TreeIndexHandoff::default();
-            handoff.expect_lint(dir.path().join("events"));
-            handoff.finish(completion);
-            let answer = handoff.await_lint(
-                |_| false,
-                || interrupted,
-                || keep_build,
-                || panic!("a completed tree must release the waiter"),
+            shares.finish(2);
+            let build = drain(shares.pool(false));
+            assert_eq!(build.len(), 4, "export completion stays on serial build");
+            assert!(drain(shares.pool(true)).is_empty());
+            drop(build);
+            shares.finish(0);
+            assert!(drain(shares.pool(false)).is_empty());
+            assert_eq!(
+                drain(shares.pool(true)).len(),
+                4,
+                "build completion transfers the same bounded allocation to tree"
             );
-            assert_eq!(answer.is_ok(), succeeds);
-        }
+        };
+        assert_serial(false);
+        assert_serial(true);
+
         let dir = aterm_tempfile::tempdir().unwrap();
-        let handoff = super::TreeIndexHandoff::default();
-        handoff.expect_lint(dir.path().to_owned());
-        assert!(
-            handoff
-                .await_lint(
-                    |_| true,
-                    || false,
-                    || true,
-                    || panic!("a failed gate preparation must not wait")
+        let shares = aterm_capacity::BranchShares::new(
+            &dir.path().join("concurrent.jobs"),
+            4,
+            1,
+            [true, true],
+        )
+        .unwrap();
+        let barrier = std::sync::Mutex::new(Some(shares.reserve_initial().unwrap()));
+        assert!(super::await_tree_memory_with_barrier(
+            &barrier,
+            &|| false,
+            || super::TreeLintObservation::Claim(super::TreeLintClaim::Held),
+            || panic!("an exact held Tippy claim needs no further scan"),
+        ));
+        drop(barrier.lock().unwrap().take());
+        assert_eq!(
+            (
+                drain(shares.pool(false)).len(),
+                drain(shares.pool(true)).len()
+            ),
+            (2, 1),
+            "held Tippy preserves build-first width and one tree compiler"
+        );
+    }
+
+    /// A resume may have only one branch. NEGATIVE CONTROL: the former all-compiler allocation
+    /// gives a build-only one-slot plan's sole token to tree.
+    #[test]
+    fn qualify_pool_allocates_only_to_branches_in_the_resume_plan() {
+        fn drain(pool: &aterm_capacity::Jobserver) -> Vec<aterm_capacity::Token<'_>> {
+            let mut tokens = Vec::new();
+            while let Some(token) = pool.try_acquire().unwrap() {
+                tokens.push(token);
+            }
+            tokens
+        }
+
+        type ResumeCase<'a> = (u32, &'a [Branch], u32, (usize, usize));
+        let cases: &[ResumeCase<'_>] = &[
+            (1, &[Branch::Build], 0, (1, 0)),
+            (4, &[Branch::Tree], 0, (0, 4)),
+            (4, &[Branch::Build, Branch::Export], 1, (3, 0)),
+            (4, &[Branch::Tree, Branch::Export], 1, (0, 3)),
+            (4, &[Branch::Export], 4, (0, 0)),
+        ];
+        for &(slots, branches, expected_export, expected_compilers) in cases {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+            let machine =
+                aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, slots));
+            let pool = super::qualify_pool(&dir.path().join("resume.jobs"), branches, |need| {
+                aterm_capacity::admit_with(
+                    &ledger,
+                    &machine,
+                    need.cores(slots),
+                    aterm_capacity::Admit::Now,
+                    aterm_capacity::Pace::default(),
+                    &mut |_| {},
                 )
-                .is_err(),
-            "a gate that could not clear stale events must never authorize slice launch"
+            })
+            .unwrap();
+            assert_eq!(pool.export, expected_export);
+            let barrier = pool.jobs.reserve_initial().unwrap();
+            assert_eq!(
+                barrier.len(),
+                usize::try_from(slots - expected_export).unwrap()
+            );
+            drop(barrier);
+            let build = drain(pool.jobs.pool(false));
+            let tree = drain(pool.jobs.pool(true));
+            assert_eq!((build.len(), tree.len()), expected_compilers);
+            assert_eq!(
+                build.len() + tree.len() + usize::try_from(expected_export).unwrap(),
+                usize::try_from(slots).unwrap()
+            );
+        }
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let old = aterm_capacity::BranchShares::new(
+            &dir.path().join("old-all-compiler.jobs"),
+            1,
+            0,
+            [true, true],
+        )
+        .unwrap();
+        drop(old.reserve_initial().unwrap());
+        assert_eq!(
+            (drain(old.pool(false)).len(), drain(old.pool(true)).len()),
+            (0, 1),
+            "NEGATIVE CONTROL: an all-compiler allocation starves a build-only one-slot resume"
         );
     }
 
     #[test]
-    fn a_staged_supersession_refusal_names_the_fix_hop_remedy() {
+    fn a_published_supersession_refusal_names_the_fix_hop_remedy() {
         let previous = super::Line::start("0.189.0", "0123456789abcdef0123456789abcdef01234567", 1);
         let refusal = super::SupersedeCheck::Present(
-            "the line has a staged publication; cannot supersede".into(),
+            "the line has a release object; cannot supersede".into(),
         )
         .refusal(Some(&previous));
         assert_eq!(refusal.remedy, crate::release::fix_remedy(previous.head()));
     }
 
     #[test]
-    fn the_staging_classifier_refuses_the_same_or_newer_version() {
-        assert!(!super::staged_covers_version("0.188.0", "0.189.0").unwrap());
-        assert!(super::staged_covers_version("0.189.0", "0.189.0").unwrap());
-        assert!(super::staged_covers_version("0.190.0", "0.189.0").unwrap());
-        assert!(super::staged_covers_version("not-a-version", "0.189.0").is_err());
+    fn the_staging_classifier_allows_replacement_of_the_same_version() {
+        assert!(!super::staged_ahead_of_version("0.188.0", "0.189.0").unwrap());
+        assert!(!super::staged_ahead_of_version("0.189.0", "0.189.0").unwrap());
+        assert!(super::staged_ahead_of_version("0.190.0", "0.189.0").unwrap());
+        assert!(super::staged_ahead_of_version("not-a-version", "0.189.0").is_err());
     }
 
     #[test]
@@ -11151,7 +12354,7 @@ mod tests {
         competing.replacement = Line::start("0.189.0", &"3".repeat(40), 3);
         let result = settle_post_claim_public_state(
             Err(SupersedeCheck::Present(
-                "the line has a staged publication; cannot supersede".into(),
+                "the line has a release object; cannot supersede".into(),
             )),
             &previous,
             |why| classify_claim_stop(&requested, why, Ok(Some(competing.clone()))),
@@ -11198,7 +12401,7 @@ mod tests {
         assert_eq!(path, "Cargo.toml");
         let version = match slug {
             "fixture/retired-staging" => "0.188.0",
-            "fixture/retired-hop-staging" => "0.189.0",
+            "fixture/retired-hop-staging" => "0.190.0",
             "fixture/replacement-staging" => "0.188.0",
             other => return Err(format!("unexpected staging repository {other}")),
         };
@@ -11207,7 +12410,7 @@ mod tests {
 
     /// Production preflight reads every retired-line staging declaration before any selection
     /// write. NEGATIVE CONTROL: reading only either base, or `replacement.base`, sees only older
-    /// staged versions and cannot produce the required fix-hop remedy.
+    /// staged versions and cannot detect that staging advanced beyond the requested version.
     #[test]
     fn production_supersede_preflight_reads_the_retired_lines_staging_repo() {
         use super::*;
@@ -11259,10 +12462,21 @@ mod tests {
         let proposed = Line::start("0.189.0", &replacement, 2);
         let head_before = run(&["rev-parse", "HEAD"]).stdout_utf8().trim().to_string();
         let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        real.staging_file = |_, _, _| Ok(b"[workspace.package]\nversion = \"0.189.0\"\n".to_vec());
+        real.supersede_staging_state(&previous, &proposed).unwrap();
+        // NEGATIVE CONTROL: the former >= comparison refuses this same staged version,
+        // leaving only the fix-hop route even when a later main series cannot be carried.
+        let staged_version = [0_u64, 189, 0];
+        let requested_version = proposed
+            .version
+            .split('.')
+            .map(|n| n.parse::<u64>().unwrap())
+            .collect::<Vec<_>>();
+        assert!(staged_version.as_slice() >= requested_version.as_slice());
         real.staging_file = supersede_staging_fixture;
         let refusal = Backend::preflight_supersede(&mut real, &proposed, Some(&previous))
-            .expect_err("the retired line is already staged");
-        assert_eq!(refusal.remedy, crate::release::fix_remedy(previous.head()));
+            .expect_err("a retired hop has a newer staged version");
+        assert!(refusal.why.contains("staging has advanced to v0.190.0"));
         assert_eq!(
             run(&["rev-parse", "HEAD"]).stdout_utf8().trim(),
             head_before
@@ -11348,6 +12562,19 @@ mod tests {
             handoff.expected(),
             "the production build path kept the tree promise"
         );
+        if let Some(pool) = &real.pool {
+            let tree = pool.jobs.pool(true);
+            let mut held = Vec::new();
+            while let Some(token) = tree.try_acquire().unwrap() {
+                held.push(token);
+            }
+            assert_eq!(
+                held.len(),
+                4,
+                "tree must be able to produce the fixture index before build ends"
+            );
+            assert!(pool.jobs.pool(false).try_acquire().unwrap().is_none());
+        }
         std::fs::write(real.repo.join("fixture-waited"), b"waited").unwrap();
         Ok(())
     }
@@ -11429,9 +12656,55 @@ mod tests {
         assert!(built.fixtures.is_some_and(|result| result.is_ok()));
         assert!(repo.join("fixture-staged").is_file());
 
+        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+        let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 4));
+        real.pool = Some(
+            qualify_pool(&dir.path().join("serial.jobs"), &Branch::ALL, |need| {
+                aterm_capacity::admit_with(
+                    &ledger,
+                    &machine,
+                    need,
+                    aterm_capacity::Admit::Wait,
+                    aterm_capacity::Pace::default(),
+                    &mut |_| {},
+                )
+            })
+            .unwrap(),
+        );
+        let pool = real.pool.as_ref().unwrap();
+        pool.jobs
+            .reserve_initial()
+            .unwrap()
+            .release_to_build()
+            .unwrap();
+        pool.jobs.finish(2);
+        real.build_run_op = |_, _, _, _, _, _| {
+            Ok(Artifact {
+                key: String::new(),
+                app: PathBuf::new(),
+                macho_sha256: String::new(),
+                build: 1,
+            })
+        };
+        let built = real.build_branch(
+            &candidate,
+            &reservation,
+            &prover,
+            BuildWork {
+                bundle: true,
+                fixtures: true,
+            },
+            &handoff,
+            &BranchStop::default(),
+        );
+        assert!(built.artifact.is_some_and(|result| result.is_ok()));
+        assert!(built.fixtures.is_some_and(|result| result.is_ok()));
+        real.pool = None;
+
         real.verify_half_op = red_tree_verify;
         let branches = RealBranches {
             real: &real,
+            admission_barrier: std::sync::Mutex::new(None),
             tree_index: TreeIndexHandoff::default(),
         };
         branches.tree_index.expect();
@@ -12166,7 +13439,7 @@ mod tests {
         )
         .unwrap();
         let source = std::fs::canonicalize(source).unwrap();
-        let cache = real.release.join("cutter-cache");
+        let cache = cutter_cache_dir(&real.release);
         let inputs = crate::cutter_inputs::Inputs {
             digest: "1".repeat(64),
             sources: "2".repeat(64),
@@ -12421,7 +13694,7 @@ mod tests {
             );
             assert!(
                 !repo
-                    .join(".git/aterm-release/cutter-cache/prefreeze-running")
+                    .join(".git/aterm-release/.ubd/cutter-cache/prefreeze-running")
                     .exists()
             );
             let remaining = aterm_sysprobe::kproc::record_read(compiler).unwrap();
@@ -12536,7 +13809,7 @@ mod tests {
             git_run(&["checkout", "--quiet", "--detach", &next]);
             if prepared {
                 let compiler = real
-                    .cutter_workspace_at(&real.release.join("cutter-cache"), &next)
+                    .cutter_workspace_at(&cutter_cache_dir(&real.release), &next)
                     .unwrap();
                 compiler.frozen_cutter_here(&next, &prover).unwrap();
                 assert_eq!(
@@ -12759,7 +14032,7 @@ mod tests {
                 .unwrap()
                 .stdout_utf8();
             let compiler = real
-                .cutter_workspace_at(&real.release.join("cutter-cache"), commit.trim())
+                .cutter_workspace_at(&cutter_cache_dir(&real.release), commit.trim())
                 .unwrap();
             let log = compiler.step_log(compiler.step);
             std::fs::write(&log, "").unwrap();
@@ -13056,6 +14329,7 @@ mod tests {
         let warm_stop = std::sync::Arc::clone(&stopped);
         let timeout = std::time::Duration::from_secs(60);
         let verdict = super::with_reader_prebuild(
+            None,
             move |stop| {
                 *warm_stop.lock().unwrap() = Some(stop.clone());
                 started.send(()).unwrap();
@@ -13742,7 +15016,7 @@ mod tests {
         let ledger_path = dir.path().join("pool-ledger");
         let ledger = aterm_capacity::Ledger::at(&ledger_path);
         let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 4));
-        let pool = qualify_pool(&path, true, |need| {
+        let pool = qualify_pool(&path, &Branch::ALL, |need| {
             assert_eq!(need.rank, aterm_capacity::Rank::Release);
             aterm_capacity::admit_with(
                 &ledger,
@@ -13766,7 +15040,30 @@ mod tests {
         );
         let (slots, export) = (pool.slots, pool.export);
         assert_eq!(slots, 4);
-        assert_eq!(export, export_share(slots, true));
+        assert_eq!(export, export_share(slots, true, true));
+        let barrier = pool.jobs.reserve_initial().unwrap();
+        assert_eq!(
+            barrier.len(),
+            usize::try_from(slots - export).unwrap(),
+            "every compiler token is withheld until both memory reservations stand"
+        );
+        assert!(
+            pool.jobs.pool(false).try_acquire().unwrap().is_none(),
+            "no build Cargo driver can start through the admission snapshot"
+        );
+        assert!(
+            pool.jobs.pool(true).try_acquire().unwrap().is_none(),
+            "no tree Cargo driver can start through the admission snapshot"
+        );
+        drop(barrier);
+        assert!(
+            pool.jobs.pool(false).try_acquire().unwrap().is_some(),
+            "releasing the barrier returns the build's compiler tokens"
+        );
+        assert!(
+            pool.jobs.pool(true).try_acquire().unwrap().is_some(),
+            "releasing the barrier returns the tree's compiler tokens"
+        );
         let fifo = pool.jobs.pool(false).path().as_os_str().to_owned();
         assert_eq!(
             Path::new(&fifo),
@@ -13828,17 +15125,18 @@ mod tests {
 
         let mut build = command("ship");
         real.hand_pool(&mut build, false).unwrap();
+        let non_export = slots - export;
         assert_eq!(
             pool_of(&build),
-            Some(((slots - export).div_euclid(2).to_string(), fifo.clone()))
+            Some(((non_export - 1).to_string(), fifo.clone())),
+            "build receives every non-export token except tree's one"
         );
         let mut verify = command("targo");
         real.hand_pool(&mut verify, true).unwrap();
-        let share = (slots - export) - (slots - export) / 2;
         assert_eq!(
             pool_of(&verify),
             Some((
-                share.to_string(),
+                1_u32.to_string(),
                 real.pool
                     .as_ref()
                     .unwrap()
@@ -13865,11 +15163,45 @@ mod tests {
         let plain = real.child("generator", None);
         assert_eq!(pool_of(&plain), None, "a plain child is handed no pool");
 
+        // NEGATIVE CONTROL: recovering the build share before returning the barrier's original
+        // token remints one byte too many. The finish guard must return all originals first.
+        let pool = real.pool.as_ref().unwrap();
+        let barrier = std::sync::Mutex::new(Some(pool.jobs.reserve_initial().unwrap()));
+        drop(FinishShare {
+            pool: Some(pool),
+            branch: 0,
+            admission_barrier: &barrier,
+        });
+        assert!(
+            barrier
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none(),
+            "branch completion returns the admission tokens before recovering its share"
+        );
+        let drain = |tree| {
+            let branch = pool.jobs.pool(tree);
+            let mut held = Vec::new();
+            while let Some(token) = branch.try_acquire().unwrap() {
+                held.push(token);
+            }
+            held
+        };
+        let build_tokens = drain(false);
+        let tree_tokens = drain(true);
+        assert_eq!(
+            (build_tokens.len(), tree_tokens.len()),
+            (0, usize::try_from(slots - export).unwrap()),
+            "early build completion conserves the grant and moves its share to tree"
+        );
+        drop((build_tokens, tree_tokens));
+        drop(barrier);
+
         // A real one-slot pool must admit tree before probing build's memory admission.
         // The ended predicate is an observation, so this control does not wait on a clock.
         real.pool = None;
         real.pool = Some(
-            qualify_pool(&dir.path().join("single.jobs"), true, |need| {
+            qualify_pool(&dir.path().join("single.jobs"), &Branch::ALL, |need| {
                 aterm_capacity::admit_with(
                     &ledger,
                     &machine,
@@ -13896,17 +15228,20 @@ mod tests {
     /// The export's reservation stays bounded even on a one-slot host.
     #[test]
     fn the_export_reservation_is_bounded_by_the_grant() {
-        assert_eq!(export_share(18, true), 4);
-        assert_eq!(export_share(3, true), 1);
-        assert_eq!(export_share(2, true), 1);
-        assert_eq!(export_share(1, true), 1);
-        assert_eq!(export_share(18, false), 0);
+        assert_eq!(export_share(18, true, true), 4);
+        assert_eq!(export_share(3, true, true), 1);
+        assert_eq!(export_share(2, true, true), 1);
+        assert_eq!(export_share(1, true, true), 1);
+        assert_eq!(export_share(18, false, true), 0);
+        assert_eq!(export_share(18, true, false), 18);
     }
 
     #[test]
     fn a_zero_token_build_cannot_reserve_memory_before_tree_returns_its_share() {
         let dir = aterm_tempfile::tempdir().unwrap();
-        let shares = aterm_capacity::BranchShares::new(&dir.path().join("jobs"), 1, 0).unwrap();
+        let shares =
+            aterm_capacity::BranchShares::new(&dir.path().join("jobs"), 1, 0, [true, true])
+                .unwrap();
         let entered = std::cell::Cell::new(false);
         let result = super::start_with_share(shares.pool(false), &|| true, || entered.set(true));
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
@@ -15252,6 +16587,23 @@ mod tests {
                 &root.join("agh"),
             )
             .unwrap();
+        let (full, _) = real
+            .local_stage_command(
+                &root.join("engine"),
+                "c0ffee",
+                &root.join("clone"),
+                &reads(Some("1")).unwrap(),
+                &root.join("agh"),
+                Some(3),
+            )
+            .unwrap();
+        assert!(stage.get_args().any(|arg| arg == "--no-check"));
+        assert!(!full.get_args().any(|arg| arg == "--no-check"));
+        assert!(full.get_args().any(|arg| arg == "--dry-run"));
+        assert!(
+            full.get_envs().any(|(key, value)| key == "CARGO_BUILD_JOBS"
+                && value == Some(std::ffi::OsStr::new("3")))
+        );
         // This test process was never judged at its start, so it is no commit's build: the dry
         // run it builds is handed no cutter, not even one this process inherited.
         for name in [RELEASE_CUTTER_ENV, RELEASE_CUTTER_SINCE_ENV] {

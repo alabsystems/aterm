@@ -644,6 +644,12 @@ pub(crate) fn name_area(name: &Result<crate::converge::MacName, String>) -> Area
             ),
             "check the Mac's existing naming permission before asking for another password",
         ),
+        Some(MacNamePending::Collision(pending)) => Area::due(
+            NAME,
+            format!("{target}; {fleet}; {pending}"),
+            Who::Person,
+            "resolve the Bonjour name collision; setup leaves the current alias in place",
+        ),
         None => Area::ok(NAME, format!("{target}; {fleet}")),
     }
 }
@@ -809,6 +815,17 @@ fn owed_area(owed: &Result<OwedClone, String>, token: bool) -> Area {
         Ok(OwedClone::Verified { present, total }) => Area::ok(
             NAME,
             format!("{present}/{total} vault repositories verified on this machine"),
+        ),
+        Ok(OwedClone::Unobserved {
+            present,
+            unborn,
+            total,
+        }) => Area::ok(
+            NAME,
+            format!(
+                "{present}/{total} vault repositories verified on this machine, {unborn} more \
+                 checked out without a commit: the vault's sync reads their remotes"
+            ),
         ),
         Ok(OwedClone::Nothing(_)) if token => Area::due(
             NAME,

@@ -85,7 +85,8 @@ fn host() {
             .chain(arguments.iter().map(|v| v.as_os_str().as_bytes().to_vec()))
             .collect();
     pending.recipe = Some(recipe::Recipe {
-        kind: recipe::Kind::Ay,
+        ay: None,
+        kind: recipe::Kind::LifecycleFixture,
         compiler: None,
         program: program.path().to_owned(),
         arguments,

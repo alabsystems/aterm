@@ -1868,6 +1868,50 @@ impl<'a> ProofScope<'a> {
     ) -> Result<join::Joined, join::Missed> {
         join::prove_first_admitted(paths, dial, joining, sign_node, ats, &self.admission)
     }
+
+    fn direct_prepared(
+        &self,
+        paths: &Paths,
+        dial: &Dial<'_>,
+        joining: &Joining<'_>,
+        sign_node: aterm_secrets::members::joiner::SignNode<'_>,
+        ats: &[String],
+        until: std::time::Instant,
+    ) -> Result<join::Joined, join::Missed> {
+        if !join::pending_proof(paths).is_ok_and(|pending| !pending) {
+            return self.direct(paths, dial, joining, sign_node, ats);
+        }
+        let (numeric, named): (Vec<_>, Vec<_>) = ats.iter().cloned().partition(|at| {
+            aterm_net::fleet_member::parse_host_port(at, None)
+                .is_ok_and(|(host, _)| host.parse::<std::net::IpAddr>().is_ok())
+        });
+        if numeric.is_empty() {
+            return self.direct(paths, dial, joining, sign_node, ats);
+        }
+        let prepare = |at: &str| crate::vault_join::prepare_ask(at, until, DIAL_WITHIN);
+        let mut missed = match join::prove_first_prepared_admitted(
+            paths,
+            &prepare,
+            until,
+            joining,
+            sign_node,
+            &numeric,
+            Some(&self.admission),
+        ) {
+            Ok(joined) => return Ok(joined),
+            Err(missed) if missed.signed_maybe => return Err(missed),
+            Err(missed) => missed,
+        };
+        if named.is_empty() {
+            return Err(missed);
+        }
+        self.direct(paths, dial, joining, sign_node, &named)
+            .map_err(|mut later| {
+                missed.refused.append(&mut later.refused);
+                missed.signed_maybe = later.signed_maybe;
+                missed
+            })
+    }
 }
 
 fn prove_routes(
@@ -1913,8 +1957,8 @@ fn prove_routes_at_state(
     let sign_node = |message: &[u8]| -> [u8; 64] {
         node.sign_record(aterm_secrets::members::desk::PROVE_RECORD, message)
     };
-    let direct =
-        crate::vault_join::dial_until(until.map(first_proof_share), DIAL_WITHIN, &dial_within);
+    let direct_until = until.map(first_proof_share);
+    let direct = crate::vault_join::dial_until(direct_until, DIAL_WITHIN, &dial_within);
     let Ok(expected) = client::config(&me.paths) else {
         return Proved::No;
     };
@@ -1939,7 +1983,10 @@ fn prove_routes_at_state(
         Ok(scope) => scope,
         Err(_) => return Proved::SignedMaybe,
     };
-    let tried = scope.direct(&me.paths, &direct, &joining, &sign_node, ats);
+    let tried = match direct_until {
+        Some(until) => scope.direct_prepared(&me.paths, &direct, &joining, &sign_node, ats, until),
+        None => scope.direct(&me.paths, &direct, &joining, &sign_node, ats),
+    };
     match proof_outcome(tried) {
         Proved::No => {}
         done => return done,

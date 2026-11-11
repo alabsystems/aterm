@@ -130,18 +130,5 @@ impl<const LIMBS: usize> BitOrAssign<&Wrapping<Uint<LIMBS>>> for Wrapping<Uint<L
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::U128;
-
-    #[test]
-    fn checked_or_ok() {
-        let result = U128::ZERO.checked_or(&U128::ONE);
-        assert_eq!(result.unwrap(), U128::ONE);
-    }
-
-    #[test]
-    fn overlapping_or_ok() {
-        let result = U128::MAX.wrapping_or(&U128::ONE);
-        assert_eq!(result, U128::MAX);
-    }
-}
+#[path = "bit_or_tests.rs"]
+mod tests;

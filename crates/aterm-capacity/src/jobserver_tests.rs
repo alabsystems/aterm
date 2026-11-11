@@ -705,7 +705,7 @@ fn a_waiter_gets_a_token_while_a_blocked_reader_competes_for_it() {
 }
 
 #[test]
-fn partial_charges_on_one_handle_take_turns_instead_of_splitting_the_pool() {
+fn whole_charges_do_not_deadlock_by_splitting_the_pool() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let pool = Jobserver::new(&dir.path().join("jobs"), 2).unwrap();
     let started = Instant::now();
@@ -756,6 +756,75 @@ fn a_stopped_partial_charge_returns_what_it_took() {
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     assert_eq!(every_free_token(&pool).len(), 2, "nothing kept on a stop");
     drop(mine);
+}
+
+#[test]
+fn a_waiting_whole_charge_leaves_idle_tokens_for_running_work() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let pool = Jobserver::new(&dir.path().join("jobs"), 4).unwrap();
+    let implicit = pool.acquire(&|| false).unwrap();
+    let began = Instant::now();
+    let stopped = || began.elapsed() >= MUST_HAPPEN;
+    let (waiting_tx, waiting_rx) = mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+    std::thread::scope(|scope| {
+        let (pool, stopped) = (&pool, &stopped);
+        let waiter = scope.spawn(move || {
+            let first = AtomicBool::new(true);
+            pool.acquire_batch(4, stopped, &|| {
+                if first.swap(false, Ordering::SeqCst) {
+                    waiting_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(MUST_HAPPEN).unwrap();
+                }
+            })
+            .unwrap()
+        });
+        waiting_rx.recv_timeout(MUST_HAPPEN).unwrap();
+        let idle = every_free_token(pool);
+        assert_eq!(
+            idle.len(),
+            3,
+            "the waiter retains no idle fraction of its charge"
+        );
+        resume_tx.send(()).unwrap();
+        drop(idle);
+        drop(implicit);
+        let charge = waiter.join().unwrap();
+        assert_eq!(charge.len(), 4);
+        assert!(pool.try_acquire().unwrap().is_none());
+        drop(charge);
+    });
+    assert_eq!(every_free_token(&pool).len(), 4);
+}
+
+#[test]
+fn a_batch_stop_or_panic_returns_every_byte_of_a_short_read() {
+    for panic in [false, true] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let pool = Jobserver::new(&dir.path().join("jobs"), 4).unwrap();
+        let _implicit = pool.acquire(&|| false).unwrap();
+        let asked = std::cell::Cell::new(0);
+        let stopped = || {
+            let n = asked.get();
+            asked.set(n + 1);
+            if n == 1 && panic {
+                panic!("post-read stop control");
+            }
+            n == 1
+        };
+        let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.acquire_many(4, &stopped)
+        }));
+        if panic {
+            assert!(answer.is_err());
+        } else {
+            assert_eq!(
+                answer.unwrap().unwrap_err().kind(),
+                io::ErrorKind::Interrupted
+            );
+        }
+        assert_eq!(every_free_token(&pool).len(), 3);
+    }
 }
 #[test]
 fn an_empty_wait_states_itself_without_minting_or_retrying() {

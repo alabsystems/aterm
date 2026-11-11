@@ -3,16 +3,6 @@
 
 # aterm-libc: spec recovery
 
-> Status 2026-10-16: the 3 specs below are the crate's migration worklist. Each one is proved
-> through Trust/Clean against the compiled Rust function, and then the tests it subsumes are
-> deleted. Two of the three (LIBC-2, LIBC-3) need their subject code moved out of the test file
-> first (§4).
-
-> Status 2026-10-17: the tests-and-gates audit deleted the crate's only test file (fd110c6c94),
-> with its 4 tests and the test-only helpers they sampled. LIBC-2 and LIBC-3 were specs of those
-> helpers and went with them, and so did §5's five items, which were all about that file. LIBC-1
-> is the one spec left. Nothing here is proved yet.
-
 Source: `crates/aterm-libc` (read only). The lib has `test = false` and no `#[test]` in `src/`, and
 the crate has no integration tests now. Nothing was compiled or run. The claims below come from
 reading the code.
@@ -38,7 +28,7 @@ triple to a cell.
 ## 1. Specs (TSV)
 
 `difficulty` is the Rust features a proof must handle; `blocking_gaps` are rows of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -48,10 +38,3 @@ LIBC-1	contract	aterm_forge::resolve::default_cells	ensures: ∀ c ∈ default_c
 ## 2. Test → spec map
 
 None. The crate has no tests.
-
-## 6. Proof order
-
-LIBC-1 needs gaps 0, 1 (string, `Vec` and `Option` content models) and 5 (quantified clauses).
-`default_cells()` builds a constant `Vec`, so once gap 1 lands the quantifier unrolls over a fixed
-list and the goal is decided by evaluation. Gap 12 (cross-crate citation) is needed only to cite
-`G` from aterm-libc; stating `G` inline in aterm-forge avoids it.

@@ -276,7 +276,7 @@ pub fn wall_login(
 /// # Errors
 /// The marker cannot be written.
 pub fn mark_refused(file: &Path) -> io::Result<()> {
-    super::upgrade_models::write_atomic_mode(
+    super::atomic_write::write_atomic_mode(
         &refused_marker(file),
         "grok drew its sign-in screen over this login; aterm reads it as signed out until a newer \
          login replaces it\n",
@@ -373,7 +373,7 @@ pub fn read_record(state: &Path) -> Record {
 }
 
 fn write_record(state: &Path, record: &Record) -> io::Result<()> {
-    super::upgrade_models::write_atomic_mode(&state.join(RECORD_FILE), &record.line(), Some(0o600))
+    super::atomic_write::write_atomic_mode(&state.join(RECORD_FILE), &record.line(), Some(0o600))
 }
 
 /// The label `accounts adopt-default` gives the default home's row in the once-ever setup
@@ -1192,7 +1192,7 @@ impl Leading {
     fn write(state: &Path, now: i64) -> Leading {
         let pid = std::process::id();
         let file = state.join(RUNNING_FILE);
-        let _ = super::upgrade_models::write_atomic_mode(
+        let _ = super::atomic_write::write_atomic_mode(
             &file,
             &format!("pid={pid} birth={} t={now}\n", birth_word(pid)),
             Some(0o600),
@@ -1386,6 +1386,26 @@ pub fn ledger_line(host: Option<&str>, word: &str, rungs: &str) -> String {
     )
 }
 
+/// How the sign-in a [`ledger_line`] records ended, read back from it: signed in here, or by
+/// another sign-in or login (`signed-in-elsewhere`), is
+/// [`super::accounts::AttemptOutcome::SignedIn`]; any other end reads as a driven renewal's
+/// ([`Drove::attempt_of`]), `stopped` as failed; `None` for a line of another shape.
+#[must_use]
+pub fn attempt_of(why: &str) -> Option<super::accounts::AttemptOutcome> {
+    let (head, _rungs) = why.split_once("; ")?;
+    let words: Vec<&str> = head.split(' ').collect();
+    let [_, flow, word] = words.as_slice() else {
+        return None;
+    };
+    if *flow != Flow::Device.as_str() {
+        return None;
+    }
+    match *word {
+        "signed-in-elsewhere" => Some(super::accounts::AttemptOutcome::SignedIn),
+        _ => Drove::attempt_of(head),
+    }
+}
+
 fn unsigned_why(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Hung => format!(
@@ -1407,6 +1427,7 @@ fn unsigned_why(outcome: &Outcome) -> String {
         Outcome::NotRun(why) | Outcome::PageNotOpened(why) | Outcome::Unverified(why) => {
             why.clone()
         }
+        Outcome::PreparationFailed(stage) => stage.reason().into(),
         Outcome::Refused(why)
         | Outcome::NeedsYou(why)
         | Outcome::NeedsSignIn(why)
@@ -1973,7 +1994,7 @@ fn place(staged: &Path, target: &Path) -> Result<(), String> {
         aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o700)
             .map_err(|e| format!("{} cannot be made: {e}", dir.display()))?;
     }
-    super::upgrade_models::write_atomic_mode(target, &text, Some(0o600))
+    super::atomic_write::write_atomic_mode(target, &text, Some(0o600))
         .map_err(|e| format!("{} cannot be written: {e}", target.display()))?;
     // The new login is newer than any marker, so it counts even where the marker stays.
     let _ = std::fs::remove_file(refused_marker(target));

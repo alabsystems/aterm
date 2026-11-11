@@ -7,8 +7,9 @@
 //! The fabric lane ([`super::fabric`]) holds no floor: what it times is a disk's fsync and a
 //! shared desk's scheduler before it is aterm's. Some of what its bench reports is not time but
 //! structure, how many calls of a kind a world made and how many records a restart read back from
-//! the log file, and those counts are what the campaign's wins removed. Unit tests pin each step
-//! alone; only the bench sees aterm's handlers and the bridge compose. This lane builds the bench
+//! the log file, and those counts are what the campaign's wins removed. Unit tests isolate each
+//! law with compact semantic reports; only the bench sees aterm's handlers and the bridge compose.
+//! This lane builds the bench
 //! as the fabric lane does ([`bench_build::prepare`], the `test` profile), runs three small worlds
 //! on its default in-process broker ([`worlds`]) without waiting for a quiet machine, reports the
 //! load each ran at, and judges every count against its law ([`Law`]) and the committed baseline
@@ -680,49 +681,80 @@ fn measured(report: &Value) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn attach_report(eight: u64, thirty_two: u64) -> Value {
-        aterm_json::json!({"attach": {"tallies": {"rounds": [
-            {"group": "attach, 8 session(s)", "wait": {
-                "format": "wait-tally v=4", "rows": {
-                    "lane_sessions_status": {"count": 1}, "lane_meta": {"count": eight}
-                }
-            }},
-            {"group": "attach, 32 session(s)", "wait": {
-                "format": "wait-tally v=4", "rows": {
-                    "lane_sessions_status": {"count": 1}, "lane_meta": {"count": thirty_two}
-                }
-            }}
-        ]}}})
+    /// One attach tally round in the shape [`attach_meta`] reads.
+    fn tally_round(sessions: u64, lane_meta: u64) -> Value {
+        aterm_json::json!({
+            "group": format!("attach, {sessions} session(s)"),
+            "wait": {
+                "format": WAIT_FORMATS[0],
+                "rows": {
+                    "lane_sessions_status": {"count": 1},
+                    "lane_meta": {"count": lane_meta},
+                },
+            },
+        })
     }
 
-    fn fleet_report(fast: u64, paced: u64) -> Value {
-        aterm_json::json!({"pingpong": {
-            "handlers": {"rows": {"inbox": {"count": 1}, "fleet_mail": {"count": fast}}},
-            "paced": {"handlers": {"rows": {"inbox": {"count": 1}, "fleet_mail": {"count": paced}}}}
-        }})
+    /// The attach report shape for E05, with each population's aggregate meta count.
+    fn attach_report(meta_8: u64, meta_32: u64) -> Value {
+        aterm_json::json!({
+            "attach": {
+                "tallies": {
+                    "rounds": [tally_round(8, meta_8), tally_round(32, meta_32)],
+                },
+            },
+        })
     }
 
-    fn messaging_report(limited: bool) -> Value {
-        let spec = if limited {
-            "rate_limit=on"
-        } else {
-            "rate_limit=off"
-        };
-        aterm_json::json!({"spec": spec, "messaging": {
-            "latency": {"rate_limited": 0},
-            "burst": {"rate_limited": 0},
-            "paced_notes": {"rate_limited": 0}
-        }})
+    /// The ping-pong report shape for D01, with each window's fleet-mail count.
+    fn pingpong_report(back_to_back: u64, paced: u64) -> Value {
+        aterm_json::json!({
+            "pingpong": {
+                "handlers": {
+                    "rows": {
+                        "fleet_mail": {"count": back_to_back},
+                        "inbox": {"count": 1},
+                    },
+                },
+                "paced": {
+                    "handlers": {
+                        "rows": {
+                            "fleet_mail": {"count": paced},
+                            "inbox": {"count": 1},
+                        },
+                    },
+                },
+            },
+        })
     }
 
+    /// The messaging report shape for E06, with zero refusals in every window.
+    fn messaging_report(rate_limit: bool) -> Value {
+        let rate_limit = if rate_limit { "on" } else { "off" };
+        aterm_json::json!({
+            "spec": format!("rate_limit={rate_limit}"),
+            "messaging": {
+                "latency": {"rate_limited": 0},
+                "burst": {"rate_limited": 0},
+                "paced_notes": {"rate_limited": 0},
+            },
+        })
+    }
+
+    /// The attach backlog shape for D10d at both populations' exact bounds.
     fn cold_report() -> Value {
-        aterm_json::json!({"attach": {"backlog": {
-            "records": 100_000, "resident_budget": 16_777_216,
-            "sizes": [
-                {"sessions": 8, "cold_reads_per_restart": [15, 7, 7]},
-                {"sessions": 32, "cold_reads_per_restart": [63, 31, 31]}
-            ]
-        }}})
+        aterm_json::json!({
+            "attach": {
+                "backlog": {
+                    "records": BACKLOG,
+                    "resident_budget": 16_u64 * 1024 * 1024,
+                    "sizes": [
+                        {"sessions": 8, "cold_reads_per_restart": [15, 7, 7]},
+                        {"sessions": 32, "cold_reads_per_restart": [63, 31, 31]},
+                    ],
+                },
+            },
+        })
     }
 
     fn findings(run: &LaneRun) -> Vec<String> {
@@ -761,7 +793,8 @@ mod tests {
         }
     }
 
-    /// E05 rejects per-session meta reads and accepts a status batch with none.
+    /// E05's pre-change aggregate has 160 `@<sid> meta` calls at 8 sessions and 640 at 32. The
+    /// judge fails it on E05's law; the post-change zeroes hold it.
     #[test]
     fn the_judge_fails_e05s_a_arm_on_lane_meta() {
         let before = counts(&attach_report(160, 640)).expect("reads");
@@ -781,10 +814,12 @@ mod tests {
         assert_eq!(judge(&after, None).status, Status::Pass);
     }
 
-    /// D01 rejects fleet-mailbox transactions in both windows and accepts zero counts.
+    /// D01's pre-change aggregate has 1,201 fleet-mailbox transactions over the back-to-back
+    /// round trips and 301 over the paced ones. The judge fails it on D01's law; the post-change
+    /// zeroes hold it.
     #[test]
     fn the_judge_fails_d01s_a_arm_on_fleet_mail() {
-        let before = counts(&fleet_report(1201, 301)).expect("reads");
+        let before = counts(&pingpong_report(1201, 301)).expect("reads");
         assert_eq!(value_of(&before, "pingpong_fleet_mail"), 1201);
         assert_eq!(value_of(&before, "pingpong_paced_fleet_mail"), 301);
         let failed = findings(&judge(&before, None));
@@ -795,12 +830,13 @@ mod tests {
                 .all(|f| f.contains("fleet_mail") && f.contains("D01")),
             "{failed:?}"
         );
-        let after = counts(&fleet_report(0, 0)).expect("reads");
+        let after = counts(&pingpong_report(0, 0)).expect("reads");
         assert_eq!(after.len(), 2);
         assert_eq!(judge(&after, None).status, Status::Pass);
     }
 
-    /// E06 rejects a rate refusal only when the report enables the default rate limit.
+    /// E06's rate-limit-on shape holds with no refusal; writing one into its burst window makes
+    /// the judge fail it on E06's law. The rate-limit-off shape yields no rate count at all.
     #[test]
     fn the_judge_fails_a_rate_refusal_and_reads_none_without_the_limit() {
         let mut report = messaging_report(true);
@@ -830,7 +866,8 @@ mod tests {
         );
     }
 
-    /// D10d accepts its first and later bounds, then rejects one extra read in each regime.
+    /// D10d's exact-bound shape reads 15 then 7 at 8 sessions and 63 then 31 at 32. Writing one
+    /// more cold read into each 8-session regime makes the judge fail both D10d laws.
     #[test]
     fn the_judge_holds_d10ds_cold_reads_to_their_bounds() {
         let mut report = cold_report();
@@ -951,7 +988,8 @@ mod tests {
         assert!(why.contains("sessions status"), "{why}");
     }
 
-    /// A valid status-batch report with its first `wait.format` replaced or removed.
+    /// A valid E05-shaped report with its first tally round's `wait.format` set to `format`
+    /// (`None` removes it).
     fn with_wait_format(format: Option<&str>) -> Value {
         let mut report = attach_report(0, 0);
         let wait = report

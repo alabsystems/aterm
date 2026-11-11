@@ -21,15 +21,6 @@ paths = []
 [package.metadata.aterm.test-inputs.targets.lib]
 bounded = false
 
-[package.metadata.aterm.lint-inputs]
-bounded = true
-content-only = true
-read-only = true
-paths = []
-workspace-paths = []
-tools = []
-volatile-environment = []
-
 [dependencies]
 # None — pure std
 

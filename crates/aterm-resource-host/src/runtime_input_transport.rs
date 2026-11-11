@@ -254,7 +254,11 @@ mod tests {
     fn support_close_refuses_wrong_ack_and_trailing_frames() {
         for wrong_ack in [true, false] {
             let (_directory, caller, accepted) = connected();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            // A refusal can precede the caller's remaining writes. Keep the accepted
+            // endpoint alive until the caller ends its send half, independently of the
+            // server task.
+            let accepted_owner = accepted.try_clone().unwrap();
             let server = std::thread::spawn(move || {
                 let mut channel = Channel::new(accepted).unwrap();
                 channel.send(b"transport-only reply", deadline).unwrap();
@@ -270,7 +274,15 @@ mod tests {
                 client.send(b"trailing frame", deadline).unwrap();
             }
             wire::transport::finish_reply(&mut client).unwrap();
-            assert!(server.join().unwrap().is_err());
+            assert_eq!(
+                server.join().unwrap().unwrap_err().kind(),
+                if wrong_ack {
+                    io::ErrorKind::PermissionDenied
+                } else {
+                    io::ErrorKind::InvalidData
+                }
+            );
+            drop(accepted_owner);
         }
     }
 

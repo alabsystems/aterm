@@ -56,7 +56,7 @@ decoder's tests (`src/decode/*`, `tests/cli_decode.rs`, `tests/sweep.rs` and the
 ## 1. Specs (TSV)
 
 `subsumes` names the tests a proof retires, `difficulty` the Rust features it must handle,
-and `blocking gaps` rows of the gap list in `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+and `blocking gaps` rows of the gap list in `docs/TRUST-LANE.md` (Blocking gaps)
 §7.
 
 ```tsv
@@ -86,11 +86,6 @@ tests/decode_frames.rs	every_raw_frame_decodes_to_its_content	raw-frame-rfc8878-
 tests/decode_frames.rs	concatenated_raw_frames_decode_as_one_stream	raw-frame-rfc8878-conformance	write-raw-layout
 ```
 
-## 3. Coverage
-
-- §2 maps the 7 raw-frame and XXH64 tests; §7 maps the encoder tests (96 `#[test]` functions across
-  `src/` and `tests/`).
-
 ## 4. Tests that are not spec samples
 
 None.
@@ -106,45 +101,7 @@ None.
 3. **Resolved: `sanity()` is defined once** in `tests/support/sanity.rs`, re-exported by
    `tests/support/mod.rs` and mounted via `#[path]` in `src/xxh64.rs`'s test module.
 
-## 6. Proof order (easiest high-value first)
-
-No spec here is blocked by gap 0 alone. Every spec that touches the Rust fn also needs
-gap 1 (slices and byte lists) and gap 3 (calls, casts, shifts and loops in reflected bodies).
-
-1. **`xxh64-model-reference-vectors`** (gaps 0, 14). This is Lean only, with no Rust
-   carrier. It is the evidence base for every other XXH64 spec. It retires nothing by itself.
-2. **The scalar core of `write-raw-refuses-oversize`**: `ContentSize::of`, `flag` and
-   `block_header`. These are a range `match` on `usize`, casts that the arms make exact, and
-   shifts. They fit gap 0 plus the cast/shift slice of gap 3, which is the nearest E6 widening
-   to the range match on `u8` that seal `150efe4a` already admits. They are the lemmas
-   `write-raw-layout` is built on. The `write_raw` half then waits on the writer model
-   (gaps 1, 8, 11).
-3. **`xxh64-update-no-panic`** (gaps 0, 1, 2, 3). This is bounds arithmetic over `usize`
-   with `buffered < 32` as the only fact needed. It is `omega`-class once slices and
-   `&mut self` are carried. It is also the first conjunct of the streaming invariant.
-4. **`xxh64-oneshot-refines-model`** (gaps 0, 1, 2, 3, 4, 5, 7, 14). This is the
-   highest-value spec: with item 1 it retires 3 tests and 597 recorded answers.
-   `xxh64-streaming-refines-oneshot` (gaps 0, 1, 2, 3, 5, 7) follows from the same
-   stripe-fold lemma plus `Inv`. Together they retire all 4 `xxh64.rs` tests and both
-   recorded-answer tests.
-5. **`write-raw-layout`**, then **`raw-frame-rfc8878-conformance`**. The first carries the
-   generic writer (gaps 8, 11). The second needs the `Rfc8878` model and the model→code
-   surface (gap 10). They retire the remaining frame tests and the raw-frame tests of `tests/decode_frames.rs`.
-
 ## 7. The encoder (`src/encode`, S17 E1 and E2)
-
-> Status 2026-10-24: the producer (atpkg-publish's `tarwrite::options`) now declares a pack's
-> size when its tar is within 2^27 bytes, so that frame is a single segment whose window is the
-> tar (`encode-content-size-contract`, and `encode-window-bound`'s single-segment leg); only a
-> longer tar is streamed under the 2^27 window with no declared size. No encoder code changed.
-> The corpus config below named the producer's is the shape of the packs past 2^27 bytes; a
-> smaller pack's frame is the level 19 one-shot config's shape (a declared size, a single
-> segment), and atpkg-publish's oracle test decodes one under `zstd --memory=8MB`.
-
-> Status 2026-10-23: written with the encoder (E1); the rows for the parse by price, its
-> binary tree and the long-distance anchors (levels 16 to 19) came with E2. Nothing here is proved; the tests named in
-> the map are what runs. Each row states the claim its tests sample, so a proof can retire
-> them as §1's rows do for the frame writer and XXH64.
 
 Public surface: `encode::compress`, `encode::Encoder::{new, write, flush, finish, get_ref}`
 (`write` and `flush` through `std::io::Write`), `encode::Options::{new, level, window_log,

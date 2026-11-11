@@ -30,7 +30,7 @@ offline = true\n";
 
 const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
-/// The per-clone release cache: `<clone>-release.noindex`, beside the clone.
+/// The per-clone release cache: `.ubd/<clone>-release.noindex`, beside the clone.
 #[derive(Debug, Clone)]
 pub struct CacheRoot {
     root: PathBuf,
@@ -66,16 +66,22 @@ impl CacheRoot {
             .ok_or_else(|| format!("{} has no name to derive its cache from", clone.display()))?;
         let mut leaf = name.to_os_string();
         leaf.push("-release.noindex");
-        Self::at(clone.with_file_name(leaf))
+        let parent = clone.parent().ok_or("release clone has no parent")?;
+        let quiet = aterm_tempfile::quiet_in(parent);
+        let parent = if aterm_tempfile::is_quiet(&quiet) {
+            quiet
+        } else {
+            let quiet = parent.join(aterm_tempfile::QUIET);
+            private_dir(&quiet, "release cache parent")?;
+            quiet
+        };
+        Self::at(parent.join(leaf))
     }
 
-    /// The cache at `root`, created private when absent, with its quiet folder ([`Self::quiet`]).
+    /// The cache at a caller-selected `root`, created private when absent. Production takes
+    /// use [`Self::for_repo`], which places the whole cache beneath a quiet parent.
     pub fn at(root: PathBuf) -> Result<Self, String> {
         private_dir(&root, "release cache")?;
-        private_dir(
-            &root.join(aterm_tempfile::QUIET),
-            "release cache's quiet folder",
-        )?;
         Ok(Self { root })
     }
 
@@ -141,21 +147,11 @@ impl CacheRoot {
         self.root.join("cargo-home")
     }
 
-    /// `.ubd/`, where the build's own folders live ([`Self::target`], [`Self::tmp`],
-    /// [`Self::build_cargo_home`], [`Self::stage`]): fseventsd drops the file events of what is
-    /// made under it (`aterm_tempfile::QUIET`), and a release build makes tens of thousands of
-    /// files in two slices.
+    /// The whole cache is under `.ubd`, including its snapshot, vendoring and artifacts.
+    /// Keeping only intermediate builds quiet still exposed all of those other writes.
     #[must_use]
     pub fn quiet(&self) -> PathBuf {
-        self.root.join(aterm_tempfile::QUIET)
-    }
-
-    /// Where the build's own folders were until they moved into [`Self::quiet`] (2026-10-26):
-    /// `target`, `tmp`, `cargo-home-build` and `stage` beside `snapshot/`. No take of this
-    /// version writes them; a take removes what is left under its hold.
-    #[must_use]
-    pub fn moved_from(&self) -> [PathBuf; 4] {
-        ["target", "tmp", "cargo-home-build", "stage"].map(|name| self.root.join(name))
+        self.root.clone()
     }
 
     /// The builds' `CARGO_HOME` root.
@@ -1628,13 +1624,12 @@ fn digest_of(listing: &Listing) -> String {
 mod tests {
     use super::*;
 
-    /// The folders a build writes sit in the cache's quiet folder, still in its `*.noindex`
-    /// root. NEGATIVE CONTROL: what is kept between takes and read (the snapshot, the vendoring
-    /// home, the bundles) and the folders the build used before are outside it.
+    /// Every release writer, including materialization, vendoring and retained bundles,
+    /// sits in the quiet cache. Previously only compiler intermediates were quiet.
     #[test]
     fn a_release_builds_in_the_caches_quiet_folder() {
         let cache = CacheRoot {
-            root: PathBuf::from("/c/a-release.noindex"),
+            root: PathBuf::from("/c/.ubd/a-release.noindex"),
         };
         for built in [
             cache.target(),
@@ -1645,17 +1640,13 @@ mod tests {
             assert_eq!(built.parent(), Some(cache.quiet().as_path()), "{built:?}");
             assert!(aterm_tempfile::is_quiet(&built), "{built:?}");
         }
-        assert!(cache.quiet().starts_with("/c/a-release.noindex"));
+        assert_eq!(cache.quiet(), cache.path());
         for kept in [
             cache.snapshot(),
             cache.vendor_cargo_home(),
             cache.artifacts(),
         ] {
-            assert!(!aterm_tempfile::is_quiet(&kept), "{kept:?}");
-        }
-        for old in cache.moved_from() {
-            assert!(!aterm_tempfile::is_quiet(&old), "{old:?}");
-            assert_eq!(old.parent(), Some(cache.path()));
+            assert!(aterm_tempfile::is_quiet(&kept), "{kept:?}");
         }
     }
 

@@ -41,7 +41,7 @@ mod macos {
         sel,
     };
     use aterm_window::application::ApplicationHandler;
-    use aterm_window::event::{ElementState, WindowEvent};
+    use aterm_window::event::{ElementState, InputOrigin, WindowEvent};
     use aterm_window::event_loop::ActiveEventLoop;
     use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
     use aterm_window::window::{Window, WindowId};
@@ -186,6 +186,17 @@ mod macos {
     const VK_SHIFT: u16 = 56;
     /// The `kVK_ANSI_A` virtual key.
     const VK_A: u16 = 0;
+
+    /// Give the modifier rows a verdict distinct from the ordinary key rows. The driver calls
+    /// both callbacks directly, so this proves the native event's identity reaches every queued
+    /// callback without depending on WindowServer event posting.
+    fn fixture_input_origin(event: aterm_window::platform::macos::NativeInputEvent) -> InputOrigin {
+        if event.kind == FLAGS_CHANGED && event.keycode == VK_SHIFT {
+            InputOrigin::Relayed
+        } else {
+            InputOrigin::Person
+        }
+    }
 
     /// `CGMouseButton`.
     const CG_BUTTON_LEFT: u32 = 0;
@@ -681,11 +692,17 @@ mod macos {
 
     type Deferred = Box<dyn FnOnce(&mut Driver)>;
 
+    #[derive(Debug)]
+    struct ObservedEvent {
+        name: &'static str,
+        origin: Option<InputOrigin>,
+    }
+
     struct Driver {
         window: Option<Window>,
         report: Report,
-        /// `WindowEvent` names delivered by winit.
-        events: Vec<String>,
+        /// `WindowEvent` names and their retained native-input verdicts delivered by winit.
+        events: Vec<ObservedEvent>,
         done: bool,
         stage: usize,
         pending: Option<Deferred>,
@@ -713,12 +730,19 @@ mod macos {
             Some(unsafe { send_isize(win, sel!(windowNumber)) })
         }
 
-        fn drain(&mut self) -> Vec<String> {
+        fn drain(&mut self) -> Vec<ObservedEvent> {
             std::mem::take(&mut self.events)
         }
 
-        fn count(events: &[String], name: &str) -> usize {
-            events.iter().filter(|e| e.as_str() == name).count()
+        fn count(events: &[ObservedEvent], name: &str) -> usize {
+            events.iter().filter(|e| e.name == name).count()
+        }
+
+        fn count_origin(events: &[ObservedEvent], name: &str, origin: InputOrigin) -> usize {
+            events
+                .iter()
+                .filter(|event| event.name == name && event.origin == Some(origin))
+                .count()
         }
 
         /// Enter one row with one event and log the survival. A nil event means the
@@ -811,7 +835,10 @@ mod macos {
                 WindowEvent::RedrawRequested => "RedrawRequested",
                 _ => "other",
             };
-            self.events.push(name.to_owned());
+            self.events.push(ObservedEvent {
+                name,
+                origin: aterm_window::platform::macos::window_event_origin(),
+            });
         }
 
         fn about_to_wait(&mut self, el: &ActiveEventLoop) {
@@ -1257,6 +1284,8 @@ mod macos {
             };
             self.drive(view, sel!(keyDown:), "keyDown:", kd, "KeyDown/factory");
             self.drive(view, sel!(keyUp:), "keyUp:", ku, "KeyUp/factory");
+            self.drive(view, sel!(keyDown:), "keyDown:", cg_kd, "KeyDown/cg");
+            self.drive(view, sel!(keyUp:), "keyUp:", cg_ku, "KeyUp/cg");
             self.drive(
                 view,
                 sel!(flagsChanged:),
@@ -1264,8 +1293,6 @@ mod macos {
                 fc,
                 "FlagsChanged/factory",
             );
-            self.drive(view, sel!(keyDown:), "keyDown:", cg_kd, "KeyDown/cg");
-            self.drive(view, sel!(keyUp:), "keyUp:", cg_ku, "KeyUp/cg");
             self.drive(
                 view,
                 sel!(flagsChanged:),
@@ -1292,15 +1319,29 @@ mod macos {
             self.pending = Some(Box::new(|d: &mut Driver| {
                 let got = d.drain();
                 let keys = Driver::count(&got, "KeyboardInput");
+                let person_keys = Driver::count_origin(&got, "KeyboardInput", InputOrigin::Person);
+                let relayed_keys =
+                    Driver::count_origin(&got, "KeyboardInput", InputOrigin::Relayed);
+                let relayed_modifiers =
+                    Driver::count_origin(&got, "ModifiersChanged", InputOrigin::Relayed);
                 d.report.expect(
                     "keyDown:/keyUp: yield KeyboardInput, both shapes",
-                    keys >= 4,
-                    format!("{keys} KeyboardInput (want >= 4) in {got:?}"),
+                    keys >= 4 && person_keys >= 4,
+                    format!(
+                        "{keys} KeyboardInput, {person_keys} Person (want >= 4 of each) in {got:?}"
+                    ),
                 );
                 d.report.expect(
                     "flagsChanged: yields ModifiersChanged",
                     Driver::count(&got, "ModifiersChanged") >= 1,
                     format!("{got:?}"),
+                );
+                d.report.expect(
+                    "flagsChanged: retains Relayed for deferred KeyboardInput and ModifiersChanged",
+                    relayed_keys >= 2 && relayed_modifiers >= 2,
+                    format!(
+                        "{relayed_keys} relayed KeyboardInput and {relayed_modifiers} relayed ModifiersChanged (want >= 2 of each) in {got:?}"
+                    ),
                 );
             }));
         }
@@ -1422,6 +1463,7 @@ mod macos {
         trap::install();
         trap::set_row("(before any row)");
         arm_hang_watchdog();
+        aterm_window::platform::macos::set_window_input_classifier(fixture_input_origin);
         let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
             Ok(el) => el,
             Err(e) => {

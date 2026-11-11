@@ -1745,7 +1745,7 @@ impl Pool {
 
     /// The login a launch that takes no row runs on when started plainly, in the report's words.
     fn own(&self) -> String {
-        own_login_words(&self.roster())
+        own_login_words(&self.roster(), None)
     }
 }
 

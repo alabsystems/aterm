@@ -313,7 +313,7 @@ impl Fetcher for LiveFetcher {
 
 fn write_private(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
     aterm_types::fs_restricted::ensure_private_dir(dir)?;
-    crate::harness::upgrade_models::write_atomic(&dir.join(name), text)
+    crate::harness::atomic_write::write_atomic(&dir.join(name), text)
 }
 
 /// Fetches `<url>` and `<url>.sig`, verifies them under `key`, and updates the cache.

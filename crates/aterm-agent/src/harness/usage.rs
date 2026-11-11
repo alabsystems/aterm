@@ -564,7 +564,7 @@ pub struct LimitNoticeRow {
 pub(crate) fn row_time(obj: &Map) -> Option<i64> {
     obj.get("timestamp")
         .and_then(Value::as_str)
-        .and_then(super::upgrade_models::parse_utc)
+        .and_then(super::unix_time::parse_utc)
         .and_then(|t| i64::try_from(t).ok())
 }
 
@@ -2078,7 +2078,7 @@ mod tests {
     }
 
     fn unix(at: &str) -> i64 {
-        i64::try_from(super::super::upgrade_models::parse_utc(at).expect("a stamp")).unwrap()
+        i64::try_from(super::super::unix_time::parse_utc(at).expect("a stamp")).unwrap()
     }
 
     fn totals(t: &TranscriptUsage) -> (u64, u64) {
@@ -2392,7 +2392,7 @@ mod tests {
     fn projected_usage_preserves_the_live_limit_wall_and_its_lift() {
         let at = |minute: u32| format!("2026-09-28T12:{minute:02}:00Z");
         let unix = |minute: u32| {
-            i64::try_from(super::super::upgrade_models::parse_utc(&at(minute)).unwrap()).unwrap()
+            i64::try_from(super::super::unix_time::parse_utc(&at(minute)).unwrap()).unwrap()
         };
         let answer = |output: u64, minute: u32, api_error: bool| {
             format!(

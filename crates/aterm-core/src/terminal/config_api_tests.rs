@@ -1,0 +1,749 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+#[test]
+fn the_mode_seed_holds_exactly_what_a_default_host_config_carries() {
+    let host = crate::config::TerminalConfig::default();
+    let seed = super::super::state::ConfiguredModes::default();
+    assert_eq!(seed.auto_wrap, host.auto_wrap, "auto_wrap (DECAWM)");
+    assert_eq!(
+        seed.bracketed_paste, host.bracketed_paste,
+        "bracketed_paste (DEC 2004)"
+    );
+    assert_eq!(
+        seed.focus_reporting, host.focus_reporting,
+        "focus_reporting (DEC 1004)"
+    );
+}
+use super::*;
+use crate::config::{BiDiMode, ConfigChange, TerminalConfig};
+use crate::terminal::{Rgb, TerminalBuilder};
+
+fn clean_terminal_with_defaults() -> (Terminal, TerminalConfig) {
+    let mut terminal = Terminal::new(4, 16);
+    let config = TerminalConfig::default();
+    terminal.apply_config(&config);
+    terminal.take_damage();
+    (terminal, config)
+}
+
+#[test]
+fn bidi_reload_damages_static_cells_exactly_when_changed() {
+    let (mut terminal, mut config) = clean_terminal_with_defaults();
+    let before = terminal.damage_epoch();
+
+    config.bidi.mode = if config.bidi.mode == BiDiMode::Disabled {
+        BiDiMode::Implicit
+    } else {
+        BiDiMode::Disabled
+    };
+    let changes = terminal.apply_config(&config);
+    assert!(changes.contains(&ConfigChange::BiDi));
+    assert!(terminal.has_damage(), "static RTL cells need a repaint");
+    assert_eq!(terminal.damage_epoch(), before + 1);
+
+    terminal.take_damage();
+    let unchanged = terminal.apply_config(&config);
+    assert!(!unchanged.contains(&ConfigChange::BiDi));
+    assert!(!terminal.has_damage(), "an identical reload stays a no-op");
+}
+
+#[test]
+fn ambiguous_width_reload_changes_new_text_without_reflowing_existing_cells() {
+    const AMBIGUOUS: &str = "\u{00B7}"; // MIDDLE DOT, East Asian Width=A
+    let (mut terminal, mut config) = clean_terminal_with_defaults();
+    config.ambiguous_width_double = true;
+    assert!(
+        terminal
+            .apply_config(&config)
+            .contains(&ConfigChange::AmbiguousWidth)
+    );
+    terminal.process(AMBIGUOUS.as_bytes());
+    assert!(terminal.grid().cell(0, 0).unwrap().is_wide());
+    assert!(terminal.grid().is_wide_continuation_at(0, 1));
+    terminal.take_damage();
+
+    config.ambiguous_width_double = false;
+    assert!(
+        terminal
+            .apply_config(&config)
+            .contains(&ConfigChange::AmbiguousWidth)
+    );
+    assert!(
+        !terminal.has_damage(),
+        "policy reload must not pretend it reflowed existing geometry"
+    );
+    assert!(
+        terminal.grid().cell(0, 0).unwrap().is_wide(),
+        "the previously received glyph keeps its two-cell geometry"
+    );
+
+    terminal.process(AMBIGUOUS.as_bytes());
+    assert_eq!(terminal.grid().cell(0, 2).unwrap().char(), '\u{00B7}');
+    assert!(
+        !terminal.grid().cell(0, 2).unwrap().is_wide(),
+        "subsequent input uses the newly selected narrow policy"
+    );
+}
+
+#[test]
+fn bidi_reload_reprojects_already_received_rtl_text() {
+    let (mut terminal, mut config) = clean_terminal_with_defaults();
+    terminal.process("\u{05D0}\u{05D1}\u{05D2}".as_bytes());
+    let visual: Vec<char> = terminal.cell_frame(4, 16).cells[0]
+        .iter()
+        .take(3)
+        .map(|cell| cell.ch)
+        .collect();
+    assert_eq!(visual, vec!['\u{05D2}', '\u{05D1}', '\u{05D0}']);
+    terminal.take_damage();
+
+    config.bidi.mode = BiDiMode::Disabled;
+    let changes = terminal.apply_config(&config);
+    assert!(changes.contains(&ConfigChange::BiDi));
+    assert!(terminal.has_damage());
+    let logical: Vec<char> = terminal.cell_frame(4, 16).cells[0]
+        .iter()
+        .take(3)
+        .map(|cell| cell.ch)
+        .collect();
+    assert_eq!(logical, vec!['\u{05D0}', '\u{05D1}', '\u{05D2}']);
+}
+
+/// RIS, DECSTR and the host's reset return BiDi to the host's configured mode and direction
+/// (`bidi = "disabled"`, which no program can choose), never to the power-on Implicit/Auto, so
+/// Hebrew sent after the reset stays in logical order and an unchanged reload has nothing to
+/// restore. A program's own change (BDSM, `CSI 8 l`) is undone by the reset as before.
+/// NEGATIVE CONTROL: with `reset_modes` leaving BiDi to `TerminalModes::new()` (or DECSTR
+/// writing Implicit/Auto), `` keeps the host's BiDi `` fails for that reset.
+#[test]
+fn every_reset_returns_bidi_to_the_hosts_configured_mode() {
+    const HEBREW: &str = "\u{05D0}\u{05D1}\u{05D2}";
+    let logical = vec!['\u{05D0}', '\u{05D1}', '\u{05D2}'];
+    let row0 = |t: &mut Terminal| -> Vec<char> {
+        t.cell_frame(4, 16).cells[0]
+            .iter()
+            .take(3)
+            .map(|cell| cell.ch)
+            .collect()
+    };
+    let mut config = TerminalConfig::default();
+    config.bidi.mode = BiDiMode::Disabled;
+    config.bidi.direction = aterm_types::ParagraphDirection::Rtl;
+    let host = || {
+        let mut t = Terminal::new(4, 16);
+        assert!(t.apply_config(&config).contains(&ConfigChange::BiDi));
+        // The program's own change, which a reset undoes.
+        t.process(b"\x1b[8l");
+        assert_eq!(
+            t.modes().bidi_mode,
+            BiDiMode::Explicit,
+            "PRECONDITION: BDSM"
+        );
+        t
+    };
+    let resets: [(&str, fn(&mut Terminal)); 3] = [
+        ("RIS", |t| t.process(b"\x1bc")),
+        ("DECSTR", |t| t.process(b"\x1b[!p")),
+        ("the host's reset", Terminal::reset),
+    ];
+    for (name, reset) in resets {
+        let mut t = host();
+        reset(&mut t);
+        assert_eq!(
+            (t.modes().bidi_mode, t.modes().bidi_direction),
+            (BiDiMode::Disabled, aterm_types::ParagraphDirection::Rtl),
+            "{name} keeps the host's BiDi"
+        );
+        t.process(HEBREW.as_bytes());
+        assert_eq!(
+            row0(&mut t),
+            logical,
+            "{name}: Hebrew stays in logical order"
+        );
+        assert!(
+            !t.apply_config(&config).contains(&ConfigChange::BiDi),
+            "{name}: an unchanged reload has nothing to restore"
+        );
+    }
+    let mut same_batch = host();
+    same_batch.process(format!("\x1bc{HEBREW}").as_bytes());
+    assert_eq!(
+        row0(&mut same_batch),
+        logical,
+        "RIS and the text in one batch"
+    );
+
+    // The default config still reorders after a reset.
+    let (mut implicit, _) = clean_terminal_with_defaults();
+    implicit.process(format!("\x1bc{HEBREW}").as_bytes());
+    assert_eq!(
+        row0(&mut implicit),
+        vec!['\u{05D2}', '\u{05D1}', '\u{05D0}']
+    );
+}
+
+fn settle(term: &mut Terminal) -> u64 {
+    term.take_damage();
+    assert!(!term.has_damage());
+    term.damage_epoch()
+}
+
+#[test]
+fn cursor_color_only_reload_marks_visual_damage() {
+    let mut term = Terminal::new(2, 8);
+    let before = settle(&mut term);
+    let mut config = TerminalConfig::default();
+    config.cursor_color = Some(Rgb::new(0x12, 0x34, 0x56));
+
+    let changes = term.apply_config(&config);
+
+    assert!(changes.contains(&ConfigChange::CursorColor));
+    assert!(term.has_damage(), "an idle cursor must be recolored now");
+    assert!(term.damage_epoch() > before);
+}
+
+#[test]
+fn style_policy_reload_repaints_preexisting_cells() {
+    let mut term = Terminal::new(2, 8);
+    term.process(b"\x1b[1;33mB\x1b[0m \x1b[2mD");
+    let before_cells = term.render_row(0);
+    let before_epoch = settle(&mut term);
+    let mut config = TerminalConfig::default();
+    config.bold_is_bright = false;
+    config.faint_opacity = 1.0;
+
+    let changes = term.apply_config(&config);
+    let after_cells = term.render_row(0);
+
+    assert!(changes.contains(&ConfigChange::StylePolicy));
+    assert_ne!(after_cells[0].fg, before_cells[0].fg);
+    assert_ne!(after_cells[2].fg, before_cells[2].fg);
+    assert!(term.has_damage());
+    assert!(term.damage_epoch() > before_epoch);
+
+    term.take_damage();
+    let unchanged = term.apply_config(&config);
+    assert!(!unchanged.contains(&ConfigChange::StylePolicy));
+    assert!(!term.has_damage(), "an identical reload stays a no-op");
+}
+
+#[test]
+fn config_reload_during_reflow_survives_terminal_reset() {
+    let mut term = TerminalBuilder::new()
+        .size(6, 40)
+        .tiered_scrollback_defaults()
+        .build();
+    for i in 0..200 {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    let initial_budget = term
+        .main_grid()
+        .scrollback_memory_budget()
+        .expect("tiered store budget");
+    let job = term
+        .resize_offloading_scrollback(6, 20)
+        .expect("width change detaches tiered store");
+
+    let config = TerminalConfig {
+        memory_budget: initial_budget.saturating_sub(1_000_000).max(1),
+        scrollback_limit: None,
+        ..TerminalConfig::default()
+    };
+    let changes = term.apply_config(&config);
+    assert!(changes.contains(&ConfigChange::MemoryBudget));
+    assert!(
+        changes.contains(&ConfigChange::ScrollbackLimit),
+        "detached finite limit must not be mistaken for unlimited"
+    );
+    assert_eq!(
+        term.main_grid().scrollback_memory_budget(),
+        Some(config.memory_budget)
+    );
+    assert_eq!(term.scrollback_line_limit(), None);
+    let changes = term.apply_config(&config);
+    assert!(
+        !changes.contains(&ConfigChange::MemoryBudget),
+        "pending budget makes an identical reload a no-op"
+    );
+    assert!(
+        !changes.contains(&ConfigChange::ScrollbackLimit),
+        "pending unlimited value makes an identical reload a no-op"
+    );
+
+    term.reset();
+    assert!(
+        term.finish_resize_offload(job.reflow()).is_none(),
+        "the erase/replacement race never converges (RFL-3): nothing stale to rewrap"
+    );
+
+    assert_eq!(term.main_grid().scrollback_lines(), 0);
+    assert_eq!(term.scrollback_line_limit(), None);
+    assert_eq!(
+        term.scrollback()
+            .expect("cleared store re-attached")
+            .memory_budget(),
+        config.memory_budget
+    );
+
+    let changes = term.apply_config(&config);
+    assert!(!changes.contains(&ConfigChange::MemoryBudget));
+    assert!(!changes.contains(&ConfigChange::ScrollbackLimit));
+}
+
+#[test]
+fn config_reload_during_reflow_targets_saved_primary_under_alt_screen() {
+    let mut term = TerminalBuilder::new()
+        .size(6, 40)
+        .tiered_scrollback_defaults()
+        .build();
+    for i in 0..100 {
+        term.process(format!("main-{i}\r\n").as_bytes());
+    }
+    term.process(b"\x1b[?1049h");
+    let initial_budget = term
+        .main_grid()
+        .scrollback_memory_budget()
+        .expect("saved primary has tiered scrollback");
+    let job = term
+        .resize_offloading_scrollback(6, 20)
+        .expect("saved primary store detaches");
+
+    let config = TerminalConfig {
+        memory_budget: initial_budget.saturating_sub(2_000_000).max(1),
+        scrollback_limit: Some(50),
+        ..TerminalConfig::default()
+    };
+    let changes = term.apply_config(&config);
+    assert!(changes.contains(&ConfigChange::MemoryBudget));
+    assert!(changes.contains(&ConfigChange::ScrollbackLimit));
+    assert_eq!(
+        term.main_grid().scrollback_memory_budget(),
+        Some(config.memory_budget)
+    );
+    assert_eq!(term.scrollback_line_limit(), Some(50));
+
+    let changes = term.apply_config(&config);
+    assert!(!changes.contains(&ConfigChange::MemoryBudget));
+    assert!(!changes.contains(&ConfigChange::ScrollbackLimit));
+
+    assert!(
+        term.finish_resize_offload(job.reflow()).is_none(),
+        "widths agree — no convergence pass expected"
+    );
+    assert_eq!(
+        term.main_grid().scrollback_memory_budget(),
+        Some(config.memory_budget)
+    );
+    assert_eq!(term.scrollback_line_limit(), Some(50));
+    term.process(b"\x1b[?1049l");
+    assert_eq!(term.scrollback_line_limit(), Some(50));
+    assert_eq!(
+        term.scrollback()
+            .expect("primary store restored")
+            .memory_budget(),
+        config.memory_budget
+    );
+}
+
+#[test]
+fn a_config_reload_leaves_an_app_negotiated_bracketed_paste_alone() {
+    let mut term = Terminal::new(4, 16);
+    let config = TerminalConfig::default();
+    term.apply_config(&config);
+    term.process(b"\x1b[?2004h");
+    assert!(term.modes().bracketed_paste(), "the app set DEC 2004");
+
+    let changes = term.apply_config(&config);
+
+    assert!(
+        term.modes().bracketed_paste(),
+        "an unrelated config reload must not clear the shell's bracketed paste"
+    );
+    assert!(!changes.contains(&ConfigChange::BracketedPaste));
+    assert_eq!(
+        term.format_paste("a\nb"),
+        b"\x1b[200~a\rb\x1b[201~",
+        "pastes stay framed after the reload"
+    );
+}
+
+#[test]
+fn a_config_reload_leaves_app_negotiated_wrap_and_focus_reporting_alone() {
+    let mut term = Terminal::new(4, 16);
+    let config = TerminalConfig::default();
+    term.apply_config(&config);
+    term.process(b"\x1b[?7l\x1b[?1004h");
+    assert!(!term.modes().auto_wrap(), "the app reset DECAWM");
+    assert!(term.focus_reporting_enabled(), "the app set DEC 1004");
+
+    let changes = term.apply_config(&config);
+
+    assert!(
+        !term.modes().auto_wrap(),
+        "reload must not re-enable DECAWM"
+    );
+    assert!(
+        term.focus_reporting_enabled(),
+        "reload must not stop the app's focus reports"
+    );
+    assert!(!changes.contains(&ConfigChange::AutoWrap));
+    assert!(!changes.contains(&ConfigChange::FocusReporting));
+}
+
+#[test]
+fn a_real_host_change_to_a_negotiated_mode_still_reaches_the_terminal() {
+    let mut term = Terminal::new(4, 16);
+    let mut config = TerminalConfig::default();
+    term.apply_config(&config);
+    term.process(b"\x1b[?2004h");
+
+    config.bracketed_paste = false;
+    config.auto_wrap = false;
+    config.focus_reporting = true;
+    let changes = term.apply_config(&config);
+    assert!(changes.contains(&ConfigChange::AutoWrap));
+    assert!(changes.contains(&ConfigChange::FocusReporting));
+    assert!(!changes.contains(&ConfigChange::BracketedPaste));
+    assert!(!term.modes().auto_wrap());
+    assert!(term.focus_reporting_enabled());
+    assert!(term.modes().bracketed_paste());
+
+    config.bracketed_paste = true;
+    assert!(
+        term.apply_config(&config).is_empty(),
+        "the mode already matches the new host value, so nothing was modified"
+    );
+    config.bracketed_paste = false;
+    let changes = term.apply_config(&config);
+    assert!(changes.contains(&ConfigChange::BracketedPaste));
+    assert!(!term.modes().bracketed_paste());
+    assert_eq!(term.format_paste("a\nb"), b"a\rb", "no guards to emit");
+
+    assert!(term.apply_config(&config).is_empty());
+}
+
+#[test]
+fn a_reset_returns_a_negotiated_mode_to_the_power_on_value_not_the_config_seed() {
+    let mut term = Terminal::new(4, 16);
+    let mut config = TerminalConfig::default();
+    config.bracketed_paste = true;
+    term.apply_config(&config);
+    assert!(term.modes().bracketed_paste(), "the host seeded 2004 on");
+
+    term.process(b"\x1b[!p"); // DECSTR
+    assert!(!term.modes().bracketed_paste(), "soft reset clears 2004");
+    assert!(
+        !term
+            .apply_config(&config)
+            .contains(&ConfigChange::BracketedPaste),
+        "an unchanged config does not undo the program's reset"
+    );
+    assert!(!term.modes().bracketed_paste());
+
+    term.process(b"\x1b[?2004h");
+    term.reset(); // RIS
+    assert!(!term.modes().bracketed_paste(), "RIS clears 2004");
+    assert!(
+        !term
+            .apply_config(&config)
+            .contains(&ConfigChange::BracketedPaste)
+    );
+    assert!(!term.modes().bracketed_paste());
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
+    Rgb { r, g, b }
+}
+
+fn seeded_baseline(seed: u8) -> ColorBaseline {
+    let mut palette = aterm_types::ColorPalette::new();
+    for index in 0..16u8 {
+        palette.set(index, rgb(seed, index, seed.wrapping_add(index)));
+    }
+    ColorBaseline {
+        foreground: rgb(seed, seed, seed),
+        background: rgb(seed / 2, 0, seed / 3),
+        cursor: Some(rgb(0, seed, 0)),
+        selection_background: Some(rgb(seed, 0, 0)),
+        selection_foreground: None,
+        palette: Some(palette),
+        color_scheme: Some(aterm_types::Appearance::Dark),
+    }
+}
+
+const PROGRAM_BG: Rgb = rgb(0x10, 0x11, 0x12);
+const PROGRAM_P1: Rgb = rgb(0x28, 0x2a, 0x36);
+
+#[test]
+fn rebase_keeps_program_colours_and_moves_the_reset_baseline() {
+    let mut t = Terminal::new(4, 16);
+    t.set_allow_palette_reconfigure(true);
+    t.rebase_colors(&seeded_baseline(200));
+    t.process(b"\x1b]11;rgb:10/11/12\x07\x1b]4;1;rgb:28/2a/36\x07");
+    let new = seeded_baseline(90);
+    let rebase = t.rebase_colors(&new);
+    assert!(rebase.colors_changed, "fg and untouched slots moved");
+    assert_eq!(t.default_background(), PROGRAM_BG, "OSC 11 survives");
+    assert_eq!(t.palette_color(1), PROGRAM_P1, "OSC 4;1 survives");
+    assert_eq!(t.default_foreground(), new.foreground, "fg follows");
+    let new_palette = new.palette.as_ref().expect("seeded palette");
+    assert_eq!(t.palette_color(2), new_palette.get(2), "slot 2 follows");
+    assert_eq!(t.color_baseline(), new);
+
+    t.process(b"\x1b]111\x07\x1b]104\x07");
+    assert_eq!(t.default_background(), new.background, "OSC 111 → new bg");
+    assert_eq!(
+        t.palette_color(1),
+        new_palette.get(1),
+        "OSC 104 → new palette"
+    );
+
+    let mut legacy = Terminal::new(4, 16);
+    legacy.rebase_colors(&seeded_baseline(200));
+    legacy.process(b"\x1b]11;rgb:10/11/12\x07");
+    legacy.set_default_background(new.background);
+    assert_ne!(legacy.default_background(), PROGRAM_BG);
+}
+
+#[test]
+fn rebase_reports_change_only_when_live_colours_move() {
+    let mut t = Terminal::new(4, 16);
+    t.rebase_colors(&seeded_baseline(200));
+    t.take_damage();
+    let same = t.color_baseline();
+    assert_eq!(t.rebase_colors(&same), ColorRebase::default());
+    assert!(!t.has_damage(), "a no-op rebase leaves no damage");
+    let moved = t.rebase_colors(&seeded_baseline(90));
+    assert!(moved.colors_changed && moved.cursor_changed);
+    assert!(t.has_damage());
+}
+
+#[test]
+fn rebase_reports_the_scheme_once_after_the_colours() {
+    let mut t = Terminal::new(4, 16);
+    t.process(b"\x1b[?2031h");
+    while t.take_response().is_some() {}
+    let mut light = seeded_baseline(240);
+    light.color_scheme = Some(aterm_types::Appearance::Light);
+    let rebase = t.rebase_colors(&light);
+    assert!(rebase.scheme_changed);
+    assert_eq!(t.color_scheme(), aterm_types::Appearance::Light);
+    assert_eq!(t.take_response().as_deref(), Some(&b"\x1b[?997;2n"[..]));
+    assert!(!t.rebase_colors(&light).scheme_changed);
+    assert_eq!(t.take_response(), None);
+}
+
+#[test]
+fn apply_config_colour_half_is_rebase() {
+    let configs = [
+        TerminalConfig::default(),
+        TerminalConfig {
+            default_foreground: rgb(1, 2, 3),
+            default_background: rgb(250, 250, 240),
+            cursor_color: Some(rgb(9, 9, 9)),
+            color_scheme: Some(aterm_types::Appearance::Light),
+            ..TerminalConfig::default()
+        },
+        TerminalConfig {
+            selection_background: Some(rgb(5, 6, 7)),
+            selection_foreground: Some(rgb(8, 9, 10)),
+            custom_palette: seeded_baseline(77).palette,
+            allow_palette_reconfigure: true,
+            ..TerminalConfig::default()
+        },
+    ];
+    let mut a = Terminal::new(4, 16);
+    let mut b = Terminal::new(4, 16);
+    for t in [&mut a, &mut b] {
+        t.process(b"\x1b]11;rgb:10/11/12\x07\x1b]12;rgb:fe/01/80\x07");
+    }
+    let mut saw_change = false;
+    for config in &configs {
+        b.set_allow_palette_reconfigure(config.allow_palette_reconfigure);
+        let changes = a.apply_config(config);
+        let rebase = b.rebase_colors(&ColorBaseline::of_config(config));
+        assert_eq!(
+            changes.contains(&ConfigChange::Colors),
+            rebase.colors_changed
+        );
+        assert_eq!(
+            changes.contains(&ConfigChange::CursorColor),
+            rebase.cursor_changed
+        );
+        assert_eq!(
+            changes.contains(&ConfigChange::ColorScheme),
+            rebase.scheme_changed
+        );
+        saw_change |= rebase.colors_changed;
+        assert_eq!(a.color_baseline(), b.color_baseline());
+        assert_eq!(a.default_background(), b.default_background());
+        assert_eq!(a.default_foreground(), b.default_foreground());
+        assert_eq!(a.cursor_color(), b.cursor_color());
+        assert_eq!(a.color_scheme(), b.color_scheme());
+        for i in 0..=u8::MAX {
+            assert_eq!(a.palette_color(i), b.palette_color(i), "slot {i}");
+        }
+    }
+    assert!(saw_change, "the configs must move the colours");
+}
+
+#[test]
+fn apply_config_colors_takes_the_colours_and_policy_and_leaves_the_programs_modes() {
+    use crate::terminal::CursorStyle;
+    let config = TerminalConfig {
+        default_background: rgb(250, 250, 240),
+        bold_is_bright: false,
+        auto_wrap: false,
+        ..TerminalConfig::default()
+    };
+    let program = |t: &mut Terminal| t.process(b"\x1b[?25l\x1b[6 q");
+    let modes = |t: &Terminal| (t.cursor_visible(), t.cursor_style(), t.modes().auto_wrap);
+    let mut colors = Terminal::new(4, 16);
+    program(&mut colors);
+    let set = modes(&colors);
+    assert_eq!(set, (false, CursorStyle::SteadyBar, true), "fixture");
+    colors.take_damage();
+    colors.apply_config_colors(&config);
+    assert_eq!(modes(&colors), set, "the program's modes stay");
+    assert_eq!(colors.default_background(), rgb(250, 250, 240));
+    assert!(!colors.color.bold_is_bright, "the colour policy is taken");
+    assert!(colors.has_damage(), "a colour move repaints");
+    let mut whole = Terminal::new(4, 16);
+    program(&mut whole);
+    whole.apply_config(&config);
+    assert_ne!(
+        modes(&whole),
+        set,
+        "negative control: the whole config moves the program's modes"
+    );
+}
+
+/// The configured pair is the host's: a program's OSC 10/11, their resets OSC 110/111 and
+/// DECSCNM move the live page and never the pair; `apply_config` and `rebase_colors` move it
+/// (`docs/design/PRISM-GLASS.md` §15.1 P0.2a, the light latch's key).
+#[test]
+fn the_configured_colours_move_only_with_the_config() {
+    let light = TerminalConfig {
+        default_foreground: rgb(0x2b, 0x2d, 0x33),
+        default_background: rgb(0xf6, 0xf7, 0xf9),
+        ..TerminalConfig::default()
+    };
+    let mut t = Terminal::new(4, 16);
+    t.apply_config(&light);
+    let pair = (rgb(0x2b, 0x2d, 0x33), rgb(0xf6, 0xf7, 0xf9));
+    assert_eq!(t.configured_colors(), pair, "apply_config sets it");
+    for page in [
+        &b"\x1b]10;rgb:ff/00/00\x07"[..],
+        b"\x1b]11;rgb:00/00/00\x07",
+        b"\x1b]110\x07",
+        b"\x1b]111\x07",
+        b"\x1b]10;#d0d0d0\x1b\\\x1b]11;#111318\x1b\\",
+        b"\x1b[?5h",
+        b"\x1b[?5l",
+    ] {
+        t.process(page);
+        assert_eq!(
+            t.configured_colors(),
+            pair,
+            "{:?} moved the configured pair",
+            String::from_utf8_lossy(page)
+        );
+    }
+    t.process(b"\x1b[?5h\x1b]11;rgb:00/00/00\x07");
+    assert_ne!(
+        t.default_background(),
+        pair.1,
+        "control: the program moved the live page"
+    );
+    assert_eq!(t.configured_colors(), pair);
+
+    let dark = seeded_baseline(40);
+    t.rebase_colors(&dark);
+    assert_eq!(
+        t.configured_colors(),
+        (dark.foreground, dark.background),
+        "rebase_colors moves it"
+    );
+    assert_eq!(
+        t.configured_colors(),
+        (t.color_baseline().foreground, t.color_baseline().background),
+        "the baseline's pair"
+    );
+}
+
+/// A host install journals one config op (recolouring only when a colour moved) and a replay set-up none; the op replayed on a fresh engine is the live install, the scheme push the live host took dropped.
+#[test]
+fn apply_config_journals_one_config_op_and_keeping_modes_none() {
+    use crate::terminal::{ClockReading, HostOp};
+    let configs = |t: &Terminal, since: u64| -> Vec<HostOp> {
+        let (reports, lost) = t.host_journal_since(since);
+        assert_eq!(lost, 0);
+        reports.into_iter().map(|r| r.op).collect()
+    };
+    let light = TerminalConfig {
+        default_background: rgb(250, 250, 240),
+        default_foreground: rgb(10, 10, 10),
+        color_scheme: Some(aterm_types::Appearance::Light),
+        cursor_style: crate::terminal::CursorStyle::SteadyUnderline,
+        ..TerminalConfig::default()
+    };
+    let mut live = Terminal::new(4, 16);
+    live.process(b"\x1b[?2031h");
+    while live.take_response().is_some() {}
+    let from = live.host_ordinal();
+    let _ = live.apply_config(&light);
+    let ops = configs(&live, from);
+    assert!(
+        matches!(
+            ops.as_slice(),
+            [HostOp::Config {
+                recolored: true,
+                ..
+            }]
+        ),
+        "{ops:?}"
+    );
+    assert_eq!(
+        live.take_response().as_deref(),
+        Some(&b"\x1b[?997;2n"[..]),
+        "fixture: the install pushed the scheme to the program"
+    );
+    let from = live.host_ordinal();
+    let _ = live.apply_config(&light);
+    assert!(
+        matches!(
+            configs(&live, from).as_slice(),
+            [HostOp::Config {
+                recolored: false,
+                ..
+            }]
+        ),
+        "the same install again moves no colour"
+    );
+    let from = live.host_ordinal();
+    live.apply_config_keeping_modes(&TerminalConfig::default());
+    assert!(
+        configs(&live, from).is_empty(),
+        "a replay set-up journals nothing"
+    );
+
+    let mut replay = Terminal::new(4, 16);
+    replay.process(b"\x1b[?2031h");
+    while replay.take_response().is_some() {}
+    let mut probe = Terminal::new(4, 16);
+    probe.process(b"\x1b[?2031h");
+    while probe.take_response().is_some() {}
+    let _ = probe.apply_config(&light);
+    let _ = probe.take_response();
+    replay.apply_host_op_at(ops.into_iter().next().expect("one op"), ClockReading::now());
+    assert_eq!(replay.take_response(), None, "the replay drops the push");
+    assert_eq!(replay.default_background(), probe.default_background());
+    assert_eq!(replay.cursor_style(), probe.cursor_style());
+    assert_eq!(replay.color_scheme(), probe.color_scheme());
+    assert_eq!(
+        replay.checkpoint_visible(),
+        probe.checkpoint_visible(),
+        "the replayed install is the live one"
+    );
+}

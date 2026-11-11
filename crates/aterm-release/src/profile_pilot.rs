@@ -84,6 +84,7 @@ pub(crate) struct Options {
     compat_jobs: Option<u32>,
     summary: Option<std::path::PathBuf>,
     anatomy: bool,
+    native_only: bool,
 }
 
 impl Options {
@@ -105,8 +106,13 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
         compat_jobs: None,
         summary: None,
         anatomy: false,
+        native_only: false,
     };
     while let Some(flag) = args.next() {
+        if flag == "--native-only" {
+            opts.native_only = true;
+            continue;
+        }
         if flag == "--anatomy" {
             opts.anatomy = true;
             continue;
@@ -160,6 +166,7 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
             || takes_named
             || opts.jobs.is_some()
             || opts.compat_jobs.is_some()
+            || opts.native_only
         {
             return Err("--summary takes only a retained pilot directory".into());
         }
@@ -563,7 +570,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         .parse()
         .map_err(|_| "commit has no timestamp")?;
     for (n, arm) in order(opts) {
-        let targets = if cfg!(target_os = "macos") {
+        let targets = if cfg!(target_os = "macos") && !opts.native_only {
             vec![None, Some("x86_64-apple-darwin")]
         } else {
             vec![None]

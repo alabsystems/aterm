@@ -10642,7 +10642,10 @@ fn serve_session_verb(
         );
     }
     if verb == "codex-accounts" {
-        if rest.split_ascii_whitespace().next() == Some("enrollment-status") {
+        if matches!(
+            rest.split_ascii_whitespace().next(),
+            Some("enrollment-status" | "enrollment-diagnostics")
+        ) {
             return crate::native_act::serve_codex_enrollment(
                 self_ctx,
                 master,

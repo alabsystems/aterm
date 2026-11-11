@@ -48,7 +48,7 @@ cites").
 ## 1. Specs (TSV)
 
 `subsumes` names the primary tests (paths relative to `crates/aterm-png`; the rest are in §2), and
-`blocking gaps` rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`blocking gaps` rows of the gap table in `docs/TRUST-LANE.md` (Blocking gaps).
 Gap 0 blocks every row; none is blocked by gap 0 alone.
 
 ```tsv
@@ -129,12 +129,6 @@ tests/decode_encode.rs	indexed_encoding_round_trips_and_refuses_an_index_past_th
 tests/decode_encode.rs	srgb_intent_round_trips	encode-indexed-and-metadata	
 ```
 
-## 3. Coverage
-
-- 41 live `#[test]` functions (`src/checksum.rs` 5, `src/deflate.rs` 8, `src/encode.rs` 1,
-  `src/gzip.rs` 2, `src/squeeze.rs` 4, `tests/decode_encode.rs` 20, `tests/encode_memory.rs` 1);
-  every one maps to one of the 21 specs in §1, with 0 missing rows and 0 `+bench` leftovers.
-
 ## 4. Tests that are not spec samples
 
 None (resolved: the `20x` scanline compression-ratio check in `src/deflate.rs::roundtrips_image_like_input` and the `encoded_total < raw_total` corpus-ratio check in `tests/decode_encode.rs::the_repository_corpus_decodes_and_round_trips` were removed so both tests sample only `zlib-compress-roundtrip`, `decode-total`, and `encode-decode-roundtrip`).
@@ -158,33 +152,3 @@ Count by action: move-to-bench 0, delete 0, become-spec 0.
 5. **Resolved — `encoded_input_cannot_bypass_the_pixel_budget` now bounds rather than pins `consumed`.**
    It asserts `0 < consumed <= encoded_limit + 1` (backed by `GuardedRepeat`'s ceiling check) rather
    than requiring exact `encoded_limit + 1`, matching `decode-limits-encoded-input`.
-
-## 6. Proof order (easiest high-value first)
-
-Every spec is blocked by gap 0; none is blocked by gap 0 alone, so the order goes by the smallest
-remaining gap set and by what each proof unlocks.
-
-1. **`deflate-code-tables`** (gaps 0,3,5,7). Pure tables over bounded domains, decidable by
-   evaluation once the loops and casts are admitted (gap 3). It forces the two missing `requires`
-   (§5.2, §5.3) and is a lemma of `zlib-compress-roundtrip`.
-2. **`crc32-table-generation`** (0,3,5,7) and the slicing loop's refinement contract on
-   `crc32_ieee_update`, both astream-wire's: its Lean model proves both, and binding them to the
-   Rust code waits on Trust admitting slice-fold specs (the tables are built at compile time, so
-   gap 8 does not apply). Then **`crc32-denotation`** (0,1,2,3,5,7,12): the wrapper's `of` loop plus
-   one cross-crate citation (gap 12) of that contract. It retires 3 tests and feeds
-   `chunk-structure`.
-3. **`adler32-no-overflow`** (one nonlinear loop invariant), then **`adler32-denotation`** (a
-   ring-homomorphism argument), which feeds `zlib-framing`.
-4. **`zlib-framing`** (gaps 0, 1, 4), the smallest gap set here.
-5. **`bitwriter-denotation`**, **`lz77-tokens-reconstruct`**, then **`zlib-compress-roundtrip`**
-   (adding gaps 10 and 12 for the Lean inflate model).
-6. The decoder front end: **`decode-limits-encoded-input`**, **`decode-limits-output`**,
-   **`chunk-structure`**, **`decode-total`**, then **`decode-work-budget`** once aterm-codec's
-   `inflate-header-work` is proved.
-7. **`decode-denotation`**, **`idat-trailing-and-excess`**, **`decode-rgba8-contract`**, which
-   need the Lean `PngSem` model.
-8. **`encode-decode-roundtrip`** and **`encode-indexed-and-metadata`**, composing the deflate specs
-   with `decode-denotation` (gap 4).
-9. **`squeeze-deflate-roundtrip`** and **`gzip-member-denotation`**, adding length-limited canonical
-   Huffman coding, three-way block bit-cost selection, and deterministic RFC 1952 framing over
-   `Crc32::of` (gaps 10, 12).

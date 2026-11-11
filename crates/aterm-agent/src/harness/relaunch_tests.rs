@@ -1512,9 +1512,6 @@ fn the_resumed_prompt_is_one_line_and_keeps_going() {
         CAUSE_EXIT,
         CAUSE_MEMORY,
         CAUSE_INPUT_LOST,
-        "model:opus",
-        "model-back:fable",
-        "model-back:",
         CAUSE_STALL,
         CAUSE_HOST,
         CAUSE_ASKED,
@@ -1541,21 +1538,12 @@ fn every_continuation_aterm_types_is_its_own_words() {
     let mut texts = vec![
         upgrade::continue_prompt(&v("2.1.305"), &v("2.1.310"), None),
         upgrade::continue_prompt(&v("2.1.310"), &v("2.1.310"), Some("opus")),
-        upgrade::continue_prompt_with_model(
-            &v("2.1.305"),
-            &v("2.1.310"),
-            Some("opus"),
-            Some("sonnet"),
-        ),
     ];
     texts.extend(
         [
             CAUSE_EXIT,
             CAUSE_MEMORY,
             CAUSE_INPUT_LOST,
-            "model:opus",
-            "model-back:fable",
-            "model-back:",
             CAUSE_STALL,
             CAUSE_HOST,
             CAUSE_ASKED,
@@ -1905,7 +1893,6 @@ fn the_relaunch_line_carries_the_mode() {
             exe,
             &args(argv),
             Some(id),
-            None,
             Some("auto"),
             &[],
         )
@@ -1935,6 +1922,57 @@ fn the_relaunch_line_carries_the_mode() {
             "fix it"
         ]),
         want
+    );
+}
+
+/// A RELAUNCH LINE CARRIES THE LAUNCH'S OWN `--model` AND ADDS NONE: a launch without one is
+/// relaunched without one; one with `--model X` or `--model=X` keeps exactly that, in its own
+/// spelling, before the `--resume` pair; a permission mode resumed beside it leaves it one pair.
+/// The line's model is the agent's to say (its settings, or `/model` in the session), never the
+/// harness's.
+#[test]
+fn a_relaunch_line_carries_the_launchs_own_model_and_adds_none() {
+    let exe = Path::new("/opt/claude");
+    let id = "0b5e7a11-f100-4a2b-9c3d-5e6f70819a2b";
+    let line = |argv: &[&str], mode: Option<&str>| {
+        line_for(
+            Dialect::Bash,
+            None,
+            None,
+            exe,
+            &args(argv),
+            Some(id),
+            mode,
+            &[],
+        )
+        .unwrap_or_else(|_| panic!("no line for {argv:?}"))
+    };
+    let bare = line(&["claude"], None);
+    assert!(!bare.contains("--model"), "{bare}");
+    assert!(
+        bare.ends_with(&format!("'/opt/claude' '--resume' '{id}'")),
+        "{bare}"
+    );
+    let named = line(&["claude", "--model", "X"], None);
+    assert!(
+        named.ends_with(&format!("'/opt/claude' '--model' 'X' '--resume' '{id}'")),
+        "{named}"
+    );
+    let joined = line(&["claude", "--model=X"], None);
+    assert!(
+        joined.ends_with(&format!("'/opt/claude' '--model=X' '--resume' '{id}'")),
+        "{joined}"
+    );
+    let moded = line(&["claude", "--model", "X"], Some("auto"));
+    assert_eq!(moded.matches("'--model'").count(), 1, "{moded}");
+    let pair = moded.find("'--model' 'X'").expect("the launch's pair");
+    let resume = moded.find("'--resume'").expect("the resume pair");
+    assert!(pair < resume, "{moded}");
+    assert!(
+        moded.ends_with(&format!(
+            "'/opt/claude' '--model' 'X' '--permission-mode' 'auto' '--resume' '{id}'"
+        )),
+        "{moded}"
     );
 }
 
@@ -2018,7 +2056,6 @@ fn login_line(
         Path::new("/opt/claude"),
         &args(argv),
         Some(LOGIN_ID),
-        None,
         None,
         required,
     )
@@ -2286,72 +2323,26 @@ fn an_account_moves_record_is_a_relaunch_that_ended_its_own_agent() {
         to: label.to_string(),
         at: crate::supervise::policy::turn_end::AccountAt::Wall,
     };
-    let plain = model_restart(
-        &to("work-2"),
-        None,
-        "claude-fable-5-1".to_string(),
-        None,
-        None,
-    );
-    assert_eq!(
-        plain,
-        ModelRestart {
-            model: None,
-            cause: "account:work-2".to_string(),
-            launch_model: "claude-fable-5-1".to_string(),
-            fallback_from: None,
-        }
-    );
-    assert!(relaunch_cause(&plain.cause) && ends_its_agent(&plain.cause));
-    assert!(carried_quietly(&plain.cause, false) && carried_quietly(&plain.cause, true));
-    assert!(!starts_afresh(&plain.cause));
-    assert!(ends_at_once(&plain.cause));
-    let hand = model_restart(
-        &to("work-2"),
-        None,
-        "claude-fable-5-1".to_string(),
-        None,
-        Some("claude-opus-5-5".to_string()),
-    );
-    assert_eq!(hand.model.as_deref(), Some("claude-opus-5-5"));
-    let riding = model_restart(
-        &to("work-2"),
-        None,
-        "claude-fable-5-1".to_string(),
-        Some("claude-fable-5-2".to_string()),
-        Some("claude-opus-5-5".to_string()),
-    );
-    assert_eq!(riding.model.as_deref(), Some("claude-fable-5-2"));
-    let fell = St {
-        cause: "model:claude-sonnet-5-5".to_string(),
-        fallback_from: Some("claude-fable-5-1".to_string()),
-        ..St::default()
-    };
-    let back = model_restart(
-        &to("work-2"),
-        Some(&fell),
-        "claude-sonnet-5-5".to_string(),
-        None,
-        None,
-    );
-    assert_eq!(
-        (back.model.as_deref(), back.fallback_from),
-        (Some("claude-fable-5-1"), None)
-    );
-    let memory = model_restart(
-        &Restart::Memory,
-        Some(&fell),
-        "claude-sonnet-5-5".to_string(),
-        None,
-        None,
-    );
-    assert_eq!(
-        (memory.model, memory.fallback_from.as_deref()),
-        (None, Some("claude-fable-5-1"))
-    );
-    for cause in ["account", "accounts", "", CAUSE_FRESH] {
+    let cause = restart_cause(&to("work-2"));
+    assert_eq!(cause, "account:work-2");
+    assert!(relaunch_cause(&cause) && ends_its_agent(&cause));
+    assert!(carried_quietly(&cause, false) && carried_quietly(&cause, true));
+    assert!(!starts_afresh(&cause));
+    assert!(ends_at_once(&cause));
+    // `model:` and `model-back:` are causes an older build's record may carry: unknown here.
+    for cause in [
+        "account",
+        "accounts",
+        "",
+        CAUSE_FRESH,
+        "model:opus",
+        "model-back:",
+    ] {
         assert!(!relaunch_cause(cause), "{cause:?}");
         assert!(!carried_quietly(cause, false), "{cause:?}");
+    }
+    for cause in ["model:opus", "model-back:"] {
+        assert!(!ends_its_agent(cause), "{cause:?}");
     }
     assert!(
         !carried_quietly(CAUSE_MEMORY, true),
@@ -2365,50 +2356,17 @@ fn an_account_moves_record_is_a_relaunch_that_ended_its_own_agent() {
 }
 
 /// A RESTART IN PLACE FOR A LINE THE WORKER READ AND DREW NONE OF ([`Restart::InputLost`]) IS A
-/// RELAUNCH THAT ENDED ITS OWN AGENT, carried as a memory restart's is: its own cause
-/// ([`CAUSE_INPUT_LOST`]), the model the agent rode (or the hand's) kept, and a fallback it rode
-/// carried; the relaunch is no exit, and its resumed prompt says why in words of its own.
+/// RELAUNCH THAT ENDED ITS OWN AGENT, carried as a memory restart's is, under its own cause
+/// ([`CAUSE_INPUT_LOST`]); the relaunch is no exit, and its resumed prompt says why in words of
+/// its own.
 #[test]
-fn a_restart_for_a_lost_line_ends_its_agent_and_keeps_its_model() {
-    let fell = St {
-        cause: "model:claude-sonnet-5-5".to_string(),
-        fallback_from: Some("claude-fable-5-1".to_string()),
-        ..St::default()
+fn a_restart_for_a_lost_line_ends_its_agent() {
+    let lost = Restart::InputLost {
+        of: (None, None),
+        line: crate::supervise::custody::LineAsk { at_ms: 0, nth: 0 },
     };
-    let at = |why: &Restart, riding: Option<&str>, hand: Option<&str>| {
-        model_restart(
-            why,
-            Some(&fell),
-            "claude-sonnet-5-5".to_string(),
-            riding.map(str::to_string),
-            hand.map(str::to_string),
-        )
-    };
-    for (riding, hand) in [
-        (None, None),
-        (Some("claude-opus-5-5"), None),
-        (None, Some("claude-fable-5-2")),
-        (Some("claude-opus-5-5"), Some("claude-fable-5-2")),
-    ] {
-        let lost = at(
-            &Restart::InputLost {
-                of: (None, None),
-                line: crate::supervise::custody::LineAsk { at_ms: 0, nth: 0 },
-            },
-            riding,
-            hand,
-        );
-        let memory = at(&Restart::Memory, riding, hand);
-        assert_eq!(lost.cause, CAUSE_INPUT_LOST, "{riding:?} {hand:?}");
-        assert_eq!(
-            ModelRestart {
-                cause: CAUSE_MEMORY.to_string(),
-                ..lost
-            },
-            memory,
-            "carried as a memory restart's: {riding:?} {hand:?}"
-        );
-    }
+    assert_eq!(restart_cause(&lost), CAUSE_INPUT_LOST);
+    assert_eq!(restart_cause(&Restart::Memory), CAUSE_MEMORY);
     assert!(relaunch_cause(CAUSE_INPUT_LOST));
     assert!(ends_its_agent(CAUSE_INPUT_LOST) && ends_at_once(CAUSE_INPUT_LOST));
     assert!(!starts_afresh(CAUSE_INPUT_LOST));
@@ -2497,12 +2455,7 @@ fn an_account_move_over_another_restart_in_flight_is_not_tried() {
     };
     let word =
         |why: &Restart, cause: &str, step: &str| carried_word(why, false, cause, step.to_string());
-    for cause in [
-        "",
-        CAUSE_MEMORY,
-        "model:claude-sonnet-5-5",
-        "account:pool-a",
-    ] {
+    for cause in ["", CAUSE_MEMORY, "route:token", "account:pool-a"] {
         for step in [
             "adopted",
             "relaunched",
@@ -2813,8 +2766,6 @@ fn a_typed_relaunch_line_is_recorded_before_anything_after_it() {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         usage_tap: None,
         agents_off: Vec::new(),
@@ -2879,8 +2830,6 @@ fn whether_the_adopted_agent_is_gone_is_the_records_to_say() {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         usage_tap: None,
         agents_off: Vec::new(),
@@ -2972,8 +2921,6 @@ fn a_relaunch_only_lanes_worker_is_owed_its_own_agents_record_alone() {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         usage_tap: None,
         agents_off: Vec::new(),
@@ -3064,15 +3011,6 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
     const ID: &str = "0badf00d-1111-2222-3333-444455556666";
     const WRITTEN: u64 = 1_791_477_331;
     let tail = include_str!("../supervise/fixtures/claude-2.1.294-transcript-weekly-limit.jsonl");
-    let sonnet = tail
-        .replace(
-            "You've hit your weekly limit · resets Oct 11 at 9:35am (America/Los_Angeles)",
-            "You've hit your Sonnet limit · resets Oct 11 at 9:35am (America/Los_Angeles)",
-        )
-        .replace(
-            "\"rateLimitType\":\"seven_day\"",
-            "\"rateLimitType\":\"seven_day_sonnet\"",
-        );
     let dir = crate::supervise::ScratchDir::new("relaunch", "standing-limit");
     let o = Opts {
         home: dir.join("home"),
@@ -3087,8 +3025,6 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -3142,28 +3078,25 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
         weekly.row.as_deref(),
         Some("a65a7337-1491-48c9-983b-5dd498b525a0")
     );
-    for (cause, tail) in [
-        ("account:work-2", tail),
-        ("model:opus", sonnet.as_str()),
-        ("model-back:claude-fable-5-1", tail),
-    ] {
-        assert_eq!(standing(Some(cause), after, tail), None, "{cause}");
-        assert_eq!(
-            standing(Some(cause), 0, tail),
-            None,
-            "{cause}: an older record with no instant"
-        );
-    }
+    let cause = "account:work-2";
+    assert_eq!(standing(Some(cause), after, tail), None, "{cause}");
+    assert_eq!(
+        standing(Some(cause), 0, tail),
+        None,
+        "{cause}: an older record with no instant"
+    );
     for cause in [CAUSE_EXIT, CAUSE_HOST, CAUSE_STALL, CAUSE_MEMORY, ""] {
         assert!(standing(Some(cause), after, tail).is_some(), "{cause:?}");
     }
-    for cause in ["account:work-2", "model:opus"] {
-        assert!(
-            standing(Some(cause), WRITTEN - 600, tail).is_some(),
-            "{cause}: the row was written after the move"
-        );
-    }
-    let kept = |moved_at: u64| {
+    assert!(
+        standing(Some(cause), WRITTEN - 600, tail).is_some(),
+        "{cause}: the row was written after the move"
+    );
+    let on_work_2 = Snapshot {
+        login: Some("work-2".to_string()),
+        ..snap.clone()
+    };
+    let kept = |moved_at: u64, moved_login: Option<&str>| {
         let _ = std::fs::remove_file(state_dir(&o).join(format!("{ID}.json")));
         save(
             &o,
@@ -3173,14 +3106,26 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
                 tab: "s-restored".to_string(),
                 relaunched_at: after + 60,
                 moved_at,
+                moved_login: moved_login.map(str::to_owned),
                 ..St::default()
             },
         );
-        standing_limit(&o, &snap, tail)
+        standing_limit(&o, &on_work_2, tail)
     };
-    assert_eq!(kept(after), None, "the move a restore's record keeps");
-    assert!(kept(WRITTEN - 600).is_some(), "a row after the kept move");
-    assert!(kept(0).is_some(), "no move kept");
+    assert_eq!(
+        kept(after, Some("work-2")),
+        None,
+        "the move a restore's record keeps"
+    );
+    assert!(
+        kept(WRITTEN - 600, Some("work-2")).is_some(),
+        "a row after the kept move"
+    );
+    assert!(kept(0, Some("work-2")).is_some(), "no move kept");
+    assert!(
+        kept(after, None).is_some(),
+        "a kept move that names no login moved nothing"
+    );
     let unnamed = Snapshot {
         session: None,
         ..snap.clone()
@@ -3236,40 +3181,6 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
     };
     assert!(under(kept.clone(), &live(None, &bare), tail).is_some());
     assert_eq!(under(kept, &live(Some("work-2"), &bare), tail), None);
-    let model = St {
-        cause: "model:opus".to_string(),
-        tab: "s-crashed".to_string(),
-        relaunched_at: after,
-        fallback_from: Some("claude-sonnet-x".to_string()),
-        ..St::default()
-    };
-    assert!(
-        under(
-            model.clone(),
-            &live(None, &["/opt/claude", "--model", "claude-sonnet-x"]),
-            &sonnet
-        )
-        .is_some(),
-        "back on the model the fallback left"
-    );
-    assert!(
-        under(
-            model.clone(),
-            &live(None, &["/opt/claude", "--model=claude-sonnet-x"]),
-            &sonnet
-        )
-        .is_some(),
-        "its `--model=` spelling"
-    );
-    assert_eq!(
-        under(
-            model,
-            &live(None, &["/opt/claude", "--model", "opus"]),
-            &sonnet
-        ),
-        None,
-        "under the fallback"
-    );
     let older = St {
         cause: "account:work-2".to_string(),
         tab: "s-crashed".to_string(),
@@ -3298,8 +3209,6 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -3423,25 +3332,24 @@ fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
     };
     let bare = format!("claude --verbose --resume {LOGIN_ID}");
     assert_eq!(
-        told_command(user, None, &snap(None, Some("/u/other/.claude"), "/w")),
+        told_command(user, &snap(None, Some("/u/other/.claude"), "/w")),
         Some(format!("HOME=/u/other {bare}")),
         "another HOME"
     );
     assert_eq!(
-        told_command(user, None, &snap(Some("/abs/.claude"), None, "/w")),
+        told_command(user, &snap(Some("/abs/.claude"), None, "/w")),
         Some(format!("CLAUDE_CONFIG_DIR=/abs/.claude {bare}")),
         "an absolute CLAUDE_CONFIG_DIR"
     );
     assert_eq!(
         told_command(
             user,
-            None,
             &snap(Some("rel/.claude"), Some("/work/b/rel/.claude"), "/work/c")
         ),
         None,
         "a relative home the line would move"
     );
-    let own = told_command(user, None, &snap(None, None, "/w"));
+    let own = told_command(user, &snap(None, None, "/w"));
     assert_eq!(
         own,
         super::super::resume::command(&words(&["/opt/claude", "--verbose"]), LOGIN_ID)
@@ -3455,7 +3363,7 @@ fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
         }),
         ..snap(None, None, "/w")
     };
-    assert_eq!(told_command(user, None, &codex), None, "a Codex");
+    assert_eq!(told_command(user, &codex), None, "a Codex");
 }
 
 /// The tap's value for the installed app's path.
@@ -3480,7 +3388,6 @@ fn the_tap_rides_before_the_resume_in_every_shells_form() {
             Path::new("/opt/claude"),
             &args(&["claude", "--verbose"]),
             session,
-            None,
             None,
             &[],
             tap,
@@ -3516,7 +3423,6 @@ fn the_tap_rides_before_the_resume_in_every_shells_form() {
             &args(&["claude", "--verbose"]),
             Some(LOGIN_ID),
             None,
-            None,
             &[],
         );
         assert_eq!(plain.ok(), Some(golden), "{dialect:?}");
@@ -3551,7 +3457,6 @@ fn the_tap_is_dropped_before_the_required_login() {
                 .chain([format!("/{}", "d".repeat(pad))])
                 .collect::<Vec<_>>(),
             Some(LOGIN_ID),
-            None,
             None,
             &login,
             Some(&value),
@@ -3649,7 +3554,6 @@ fn the_measured_machines_relaunch_line_carries_the_tap() {
             &argv,
             Some(LOGIN_ID),
             None,
-            None,
             &[],
             None,
             Some(tap),
@@ -3709,8 +3613,6 @@ fn a_dropped_tap_or_token_is_recorded_in_the_ledger() {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: super::super::upgrade_drive::Instances::Machine,
         agents_off: Vec::new(),
@@ -3793,8 +3695,6 @@ fn a_restart_whose_own_relaunch_was_retired_unissued_holds_no_claim() {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: super::super::upgrade_drive::Instances::Machine,
         agents_off: Vec::new(),
@@ -3803,9 +3703,7 @@ fn a_restart_whose_own_relaunch_was_retired_unissued_holds_no_claim() {
         press: None,
         timings: super::super::Timings::for_build(),
     };
-    let why = Restart::Model {
-        to: "claude-fallback".to_string(),
-    };
+    let why = Restart::Memory;
     let ask = RestartAsk::of(&why, 600);
     let report = Report {
         pid: 4242,
@@ -3816,7 +3714,7 @@ fn a_restart_whose_own_relaunch_was_retired_unissued_holds_no_claim() {
         step: String::new(),
     };
     let record = |held: bool| St {
-        cause: format!("{CAUSE_MODEL}claude-fallback"),
+        cause: CAUSE_MEMORY.to_string(),
         ask: ask.word().to_string(),
         tab: "s-1".to_string(),
         phase: upgrade::Phase::Exiting { at_s: 1 },
@@ -3852,7 +3750,7 @@ fn a_restart_whose_own_relaunch_was_retired_unissued_holds_no_claim() {
 
 /// THE FOOTER'S PROMISE ASKS THE LINE'S ROOM ([`tap_room`]): the measured machine's restart line
 /// (zsh, atpkg's heal hook, the managed twin, a resumed conversation) has room for the carrying
-/// tap and for a model and permission mode besides; the same agent started in a directory so long
+/// tap and for a permission mode besides; the same agent started in a directory so long
 /// that its line keeps no room for the tap has none, so the footer never promises a tap the line
 /// would drop; and a snapshot no line can be built from has none.
 #[cfg(unix)]
@@ -3899,7 +3797,6 @@ fn the_footers_promise_asks_whether_the_line_has_room_for_the_tap() {
     };
     assert!(tap_room(home, &snap("/Users//example/trust"), &value));
     let heal = atpkg::hooks::hook_file(home, "zsh").map(|(p, _)| p);
-    let model = "m".repeat(TAP_ROOM_MODEL);
     let typed = |cwd: &str, tap: Option<&str>| {
         let s = snap(cwd);
         line_tap_kept(
@@ -3909,7 +3806,6 @@ fn the_footers_promise_asks_whether_the_line_has_room_for_the_tap() {
             &s.program,
             &s.argv,
             Some(LOGIN_ID),
-            Some(&model),
             Some(TAP_ROOM_MODE),
             &[],
             None,
@@ -3967,8 +3863,6 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -4282,7 +4176,6 @@ fn a_store_binarys_line_exports_its_shims_env_and_a_bare_build_adds_nothing() {
             &argv,
             Some(SESSION),
             None,
-            None,
             &[],
             None,
             None,
@@ -4441,7 +4334,6 @@ fn a_store_binarys_long_line_drops_the_survey_switch_and_keeps_the_updater_switc
             &padded(pad),
             Some(SESSION),
             None,
-            None,
             &[],
             None,
             None,
@@ -4585,328 +4477,17 @@ fn a_worker_carries_its_managers_claude_home_resolved_where_the_manager_runs() {
     );
 }
 
+/// A line that clears and sets its environment quotes every word in each dialect's own form, and
+/// refuses a name it cannot write, a name both set and unset, or a value spanning lines. A tapped
+/// line keeps its required words and unsets, and one too long to hold them is refused rather than
+/// shortened by dropping any.
 #[test]
-fn a_model_move_reads_the_launchs_model_and_never_another_flags_value() {
-    let live = |argv: &[&str]| Snapshot {
-        launch_env: None,
-        auth_observed: true,
-        tab: "s-cafe".to_string(),
-        pid: 0,
-        start: String::new(),
-        shell: 0,
-        program: PathBuf::from("/fixture/claude"),
-        argv: words(argv),
-        session: None,
-        cwd: String::new(),
-        version: None,
-        run: crate::harness::relaunch::AgentRun::Claude,
-        dialect: None,
-        login: None,
-        home: None,
-        claude_dir: None,
-        route: crate::harness::accounts::AuthRoute::Outside,
-        profile: None,
-    };
-    for (argv, expected) in [
-        (&["claude"][..], ""),
-        (&["claude", "--model", "default"][..], "default"),
-        (&["claude", "--model", "opus"][..], "opus"),
-        (&["claude", "--model=sonnet"][..], "sonnet"),
-        (
-            &["claude", "--model", "opus", "--model=sonnet"][..],
-            "sonnet",
-        ),
-        (
-            &[
-                "claude",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                "--",
-                "--model=sonnet",
-            ][..],
-            "sonnet",
-        ),
-        (
-            &[
-                "claude",
-                "--append-system-prompt=--model=sonnet",
-                "--model",
-                "opus",
-            ][..],
-            "opus",
-        ),
-    ] {
-        let snap = live(argv);
-        assert_eq!(launch_model_of(&snap.argv), expected, "{argv:?}");
-        assert!(
-            !runs_moved(&snap, None, Some(expected)),
-            "the selected model still stands: {argv:?}"
-        );
-        assert!(
-            runs_moved(&snap, None, Some("another-model")),
-            "a different named model is left: {argv:?}"
-        );
-        assert!(
-            runs_moved(&snap, None, None),
-            "an older record names no model target"
-        );
-    }
-    let opus = live(&["claude", "--model", "opus"]);
-    assert!(
-        runs_moved(&opus, Some(""), Some("sonnet")),
-        "ordinary default-login control"
-    );
-    assert!(
-        !runs_moved(&opus, Some("another-login"), Some("sonnet")),
-        "a different login never proves the move"
-    );
-
-    let mut changed = Vec::new();
-    for (argv, expected) in [
-        (
-            &[
-                "claude",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                "--model=sonnet",
-            ][..],
-            "opus",
-        ),
-        (
-            &[
-                "claude",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                "--model",
-                "sonnet",
-            ][..],
-            "opus",
-        ),
-        (
-            &["claude", "--model", "opus", "--add-dir", "--model=sonnet"][..],
-            "opus",
-        ),
-        (
-            &["claude", "--model", "opus", "--", "--model=sonnet"][..],
-            "opus",
-        ),
-        (
-            &["claude", "--model", "opus", "--", "--model", "sonnet"][..],
-            "opus",
-        ),
-        (
-            &["claude", "--append-system-prompt", "--model=sonnet"][..],
-            "",
-        ),
-        (&["claude", "--", "--model=sonnet"][..], ""),
-    ] {
-        let snap = live(argv);
-        let read = launch_model_of(&snap.argv);
-        let moved = runs_moved(&snap, None, Some(expected));
-        if read != expected || moved {
-            changed.push((words(argv), read.to_string(), moved));
-        }
-    }
-    assert!(
-        changed.is_empty(),
-        "model selection must respect option values and -- boundaries: {changed:?}"
-    );
-}
-
-#[test]
-fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
-    let billed = ["fable".to_string()];
-    let fallback = |to: &str| Restart::Model { to: to.to_string() };
-    let back = Restart::ModelBack {
-        to: Some("fable".to_string()),
-    };
-    assert!(moves_onto_credits(
-        &fallback("fable"),
-        Some("fable"),
-        Some(&billed)
-    ));
-    assert!(moves_onto_credits(
-        &fallback("claude-fable-5-1[1m]"),
-        Some("claude-fable-5-1[1m]"),
-        Some(&billed)
-    ));
-    assert!(moves_onto_credits(&back, Some("fable"), Some(&billed)));
-    assert!(moves_onto_credits(&fallback("opus"), Some("opus"), None));
-    assert!(moves_onto_credits(&back, Some("fable"), None));
-    assert!(!moves_onto_credits(&back, None, None));
-    assert!(!moves_onto_credits(&back, Some("fable"), Some(&[])));
-    assert!(!moves_onto_credits(
-        &fallback("opus"),
-        Some("opus"),
-        Some(&billed)
-    ));
-    assert!(!moves_onto_credits(&back, None, Some(&billed)));
-    let account = Restart::Account {
-        to: "work-2".to_string(),
-        at: crate::supervise::policy::turn_end::AccountAt::Wall,
-    };
-    for rides in [Restart::Memory, account] {
-        assert!(!moves_onto_credits(&rides, Some("opus"), None));
-        assert!(!moves_onto_credits(
-            &rides,
-            Some("claude-fable-5-1"),
-            Some(&billed)
-        ));
-    }
-
-    use super::super::profile::Context;
-    let home = Path::new("/captured/home");
-    // Where the launch starts and a config it names: absolute on this
-    // platform, so a set-empty (relative) config resolves under the first and
-    // the second is taken as given.
-    let (work, config) = if cfg!(windows) {
-        (r"C:\captured\work", r"C:\captured\config")
-    } else {
-        ("/captured/work", "/captured/config")
-    };
-    let records = home.join(".claude");
-    let standard = vec![format!("{}=/captured/home", accounts::HOMEDIR_ENV)];
-    let mut custom = standard.clone();
-    custom.push("CLAUDE_CODE_CUSTOM_OAUTH_URL=https://auth.example.invalid".to_string());
-    let standard_context = Context::of_exec_env(home, &records, &standard).expect("standard");
-    let custom_context = Context::of_exec_env(home, &records, &custom).expect("custom");
-    let target = standard_context
-        .for_launch(home, work, &required_env(None, None, None))
-        .expect("explicit Standard target");
-    assert_eq!(target.context, standard_context);
-    assert_eq!(target.unset, [accounts::HOME_ENV, accounts::LOGIN_ENV]);
-    assert_eq!(
-        target.values,
-        [
-            (accounts::HOMEDIR_ENV, "/captured/home".to_string()),
-            ("CLAUDE_CODE_CUSTOM_OAUTH_URL", String::new()),
-        ]
-    );
-    assert!(billing_allows_launch(
-        false,
-        ModelBilling::Move(Some(&standard_context)),
-        Some("opus"),
-        Some(&target.context)
-    ));
-    assert!(custom_context.for_launch(home, work, &[]).is_none());
-    assert!(!billing_allows_launch(
-        false,
-        ModelBilling::Move(Some(&standard_context)),
-        Some("opus"),
-        Some(&custom_context)
-    ));
-    assert!(!billing_allows_launch(
-        false,
-        ModelBilling::Move(Some(&custom_context)),
-        Some("opus"),
-        Some(&target.context)
-    ));
-    assert!(!billing_allows_launch(
-        false,
-        ModelBilling::Move(Some(&custom_context)),
-        Some("opus"),
-        Some(&custom_context)
-    ));
-    assert!(billing_allows_launch(
-        true,
-        ModelBilling::Move(Some(&custom_context)),
-        Some("opus"),
-        None
-    ));
-    assert!(billing_allows_launch(
-        true,
-        ModelBilling::Move(None),
-        None,
-        None
-    ));
-    assert!(!billing_allows_launch(
-        false,
-        ModelBilling::Move(None),
-        Some("opus"),
-        Some(&target.context)
-    ));
-    assert!(!billing_allows_launch(
-        false,
-        ModelBilling::Move(Some(&standard_context)),
-        Some("opus"),
-        None
-    ));
-    for model in [None, Some("")] {
-        assert!(!billing_allows_launch(
-            false,
-            ModelBilling::Move(Some(&standard_context)),
-            model,
-            Some(&target.context)
-        ));
-    }
-    assert!(billing_allows_launch(false, ModelBilling::Keep, None, None));
-    assert!(Context::of_exec_env(home, &records, &[]).is_none());
-    let absent = Context::of_exec_env(home, &records, &["PATH=/captured/bin".to_string()])
-        .expect("known absent profile variables");
-    let absent_target = absent.for_launch(home, work, &[]).expect("unset carrier");
-    assert_eq!(absent_target.context, absent);
-    assert_eq!(
-        absent_target.unset,
-        [
-            accounts::HOMEDIR_ENV,
-            accounts::HOME_ENV,
-            accounts::LOGIN_ENV
-        ]
-    );
-    let empty = Context::of_exec_env(
-        home,
-        Path::new(work),
-        &[
-            format!("{}=", accounts::HOMEDIR_ENV),
-            format!("{}=", accounts::HOME_ENV),
-            format!("{}=", accounts::LOGIN_ENV),
-        ],
-    )
-    .expect("set-empty context");
-    let empty_target = empty.for_launch(home, work, &[]).expect("empty carrier");
-    assert!(empty_target.unset.is_empty());
-    assert_eq!(empty_target.context, empty);
-    assert_ne!(empty, absent);
-    assert!(
-        empty.for_launch(home, "", &[]).is_none(),
-        "relative config needs known cwd"
-    );
-    let overlay = required_env(Some(config), Some("/captured/other"), Some("named"));
-    let moved = vec![
-        format!("{}=/captured/other", accounts::HOMEDIR_ENV),
-        format!("CLAUDE_CONFIG_DIR={config}"),
-        format!("{}=named", accounts::LOGIN_ENV),
+fn an_env_clearing_relaunch_line_quotes_its_words_and_refuses_what_it_cannot_carry() {
+    let values = [
+        (accounts::HOMEDIR_ENV, "/captured/home"),
+        ("CLAUDE_CODE_CUSTOM_OAUTH_URL", ""),
     ];
-    let captured =
-        Context::of_exec_env(home, Path::new(config), &moved).expect("captured overrides");
-    let overlaid = captured
-        .for_launch(home, work, &overlay)
-        .expect("matching required overlay");
-    assert_eq!(captured, overlaid.context);
-    assert!(billing_allows_launch(
-        false,
-        ModelBilling::Move(Some(&captured)),
-        Some("opus"),
-        Some(&overlaid.context)
-    ));
-    let changed = standard_context
-        .for_launch(home, work, &overlay)
-        .expect("different required target");
-    assert!(!billing_allows_launch(
-        false,
-        ModelBilling::Move(Some(&standard_context)),
-        Some("opus"),
-        Some(&changed.context)
-    ));
-    assert!(
-        standard_context
-            .for_launch(home, work, &[("OTHER", "1")])
-            .is_none()
-    );
-
+    let unset = [accounts::HOME_ENV, accounts::LOGIN_ENV];
     for dialect in [Dialect::Zsh, Dialect::Bash, Dialect::Fish] {
         let line = upgrade::relaunch_line_env_clear(
             dialect,
@@ -4970,11 +4551,6 @@ fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
             )
             .is_err()
         );
-        let values: Vec<_> = target
-            .values
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect();
         let carried = line_tapped_clear(
             dialect,
             None,
@@ -4982,10 +4558,9 @@ fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
             Path::new("/captured/claude"),
             &words(&["/captured/claude"]),
             None,
-            Some("opus"),
             None,
             &values,
-            Some(&target.unset),
+            Some(&unset),
             Some("{}"),
         )
         .unwrap_or_else(|_| panic!("required context on tapped line"));
@@ -5000,10 +4575,9 @@ fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
                 Path::new("/captured/claude"),
                 &words(&["/captured/claude"]),
                 None,
-                Some("opus"),
                 None,
                 &[("HOME", &too_long)],
-                Some(&target.unset),
+                Some(&unset),
                 Some("{}")
             )
             .is_err(),
@@ -5026,8 +4600,6 @@ fn every_lanes_carry_on_ends_on_the_continuation_and_its_needs_sentence() {
         CAUSE_STALL,
         CAUSE_ASKED,
         CAUSE_HOST,
-        "model:claude-opus-5-5",
-        "model-back:",
     ];
     let mut texts: Vec<String> = agents
         .iter()
@@ -5572,8 +5144,6 @@ fn a_harness_restart_held_by_keys_is_tried_once_its_own_grace_lets_them_go() {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         usage_tap: None,
         agents_off: Vec::new(),
@@ -5673,7 +5243,7 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
     const START_OLD: &str = "Wed Oct 28 16:00:00 2026";
     const START_NEW: &str = "Wed Oct 28 17:00:10 2026";
     const START_LATE: &str = "Wed Oct 28 18:30:00 2026";
-    let new_began = crate::harness::upgrade_models::parse_lstart(START_NEW).expect("lstart");
+    let new_began = crate::harness::unix_time::parse_lstart(START_NEW).expect("lstart");
     let dir = crate::supervise::ScratchDir::new("relaunch", "agent-resumed");
     let o = Opts {
         home: dir.join("home"),
@@ -5688,8 +5258,6 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         usage_tap: None,
         agents_off: Vec::new(),
@@ -6050,8 +5618,6 @@ fn a_launch_that_resumes_a_conversation_is_a_resumed_agent() {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         usage_tap: None,
         agents_off: Vec::new(),
@@ -6176,7 +5742,7 @@ fn a_launch_that_resumes_a_conversation_is_a_resumed_agent() {
         assert_eq!(resumes_conversation(None, &s), want, "no options: {argv:?}");
     }
     // aterm's own relaunch, its record on file, still answers so.
-    let began = crate::harness::upgrade_models::parse_lstart(START).expect("lstart");
+    let began = crate::harness::unix_time::parse_lstart(START).expect("lstart");
     save(
         &o,
         ID,
@@ -6263,7 +5829,6 @@ fn a_relaunch_with_no_marker_types_the_build_the_twin_execs() {
             exe,
             &words(argv),
             session,
-            None,
             mode,
             &[],
             None,
@@ -6383,7 +5948,6 @@ fn budget_stages_unsetting(stored: bool, served_unset: Option<&[&str]>) -> (Vec<
             &argv,
             Some(LOGIN_ID),
             None,
-            None,
             &[],
             Some(&token_route::TOKEN_STATE_ENV),
             served_unset,
@@ -6401,7 +5965,6 @@ fn budget_stages_unsetting(stored: bool, served_unset: Option<&[&str]>) -> (Vec<
             build,
             &argv,
             Some(LOGIN_ID),
-            None,
             None,
             &[],
             Some(&token_route::TOKEN_STATE_ENV),

@@ -19,8 +19,10 @@ use trust_resource_controller::bootstrap_graph as wire;
 
 #[path = "resource_admission_bootstrap_graph/custody.rs"]
 mod input_custody;
-pub(super) use input_custody::OriginalOutput;
-pub(crate) use input_custody::{EnrollmentAttachment, OutputTransfer, Preparing, Support};
+pub(crate) use input_custody::{
+    EnrollmentAttachment, OutputTransfer, Preparing, SourceTransfer, Support,
+};
+pub(super) use input_custody::{OriginalOutput, OriginalSource};
 #[path = "resource_admission_bootstrap_graph/query_gate.rs"]
 mod query_gate;
 pub(super) use query_gate::{ObjectOperation, QueryOperation};
@@ -325,24 +327,35 @@ impl Owner {
                     }
                     root.deadline()
                 };
-                self.journal
-                    .update(&job.binding, "running", aterm_json::json!({}))?;
+                let (monotonic_ns, unix_ns) = start::clocks()?;
+                let started = Instant::now();
+                let remaining = start::remaining_workload_timeout(deadline, started)
+                    .ok_or(io::ErrorKind::TimedOut)?;
+                self.journal.update(
+                    &job.binding,
+                    "running",
+                    aterm_json::json!({"monotonic_ns":monotonic_ns,"unix_ns":unix_ns}),
+                )?;
                 job::inspection(&self.fence, &self.debt, job)?;
-                time(deadline)?;
+                let pid = job.child.child_mut().id();
+                job.bootstrap_graph
+                    .as_ref()
+                    .ok_or_else(|| refused("Bootstrap Root preparation unavailable"))?
+                    .validate(pid, deadline)?;
+                time(
+                    started
+                        .checked_add(remaining)
+                        .ok_or(io::ErrorKind::TimedOut)?,
+                )?;
                 if job.events.cancelled() {
                     return Err(io::ErrorKind::Interrupted.into());
                 }
-                let (monotonic_ns, unix_ns) = start::clocks()?;
-                let started = Instant::now();
-                let remaining = deadline
-                    .checked_duration_since(started)
-                    .ok_or(io::ErrorKind::TimedOut)?;
                 job.child.child_mut().resume()?;
                 job.started = started;
                 job.timeout = Some(remaining);
                 job.launched = true;
                 let _ = job.events.emit(Event::Started {
-                    pid: job.child.child_mut().id(),
+                    pid,
                     birth: job.root_birth,
                     monotonic_ns,
                     unix_ns,

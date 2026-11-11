@@ -42,23 +42,5 @@ pub fn set_once(console: Console) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::message;
-
-    #[test]
-    fn the_message_is_upstreams_format() {
-        for (info, stack) in [
-            (
-                "panicked at src/lib.rs:5:9:\nboom",
-                "Error\n    at f (wasm://wasm/1:1)",
-            ),
-            ("panicked at a.rs:1:1:\nline one\nline two", ""),
-            ("", "Error"),
-        ] {
-            assert_eq!(
-                message(&info, stack),
-                format!("{}\n\nStack:\n\n{}\n\n", info, stack)
-            );
-        }
-    }
-}
+#[path = "panic_hook_tests.rs"]
+mod tests;

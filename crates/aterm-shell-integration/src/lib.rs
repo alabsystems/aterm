@@ -1527,14 +1527,5 @@ fn cmd_prompt(inherited: Option<&str>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    include!("tests.rs");
-    include!("tests_loader.rs");
-    include!("tests_tty.rs");
-    include!("tests_spare.rs");
-    include!("tests_pwsh_keys.rs");
-    include!("tests_windows_marks.rs");
-    include!("tests_hooks.rs");
-    include!("tests_editor.rs");
-    include!("tests_clt_shim.rs");
-}
+#[path = "lib_tests.rs"]
+mod tests;

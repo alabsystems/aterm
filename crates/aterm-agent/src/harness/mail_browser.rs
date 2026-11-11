@@ -5,9 +5,46 @@
 #[cfg(unix)]
 mod owner;
 
+/// A mailbox setup failure, retaining classified read failures across construction.
+/// Opaque browser and local setup errors carry no permission to retry.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct MailboxOpenError {
+    pub(crate) message: String,
+    pub(crate) proton_failure: Option<aterm_mail::proton_error::Failure>,
+}
+
+#[cfg(unix)]
+impl From<String> for MailboxOpenError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            proton_failure: None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<&str> for MailboxOpenError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for MailboxOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for MailboxOpenError {}
+
 #[cfg(unix)]
 mod native {
     use super::super::{browser_window::ProfileLock, headless_fetch, headless_oauth as browser};
+    use super::MailboxOpenError;
     use aterm_json::{Value, json};
     use aterm_mail::Secret;
     use std::{
@@ -166,7 +203,7 @@ mod native {
     pub fn shared_mailbox(
         home: &Path,
         credentials: Credentials<'_>,
-    ) -> Result<SharedMailbox, String> {
+    ) -> Result<SharedMailbox, MailboxOpenError> {
         shared_mailbox_until(home, credentials, None)
     }
 
@@ -174,7 +211,7 @@ mod native {
         home: &Path,
         credentials: Credentials<'_>,
         end: Option<Instant>,
-    ) -> Result<SharedMailbox, String> {
+    ) -> Result<SharedMailbox, MailboxOpenError> {
         static SLOTS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<std::path::PathBuf, Slot>>> =
             std::sync::OnceLock::new();
         let profile = HeadlessMail::profile_path(home, credentials.email);
@@ -388,7 +425,7 @@ mod native {
                         self.local_id = account.into();
                         let marker = self.profile_path.join("mail-session-ready");
                         if !marker.is_file() {
-                            crate::harness::upgrade_models::write_atomic(&marker, "1")
+                            crate::harness::atomic_write::write_atomic(&marker, "1")
                                 .map_err(|_| "Could not save browser session readiness")?;
                         }
                         progress("Headless mailbox identity verified");

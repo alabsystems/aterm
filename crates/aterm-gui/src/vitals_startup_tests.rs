@@ -121,6 +121,48 @@ fn a_launch_notes_the_restart_and_the_stops_time_for_the_strips_restore() {
 }
 
 #[test]
+fn a_delayed_report_write_does_not_move_the_panic_in_the_strip() {
+    let dir = aterm_tempfile::tempdir().expect("scratch log dir");
+    let crash_ms = LAST_CHECKPOINT_MS + 4_250;
+    let written_ms = crash_ms + 3 * 60 * 60 * 1_000;
+    let first = format!(
+        "aterm-gui 0.1.0 crashed at unix {}.{:03} in run 1 on the main thread",
+        crash_ms / 1_000,
+        crash_ms % 1_000
+    );
+    let crash = CrashEvidence {
+        path: written_at(
+            dir.path().join("crash-4242.log.seen"),
+            first.as_bytes(),
+            written_ms,
+        ),
+        head: vec![first],
+    };
+    let prior = PriorStop::of(Some(&crash), Some(&kill_evidence(dir.path())))
+        .expect("panic beside a kill marker");
+    assert_eq!(
+        prior,
+        PriorStop::CrashedAndKilled(Some(crash_ms), Some(KILLED_LAUNCH_MS))
+    );
+    let marks = startup_marks(prior, written_ms + 1_000);
+    assert_eq!(marks.crashed_at, Some(crash_ms));
+    let mut survived = SavedStrip {
+        last_wall_ms: crash_ms + 10_000,
+        ..SavedStrip::default()
+    };
+    let before = survived.clone();
+    date_crash(
+        &mut survived,
+        marks.crashed_at.expect("panic time"),
+        written_ms + 1_000,
+    );
+    assert_eq!(
+        survived, before,
+        "a checkpoint after the panic proves survival"
+    );
+}
+
+#[test]
 fn a_kills_marker_never_dates_the_stop() {
     let dir = aterm_tempfile::tempdir().expect("scratch log dir");
     let killed = kill_evidence(dir.path());

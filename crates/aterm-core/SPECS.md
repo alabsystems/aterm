@@ -3,131 +3,6 @@
 
 # aterm-core: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 405 tests
-> it deleted and the 10 vi copy-mode specs whose functions it deleted are gone. The §1 kind and gap
-> tables count the 293 specs §1 now lists, and §4 lists only the 6 of its tests still present. Other
-> counts in this file were taken before.
-
-> 2026-10-27: `terminal-host-adapter` is gone with the `aterm_types::terminal_host` traits it described
-> (no crate called them); the kind and gap tables drop it, so they count 292.
-
-> 2026-10-30, input review (DECDWL x DECSLRM autowrap hang): `decslrm-run-wraps-at-the-right-margin` now says where a
-> wrap lands on a double-width row, min(L, cols/2 − 1) as a line feed would, where it used to skip a row whose half ends
-> left of L, and that a run from right of R goes on at L (the row said column 0, which the code never did). The three
-> tests of `tests/double_width_margin_wrap.rs` are mapped in §2; the counts in §3 predate them.
-
-> 2026-10-30, decoder review IMG-INFLATE: `kitty-frames` says a compose checks its arguments before it decodes
-> a frame, and a PNG frame a compose or a frame load reads is decoded once and stored as RGBA8 with its pixels,
-> placements and animation clock unchanged (one that does not decode keeps its bytes and is refused without a
-> second decode); `kitty-store-budget` charges the decoded frame. Four tests are mapped in §2. The counts in these
-> headers predate them.
-
-> 2026-11-07, own-notices removal S7: `notification-gate` loses the host's admission
-> (`Terminal::set_notification_admission`), which no host installs since aterm-gui's last one went with
-> `BoxBanner`. Its test `the_admission_sees_the_report_standing_at_the_notifications_byte` and that test's line
-> in §2 go, and the row's `tests` cell counts the 8 left. `ProgramStateReport::restored_from`, which no row
-> named, goes with it. The counts in §3 predate this.
-
-> 2026-11-07, own-notices removal S8: `OutputStateRepr::program_state_began`, which no restore has read since
-> S7, goes, so `program-state-turn-edges` says a checkpoint carries only the report's body.
-> `CHECKPOINT_CANON_VERSION` moves from 2 to 3, so a stream version 2 wrote is refused at its version word
-> rather than read askew (`a_version_2_stream_is_refused_at_its_version`, in checkpoint_canon.rs, whose tests
-> §2 does not map). A pane step restores the report standing as its first, where the live engine numbers it
-> from the report that began it, and the field put that number in the bytes a witness digests, so
-> `aterm ctl rewind check` failed `WitnessMatches` on a faithful replay once a program's report had moved to
-> another state; it now passes (`a_programs_report_that_moved_matches_every_witness`, in aterm-aos-pane,
-> added after review of S8). The counts in §3 predate this.
-
-> 2026-11-07, spec symbol scan: two rows named functions aterm-core never had (both since the recovery,
-> 78587da206). `kitty-store-lifecycle` names `TerminalHandler::{handle_kitty_command,handle_complete_kitty_command}`
-> where it named `handle_kitty_graphics`, and `rj-full-clear-count` names `TerminalHandler::dispatch_csi_handler`'s
-> `CsiHandler::EraseDisplay` arm and `resize_journal::is_full_clear` where it named `erase_display`; both statements
-> hold of that code.
-
-> 2026-11-07, the qualified-path pass: `alt-archive-pool-share` drops `AltArchive::drop`, a `Drop` the archive
-> never had: dropping an archive drops its `BudgetShare`, whose `Drop` (named already) leaves the live count, as
-> the statement now says. `cfg-defaults` drops `BiDiConfig::{disabled,is_enabled}`, the test-only helpers
-> 05cf207422 deleted with `config/tests.rs`, and their clauses; it says `BiDiConfig::default()` whole (mode
-> `Implicit`, direction `Auto`, `reorder_nsm` and `alternate_screen` true). No test in §2 samples it now.
-
-> 2026-10-29, ATERM-KI-1029-1: `program-state-turn-edges` (`ProgramStateReport::turn_edges`, the newest four turns
-> the OSC 7501 reports drew, each edge dated at its parse batch's injected wall clock) is added with its three tests
-> mapped in §2; the kind and gap tables count it. `pr-process-at-determinism` now names the turn edges, which its
-> test samples, and `checkpoint-carry-continues` says a checkpoint carries none, which
-> `the_programs_own_report_is_carried` samples. The counts in §3 predate it.
-
-> 2026-10-20, predictive editing increment 3: `paint-prediction-span` (`RenderInput::paint_prediction_span`,
-> the all-or-nothing painter of a state chain whose shifts move text in its own style) is added with its six
-> tests mapped in §2 (five, and a sixth since review: a moved cell whose source is its own column is
-> painted, not skipped). The counts in these headers include it.
-
-> 2026-10-20, predictive editing increment 4: `input-region-start` (`Terminal::input_region_start`, the visible cell of
-> the authenticated OSC 133/633 `B` of the prompt in front, which the predictor places Home, End, Ctrl-A, Ctrl-E and
-> Delete on) is added with its two tests mapped in §2. The counts in these headers predate it.
->
-> 2026-10-20, after review of increment 4: the row names the prompt too (`Terminal::prompt_in_front`, the block id
-> `InputRegionStart::prompt` carries), and only a `B` that says it stands where the buffer starts (`aterm_input=start`)
-> names one: zsh sends its `B` from zle-line-init after zle drew a line pre-filled from its buffer stack. Two tests
-> are added, one the negative control of that word and one of each of the re-key window's two conjuncts.
-> `control-chords-escaped` (`Terminal::control_chords_escaped`, whether Ctrl-A goes out escaped, which the predictor
-> refuses: Kitty's `CSI u` and modifyOtherKeys level 2) is added with its test, bound to the encoder.
-
-> 2026-10-23, `await block`: `BlockComplete{after}` latches once `completed_command_seq` passes the count
-> read at arm, so a `D` whose next prompt's `A` and `B` land in the same batch still answers, and it is
-> evaluated at arm (`obs-arm-eval-classes`, which now names `FrameWhole` too). In §2,
-> `block_complete_latches_on_first_complete` is renamed and one test is added. The counts in these headers
-> predate it; the `tests` cells of `obs-terminal-watch-arm-eval` (6/6) and `obs-observe-latch-step` (8/9,
-> the new test sampling it as `also`; it read 9/9 over 8 tests before) count §2 as it stands.
-
-> 2026-10-26, Rewind R1 review (finding 8): `restore-paint` (`Terminal::serialize_restore_ansi`, the bytes an
-> exported cast paints a keyframe's screen with) is added with its test mapped in §2. The counts in these headers
-> predate it.
-
-> 2026-10-26, Rewind R1 review (findings 15 and 37): `lift-screen` (`Terminal::lift_screen`, which draws a rewound
-> pane's past screen above its band) is added with its test mapped in §2. The counts in these headers predate it.
-
-> 2026-10-25, Rewind R2 review: `response-admission-clock`'s palette bucket gets its own test,
-> `the_palette_bucket_refills_by_the_slices_clocks` (a drained palette bucket answers an OSC 4 query only once the
-> slice's clock has moved, whatever the system clock did), mapped in §2; the row's `tests` cell reads 2/2. The counts
-> in these headers predate it.
-
-> 2026-10-25, Rewind R0a review: `response-admission-clock` (the response and palette limits are debited at the
-> batch's clock, `BatchClock(process_now)`, not the system clock, so a replay admits the replies and the 2031 push the
-> live parse did) is added with its test mapped in §2, and `color-scheme-report` and `palette-query-cap` cite it. The
-> counts in these headers predate it.
-
-> 2026-10-25, Rewind R0b review: `pr-sync-timeout` names `Terminal::end_synchronized_output`, the timeout's
-> frame close that a Rewind fold now shares, which ends an open mode-2026 frame without the parser so a partly
-> received character stays pending; `rebase-colors` names `Terminal::apply_config_colors`, `apply_config`'s colour
-> half and style policy alone, which a fold draws in so the program's cursor and modes at the shown instant stay.
-> One test each is mapped in §2. The counts in these headers predate them.
-
-> 2026-10-24, Rewind R0a: `replay-restore-lineage` (`Terminal::replay_from_checkpoint`, the restore a temporal
-> replay folds from, which adds no holder lineage of its own so a replay of a live engine captures as that engine does) is
-> added with its test mapped in §2. The counts in these headers predate it.
-
-> 2026-10-25, Rewind R1: `replay-bounded-restore` (`Terminal::replay_from_checkpoint_bounded`, the restore the Rewind
-> view folds on, whose tiered store is kept small enough to fork in bounded time) is added with its two tests mapped in
-> §2, and `replay-fork-continues` now copies a tiered grid and a standing resize hand-back instead of refusing them, and carries the shell-integration authorization (a fork used to drop every signed mark after it; one test added). The
-> counts in these headers predate it.
-
-> 2026-10-25, B13r review: `saved-cursor-follows-content` says what DECRC and 1049l do with a saved wrap after a
-> resize: a resize that changes the size marks the slot (`SavedCursorState::resized`, carried on the wire), and a
-> marked wrap whose cursor lands off a line end becomes the next column with no wrap pending (Ghostty
-> `Screen.resize`), so the next glyph neither overwrites the saved one nor joins the next row to its line. Six tests
-> are mapped to it in §2 (its `tests` cell reads 21/21), and `decrc_puts_a_saved_wrap_back_wherever_the_column_lands`
-> to `alt-screen-switch-wrap-and-save` (5/5). The counts in these headers predate it.
-
-> Status 2026-10-15: this is the crate's migration worklist. Each of the 299 specs below is proved
-> through Trust/Clean about the compiled Rust function, then the tests it subsumes are deleted in the
-> same commit. The 42 tests in §4 sample no spec and can go now (or move to a bench). No test has
-> been deleted yet, and no spec here is proved yet. Added since the recovery: the specs
-> `abs-rows-dense-read`, `checkpoint-continuing-bounded`, `paint-prediction-span`,
-> `replay-fork-continues`, `search-key-verdicts`, `search-query-layer` and `search-slot-protocol`, and
-> 31 tests in §2: the 22 those specs retire and 9 more for `si-cached-equals-fresh` (4),
-> `obs-terminal-watch-arm-eval` (3), `bidi-pointer-and-introspection-agree-with-frame` (1) and
-> `sel-scroll-invariance` (1).
-
 Source: `crates/aterm-core` (read only). Every `#[test]` was read together with the code it reaches:
 `src/render.rs`, `src/bell.rs`, `src/fault.rs`, `src/terminal/**` (unit tests and the `*_tests.rs` /
 `*_conformance.rs` modules), `tests/*.rs` (integration tests) and `test_support/**`. Nothing was compiled
@@ -190,7 +65,7 @@ or listed in §4.
   functions or two paths agree), refinement (code refines a model), round-trip, table-property (decidable
   by evaluating a finite table), no-panic, other (cost, call graph, purity, cache-key soundness,
   cross-crate composition).
-- Gaps: the rows of §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`. 1 non-scalar carriers and
+- Gaps: the rows of `docs/TRUST-LANE.md` (Blocking gaps). 1 non-scalar carriers and
   content models, 2 certified `&self`/`&mut self` views and two-state, 3 E6 body widening,
   4 callee-ensures composition, 5 quantified clauses, 6 plain-Rust clause publication, 7 loops, 8 effects,
   9 proc-macro boundary, 10 model→code refinement surface, 11 generics, 12 cross-crate theorem citation,
@@ -515,49 +390,6 @@ selection-custody	invariant	Terminal::{process,resize,set_scrollback_line_limit,
 selection-paint-equals-copy	equivalence	RenderInput::selection_contains_cell, TextSelection::contains_cell, aterm_types::selection::glyph_cell_span, Terminal::{selection_to_string,display_cell_grapheme,cell_frame}	For every selection (Simple or Block, any anchor order and half-cell sides, endpoints on live or history rows at any offset d) and display row r: (a) the painted set P(r) contains both cells of a wide pair or neither; (b) concatenating display_cell_grapheme(r, c) over P(r), trailing blanks trimmed, equals the part of selection_to_string on terminal-relative row r − d. So a selection from a wide glyph's continuation selects the whole glyph, and a combining cluster is never split.	1,2,3,5,7,12	9/9	shared pure helper in aterm-types, String building over history byte offsets
 selection-to-string-bounded	contract	Terminal::selection_to_string, selection_to_string_capped	For anchor rows anywhere in i32 (i32::MAX and i32::MIN included), selection_to_string visits only rows in [−scrollback_lines, rows−1], so it runs at most rows + scrollback_lines iterations, returns at most that many lines, and reads retained rows unchanged.	1,3,5,7	1/1	i32 clamping, loop variant
 ```
-
-### Distribution by kind (306)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 191 | bell-rate-limiter, program-state-turn-edges, ime-walk-contract, ime-overlay-contract, paint-prediction-span, input-region-start, restore-paint, lift-screen, decrsps-cursor, config-apply-keeping-modes, response-admission-clock, obs-rows-clear-settle, line-size-run-at, sparse-column-accessors, default-bg-at, clear-overlays-contract, selection-hit-denotation, effect-damage-cache, damage-words-injective, alt-archive-lifecycle, alt-archive-row-charge, alt-archive-read-paging, alt-archive-normalize-row, has-alt-1049-enter, alt-archive-hook-commit-points, alt-archive-end-to-end, bidi-visual-order-cells, bidi-default-paragraph-ltr, bidi-frame-reorder, bidi-mode-change-reprojects-and-damages, block-text-range, block-eviction-log-thinning, last-completed-block-is-sealed, scrollback-line-limit, scrollback-pressure-level, format-paste-denotation, paste-has-payload, paste-insert-cells, drain-bell-edge-flag, osc-app-event-payloads, vt-sampled-handler-effects, print-anchor, trickle-lazy-bounded, checkpoint-continuing-bounded, checkpoint-visible-projection, checkpoint-restore-sanitizes, checkpoint-shell-integration-carry, restore-advances-scroll-epoch-once, saved-cursor-follows-content, refused-parser-carry-resumes-at-ground, adopt-keeps-host-retention-config, checkpoint-carry-wire-shape, clipboard-capability-mint, clipboard-invoke-forwarding, resolve-colors-denotation, dim-contrast-law, theme-pair-contrast-floor, light-white-on-colour, host-color-mutators-damage, config-negotiated-modes-seed, config-reload-damage-and-idempotence, config-reload-during-detached-reflow, rebase-colors, foreground-handback-gate-and-post, manual-handback-post, absolute-row-update-remap, has-run-of-4, alloc-fault-fail-closed, kitty-delete-semantics, kitty-chunked-load-lifecycle, kitty-payload-source, kitty-reply-protocol, kitty-placement-layout, kitty-relative-placements, kitty-placeholder-resolution, kitty-animation-scheduler, kitty-command-parse, kitty-loadable-size, compose-rgba, png-dimensions, rgb-to-rgba, iterm2-inline-image, image-retention-horizon, history-image-payload-shared, sixel-dcs-never-leaks-glyphs, decslrm-validity, decslrm-run-wraps-at-the-right-margin, damage-scope, keyboard-mode-projection, win32-input-mode-lifecycle, host-leave-orphaned-alt, prompt-leaves-orphaned-alt, in-band-size-report, resp-take-response, cursor-blink-mode-12, cursor-style-default, color-scheme-report, xtversion-reply, vt52-address-and-ascii-after-zwj, rep-repeats-the-last-graphic-character, sanitize-title, osc-title-and-epoch, osc-semicolon-tail-preserved, osc8-uri-acceptance, cwd-store, osc633-commandline-cap, osc52-clipboard-gate, palette-query-cap, osc21-key-echoable, taskbar-progress, notification-gate, osc99-accumulation, can-sub-cancels-every-string-consumer, empty-trailing-param-is-default, sgr-extended-color-parse, erase-resets-pending-wrap, alt-screen-switch-wrap-and-save, motion-counts-columns, xtwinops-gate, xtsmgraphics-geometry, print-cell-placement, wide-wrap-bce, history-fence-export, older-history-claim, mouse-wheel-encoding, mouse-report-memo, tab-stops-shared-and-suppression-carried, obs-observe-latch-step, obs-deadline-semantics, obs-next-deadline-min, obs-capacity, obs-first-matching-row, watcher-idle-deadline, watcher-row-match, pb-bridge-decision-tree, pb-response-sink-gate, wa-mint-iff-resolve, rl-token-bucket, pr-splice-accounts, pr-ris-retires-selections, pr-post-process-scroll-verdict, pr-content-scroll-state-soundness, st-delta-since, st-band-ring, pr-sync-timeout, pr-repaint-blink-epoch, viewport-pin, st-damage-epoch, sa-completed-command-seq, sia-verify-nonce, sia-decode-hex, sia-ct-eq, cfg-defaults, gr-width-bounds, rc-render-cell-resolution, rc-extras-classification, viewport-projection, rc-implicit-blank, rc-frame-scalar-stamps, rc-cursor-projection, rc-apron-row, rc-scrolled-strip-size, viewport-memo-coherent, rn-armed-gates, rn-answer-protocol, cp-rows-grow-shape, search-key-verdicts, rj-quiet-flap-identity, rj-undo-dropped-by-output-or-switch, rj-journal-ring, rj-full-clear-count, rj-screen-replaced-and-healed-by, rj-lifetime-token, history-shed-contract, scrollback-fifo, bottom-line-feed-scrolls-the-screen, top-anchored-region-scroll-archives, content-anchored-metadata, sbg-step-budget, sbg-cursor-validity, sbg-error-retains-nothing, sbg-cursor-allocator, sbg-summary-reuse, si-match-columns-are-drawn-cells, search-slot-protocol, sel-copy-denotation, sel-smart-word-in-cells, sel-copy-caps, sel-bounded-line-text, sel-logical-line-span, selection-to-string-bounded |
-| equivalence | 45 | alt-archive-memo-equivalence, ime-overlay-agrees-with-caret-query, control-chords-escaped, replay-restore-lineage, replay-bounded-restore, render-input-content-equality-and-clone, images-eq-is-tag-stripped-equality, prepend-host-rows-splice, dec-mode-matcher, alt-archive-noninterference, alt-archive-carry-continues, bidi-pointer-and-introspection-agree-with-frame, offloaded-resize-equivalence, checkpoint-carry-continues, replay-fork-continues, srgb-transfer-tables-exact, handback-replay-and-idempotence, process-chunk-invariance, apc-put-bulk-refines-per-byte, dcs-put-bulk-refines-per-byte, xtsave-restore-roundtrip, sgr-denotation, char-width-fast-path, grid-columns-model-agreement, pg-compiled-equals-live, pg-response-slot-equals-id, pr-ris-keeps-parser-carry, sync-update-is-render-only, gr-aggregate-consistency, history-render-parity, ring-fast-materialize-equals-line-roundtrip, rc-render-row-at-screen, rc-logical-row, rc-images-frame-equals-per-row, cp-rows-shrink-native, cp-default-resize-is-native, abs-rows-dense-read, search-query-layer, reflow-preserves-logical-lines, sbg-completion-equals-one-shot, si-cached-equals-fresh, sel-history-cells-are-drawn-cells, sel-scroll-invariance, selection-paint-equals-copy, line-run-coalesce |
-| invariant | 26 | composed-fill-blessing, alt-archive-differ-no-loss, alt-archive-retention-budget, osc-event-queue-bounded-fifo, host-policy-survives-reset, cell-extras-coherence, terminal-wf-invariant, kitty-store-budget, kitty-layer-order, live-image-budget, decrqm-mode-agreement, response-buffer-bounded, row-len-is-the-written-extent, mode-mirror-coherence, pg-state-sync-invariant, pr-sync-open-dirty, pr-sync-frame-unfinished, st-content-seq, rc-wide-spacer-inherits-rendition, rn-attempt-budget, rn-hold-always-lifted, cp-absolute-keys-stable, absolute-keys-cover-retained-rows, rj-render-debt, extras-follow-their-glyph, selection-custody |
-| refinement | 21 | bell-flash-model, alt-archive-differ-exact, alt-archive-pool-share, alt-selection-park-refines-model, shell-integration-authorization-model, color-state-model, conhost-orphan-recovery, kitty-store-lifecycle, kitty-frames, kitty-keyboard-protocol, hyperlink-auth, alt-1049-roundtrip, obs-terminal-watch-arm-eval, watcher-seq-latch, st-band-history-refines-model, tm-refines-model, rc-damage-scoped-equals-full, rn-refines-model, cp-conhost-repaint-lossless, shared-scrollback-budget, sbg-refines-model |
-| table-property | 9 | bidi-base-direction, checkpoint-partial-sequence-carry, csi-dispatch-table, evidence-assertion-table, kitty-diacritic-table, width-table-ucd, obs-arm-eval-classes, pb-resolve-table, rc-refill-cause-classification |
-| other | 7 | key-encoding-composition, pg-covered-gates-are-table-reads, pr-process-at-determinism, rc-images-frame-cost, rc-presentation-fingerprint, si-cache-reuse-policy, sel-one-fetch-per-history-row |
-| round-trip | 4 | checkpoint-roundtrip, checkpoint-canonical-encoding, shell-integration-nonce-hex, parser-repr-wire-roundtrip |
-| no-panic | 3 | alt-archive-import-total, sx-decoder-bounded, sx-span-total |
-
-### Gap histogram (specs blocked by each gap)
-
-| gap | what | specs |
-|---|---|---|
-| 0 | seal that publishes Clean rows | 304 (all) |
-| 1 | non-scalar carriers and content models | 287 |
-| 2 | certified &self/&mut self views, two-state | 232 |
-| 3 | E6 body widening (calls, casts, loops, enums) | 238 |
-| 4 | callee-ensures composition | 108 |
-| 5 | quantified clauses | 123 |
-| 6 | plain-Rust clause publication (and floats) | 5 |
-| 7 | loops | 167 |
-| 8 | effects | 11 |
-| 9 | proc-macro boundary (serde) | 2 |
-| 10 | model→code refinement surface | 33 |
-| 11 | generics | 11 |
-| 12 | cross-crate theorem citation | 108 |
-| 13 | threads, atomics, closures | 37 |
-| 16 | soundness | 1 |
-
-### Proof dependency order
-
-Scalar and table specs (§6 tiers A–B) → pure byte/string functions (tier D) → the self-contained state
-machines (`bell-*`, `rn-*`, `obs-*`, `rl-token-bucket`, `pb-*`) → `resolve-colors-denotation`,
-`rc-render-cell-resolution` and the RenderInput contracts → the per-handler contracts (DEC modes,
-OSC, SGR, kitty, erase) → `terminal-wf-invariant` → `process-chunk-invariance` (a lift of
-aterm-parser's `advance-fast-chunk-invariance` through the handlers) → the checkpoint and carry
-bisimulations, the reflow and custody invariants, and the model refinements (ConPTY, alt archive,
-selection park, budgeted search) last.
 
 ## 2. Test → spec map (TSV)
 
@@ -1729,16 +1561,6 @@ tests/unicode_content_generation.rs	styled_and_no_wrap_writes_use_the_same_conte
 tests/unicode_content_generation.rs	unicode_bulk_and_fragmented_writes_advance_content_generation	st-content-seq	
 ```
 
-## 3. Coverage
-
-- 1364 tests read in 121 files. 1322 map to one of the 292 specs the recovery found; 42 are not spec
-  samples (§4). The 36 added since (in 11 files, 5 of them new) and 28 §4 deletions bring §2 to 1398 tests in 126 files,
-  1358 of them mapped to one of the 299 specs.
-- The biggest collapses (primary tests): `selection-custody` (47), `checkpoint-carry-continues` (24), `resolve-colors-denotation` (21), `reflow-preserves-logical-lines` (25), `history-render-parity` (19), `si-cached-equals-fresh` (18), `ime-overlay-contract` (18), `kitty-delete-semantics` (18), `alt-archive-differ-exact` (17), `process-chunk-invariance` (17), `alt-archive-hook-commit-points` (16), `alt-archive-carry-continues` (16), `color-state-model` (16).
-- 1 spec retires no test on its own because every test it samples is primary elsewhere: `bottom-line-feed-scrolls-the-screen`. It is kept because it is the lemma the primary spec is built on.
-- `process-chunk-invariance` and `terminal-wf-invariant` are the crate's master properties. Proving them
-  makes the chunking and fast-path halves of most handler specs free, the way aterm-parser's master simulation does.
-
 ## 4. Tests that are not spec samples
 
 **Status (2026-10-28): deleted 28** — the two fault.rs, the_fixture_row_stops_at_the_written_prefix, the two clipboard_auth invoke_*, test_no_collisions, test_z4_table_total_handler_count, in_module_construction_succeeds, no_engine_still_mints_some, test_response_reconfigure_preserves_tokens_under_new_cap, budgeted_resume_refinement_actions_are_complete, the three shell_api user-var tests, revoke_blocks_future_verification, minting_is_deterministic_in_policy_bit, test_config_equality, all_capability_modules_exist, a_module_with_no_policy_carries_no_capability_ceremony, hyperlink_auth_keeps_the_host_minted_scheme_decision, negative_control_dropping_a_record_diverges, golden_visible_content_hash_is_pinned, stale_identity_and_early_or_stuttering_drain_negative_controls_are_rejected, the_models_guards_reject_the_wrong_drivers; the rest of the `capability_ceremony` tests (every_capability_struct_has_private_seal, capability_structs_do_not_derive_default_or_clone); and `forged_over_cap_share_is_rejected` plus `slipped_real_steps_are_the_buggy_transitions_and_are_rejected` (folded as negative controls into their owning conformance tests while keeping the model checks in `aterm-models`). Every other row below is still present.
@@ -1781,63 +1603,3 @@ tests/unicode_content_generation.rs	unicode_bulk_and_fragmented_writes_advance_c
    - **Resolved — `state.rs::band_history_model_proves_and_catches_overwritten_replay`:** `ContentScrollBandHistory` lives in `aterm-models-core` (`models_content_scroll_band_history.rs`) and is bound by `terminal_band_history_conforms_through_overflow_and_rebaseline`.
    - Profile-dependent verdicts (the standard-profile wildcard case of `policy_bridge.rs::the_bridge_decision_tree`, `window_auth.rs::standard_profile_wildcard_*`, the policy_gates profile loops) depend on `aterm_policy::profiles::{standard,hardened}` data in another crate; the specs need a cross-crate profile lemma (gap 12).
    - `test_support/generated/{grapheme,sixel}.rs` test aterm-grapheme and aterm-sixel from aterm-core's build. Their specs (gr-*, sx-*) belong in those crates' SPECS.md, and the tests should move there.
-
-## 6. Proof order (easiest high-value first)
-
-Smallest Trust widenings first, the Terminal-level properties last.
-
-**Tier A: scalar, gap 2 or 3 only (land right after gap 0).**
-
-1. **`config-negotiated-modes-seed`** (gaps 2, 4; 5 tests). Its core, `apply_negotiated_mode(live, seed, v)`,
-   is straight-line code over two `&mut bool`s, the canonical first `&mut` view proof. The `apply_config`
-   half then composes it three times (gap 4).
-2. **`pr-splice-accounts`** (gap 3) and **`alt-archive-row-charge`** (gaps 3, 6). Pure `u64`/`usize`
-   arithmetic (`checked_sub`, `next_multiple_of`); each is an `omega`-class proof once `is_some_and` and
-   `next_multiple_of` are admitted.
-3. **`drain-bell-edge-flag`**, **`restore-advances-scroll-epoch-once`**, **`host-color-mutators-damage`**
-   (gap 2 only). One field read and write each, so they are the regression cases for certified views.
-4. **`sbg-cursor-allocator`** (gaps 3, 13): `fetch_update` with `checked_add`, the smallest atomic case.
-
-**Tier B: finite tables and small enum functions (gaps 1, 3; decidable by evaluation).**
-
-5. **`csi-dispatch-table`** (7 tests): evaluate the 73-entry table and `csi_hash` over 256 encodings × 256
-   finals.
-6. **`pb-resolve-table`** (3), **`st-delta-since`**, **`sgr-extended-color-parse`**, **`png-dimensions`**,
-   **`obs-arm-eval-classes`**, **`rc-cursor-projection`**, **`damage-words-injective`**, **`kitty-diacritic-table`**,
-   **`bidi-base-direction`**, **`rc-refill-cause-classification`**, **`char-width-fast-path`** (evaluation over
-   0..=0x10FFFF).
-
-**Tier C: self-contained state machines with high test counts (gaps 1, 2, 3, then 10).**
-
-7. **`rn-armed-gates`** (16 tests) and **`rn-answer-protocol`** (9), then **`rn-attempt-budget`**,
-   **`rn-hold-always-lifted`** and the model binding **`rn-refines-model`** (8). `RepaintNudge::step` is
-   a scalar machine (an enum phase, `u64` milliseconds, bool facts); it retires 39 tests with no
-   Terminal involved.
-8. **`bell-flash-model`** (5) and **`bell-rate-limiter`** (4): one `Option<Instant>` each, once
-   aterm_time's `Instant` has an ordered-time model.
-9. **`obs-*`** (the `WatcherSet` contracts, 22 tests) and **`pb-bridge-decision-tree`** (9).
-
-**Tier D: pure byte and string functions (gaps 1, 3, 7).**
-
-10. **`format-paste-denotation`** (6), **`sanitize-title`** (4), **`hyperlink-auth`** (8),
-    **`shell-integration-nonce-hex`**, **`sia-decode-hex`**, **`sia-ct-eq`**, **`sia-verify-nonce`** (8),
-    **`parser-repr-wire-roundtrip`** (3), **`osc21-key-echoable`**, **`has-run-of-4`**, **`rgb-to-rgba`**,
-    **`alt-archive-normalize-row`**, **`kitty-command-parse`** (12). These are the first users of the
-    `&str`/`Vec<u8>` content models (gap 1) and of loop invariants over slices (gap 7).
-
-**Tier E: the highest-value single specs.**
-
-11. **`resolve-colors-denotation`** (gaps 1, 3, 4; 21 tests). Copy structs, bitflags and a palette array;
-    the dim step cites `dim_toward_bg` as an opaque callee until `dim-contrast-law` (floats) is reachable.
-12. **`rc-render-cell-resolution`** (14) and the RenderInput contracts (`ime-overlay-contract` 18,
-    `render-input-content-equality-and-clone` 8, `line-size-run-at` 5).
-
-**Tier F: the Terminal-level master properties (all of gaps 1–7 and 12).**
-
-13. **`terminal-wf-invariant`** (15 tests), then **`process-chunk-invariance`** (17), which needs aterm-parser's
-    `advance-fast-refines-utf8-step-fold` cited across crates (gap 12). These two make the chunking halves
-    of most handler specs free.
-14. The handler families: kitty (`kitty-*`, about 100 tests), selection (`selection-custody` 47,
-    `sel-*`), alt archive (`alt-archive-*`, about 85), checkpoint (`checkpoint-*`, about 50), the
-    ConPTY and resize-journal refinements, and the search index. Each needs a content model of the grid
-    (gap 1) and, for the refinements, the model→code surface (gap 10).

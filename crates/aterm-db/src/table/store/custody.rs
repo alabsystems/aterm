@@ -154,9 +154,9 @@ pub(crate) fn salvage_region(
     verifier.context(prefix.scope)?;
     for entry in &prefix.entries {
         if entry.conflict {
-            super::super::conflict::Conflict::restore(verifier, prefix.scope, &entry.wire)?;
+            super::super::conflict::Conflict::restore(verifier, prefix.scope, entry.wire.wire())?;
         } else {
-            verifier.authenticate(prefix.scope, &entry.wire)?;
+            verifier.authenticate(prefix.scope, entry.wire.wire())?;
         }
     }
     prefix.recheck(session)?;
@@ -165,7 +165,7 @@ pub(crate) fn salvage_region(
         entries: prefix
             .entries
             .into_iter()
-            .map(|entry| (entry.conflict, entry.wire))
+            .map(|entry| (entry.conflict, entry.wire.into_wire()))
             .collect(),
     })
 }
@@ -211,12 +211,11 @@ impl WitnessedPrefix {
         for entry in &self.entries {
             current()?;
             let retained = if entry.conflict {
-                conflicts.get(&entry.receipt.id).copied() == Some(entry.wire.as_slice())
+                conflicts.get(&entry.receipt.id).copied() == Some(entry.wire.wire())
             } else {
-                store
-                    .records
-                    .get(&entry.receipt.id)
-                    .is_some_and(|stored| stored.quarantine.is_none() && stored.wire == entry.wire)
+                store.records.get(&entry.receipt.id).is_some_and(|stored| {
+                    stored.quarantine.is_none() && stored.wire == entry.wire.wire()
+                })
             };
             if !retained {
                 missing.push(entry);
@@ -229,9 +228,9 @@ impl WitnessedPrefix {
                 if entry.conflict == conflict {
                     current()?;
                     if conflict {
-                        store.ingest_conflict(session, &entry.wire)?;
+                        store.ingest_conflict(session, entry.wire.wire())?;
                     } else {
-                        store.ingest(session, &entry.wire)?;
+                        store.ingest(session, entry.wire.wire())?;
                     }
                 }
             }

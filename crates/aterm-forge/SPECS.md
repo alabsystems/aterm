@@ -3,31 +3,13 @@
 
 # aterm-forge: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 125 tests
-> it deleted and 1 spec whose functions it deleted are gone, and the spec rows no longer cite
-> those tests. Counts elsewhere in this file were taken before.
-
-> Status 2026-10-16: this file is the crate's migration worklist. Each of the 64 specs below
-> is proved through Trust/Clean about the compiled Rust function, and the proof's commit deletes the
-> tests it subsumes. The 19 tests marked **delete** in §4 sample no spec and can go now; the
-> 6 marked **becomes-spec-after-fix** wait on a production fix. Nothing has been proved or deleted yet.
-
-> Status 2026-11-07: `path-deps-and-normalize` names `provenance::dependency_paths` for
-> `provenance::path_deps`, which 93c173851f replaced: the dependency tables are parsed as TOML and a
-> `workspace = true` entry takes the workspace's path, so the row is restated.
-
-> Status 2026-11-07, the qualified-path pass: `path-dependants` stated its walk with `path_deps`,
-> which 93c173851f replaced with `provenance::dependency_paths` (workspace inheritance); it now names
-> that, and says the vendored roots 4ab4442c87 added (`FIRST_PARTY_VENDORED`, walked by
-> `path_dependants_outside`): a vendored root counts when it reaches `rel` and is itself consumed.
-
 Source: `crates/aterm-forge` (read only). Paths below are relative to that directory. I read every
 `#[test]` (`src/attest.rs` 28, `src/blame.rs` 12, `src/budget.rs` 22, `src/check.rs` 20, `src/cli.rs` 6,
 `src/deny.rs` 5, `src/direct_vendor.rs` 11, `src/dominator.rs` 7, `src/loc.rs` 18, `src/measured.rs` 1 (since deleted, OF-42),
 `src/policy.rs` 14, `src/provenance.rs` 7, `src/resolve.rs` 19, `src/survey.rs` 9,
 `tests/red_fixtures.rs` 5 = 184) and the code each one reaches. Nothing was compiled or run; the
-claims come from reading the code. The plan is `docs/PLAN-tests-to-specs-2026-10-15.md`; gap numbers
-are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+claims come from reading the code. The plan is `docs/TRUST-LANE.md`; gap numbers
+are the rows of `docs/TRUST-LANE.md` (Blocking gaps).
 
 Result: **64 specs**, covering **159 tests**. **25 tests are not spec samples** (§4):
 19 to delete, 6 that become specs once a production gap is fixed.
@@ -52,7 +34,7 @@ Result: **64 specs**, covering **159 tests**. **25 tests are not spec samples** 
 - A **fixture tree** is any directory the statement quantifies over. A statement that reads fs, git or
   cargo is about the pure core over those observations; proving it needs the core factored out of the
   effect (gap 8), the first refactor for every row whose gaps include 8.
-- Gaps are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7: 0 installed seal, 1
+- Gaps are the rows of `docs/TRUST-LANE.md` (Blocking gaps): 0 installed seal, 1
   non-scalar carriers, 2 `&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5
   quantified clauses, 6 plain-Rust clause publication, 7 loops, 8 effects (fs, process, env), 11
   generics, 12 cross-crate citation (`aterm_toml`, `aterm_census`, `aterm_json`), 13 closures, threads,
@@ -133,50 +115,6 @@ patch-entries-measure	contract	policy::patch_entries, patched_manifest, PatchEnt
 resolve-cells-custody	contract	check::resolve_cells, aterm_uds::output::current, aterm_uds::output::with_executor	∀ cargo, root, cells, with an executor E installed on the calling thread (with_executor): every command resolve_cells' cells run, the first on the calling thread and each other on its own scoped thread, goes through E (each thread installs current()'s E), so a caller that owns E (verify's bounded walk) refuses, stops and reaps each; with none installed each runs its command itself.	src/check.rs::every_cells_commands_stay_in_the_callers_custody	std::thread::scope, thread-local executor, Arc<dyn Fn>	8
 ```
 
-### Distribution by kind (64)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 59 | dom-cost-is-counterfactual-reach, ranked-is-sorted-permutation, blame-count-paths, blame-shortest-paths, patch-state-classification, blame-spec-parse, blame-not-found-refusal, blame-report-contents, versions-row-layout, fit-char-truncation, fit-path-suffix, commas-grouping, survey-reports-live-totals, cell-select, tree-line-parse, tree-depth-stack, strip-verbatim-prefix, abs-root-resolution, offline-first-resolution, cli-parse-grammar, deny-satisfies, deny-findings, deny-parse-policy, spdx-license-arms, apache-mandatory, req-satisfied-caret-exact, manifest-requirement-scanners, notice-line-parse, header-notice-predicate, pristine-diff, pristine-held, attest-verdict-is-conjunction, attest-structure-obligations, attest-license-obligations, classify-patch-target-locations, budget-parse-grammar, budget-validate-reason, budget-ratchet-plan, budget-validate-metric, budget-detail-lists, absent-ledger-is-empty, check-parse-patch-table, check-parse-carve-ledger, check-classify-row-scope, check-oracle-verdict, check-verdict-obligations, astream-validate-ordered-conjunction, astream-pin-motion-decision, physical-lines, count-unsafe-tokens, manifest-field-readers, package-dir-precedence, third-party-iff-not-first-party, provenance-classifier, path-deps-and-normalize, path-dependants, ledger-parse-fail-closed, semver-row-scope, patch-entries-measure |
-| invariant | 3 | dominator-shape, dominator-laminar-partition, report-line-width |
-| round-trip | 1 | budget-render-parse-roundtrip |
-| table-property | 1 | roster-well-formed |
-
-### Gap histogram (specs blocked by each audit §7 gap)
-
-| gap | specs blocked | meaning |
-|---|---|---|
-| 0 | 64 | installed seal publishes no Lean-discharged row |
-| 1 | 63 | non-scalar carriers and content models |
-| 2 | 1 | `&mut self` views and two-state clauses |
-| 3 | 59 | E6 body widening (calls, matches, loops) |
-| 4 | 11 | callee-ensures → caller composition |
-| 5 | 32 | quantified clauses |
-| 6 | 60 | plain-Rust clause publication |
-| 7 | 46 | loops |
-| 8 | 23 | effects (fs, process, env) |
-| 11 | 1 | generics |
-| 12 | 16 | cross-crate theorem citation (`aterm_toml`, `aterm_census`, `aterm_json`) |
-| 13 | 20 | closures, threads, async |
-
-Fewest blockers: `absent-ledger-is-empty` {0,8}; `abs-root-resolution` {0,1,8};
-`roster-well-formed` {0,1,5,6}; `classify-patch-target-locations` {0,1,8,12}; and the pure
-`{0,1,3,6}` group `blame-spec-parse`, `versions-row-layout`, `strip-verbatim-prefix`,
-`req-satisfied-caret-exact`, `budget-validate-reason`.
-
-### Proof dependency order
-
-`fit-char-truncation`, `commas-grouping`, `physical-lines`, `count-unsafe-tokens`, `spdx-license-arms`,
-`semver-row-scope`, `req-satisfied-caret-exact`, `deny-satisfies` (leaf string and arithmetic
-functions) → `fit-path-suffix`, `versions-row-layout`, `report-line-width`, `jstr-json-string-roundtrip`
-(report formatting) → `tree-line-parse` → `tree-depth-stack` (establishes the edge relation `WF` is
-stated over) → `dom-cost-is-counterfactual-reach` → `ranked-is-sorted-permutation` → `dominator-shape` →
-`dominator-laminar-partition`; `blame-count-paths`, `blame-shortest-paths` beside it. The TOML readers
-(`check-parse-*`, `ledger-parse-fail-closed`, `deny-parse-policy`, `manifest-field-readers`) need gap 12
-for `aterm_toml`. The effectful compositions (`package-dir-precedence` → `third-party-iff-not-first-party`;
-the `attest-*` and `astream-*` specs) → `survey-reports-live-totals`, `blame-*-refusal/contents` →
-`check-verdict-obligations` last, since it composes every other spec.
-
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec whose proof retires the test; `also` lists the other specs it samples.
@@ -243,20 +181,6 @@ tests/red_fixtures.rs	an_unpatched_sibling_version_reds_the_forge_verb	check-ver
 src/check.rs	every_cells_commands_stay_in_the_callers_custody	resolve-cells-custody	
 ```
 
-## 3. Coverage
-
-- 184 tests read: 159 map to one of the 64 specs, 25 are not spec samples (§4).
-  The chunk manifest said 183; a fresh count of `#[test]` attributes gives 184
-  (`src/attest.rs` has 28).
-- Six tests sample two specs each (the `also` column): the two `blame` path tests, the verbatim-prefix
-  test, the 80-character reason, and two `loc` member tests.
-- The biggest collapses (primary tests): `tree-line-parse` (9), `ledger-parse-fail-closed` (8), `attest-license-obligations` (7), `budget-parse-grammar` (7), `budget-ratchet-plan` (7), `astream-validate-ordered-conjunction` (7), `cli-parse-grammar` (6), `attest-structure-obligations` (6).
-- `dom-cost-is-counterfactual-reach` has 4 primary tests, but `dominator-shape`,
-  `dominator-laminar-partition`, `ranked-is-sorted-permutation` and the totals of
-  `survey-reports-live-totals` and `blame-report-contents` are corollaries of it.
-- No test is a regression of a removed bug with no general property: each regression-shaped test is an
-  instance of one of the §1 specs.
-
 ## 4. Tests that are not spec samples
 
 None remaining from the 2026-10-16 pass: the 25 non-spec tests were retired, and the crate currently
@@ -298,30 +222,3 @@ holds 104 `#[test]` functions (57 secondary/multi-spec rows in §2 alongside §1
     `budget::record_surveyed_cell` records `live.unavailable[scope]` instead of counting 0 LOC, 0 build
     scripts or 0 proc macros (`unmeasured_third_party_sources_skip_the_cell_instead_of_reporting_zero_loc`,
     `an_unpacked_third_party_package_marks_the_scope_unavailable`).
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone, so the order prefers the smallest gap sets over pure code, weighted by
-the tests each proof retires.
-
-1. **`budget-validate-reason`** {0,1,3,6}. Straight-line `Option<&str>` checks; retires 3 tests outright
-   and the boundary half of a fourth, and is the guard `budget-ratchet-plan` relies on.
-2. **`req-satisfied-caret-exact`** {0,1,3,6} with **`semver-row-scope`** {0,1,3,5,6,7,13}. Tuple
-   arithmetic on parsed versions. The second one forces the fix in §5.1, a real soundness bug in three
-   gates.
-3. **`tree-line-parse`** → **`tree-depth-stack`** {0,1,3,5,6,7}. Retires 12 tests and establishes the
-   graph every dominator and blame spec is stated over.
-4. **`budget-parse-grammar`** + **`budget-render-parse-roundtrip`**. Retires 8 tests; a line-wise
-   parser whose round trip is the ledger's integrity.
-5. **`cell-select`** {0,1,3,5,6,7,13}. Retires 5 tests across 3 files, and its "before any effect"
-   clause carries into every verb.
-6. Leaf formatters with one test each, cheap once gap 1 lands: `fit-char-truncation`, `commas-grouping`,
-   `physical-lines`, `count-unsafe-tokens`, `spdx-license-arms`, `strip-verbatim-prefix`,
-   `blame-spec-parse`, `versions-row-layout`, `roster-well-formed` (decidable by const evaluation).
-7. **`dom-cost-is-counterfactual-reach`** and its corollaries (`ranked-*`, `dominator-shape`,
-   `dominator-laminar-partition`), then `blame-count-paths` / `blame-shortest-paths`.
-8. The parsers behind gap 12 (`aterm_toml`): `ledger-parse-fail-closed` (8 tests), `check-parse-carve-ledger`
-   (5), `check-parse-patch-table` (3), `deny-parse-policy`, `manifest-field-readers`.
-9. **`budget-ratchet-plan`** (7 tests; the only spec needing gap 2 for its `&mut` row updates).
-10. The effectful compositions once their pure cores are factored out (gap 8), ending with
-    `check-verdict-obligations`, which composes all of the above.

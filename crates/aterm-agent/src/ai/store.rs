@@ -514,8 +514,8 @@ impl Store {
                 "AI health records exceed the read limit",
             ));
         }
-        crate::harness::upgrade_models::write_atomic_ordered(&self.dir.join(RECORD_FILE), &text)?;
-        crate::harness::upgrade_models::write_atomic_ordered(&self.wake_path(), "")
+        crate::harness::atomic_write::write_atomic_ordered(&self.dir.join(RECORD_FILE), &text)?;
+        crate::harness::atomic_write::write_atomic_ordered(&self.wake_path(), "")
     }
 }
 

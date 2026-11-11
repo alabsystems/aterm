@@ -1464,13 +1464,6 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
-        "harness.model_fallback",
-        "Model to relaunch on at a model limit",
-        ConfigSchemaKind::Scalar(EditKind::Text),
-        &["supervisor", "model", "limit", "opus"],
-        true,
-    ),
-    manual(
         "harness.compact_on_context_wall",
         "Compact when the context is full",
         ConfigSchemaKind::Scalar(EditKind::Bool),
@@ -5809,13 +5802,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · through Claude Code's own status line on the relaunch lines aterm types, for this machine's own login only (its default or lone one, or, where accounts.toml lists two or more accounts, one it lists or one a renewal moved a row away from); not where your own statusLine, apiKeyHelper, credential or --settings is set · its readings give the footer its weekly figure and the account stats their recorder, time the continuation at a usage limit to the reset they read, and, where accounts.toml lists two or more accounts, feed accounts = \"early\", which moves a session to the next account ahead of its limit · on by default"
         }
         "harness.usage_credits" => {
-            " · Claude Code only · on: a consent box that names usage credits is taken (`Continue with <model>` is kept by Claude Code for good for that model and account; `Continue with usage credits` saves nothing and carries the session onto credits already on) and a model limit that asks for it is continued into it · off by default: the harness keeps sessions on the subscription; such a box is cancelled with Esc, a session credits carry gets no turn of the harness's own until the reset their notice names (then one turn, which another window may still bill to credits), and no session is moved onto a model billed to credits · nothing is ever bought either way"
+            " · Claude Code only · on: a consent box that names usage credits is taken (`Continue with <model>` is kept by Claude Code for good for that model and account; `Continue with usage credits` saves nothing and carries the session onto credits already on) and a model limit that asks for it is continued into it · off by default: the harness keeps sessions on the subscription; such a box is cancelled with Esc, a session credits carry gets no turn of the harness's own until the reset their notice names (then one turn, which another window may still bill to credits) · nothing is ever bought either way"
         }
         "harness.claim_credits" => {
             " · Claude Code only · where Claude Code's cached offers name a free credit live for the signed-in account (the cloud session credit, the plan's monthly API credits), a window's host starts one worker tab with Claude in Chrome (--chrome) that opens the offer's claude.ai link in your own Chrome and claims it · it never enters payment details, buys anything, turns on extra usage or changes the plan · the harness approves only its Chrome actions on the vendor's claim pages, once each, declines every other box it raises, leaves its questions and any other Chrome action to you, and ends it about 30 minutes after it started or you last typed in it, closing its tab about 30 minutes after that unless it is its window's last tab · once per offer, again at most once a week later if the offer still stands · feature of the week (it turns on extra usage), guest passes and admin opt-ins are never claimed · off: no claim worker starts"
-        }
-        "harness.model_fallback" => {
-            " · Claude Code only, for that session alone · none: wait for the reset"
         }
         "harness.stall_term_after_s" => " · with stall_term off, a warning instead · 0: never",
         "harness.stall_term" => {
@@ -5870,7 +5860,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · default true: while the harness's theme is on a Claude Code session (its composer border drawn), the agents panel under the footer wears the theme's rainbow — each row's name in its stripe at Claude's own lightness, a workflow's bar along the whole palette — and each agent's dot tells its work: hue = which agent, brightness and glow = how much work, saturation = how fresh, full hue with a dim steady glow = in its own tool call (inside that call's timeout plus 30 s, read from its transcript), a grey breath = stuck (no work for 150 s with nothing of its own in flight), a still amber ring = awaiting approval, Claude's own green or red = done or failed — glass only; false leaves the panel as Claude drew it · serious mode keeps the colours and drops the glow · read live"
         }
         "claude_footer.switch_model" => {
-            " · default auto: a click on a Claude Code session's model or effort in the footer switches it to the best model of the harness's priority list (`aterm harness upgrade models`) that the session's Claude Code build offers · a Claude model id (`claude-opus-5-5`) or the name the footer shows (`Opus 5.5`) switches to that model instead; any other word is auto · the hover names where the click goes · read live"
+            " · default auto: a click on a Claude Code session's model or effort in the footer switches it to the first model of the click's model order (`models.json`'s `priority` under the harness's upgrade state, else Opus 5.5, Fable 5.1, Opus 5) that the session's Claude Code build offers · a Claude model id (`claude-opus-5-5`) or the name the footer shows (`Opus 5.5`) switches to that model instead; any other word is auto · the hover names where the click goes · read live"
         }
         "claude_footer.switch_effort" => {
             " · default auto: the switch goes to the highest effort the session's Claude Code build admits for the model it switches to (xhigh where its catalog is not read) · low, medium, high, xhigh or max switches to that effort instead; any other word is auto · read live"

@@ -89,8 +89,10 @@ struct Seen {
 struct Scratch {
     ledger: OnceLock<PathBuf>,
     seen: Mutex<Seen>,
-    /// The GiB available on the 24 GiB machine its claims are admitted on.
+    /// The GiB available on the machine its claims are admitted on.
     available: u64,
+    /// The machine's physical GiB.
+    physical: u64,
 }
 
 impl Scratch {
@@ -102,6 +104,21 @@ impl Scratch {
     const fn on(available: u64) -> Scratch {
         Scratch {
             available,
+            physical: 24,
+            ledger: OnceLock::new(),
+            seen: Mutex::new(Seen {
+                asked: Vec::new(),
+                said: Vec::new(),
+                looked: Vec::new(),
+            }),
+        }
+    }
+
+    /// One shaped like the release host used by the pooled-lint claim test.
+    const fn release_host() -> Scratch {
+        Scratch {
+            available: 76,
+            physical: 128,
             ledger: OnceLock::new(),
             seen: Mutex::new(Seen {
                 asked: Vec::new(),
@@ -125,7 +142,11 @@ impl Scratch {
             .push((need.what.clone(), need.mem, mode));
         crate::admit_in(
             &self.ledger(),
-            &crate::timing_test_machine::Measured::new(&on(self.available)),
+            &crate::timing_test_machine::Measured::new(&Fixed::new(Reading::of_gib(
+                self.physical,
+                self.available,
+                14,
+            ))),
             Pace {
                 poll: std::time::Duration::from_millis(20),
                 ..Pace::default()
@@ -277,6 +298,7 @@ fn failed_memory_admission_never_starts_a_stage() {
                 left: 1,
                 admit,
             });
+            let early = crate::EarlyClaims::default();
             let starts = std::cell::Cell::new(0);
             let (report, ..) = crate::staged(
                 &ctx,
@@ -289,8 +311,11 @@ fn failed_memory_admission_never_starts_a_stage() {
                     admit_quiet: admit,
                     admit_memory: admit,
                 },
-                || starts.set(starts.get() + 1),
-                || stage(&ctx, &spec),
+                &early,
+                || {
+                    starts.set(starts.get() + 1);
+                    stage(&ctx, &spec)
+                },
             );
             assert_eq!(
                 STARTED.load(Ordering::SeqCst),
@@ -360,6 +385,153 @@ fn held_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
 
 fn held_stage(_: &Ctx, spec: &StageSpec) -> Report {
     HELD.stage(spec)
+}
+
+static EARLY_TIPPY: Scratch = Scratch::release_host();
+
+fn early_tippy_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
+    EARLY_TIPPY.admit(need, mode)
+}
+
+fn early_tippy_stage(_: &Ctx, spec: &StageSpec) -> Report {
+    EARLY_TIPPY.stage(spec)
+}
+
+/// A pooled release tree reserves the bounded whole-workspace lint
+/// envelope before its first source preflight callback, then gives that exact claim to lint and
+/// drops it at lint's boundary.
+/// Ordinary and unpooled runs keep just-in-time admission. NEGATIVE CONTROLS: moving the early
+/// claim back into `staged`, admitting it twice, or applying it to either control changes these
+/// callback-time ledger snapshots or the admission count.
+#[test]
+fn pooled_release_preclaims_lint_once_and_only_until_lint_ends() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    EARLY_TIPPY
+        .ledger
+        .set(dir.path().join("ledger"))
+        .expect("this test owns its seam");
+    let seams = Seams {
+        stage: early_tippy_stage,
+        prepare_cells: None,
+        admit_quiet: early_tippy_admit,
+        admit_memory: early_tippy_admit,
+    };
+    let run = |name: &str, release: bool, pooled: bool| {
+        EARLY_TIPPY.clear();
+        let mut ctx = Ctx::new(
+            dir.path().to_owned(),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            dir.path().join(format!("scratch-{name}")),
+        )
+        .with_checks(&[Check::Lint, Check::Fmt])
+        .with_release(release)
+        .with_memory(book(dir.path()))
+        .with_quiet(Some(Admit::Wait));
+        if pooled {
+            ctx = ctx.with_pool(Some(
+                aterm_capacity::Jobserver::new(&dir.path().join(format!("jobs-{name}")), 2)
+                    .expect("private pool"),
+            ));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut log = Vec::new();
+                let code = crate::run_with(
+                    &ctx,
+                    &mut std::io::sink(),
+                    &mut log,
+                    &Show::default(),
+                    seams,
+                )
+                .expect("the result written");
+                tx.send((code, String::from_utf8_lossy(&log).into_owned()))
+                    .expect("test receiver");
+            });
+            let (code, log) = rx
+                .recv_timeout(MUST_HAPPEN)
+                .expect("hang detector: release lint did not end");
+            assert_eq!(code, 0, "{name}: {log}");
+        });
+        let seen = EARLY_TIPPY.take();
+        assert_eq!(seen.asked.len(), 1, "{name}: {seen:?}");
+        let early = release && pooled;
+        let expected = seen.asked[0].1;
+        assert!(expected > 0, "{name}: {seen:?}");
+        if early {
+            assert_eq!(expected, crate::compile_width::TIPPY_CLAIM_FLOOR, "{name}");
+            assert_ne!(
+                expected,
+                16 * GIB,
+                "NEGATIVE CONTROL: the old cold claim did not bound the measured lint learner"
+            );
+        }
+        assert_eq!(seen.looked.len(), 2, "{name}: {seen:?}");
+        assert_eq!(seen.looked[0].1.len(), usize::from(early));
+        assert!(
+            seen.looked[0].1.is_empty()
+                || seen.looked[0].1[0].0 == "verify tippy lint (--workspace)",
+            "{name}: {seen:?}"
+        );
+        assert_eq!(
+            seen.looked[1].1,
+            [("verify tippy lint (--workspace)".to_owned(), expected)],
+            "{name}: lint owns the one claim"
+        );
+        assert!(
+            EARLY_TIPPY.ledger().list().expect("ledger").is_empty(),
+            "{name}: lint's claim ended with lint"
+        );
+    };
+
+    run("release-pooled", true, true);
+    run("release-unpooled", true, false);
+    run("ordinary-pooled", false, true);
+}
+
+fn refuse_early_tippy(_: Need, _: Admit) -> Result<Claim, Error> {
+    Err(Error::Never("injected early tippy refusal".to_owned()))
+}
+
+/// An early claim which cannot be created ends the pooled release before any stage starts. This
+/// is the barrier's explicit failure handshake: retaining the error until Tippy would let another
+/// stage wait forever for compiler tokens. NEGATIVE CONTROL: the stage callback panics if any
+/// scheduling survives the refusal.
+#[test]
+fn failed_early_tippy_admission_ends_the_release_before_scheduling() {
+    fn no_stage(_: &Ctx, spec: &StageSpec) -> Report {
+        panic!("{} ran after early admission failed", spec.title)
+    }
+
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let ctx = Ctx::new(
+        dir.path().to_owned(),
+        Scope::workspace(),
+        EnvSnapshot::default(),
+        dir.path().join("scratch"),
+    )
+    .with_checks(&[Check::Lint, Check::Fmt])
+    .with_release(true)
+    .with_memory(book(dir.path()))
+    .with_quiet(Some(Admit::Wait))
+    .with_pool(Some(
+        aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 2).expect("private pool"),
+    ));
+    let seams = Seams {
+        stage: no_stage,
+        prepare_cells: None,
+        admit_quiet: refuse_early_tippy,
+        admit_memory: refuse_early_tippy,
+    };
+    let mut out = Vec::new();
+    let mut log = Vec::new();
+    let code = crate::run_with(&ctx, &mut out, &mut log, &Show::default(), seams)
+        .expect("the refusal is reported");
+    assert_eq!(code, crate::exit::COULD_NOT_RUN);
+    let out = String::from_utf8(out).expect("text output");
+    assert!(out.contains("early tippy memory admission"), "{out}");
+    assert!(out.contains("injected early tippy refusal"), "{out}");
 }
 
 static BACKGROUND_RESOURCES: Scratch = Scratch::new();
@@ -1339,6 +1511,8 @@ static UNITS: Scratch = Scratch::new();
 
 /// Whether the units stand-in's test compile passes.
 static UNITS_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static UNITS_PENDING_WRITES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn units_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
     UNITS.admit(need, mode)
@@ -1360,6 +1534,22 @@ fn units_stage(_: &Ctx, spec: &StageSpec) -> Report {
         meter.started();
         meter.book(7, &[member(11, 9), member(12, 3), member(13, 0)]);
         meter.ended(7);
+        // A real Cargo stage reaches this seam through the wrapper. Reproduce its successful
+        // maxrss observations when this run installed a unit tuple; an ordinary unpooled run
+        // deliberately has none and still must retain the meter-derived shaping rows.
+        for pid in [11, 12, 13] {
+            let crate::memory::Named::Unit(read) = units_reader(pid) else {
+                unreachable!("the fixture pids are compiler units")
+            };
+            match crate::compile_width::keep_current_unit(&read.unit, GIB / 4) {
+                Ok(Some(path)) => {
+                    assert!(path.exists(), "the wrapper observation is pending");
+                    UNITS_PENDING_WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(None) => {}
+                Err(error) => panic!("keep the wrapper fixture: {error}"),
+            }
+        }
         if UNITS_PASS.load(std::sync::atomic::Ordering::SeqCst) {
             r.pass("compiled");
         } else {
@@ -1395,9 +1585,13 @@ fn no_graph(_: &Ctx, _: &crate::shape::Piece) -> Result<String, String> {
 
 /// A TEST COMPILE KEEPS ITS HEAVY UNITS' PEAKS WHEN IT PASSED: its meter read aterm-gui's
 /// lib-test at 9 GiB and its lib at 3 GiB, and the book keeps each under its unit's key (stage
-/// `TestCompile unit`, the package, the unit's kind), the light compiler none; the time line names
-/// them, heaviest first. A test compile that failed keeps no unit's peak. NEGATIVE CONTROL: the
-/// failed run's book holds no unit row.
+/// `TestCompile unit`, the package, the unit's kind), the light compiler none. This remains true
+/// without a release pool. With a pool, wrapper-and-meter intersections enter the separate
+/// claimable book, including the light compiler at the unit floor, and the run-private pending
+/// file is removed after both a pass and a failure. NEGATIVE CONTROLS: reverting claim promotion
+/// to the heavy-only map loses the light row; the unpooled pass still shapes only heavy units;
+/// the failed runs add no unit row; retaining or inheriting either pending file fails the
+/// directory assertions.
 #[test]
 fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -1411,9 +1605,30 @@ fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
         admit_quiet: units_admit,
         admit_memory: units_admit,
     };
-    let run_units = |at: &Path, pass: bool| -> (String, crate::memory::Records) {
+    let run_units = |at: &Path, pass: bool, pooled: bool| -> crate::memory::Records {
         std::fs::create_dir_all(at).expect("a folder");
+        std::fs::create_dir(at.join("scratch")).expect("a scratch folder");
         UNITS_PASS.store(pass, std::sync::atomic::Ordering::SeqCst);
+        if pooled {
+            let mut seed = crate::memory::Records::default();
+            seed.push(
+                crate::shape::compiler_unit_key(
+                    crate::shape::UNIT_STAGE,
+                    "/seed",
+                    &crate::unitgraph::UnitName {
+                        package: "seed".into(),
+                        kind: "seed lib".into(),
+                    },
+                ),
+                GIB,
+                1,
+            );
+            seed.save(&crate::compile_width::unit_book(
+                &at.join("stage-memory.json"),
+                StageId::TestCompile,
+            ))
+            .expect("seed claimable history");
+        }
         let mut ctx = Ctx::new(
             at.to_path_buf(),
             gui(),
@@ -1423,6 +1638,11 @@ fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
         .with_checks(&[Check::Test])
         .with_quiet(Some(Admit::Wait))
         .with_memory(book(at));
+        if pooled {
+            ctx = ctx.with_pool(Some(
+                aterm_capacity::Jobserver::new(&at.join("jobs"), 2).expect("a compiler pool"),
+            ));
+        }
         ctx.unit_reader = units_reader;
         ctx.unit_graph = no_graph;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1437,13 +1657,10 @@ fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
             );
             let _ = tx.send(String::from_utf8_lossy(&log).into_owned());
         });
-        let log = rx
+        let _log = rx
             .recv_timeout(MUST_HAPPEN)
             .expect("hang detector: the run never ended");
-        (
-            log,
-            crate::memory::Records::load(&at.join("stage-memory.json")),
-        )
+        crate::memory::Records::load(&at.join("stage-memory.json"))
     };
     let units = |r: &crate::memory::Records| -> Vec<(String, u64)> {
         r.rows()
@@ -1458,7 +1675,7 @@ fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
             .collect()
     };
 
-    let (log, records) = run_units(&dir.path().join("pass"), true);
+    let records = run_units(&dir.path().join("pass"), true, false);
     assert_eq!(
         units(&records),
         [
@@ -1466,13 +1683,59 @@ fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
             ("aterm_gui test".to_owned(), 9 * GIB)
         ]
     );
-    assert!(
-        log.contains("its heaviest units kept: aterm_gui test 9 GiB, aterm_gui lib 3 GiB"),
-        "{log}"
-    );
-
-    let (_, records) = run_units(&dir.path().join("fail"), false);
+    let records = run_units(&dir.path().join("fail"), false, false);
     assert!(units(&records).is_empty(), "{records:?}");
+
+    let pending_files = |at: &Path| {
+        std::fs::read_dir(at.join("scratch"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".pending.json")
+            })
+            .count()
+    };
+    for (name, pass) in [("pooled-pass", true), ("pooled-fail", false)] {
+        let at = dir.path().join(name);
+        UNITS_PENDING_WRITES.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _ = run_units(&at, pass, true);
+        assert_eq!(
+            UNITS_PENDING_WRITES.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the pooled stage reproduced all wrapper observations"
+        );
+        assert_eq!(
+            pending_files(&at),
+            0,
+            "staged must remove this run's pending wrapper evidence"
+        );
+        let claimable = crate::memory::Records::load(&crate::compile_width::unit_book(
+            &at.join("stage-memory.json"),
+            StageId::TestCompile,
+        ));
+        let promoted: Vec<_> = claimable
+            .rows()
+            .iter()
+            .filter(|row| row.key.checkout != "/seed")
+            .map(|row| row.key.variant.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            promoted,
+            if pass {
+                vec![
+                    "aterm_grid lib".to_owned(),
+                    "aterm_gui lib".to_owned(),
+                    "aterm_gui test".to_owned(),
+                ]
+            } else {
+                Vec::new()
+            },
+            "only a successful meter/wrapper intersection becomes claimable"
+        );
+    }
 }
 
 static STUCK: Scratch = Scratch::new();

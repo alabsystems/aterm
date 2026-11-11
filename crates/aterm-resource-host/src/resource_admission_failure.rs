@@ -86,6 +86,7 @@ impl Owner {
             failed.settled = true;
             failed.custody.take();
             failed._compiler.take();
+            failed._ay.take();
             failed._sdk.take();
             failed._primary.take();
             if let Some((events, reason)) = failed.refusal.as_mut() {

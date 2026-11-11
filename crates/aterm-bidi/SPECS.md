@@ -3,12 +3,6 @@
 
 # aterm-bidi: spec recovery from its 18 unit tests
 
-> Status 2026-10-28: this is the crate's migration worklist across its 13 specs and 18 live
-> `#[test]` fns (after the tests-and-gates audit deleted 19 redundant tests and added
-> `mirror-glyph-table` plus the two boundary tests noted in §5.1 and §5.3). Each spec below is
-> proved through Trust/Clean about the compiled Rust fn, and then the tests it subsumes are
-> deleted. None of the 18 tests is a non-spec sample.
-
 Source: `crates/aterm-bidi` (read only). Every live `#[test]` (16 in `src/lib.rs`: 12 in
 `mod tests` and 4 in `mod generated`; 2 in `tests/uax9_conformance.rs`, 18 in all) and the
 code each one reaches are mapped below.
@@ -16,7 +10,7 @@ code each one reaches are mapped below.
 Result: **13 specs** covering **18 tests**. **0 tests are non-spec samples** (§4).
 
 The gap numbers in the `blocking_gaps` column are the rows of the gap list in
-the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 Gap 0 (the installed seal publishes no Lean-discharged row) is a prerequisite for every
 spec, so it is listed on every row. No spec is blocked by gap 0 alone.
 
@@ -74,38 +68,6 @@ no-rtl-is-identity	contract	has_bidi, has_bidi_classes, resolve_levels_from_clas
 uax9-levels-refine-reference	refinement	resolve_levels_from_classes, resolve_into, resolve_paragraph, resolve_sequence, match_isolates, first_strong_level, removed_by_x9	∀ c, br (missing entries are None), b: ∀ i with ¬removed_by_x9(c[i]), Lv(c, br, b)[i] = UAX9Ref(c, br, b)[i]; for every removed i, Lv[i] follows the convention in §0. Then for every line whose only B (if any) is its last char: filter(¬removed_by_x9 ∘ c, reorder_from_levels(Lv(c, br, b))) = the UAX #9 L2 visual order of the kept chars. Composed with bidi-class-table, bracket-of-table and reorder-visual-composition-and-permutation, this yields every point example: the pure-RTL reversals, EN/AN at level 2 inside RTL, N1 neutrals between R, the L1 trailing-WS reset, and forced-RTL Latin at level 2. The conformance subsets are samples of this statement; once UAX9Ref exists, their data validates UAX9Ref itself.	C::bidi_test_txt_subset_conforms, C::bidi_character_test_txt_subset_conforms, T::pure_rtl_reverses	VERY HARD: the whole algorithm (~470 lines of nested loops, Vec stacks, closures capturing &Resolve and &mut Resolve, sort_unstable on pairs, rposition/truncate on the bracket stack, find over reversed ranges, &mut buffers, a 23-variant enum, saturating u8 arithmetic), plus a Lean list/inductive UAX #9 model bound to Rust data	0, 1, 2, 3, 4, 5, 7, 10, 14; fragment: `removed_by_x9` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs", row 31). Proved via mirror: Clean R213 row `bidi_removed_by_x9` (`RowProvedB3` over a verbatim copy, with a false-clause control); not yet credited: Trust's compiler mints no calculus row until it pins a VF5 base (E4.7).
 ```
 
-### Distribution by kind (13)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 5 | paragraph-level-p2p3, reorder-visual-composition-and-permutation, cell-reorder-fold, cell-levels-fold, no-rtl-is-identity |
-| table-property | 3 | bidi-class-table, bracket-of-table, mirror-glyph-table |
-| equivalence | 2 | char-entry-points-agree, scratch-independence |
-| refinement | 2 | l2-reorder-from-levels, uax9-levels-refine-reference |
-| invariant | 1 | levels-shape |
-
-### Gap histogram (specs blocked by each audit §7 gap)
-
-| gap | specs | which |
-|---|---|---|
-| 0 | 13 | all (prerequisite) |
-| 1 | 13 | all |
-| 3 | 13 | all |
-| 5 | 13 | all |
-| 7 | 13 | all |
-| 2 | 9 | all but the three table properties and char-entry-points-agree |
-| 4 | 7 | char-entry-points-agree, scratch-independence, reorder-visual-composition-and-permutation, cell-reorder-fold, cell-levels-fold, no-rtl-is-identity, uax9-levels-refine-reference |
-| 10 | 1 | uax9-levels-refine-reference |
-| 14 | 1 | uax9-levels-refine-reference |
-
-### Proof dependency order
-
-The three table properties (`bidi-class-table`, `bracket-of-table`, `mirror-glyph-table`),
-`paragraph-level-p2p3` and `l2-reorder-from-levels` →
-`char-entry-points-agree` → `levels-shape` → `reorder-visual-composition-and-permutation`
-→ the fold lemma, then `cell-reorder-fold` → `cell-levels-fold` → `scratch-independence` →
-`no-rtl-is-identity` → `uax9-levels-refine-reference` (needs the Lean `UAX9Ref`).
-
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test; `also` lists the other specs it samples.
@@ -132,18 +94,6 @@ tests/uax9_conformance.rs	bidi_test_txt_subset_conforms	uax9-levels-refine-refer
 tests/uax9_conformance.rs	bidi_character_test_txt_subset_conforms	uax9-levels-refine-reference	bidi-class-table, bracket-of-table
 ```
 
-## 3. Coverage
-
-- 18 live tests; all 18 map to one of the 13 specs. None is a non-spec sample (§4).
-- Primary tests per spec: `uax9-levels-refine-reference` 3, `cell-reorder-fold` 3,
-  `no-rtl-is-identity` 3, `reorder-visual-composition-and-permutation` 2,
-  `cell-levels-fold` 2, and 1 each for `bidi-class-table`, `mirror-glyph-table`,
-  `char-entry-points-agree`, `scratch-independence` and `levels-shape`.
-  `bracket-of-table`, `paragraph-level-p2p3` and `l2-reorder-from-levels` have no primary test:
-  they are lemmas the conformance, multi-paragraph and point tests sample through composition.
-- `uax9-levels-refine-reference` carries the conformance subsets and is the hardest proof. Its
-  tests stay until the Lean `UAX9Ref` exists and the refinement is Certified.
-
 ## 4. Tests that are not spec samples
 
 None. Every test samples one of the specs above.
@@ -169,25 +119,3 @@ None. Every test samples one of the specs above.
    `reorder_visual_to_logical`, `reorder_cells_with_classes`, `reorder_cells_with_classes_into`,
    `match_isolates`, `first_strong_level`, and `paragraph_level_of`).
 5. **Resolved: removed dead `matching` parameter from `resolve_sequence`.**
-
-## 6. Proof order
-
-Every spec needs gaps 1, 3, 5 and 7 (content models, E6 body widening, quantified clauses, loops).
-The order takes specs that need only those first, then gap 2 (`&mut`) and gap 4 (callee-ensures
-composition), and leaves the reference-model refinement (gaps 10, 14) for last.
-
-1. **`bracket-of-table`**, **`bidi-class-table`** and **`mirror-glyph-table`** (gaps 0, 1, 3, 5, 7; no `&mut`, no
-   composition). Each is a sorted-table search lemma plus an evaluated fact over a finite
-   domain. Together they cover the data tables (`mirror_glyph_pairs`, `ascii_table_and_hebrew_threshold_match_ucd_tables`, and the data half of both conformance tests).
-2. **`char-entry-points-agree`** (adds gap 4 only). This is a map loop and an `any`, with no
-   `&mut` state. It retires 1 test and is the bridge every char-taking spec composes through.
-3. **`l2-reorder-from-levels`** (adds gap 2). This is self-contained arithmetic over levels,
-   with the "lowest odd present" lemma as its one real proof step. It is used by every reorder spec.
-4. **`paragraph-level-p2p3`**, then **`reorder-visual-composition-and-permutation`**
-   (2 tests, composing 2 and 3 with a levels-length lemma), then the **cell fold** specs
-   **`cell-reorder-fold`** (3 tests) and **`cell-levels-fold`** (2).
-5. **`levels-shape`** (1 test), **`scratch-independence`** (1) and **`no-rtl-is-identity`**
-   (3 tests, carrying `b ≠ Rtl`, §5.1). Each of these needs a loop invariant across the whole
-   resolver.
-6. **`uax9-levels-refine-reference`** (3 tests). Author `UAX9Ref` in Lean (gaps 10 and 14),
-   validate it against the conformance data, then prove the refinement.

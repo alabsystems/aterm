@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The first proven red ends a `--fail-fast` run as it ends a release (design §4.3, A3): a
+//! The first proven red ends a `--fail-fast` run as it ends an armed release (design §4.3, A3): a
 //! stand-in run in a process of its own (`test` and `doc`), whose test stage fails once the
 //! doctest stage runs a child that would nap past the hang detector. The halt ends that child's
 //! group, the run's verdict reads FAIL with doc NOT RUN, stopped at the first red, and the run
@@ -83,13 +83,18 @@ fn stage(ctx: &Ctx, spec: &StageSpec) -> Report {
 }
 
 /// Run as a stage child by [`stage`]: says it started, then naps for twice its grandparent's
-/// hang detector, so only the halt ends it in time.
+/// hang detector, so only the halt ends it in time. Its pid lands whole, by a rename: [`stage`]
+/// fails the test stage once `child` exists and [`gone_child`] then reads it, but a plain
+/// write creates the file before it writes the pid, so on a loaded machine that read found it
+/// empty (and the halt, ending this child between the two, can leave it so).
 #[test]
 fn standin_napping_child() {
     let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) else {
         return;
     };
-    std::fs::write(dir.join("child"), std::process::id().to_string()).expect("said started");
+    let written = dir.join("child.tmp");
+    std::fs::write(&written, std::process::id().to_string()).expect("said started");
+    std::fs::rename(&written, dir.join("child")).expect("said started, whole");
     std::thread::sleep(MUST_HAPPEN * 2);
 }
 
@@ -114,7 +119,10 @@ fn standin_halted_run() {
     )
     .with_checks(&[Check::Test, Check::Doc])
     .with_quiet(Some(Admit::Now))
-    .with_halt(crate::halt_of(false, true));
+    .with_halt(crate::halt_of(&crate::cli::Args {
+        fail_fast: true,
+        ..crate::cli::Args::default()
+    }));
     let mut log = std::fs::File::create(dir.join("log")).expect("the log");
     let code = crate::run_with(
         &ctx,

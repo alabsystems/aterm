@@ -510,6 +510,25 @@ fn repos_say_what_they_wait_on() {
         .level,
         Level::Ok
     );
+    let unborn = repos_area(
+        &cloned,
+        true,
+        true,
+        &Ok(OwedClone::Unobserved {
+            present: 50,
+            unborn: 3,
+            total: 53,
+        }),
+    );
+    assert_eq!(
+        unborn.level,
+        Level::Ok,
+        "an empty remote checked out is no clone owed: {unborn:?}"
+    );
+    assert!(
+        unborn.says.contains("3 more checked out without a commit"),
+        "{unborn:?}"
+    );
     assert_eq!(
         repos_area(&cloned, true, true, &none_owed()).level,
         Level::Due,
@@ -840,6 +859,15 @@ fn name_reads_one_name_across_vault_fleet_and_the_mac() {
         (unread.level, who(&unread)),
         (Level::Unknown, Some(Who::Agent))
     );
+    let collision = named(
+        FleetName::Current,
+        Some(MacNamePending::Collision("Bonjour collision".into())),
+    );
+    assert_eq!(
+        (collision.level, who(&collision)),
+        (Level::Due, Some(Who::Person))
+    );
+    assert!(!collision.next.unwrap().act.contains("password"));
     let taken = named(FleetName::Taken("node-77".to_owned()), None);
     assert_eq!(who(&taken), Some(Who::Agent));
     let yours = named(FleetName::Kept("studio".to_owned()), None);

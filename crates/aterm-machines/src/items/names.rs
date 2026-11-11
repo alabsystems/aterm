@@ -46,10 +46,20 @@ pub struct Table {
 /// # Errors
 /// One line naming the name that is still a template or is not a name macOS accepts.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+    expand_with_smb(table, ctx, true)
+}
+
+/// Setup's generated naming authority covers the three system names and its naming rule,
+/// without the general baseline's implicit SMB preference changes.
+pub(crate) fn expand_system_names(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+    expand_with_smb(table, ctx, false)
+}
+
+fn expand_with_smb(table: &Table, ctx: &Ctx, smb: bool) -> Result<Vec<Box<dyn Item>>, String> {
     let hardware = hardware::describe(&ctx.facts);
     let mut items: Vec<Box<dyn Item>> = Vec::new();
     if table.admitted_name_rule == Some(true) {
-        items.push(Box::new(crate::root_steps::NameRule));
+        items.push(Box::new(crate::root_steps::NameRule::Current));
     }
     if let Some(template) = &table.computer_name {
         let template = &said_once(template, &hardware);
@@ -62,7 +72,9 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
                     Pref::Computer,
                     Wanted::Unknown(why.clone()),
                 )));
-                items.push(Box::new(NetBios::new(Err(why))));
+                if smb {
+                    items.push(Box::new(NetBios::new(Err(why))));
+                }
             }
             Ok(name) => {
                 check_computer_name(&name)?;
@@ -70,7 +82,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
                     Pref::Computer,
                     Wanted::Value(name.clone()),
                 )));
-                if let Some(netbios) = netbios_name(&name) {
+                if smb && let Some(netbios) = netbios_name(&name) {
                     items.push(Box::new(NetBios::new(Ok(netbios))));
                 }
             }
@@ -430,6 +442,16 @@ impl Item for Scutil {
             Ok(ran) => read_scutil(&ran),
             Err(e) => Read::Unusable(format!("{}: {e}", cmd.display())),
         };
+        if let (Some(expected), Read::Value(observed)) = (wanted, &now)
+            && aterm_types::machine_name::OsSlot::from_macos_preference(self.pref.key())
+                .is_some_and(|slot| slot.collision(expected, observed))
+        {
+            return Probe::Blocked {
+                why: format!(
+                    "Bonjour reports {observed} instead of {expected}; a name collision remains, so setup leaves that alias in place"
+                ),
+            };
+        }
         decide(now, wanted, &self.previous)
     }
 
@@ -1255,6 +1277,28 @@ mod tests {
                 "\"m4-MacBook-Pro-Intel-Core-i7-3-1GHz-16GB-1TB\""
             ]
         );
+        for (expected, observed, outcome) in [
+            ("m85-dog", "m85-dog-2", Outcome::Blocked),
+            ("m85-dog", "m85-dog-02", Outcome::Planned),
+            ("m85-dog", "m85-dog-1", Outcome::Planned),
+            ("m85-dog", "m85-cat-2", Outcome::Planned),
+            ("m85-dog", "m85-dog-2-extra", Outcome::Planned),
+            ("m85-dog", "m85-dog", Outcome::Ok),
+            ("m1-MacBook-Air", "m1-MacBook-Air-2", Outcome::Blocked),
+        ] {
+            let sys = Fake::root();
+            sys.on("/usr/sbin/scutil --get LocalHostName", Ran::ok(observed));
+            sys.on("/usr/sbin/scutil --get HostName", Ran::ok(expected));
+            let items = expand(&table(None, Some(expected), Some(expected)), &ctx()).unwrap();
+            let rows = engine::run(&items, Mode::Plan, &sys, &ctx(), &mut NoJournal);
+            assert_eq!(rows[0].outcome, outcome, "{observed}: {rows:?}");
+            assert_eq!(
+                rows[1].outcome,
+                Outcome::Ok,
+                "another root item still runs: {rows:?}"
+            );
+            assert!(!sys.calls().iter().any(|call| call.contains("--set")));
+        }
     }
 
     #[test]

@@ -895,6 +895,7 @@ fn declared_prerequisites_admit_only_signed_bytes_and_hold_their_build_until_dro
         Prerequisite::OpenSslSigning,
         Prerequisite::Lake,
         Prerequisite::AtpkgKeys,
+        Prerequisite::Ay,
     ] {
         let fixture = Fixture::new(want);
         let session = fixture.session(TRIPLE).unwrap();
@@ -908,12 +909,34 @@ fn declared_prerequisites_admit_only_signed_bytes_and_hold_their_build_until_dro
             crate::lease::reclaim(&fixture.layout.prefix, &subject),
             crate::lease::Reclaim::Keep(_)
         ));
+        #[cfg(unix)]
+        let payload = aterm_uds::kept_out(|| tool.lease_descriptor()).unwrap();
         drop(tool);
+        #[cfg(unix)]
+        {
+            assert!(matches!(
+                crate::lease::reclaim(&fixture.layout.prefix, &subject),
+                crate::lease::Reclaim::Keep(_)
+            ));
+            drop(payload);
+        }
         let reclaimed = crate::lease::reclaim(&fixture.layout.prefix, &subject);
         assert!(
             matches!(reclaimed, crate::lease::Reclaim::Clear(_)),
             "{} after releasing its only owned guard: {reclaimed:?}",
             want.executable()
+        );
+        assert!(
+            session
+                .acquire_with_lease_wait(want, std::time::Duration::ZERO)
+                .is_err(),
+            "a reclaimer's held exclusive gate must prevent a new selection"
+        );
+        drop(reclaimed);
+        drop(
+            session
+                .acquire_with_lease_wait(want, std::time::Duration::ZERO)
+                .unwrap(),
         );
     }
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
@@ -1329,7 +1352,8 @@ fn a_changed_shim_is_refused_after_lease_acquisition_and_drops_the_hold() {
             Prerequisite::Python,
             7,
             &selected,
-            "fixture lease race"
+            "fixture lease race",
+            std::time::Duration::ZERO,
         )
         .is_err()
     );

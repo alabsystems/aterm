@@ -494,6 +494,57 @@ struct ClauseTxt {
     ink: InkKind,
 }
 
+/// Try priority prefixes in one buffer, shortening each from its least urgent end.
+fn choose_details(
+    clauses: &[ClauseTxt],
+    available: f64,
+    width: impl Fn(&[(&ClauseTxt, bool)]) -> f64,
+) -> Vec<(&ClauseTxt, bool)> {
+    let mut choice = Vec::with_capacity(clauses.iter().filter(|c| !c.forms.is_empty()).count());
+    choice.extend(
+        clauses
+            .iter()
+            .filter(|c| !c.forms.is_empty())
+            .map(|c| (c, false)),
+    );
+    // A mandatory clause precedes an optional one at the same priority; ties within
+    // either group retain their input order.
+    choice.sort_by_key(|(c, _)| (c.prio, !c.keep));
+    let first = choice.first().map(|&(c, _)| c);
+    loop {
+        for (_, short) in &mut choice {
+            *short = false;
+        }
+        if width(&choice) <= available {
+            return choice;
+        }
+        for i in (0..choice.len()).rev() {
+            choice[i].1 = true;
+            if width(&choice) <= available {
+                return choice;
+            }
+        }
+        if let Some(i) = choice.iter().rposition(|(c, _)| !c.keep) {
+            choice.remove(i);
+        } else {
+            if choice.is_empty()
+                && let Some(c) = first
+            {
+                choice.push((c, true));
+            }
+            return choice;
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "stats_details_tests.rs"]
+mod details_tests;
+
+#[cfg(test)]
+#[path = "stats_event_buffer_tests.rs"]
+mod event_buffer_tests;
+
 /// Everything one row draws, read from the snapshot.
 #[derive(Clone, Debug, PartialEq)]
 struct RowWords {
@@ -1669,19 +1720,24 @@ impl<'a> Deck<'a> {
         }
     }
 
-    fn strip_spans(y0: f64, y1: f64, holes: &[(f64, f64)]) -> Vec<(f64, f64)> {
-        let mut spans = Vec::new();
+    fn strip_spans(
+        y0: f64,
+        y1: f64,
+        holes: &[(f64, f64)],
+    ) -> impl Iterator<Item = (f64, f64)> + '_ {
         let mut y = y0;
-        for &(a, b) in holes {
-            if a > y {
-                spans.push((y, a));
+        let mut holes = holes.iter().copied();
+        let mut tail = Some(y1);
+        std::iter::from_fn(move || {
+            for (a, b) in holes.by_ref() {
+                let start = y;
+                y = y.max(b);
+                if a > start {
+                    return Some((start, a));
+                }
             }
-            y = y.max(b);
-        }
-        if y < y1 {
-            spans.push((y, y1));
-        }
-        spans
+            tail.take().filter(|&end| y < end).map(|end| (y, end))
+        })
     }
 
     /// Draws the strip's X-axis baseline rail (broken over a row-0 over cap it would touch,
@@ -1722,6 +1778,9 @@ impl<'a> Deck<'a> {
             return;
         };
         let horizon = strip.spec.horizon_ms();
+        if words.strip_events.is_empty() && words.time_gaps.is_empty() {
+            return;
+        }
         // Each event's pip and line, `(pip's left px, line's left px, kind)`, placed before the
         // gaps are drawn, so a gap's notch can stand clear of every pip.
         let mut events: Vec<&StripEvent> = words
@@ -1735,12 +1794,15 @@ impl<'a> Deck<'a> {
                 .cmp(&a.kind)
                 .then_with(|| b.at_unix_ms.cmp(&a.at_unix_ms))
         });
-        let mut drawn_xs: Vec<i32> = Vec::with_capacity(6);
+        // The existing six-column limit bounds the markers and their pip projection.
+        const MARK_LIMIT: usize = 6;
+        let mut drawn_xs: aterm_alloc::ArrayVec<i32, MARK_LIMIT> = aterm_alloc::ArrayVec::new();
         let lw = (0.85 * self.s).round().max(1.0) as f32;
         let pip = (2.2 * self.s).round().max(2.0) as f32;
-        let mut marks: Vec<(f32, f32, StripEventKind)> = Vec::with_capacity(6);
+        let mut marks: aterm_alloc::ArrayVec<(f32, f32, StripEventKind), MARK_LIMIT> =
+            aterm_alloc::ArrayVec::new();
         for ev in events {
-            if drawn_xs.len() >= 6 {
+            if drawn_xs.len() >= MARK_LIMIT {
                 break;
             }
             let Some(x_pt) = strip.x_at_age_ms(now_ms - ev.at_unix_ms) else {
@@ -1756,7 +1818,7 @@ impl<'a> Deck<'a> {
             let px_pip = (ex - pip / 2.0).round().clamp(x0, (x1 - pip).max(x0));
             marks.push((px_pip, lx, ev.kind));
         }
-        let pips: Vec<f32> = marks.iter().map(|m| m.0).collect();
+        let pips: aterm_alloc::ArrayVec<f32, MARK_LIMIT> = marks.iter().map(|m| m.0).collect();
         for gap in words.time_gaps.iter().rev().take(4) {
             if gap.end_ms <= now_ms - horizon || gap.start_ms >= now_ms {
                 continue;
@@ -1798,12 +1860,8 @@ impl<'a> Deck<'a> {
             let ev_ink = self.event_ink(kind);
             self.pip(pip_rect, &pieces, (0.5 * self.s) as f32, ev_ink);
         }
-        let lines: Vec<(f32, StripEventKind)> =
-            marks.iter().map(|&(_, lx, kind)| (lx, kind)).collect();
-        let spans = Self::strip_spans(y0, last, holes);
-        let rows: Vec<(f32, f32)> = spans
-            .iter()
-            .map(|&(a, b)| (self.px(a), self.px(b)))
+        let rows: Vec<(f32, f32)> = Self::strip_spans(y0, last, holes)
+            .map(|(a, b)| (self.px(a), self.px(b)))
             .filter(|(ya, yb)| yb > ya)
             .collect();
         // A device px of ground each side keeps a line off the boxes' columns and ticks
@@ -1811,14 +1869,14 @@ impl<'a> Deck<'a> {
         // before any line: two events' lines can touch, and a keyline drawn after its neighbour's
         // line would cut it.
         let ground = rgba(self.inks.ground, 0xFF);
-        for &(lx, _) in &lines {
+        for &(_, lx, _) in &marks {
             for &(ya, yb) in &rows {
                 for kx in [lx - 1.0, lx + lw] {
                     self.p.prims.push(panel(kx, ya, 1.0, yb - ya, 0.0, ground));
                 }
             }
         }
-        for (lx, kind) in lines {
+        for &(_, lx, kind) in &marks {
             let ev_ink = self.event_ink(kind);
             for &(ya, yb) in &rows {
                 match kind {
@@ -2147,41 +2205,7 @@ impl<'a> Deck<'a> {
                 })
                 .sum()
         };
-        let mut ps: Vec<&ClauseTxt> = clauses.iter().filter(|c| !c.forms.is_empty()).collect();
-        ps.sort_by_key(|c| c.prio);
-        let keepers: Vec<&ClauseTxt> = ps.iter().copied().filter(|c| c.keep).collect();
-        let others: Vec<&ClauseTxt> = ps.iter().copied().filter(|c| !c.keep).collect();
-        let mut choice: Option<Vec<(&ClauseTxt, bool)>> = None;
-        'sets: for n in (0..=others.len()).rev() {
-            let mut kept: Vec<&ClauseTxt> = keepers
-                .iter()
-                .chain(others.iter().take(n))
-                .copied()
-                .collect();
-            kept.sort_by_key(|c| c.prio);
-            let mut arr: Vec<(&ClauseTxt, bool)> = kept.iter().map(|&c| (c, false)).collect();
-            if width(&arr) <= col.w + 0.01 {
-                choice = Some(arr);
-                break;
-            }
-            for i in (0..arr.len()).rev() {
-                if let Some(slot) = arr.get_mut(i) {
-                    slot.1 = true;
-                }
-                if width(&arr) <= col.w + 0.01 {
-                    choice = Some(arr);
-                    break 'sets;
-                }
-            }
-        }
-        let choice = choice.unwrap_or_else(|| {
-            let base = if keepers.is_empty() {
-                ps.iter().take(1).copied().collect()
-            } else {
-                keepers.clone()
-            };
-            base.into_iter().map(|c| (c, true)).collect()
-        });
+        let choice = choose_details(clauses, col.w + 0.01, width);
         let room = Some((col.x, col.end()));
         let words2 = self.inks.words2;
         let mut x = col.x;

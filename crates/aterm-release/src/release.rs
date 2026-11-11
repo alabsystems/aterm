@@ -1328,14 +1328,20 @@ pub trait Branches: Sync {
     /// content-checked test-executable index. Backends without a separate fixture consumer need
     /// no state of their own.
     fn expect_tree_index(&self) {}
-    /// Prepare the tree's admission signal before any branch starts. The build waits for
-    /// lint to reserve memory before launching either slice.
-    fn expect_tree_lint(&self);
     /// Return once both release slices hold memory, their successful all-Fresh bundle has already
     /// completed, or `ended` says the build ended.
-    /// With no pending lint, the measured critical path gets memory before the
-    /// tree's moldable compile.
+    /// The measured critical path gets memory before the tree's moldable compile.
     fn build_admitted(&self, ended: &dyn Fn() -> bool);
+    /// Return once the pooled release tree holds or queues its exact early unit driver or cold
+    /// lint claim, or `ended` says the build or tree ended. False means an exact production label
+    /// carried a malformed envelope, so the graph must stop the tree before releasing its CPU
+    /// barrier. Backends without a shared compiler pool have no admission barrier.
+    fn tree_admitted(&self, _ended: &dyn Fn() -> bool) -> bool {
+        true
+    }
+    /// Release the compiler-token barrier held while the build and tree reserve memory. This is
+    /// idempotent, so every non-coordinated and early-ending graph path may call it.
+    fn release_admission_barrier(&self) {}
     /// The export check of R: `pub stage` to the staging tier (`Remote`) or without its push
     /// (`Local`); its push begun is [`BranchStop::push`].
     fn export(
@@ -1645,9 +1651,9 @@ pub trait Backend {
     fn origin_tail(&mut self) -> Option<u64>;
     fn reserve(&mut self, c: &Candidate) -> Result<Reservation, Refusal>;
     /// Before the qualify graph starts: admit its one core claim and make the pool every branch
-    /// draws from, holding the export's share of it when `export` runs, and ready the export's
-    /// engine and scanner tools; its words.
-    fn qualify_begin(&mut self, prover: &Prover, export: bool) -> Result<String, Refusal>;
+    /// draws from, partitioned only among the branches this plan runs, and ready the export's
+    /// engine and scanner tools when it runs; its words.
+    fn qualify_begin(&mut self, prover: &Prover, branches: &[Branch]) -> Result<String, Refusal>;
     /// The qualify graph ended: its pool and its core claim go.
     fn qualify_end(&mut self);
     /// What the qualify graph's branches run on.
@@ -4934,8 +4940,9 @@ impl Run<'_> {
         ))
     }
 
-    /// `--fix`'s candidate: the head of this clone's unfinished line, neither published nor
-    /// claimed, whose tree knows lines ([`LINE_SOURCE`]), with each commit `--fix` names
+    /// `--fix`'s candidate: the head of this clone's unfinished line, adopting the fleet's
+    /// line when the journal is absent. It is neither published nor claimed, and its tree
+    /// knows lines ([`LINE_SOURCE`]), with each commit `--fix` names
     /// admitted ([`Backend::fix_of`]) for preparation to carry before judgment. One a hop carries already is dropped;
     /// when every one is, the run resumes the line as it is.
     fn fix_candidate(
@@ -4943,7 +4950,23 @@ impl Run<'_> {
         unfinished: Option<&Journal>,
         selecting: bool,
     ) -> Result<Candidate, Halt> {
-        let Some(j) = unfinished else {
+        let mut journal = unfinished.cloned();
+        if journal.is_none() {
+            let mut candidate = Candidate {
+                commit: self.tip.clone(),
+                version: self.b.version_at(&self.tip).unwrap_or_default(),
+                why: "origin/main's tip".into(),
+                bump_from: None,
+                carry: Vec::new(),
+            };
+            crate::line_claim::follow(self.b, &mut candidate, &mut self.journal)
+                .map_err(|refusal| self.halted(refusal))?;
+            journal = self.journal.clone().filter(|journal| !journal.finished());
+            if journal.is_some() {
+                self.fleet_selection(&candidate);
+            }
+        }
+        let Some(j) = journal.as_ref() else {
             return Err(self.halted(Refusal::new(
                 "--fix carries landed fixes onto this clone's unpublished line, and this clone \
                  has none (no release journal, or a finished one)",
@@ -5412,6 +5435,8 @@ impl Run<'_> {
     }
 
     fn refresh(&mut self) {
+        let _timing =
+            crate::cut_timing::Timer::start(&self.b.log_path(self.cur), "release facts refresh");
         let Some(c) = self.cand.clone() else {
             return;
         };
@@ -5892,14 +5917,15 @@ impl Run<'_> {
         reserved: Option<&Reservation>,
         plan: &Plan,
     ) -> Result<Graph, Halt> {
-        let pool = match self.b.qualify_begin(p, plan.export.is_some()) {
+        let branches = plan.branches();
+        let pool = match self.b.qualify_begin(p, &branches) {
             Ok(pool) => pool,
             Err(refusal) => return Err(self.halt(refusal)),
         };
         self.say(&format!("        pool: {pool}"));
         let graph = {
             let br = self.b.branches();
-            for branch in plan.branches() {
+            for branch in branches {
                 br.say(&format!(
                     "        {}: {}; log: {}",
                     branch.name(),
@@ -7692,11 +7718,21 @@ fn branch_event(br: &dyn Branches, branch: Branch, phase: &str, at: u64, seconds
     br.say(&format!("release-event: {event}"));
 }
 
-/// Run step 4's graph on `br`: the build branch first, then the tree and export. When
-/// lint runs, the build waits for its resource admission before launching slices; otherwise
-/// the tree follows slice admission ([`Branches::build_admitted`]). Each branch has its
-/// own thread; the ledger decides what runs together, and every branch draws from the
-/// one pool [`Backend::qualify_begin`] made. A branch's red stops the other branches at once,
+fn apply_tree_admission(admitted: bool, stop: &BranchStop) {
+    if !admitted {
+        stop.fire();
+    }
+}
+
+/// Run step 4's graph on `br`: the build first; the tree once the slices' future compiler memory
+/// is reserved ([`Branches::build_admitted`]); and, where both compile, resolve the initial CPU
+/// barrier once the tree's exact unit-driver or cold claim is held or queued
+/// ([`Branches::tree_admitted`], [`Branches::release_admission_barrier`]). A held request restores
+/// the build-first all-but-one/one shares; a queued request transfers the whole non-export
+/// allocation to build until it drains; an exact malformed shape transfers that allocation and
+/// stops tree before releasing the barrier. Then export starts. The ledger's memory
+/// claims decide what runs together inside the bounded allocation
+/// [`Backend::qualify_begin`] made. A branch's red stops the other branches at once,
 /// except a proven test-execution red retains an already running build for the next hop
 /// ([`BranchStop::fire`]: an export whose staging push began finishes it, and a branch not
 /// started never starts), and says so in a branch line with its rerun; a COULD NOT RUN stops
@@ -7718,26 +7754,30 @@ fn run_graph(
     let red = AtomicBool::new(false);
     let mut graph = Graph::default();
     let t0 = br.now();
+    let build_admission = plan
+        .build
+        .zip(reserved)
+        .is_some_and(|(work, _)| work.bundle);
+    let coordinated_admission = build_admission
+        && plan
+            .tree
+            .as_ref()
+            .is_some_and(|run| run.checks.iter().any(|check| check == "lint"));
     std::thread::scope(|s| {
         let (tx, rx) = std::sync::mpsc::channel::<Note>();
         let (settled, stops) = (&settled, &stops);
         let starter = tx.clone();
         s.spawn(move || {
             let stop_of = |b: Branch| &stops[b as usize];
+            if !build_admission {
+                br.release_admission_barrier();
+            }
             if plan
                 .tree
                 .as_ref()
                 .is_some_and(|run| run.checks.iter().any(|check| check == "test"))
             {
                 br.expect_tree_index();
-            }
-            let lint_first = plan.build.is_some_and(|work| work.bundle)
-                && plan
-                    .tree
-                    .as_ref()
-                    .is_some_and(|run| run.checks.iter().any(|c| c == "lint"));
-            if lint_first {
-                br.expect_tree_lint();
             }
             if let (Some(work), Some(reserved)) = (plan.build, reserved) {
                 start_branch(
@@ -7748,8 +7788,11 @@ fn run_graph(
                     stop_of(Branch::Build),
                     move |stop| Note::Built(br.build(c, reserved, p, work, stop)),
                 );
-                if work.bundle && !lint_first {
+                if work.bundle {
                     br.build_admitted(&|| settled.load(Ordering::SeqCst));
+                    if !coordinated_admission {
+                        br.release_admission_barrier();
+                    }
                 }
             }
             if let Some(run) = &plan.tree {
@@ -7761,6 +7804,13 @@ fn run_graph(
                     stop_of(Branch::Tree),
                     move |stop| Note::Tree(br.verify(c, p, run, None, stop)),
                 );
+            }
+            if coordinated_admission {
+                apply_tree_admission(
+                    br.tree_admitted(&|| settled.load(Ordering::SeqCst)),
+                    stop_of(Branch::Tree),
+                );
+                br.release_admission_barrier();
             }
             if let Some(target) = plan.export {
                 start_branch(
@@ -7861,7 +7911,7 @@ fn run_graph(
                         }
                     ));
                 }
-                if branch == Branch::Build || ended == Ended::Red {
+                if matches!(branch, Branch::Build | Branch::Tree) || ended == Ended::Red {
                     settled.store(true, Ordering::SeqCst);
                 }
             });
@@ -8282,9 +8332,24 @@ fn newer(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_malformed_tree_admission_stops_that_branch_before_barrier_release() {
+        let valid = BranchStop::default();
+        apply_tree_admission(true, &valid);
+        assert!(!valid.fired());
+
+        let malformed = BranchStop::default();
+        apply_tree_admission(false, &malformed);
+        assert!(
+            malformed.fired(),
+            "NEGATIVE CONTROL: an invalid early memory shape cannot later receive reminted tokens"
+        );
+    }
+
     struct AllFreshHandoff {
         expected: std::sync::atomic::AtomicBool,
         admission_waiting: std::sync::atomic::AtomicBool,
+        admission_barrier_held: std::sync::atomic::AtomicBool,
         bundle_finished: std::sync::atomic::AtomicBool,
         tree_started: std::sync::atomic::AtomicBool,
         clock: std::sync::atomic::AtomicU64,
@@ -8295,6 +8360,7 @@ mod tests {
             Self {
                 expected: false.into(),
                 admission_waiting: false.into(),
+                admission_barrier_held: true.into(),
                 bundle_finished: false.into(),
                 tree_started: false.into(),
                 clock: 1.into(),
@@ -8314,9 +8380,6 @@ mod tests {
     }
 
     impl Branches for AllFreshHandoff {
-        fn expect_tree_lint(&self) {
-            unreachable!("this fixture runs only the test check");
-        }
         fn say(&self, _line: &str) {}
 
         fn now(&self) -> u64 {
@@ -8341,6 +8404,12 @@ mod tests {
                 self.expected.load(std::sync::atomic::Ordering::SeqCst),
                 "the graph declares the tree index before admitting an all-Fresh build"
             );
+            assert!(
+                self.admission_barrier_held
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "NEGATIVE CONTROL: a bundle keeps its initial CPU reservation until build \
+                 admission can transfer a serial escape to build"
+            );
             self.admission_waiting
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -8355,6 +8424,11 @@ mod tests {
                 );
                 aterm_uds::deadline::poll_yield();
             }
+        }
+
+        fn release_admission_barrier(&self) {
+            self.admission_barrier_held
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn export(
@@ -8401,6 +8475,13 @@ mod tests {
                         .bundle_finished
                         .load(std::sync::atomic::Ordering::SeqCst),
                 "the tree starts only after the all-Fresh bundle releases admission"
+            );
+            assert!(
+                !self
+                    .admission_barrier_held
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "a non-lint resume releases the initial CPU reservation after build admission \
+                 and before tree work"
             );
             self.tree_started
                 .store(true, std::sync::atomic::Ordering::SeqCst);

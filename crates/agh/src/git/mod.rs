@@ -22,7 +22,7 @@ pub use ancestry::{AncestryQuery, CommitRead, CommitReadInput};
 pub use control::{
     ControlRefChange, ControlRefTransaction, PUBLISHER_FENCE_REF, RELEASE_LEASE_REF,
 };
-pub use fetch::{FetchBatch, FetchRow};
+pub use fetch::{FETCH_ROWS_MAX, FetchBatch, FetchRow};
 pub use run::{GitOp, GitOut, GitRun, HelperCommand};
 
 /// One validation phase of an incremental native atomic ref admission.

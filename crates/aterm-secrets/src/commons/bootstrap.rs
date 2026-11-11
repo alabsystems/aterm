@@ -29,8 +29,10 @@ const CLAIM_LEN: usize = 4 + 32 + 16 + 16 + 32;
 const PIN_LEN: usize = 4 + 16 + 32 + 32;
 const MAX_DEVICE: usize = 4096;
 
-fn custody_digest(path: &Path) -> Result<[u8; 32]> {
-    fsx::private_digest(path, MAX_DEVICE, None)?
+/// The digest of the pinned custody file at `path`, its first `lstat` `glance`'s where the caller's
+/// check looks through one ([`fsx::private_digest`]).
+fn custody_digest(path: &Path, glance: Option<&fsx::Glance>) -> Result<[u8; 32]> {
+    fsx::private_digest(path, MAX_DEVICE, glance)?
         .ok_or_else(|| Error::new("Commons immutable custody is missing"))
 }
 
@@ -1484,7 +1486,7 @@ impl Bootstrap {
             dir.join("device.claim"),
         ]
         .into_iter()
-        .map(|path| custody_digest(&path).map(|digest| (path, digest)))
+        .map(|path| custody_digest(&path, None).map(|digest| (path, digest)))
         .collect::<Result<Vec<_>>>()?;
         if !must_exist && !preparing {
             // A crash during the first journal open can resume only with this
@@ -1539,7 +1541,7 @@ impl Bootstrap {
         if deadline.is_some() {
             Self::validate_snapshot(paths, snapshot)?;
             for (path, expected) in &device_custody {
-                if &custody_digest(path)? != expected {
+                if &custody_digest(path, None)? != expected {
                     return Err(Error::new(
                         "Commons device custody changed while acquiring control",
                     ));
@@ -1584,7 +1586,7 @@ impl Bootstrap {
             journal_dir.join("control.anchor"),
         ]
         .into_iter()
-        .map(|path| custody_digest(&path).map(|digest| (path, digest)))
+        .map(|path| custody_digest(&path, None).map(|digest| (path, digest)))
         .collect::<Result<_>>()?;
         Ok((
             Self {
@@ -1638,7 +1640,13 @@ impl Bootstrap {
 
     /// [`Self::revalidate_custody`], the vault observed through `look`, one look at this
     /// bootstrap's vault for checks that stand for one moment of it
-    /// ([`client::VaultLook::observe_commons`]); a look at another vault is not taken.
+    /// ([`client::VaultLook::observe_commons`]), and the digests of the pinned files taken through
+    /// its glance while it observes the lock at this vault ([`client::VaultLook::held_at`]): each
+    /// file as the look first saw it, whose digest a check kept while it stood so, and otherwise
+    /// as the file stands now. A look that observes nothing takes the digests on their own calls,
+    /// and a look at another vault is not taken. A look judges what it first saw, so this covers a
+    /// wait only where the look first looked at the files after it (a table session's admission
+    /// asks nothing through its look before its open's custody).
     ///
     /// # Errors
     /// As [`Self::revalidate_custody`].
@@ -1647,7 +1655,7 @@ impl Bootstrap {
             return self.revalidate_custody();
         }
         Self::validate_observation(&self.snapshot, look.observe_commons()?)?;
-        self.revalidate_immutable_custody()
+        self.immutable_custody_in(look.held_at(&self.paths).map(|(_, glance)| glance))
     }
 
     /// Whether an open of this bootstrap's vault ([`Self::cached_until`]) would give it back now,
@@ -1705,8 +1713,14 @@ impl Bootstrap {
     /// revalidated and exclusively held the exact vault observation. This does
     /// not acquire another state observation or grant any authority by itself.
     pub(crate) fn revalidate_immutable_custody(&self) -> Result<()> {
+        self.immutable_custody_in(None)
+    }
+
+    /// [`Self::revalidate_immutable_custody`], each file's first `lstat` `glance`'s where the
+    /// caller's check looks through one.
+    fn immutable_custody_in(&self, glance: Option<&fsx::Glance>) -> Result<()> {
         for (path, expected) in &self.immutable {
-            if &custody_digest(path)? != expected {
+            if &custody_digest(path, glance)? != expected {
                 return Err(Error::new(
                     "Commons immutable custody changed while acquiring a lock",
                 ));
@@ -1727,6 +1741,27 @@ impl Bootstrap {
         let read = crate::client::hold_commons_source(&self.paths)?;
         self.revalidate_custody()?;
         Ok(read)
+    }
+
+    /// [`Self::local_source_read`] for a check made through `look`: where the look observes the
+    /// lock at this vault ([`client::VaultLook::held_at`]), it already holds this vault against
+    /// writers for as long as it lives, so this holds nothing more and gives `None`, its custody
+    /// judged through the look ([`Self::revalidate_custody_in`]); a look that observes nothing, or
+    /// one at another vault, gives a fresh source read. A caller keeps the look for as long as it
+    /// would keep the read: `aterm-db`'s table-repair read batch, whose store opens and store read
+    /// batches stand on the batch's own source read of the vault, as its admission did.
+    ///
+    /// # Errors
+    /// As [`Self::local_source_read`], or [`Self::revalidate_custody_in`] where the look holds the
+    /// vault.
+    pub fn local_source_read_in(
+        &self,
+        look: &client::VaultLook<'_>,
+    ) -> Result<Option<crate::client::CommonsSourceRead>> {
+        if look.held_at(&self.paths).is_some() {
+            return self.revalidate_custody_in(look).map(|()| None);
+        }
+        self.local_source_read().map(Some)
     }
 
     pub fn trust(&self) -> Trust {

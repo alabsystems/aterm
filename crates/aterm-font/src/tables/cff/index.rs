@@ -222,18 +222,5 @@ impl FromData for OffsetSize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_offset_size() {
-        assert_eq!(core::mem::size_of::<OffsetSize>(), 1);
-
-        assert_eq!(Stream::new(&[0x00]).read::<OffsetSize>(), None);
-        assert_eq!(
-            Stream::new(&[0x01]).read::<OffsetSize>(),
-            Some(OffsetSize::Size1)
-        );
-        assert_eq!(Stream::new(&[0x05]).read::<OffsetSize>(), None);
-    }
-}
+#[path = "index_tests.rs"]
+mod tests;

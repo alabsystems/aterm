@@ -98,7 +98,7 @@ impl<'a> ReadCtx<'a> {
     }
 }
 
-/// Nanoseconds as milliseconds to two places: the unit of every `_ms` field but the two thresholds.
+/// Nanoseconds as milliseconds to two places.
 #[must_use]
 pub(crate) fn ms(ns: u64) -> Decimal {
     Decimal::new(ns as f64 / 1e6, 2)
@@ -108,6 +108,12 @@ pub(crate) fn ms(ns: u64) -> Decimal {
 #[must_use]
 pub(crate) fn ms3(ns: u64) -> Decimal {
     Decimal::new(ns as f64 / 1e6, 3)
+}
+
+/// Nanoseconds as milliseconds without discarding nanosecond resolution.
+#[must_use]
+pub(crate) fn ms6(ns: u64) -> Decimal {
+    Decimal::new(ns as f64 / 1e6, 6)
 }
 
 /// Nanoseconds as milliseconds to one place: `slow_threshold_ms` and `long_turn_threshold_ms`.

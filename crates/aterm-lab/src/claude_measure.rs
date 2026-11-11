@@ -270,6 +270,7 @@ pub(crate) const CLAUDE: Family = Family {
     verb: "claude-measure",
     source: "transcript",
     read: TRANSCRIPT_KEYS,
+    read_scope: |_, _| true,
     inert,
     words: &[],
     holds: is_reduction,

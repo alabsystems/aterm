@@ -22,11 +22,5 @@ pub fn mailbox_password(password: &str, salt: &[u8]) -> Result<crate::Secret, St
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn proton_mailbox_key_password_vector() {
-        let salt = aterm_codec::base64::decode("imK9IHsRcA2Zsv+yROZgbw==").unwrap();
-        let password = super::mailbox_password("password", &salt).unwrap();
-        assert_eq!(password.expose(), "Q.Gd9rSsqE0xQ8Qcf0Q9ckInb4hIzOu");
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

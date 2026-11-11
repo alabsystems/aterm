@@ -130,18 +130,5 @@ impl<const LIMBS: usize> BitXorAssign<&Wrapping<Uint<LIMBS>>> for Wrapping<Uint<
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::U128;
-
-    #[test]
-    fn checked_xor_ok() {
-        let result = U128::ZERO.checked_xor(&U128::ONE);
-        assert_eq!(result.unwrap(), U128::ONE);
-    }
-
-    #[test]
-    fn overlapping_xor_ok() {
-        let result = U128::ZERO.wrapping_xor(&U128::ONE);
-        assert_eq!(result, U128::ONE);
-    }
-}
+#[path = "bit_xor_tests.rs"]
+mod tests;

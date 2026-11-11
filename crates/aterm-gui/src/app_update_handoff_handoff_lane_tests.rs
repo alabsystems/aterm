@@ -219,6 +219,30 @@ fn a_launched_successor_is_handed_the_launchers_control_directory() {
     );
 }
 
+#[test]
+fn a_native_handoff_keeps_the_same_config_and_private_state_roots() {
+    use std::ffi::{OsStr, OsString};
+    let roots = [
+        ("XDG_CONFIG_HOME", "/private/config"),
+        ("XDG_CACHE_HOME", "/private/cache"),
+        ("XDG_DATA_HOME", "/private/data"),
+        ("XDG_STATE_HOME", "/private/state"),
+        ("ATERM_STATE_HOME", "/private/aterm"),
+        ("TMPDIR", "/private/tmp"),
+        ("SHELL", "/bin/zsh"),
+    ];
+    let command = std::process::Command::new("/bin/echo");
+    let inherited = launch_environment_over(&command, |key| {
+        roots
+            .iter()
+            .find_map(|(name, value)| (key == OsStr::new(name)).then(|| OsString::from(value)))
+    })
+    .unwrap();
+    for (key, value) in roots {
+        assert!(inherited.contains(&(key.into(), value.into())));
+    }
+}
+
 /// The bundle root of `<bundle>.app/Contents/MacOS/<bin>` is `<bundle>.app`, and the `.app` suffix is checked: a dev binary also sits three levels below something.
 #[test]
 fn only_a_dot_app_three_levels_up_is_a_bundle_root() {

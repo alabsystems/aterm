@@ -294,6 +294,36 @@ fn arm_incoming_proof(
 }
 
 #[test]
+fn a_failed_restore_window_cannot_prove_a_complete_handoff() {
+    let mut app = App::headless_for_test();
+    let failed = app.insert_logical_window(stub_session(app.next_session_id), 24, 80);
+    let (mut proof_read, _commit_write, gate) =
+        arm_incoming_proof(&mut app, "failed-restore-window");
+    let preparation = crate::control::ControlPreparation::default();
+    preparation.finish(true);
+    app.handoff_control_preparation = Some(preparation);
+
+    app.retire_unattached_restored_window(failed);
+    assert!(
+        !app.windows.contains_key(&failed),
+        "the failed window was removed"
+    );
+    app.maybe_signal_handoff_ready();
+
+    use std::os::fd::AsRawFd as _;
+    aterm_pty::set_nonblocking(proof_read.as_raw_fd(), true).expect("nonblocking proof read");
+    let observed = std::io::Read::read(&mut proof_read, &mut [0u8; 1]);
+    assert!(
+        matches!(&observed, Ok(0))
+            || observed
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
+        "an incomplete restore emitted proof bytes: {observed:?}"
+    );
+    assert!(!gate.is_released(), "the parent still owns the readers");
+}
+
+#[test]
 fn readiness_proof_fires_only_when_drained() {
     let mut app = App::headless_for_test();
     let nonce = "readiness-proof-test";

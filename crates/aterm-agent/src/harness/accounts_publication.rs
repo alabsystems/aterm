@@ -156,7 +156,7 @@ impl<'a> PreparedPublication<'a> {
             && let Some(plan) = &self.receipt.plan
             && let Some(text) = plan.roster.after.as_deref()
         {
-            super::super::super::upgrade_models::write_atomic_mode(path, text, plan.roster_mode)
+            super::super::super::atomic_write::write_atomic_mode(path, text, plan.roster_mode)
                 .map_err(|why| why.to_string())?;
         }
         if !self.changed {

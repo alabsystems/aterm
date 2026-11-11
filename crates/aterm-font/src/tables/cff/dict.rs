@@ -257,34 +257,5 @@ pub fn skip_number(b0: u8, s: &mut Stream) -> Option<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_dict_number() {
-        assert_eq!(
-            parse_number(0xFA, &mut Stream::new(&[0x7C])).unwrap(),
-            1000.0
-        );
-        assert_eq!(
-            parse_number(0xFE, &mut Stream::new(&[0x7C])).unwrap(),
-            -1000.0
-        );
-        assert_eq!(
-            parse_number(0x1C, &mut Stream::new(&[0x27, 0x10])).unwrap(),
-            10000.0
-        );
-        assert_eq!(
-            parse_number(0x1C, &mut Stream::new(&[0xD8, 0xF0])).unwrap(),
-            -10000.0
-        );
-        assert_eq!(
-            parse_number(0x1D, &mut Stream::new(&[0x00, 0x01, 0x86, 0xA0])).unwrap(),
-            100000.0
-        );
-        assert_eq!(
-            parse_number(0x1D, &mut Stream::new(&[0xFF, 0xFE, 0x79, 0x60])).unwrap(),
-            -100000.0
-        );
-    }
-}
+#[path = "dict_tests.rs"]
+mod tests;

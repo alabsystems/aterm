@@ -13,6 +13,14 @@ use crate::{
 };
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 
+mod retained;
+pub(crate) use retained::with_retained_store;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DROP_PROJECTION_CUSTODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Recognize only a canonical value-free join, independently of the
 /// application's value or authority schema.
 pub(crate) fn decode_merge(payload: &[u8]) -> Option<Command> {

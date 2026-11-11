@@ -54,7 +54,18 @@ pub struct Formula {
     pub keg_only_reason: Option<(String, String)>,
     /// The `service` block, when the formula defines one with a run
     /// command (display data for caveats; services stay delegated).
-    pub service: Option<ServiceInfo>,
+    pub service: Option<Box<ServiceInfo>>,
+    /// The `livecheck` block parsed as data from a tap file (the
+    /// API JSON never carries it; `brew livecheck` reads the same
+    /// tap files). `None` = no block or not data-parseable.
+    pub livecheck: Option<Box<LivecheckSpec>>,
+    /// The formula opts out of autobump (`no_autobump!`, or the
+    /// API object's `autobump: false`). Brew's default is
+    /// autobumped, hence the inverted, default-false field.
+    pub no_autobump: bool,
+    /// The API object's `skip_livecheck` (its `livecheck` block
+    /// declares `skip`); tap records derive it from the block.
+    pub skip_livecheck: bool,
     pub deprecate: bool,
     pub disable: bool,
     pub caveats: String,
@@ -80,6 +91,59 @@ pub struct ServiceInfo {
     /// `environment_variables` as (key, value) pairs, sorted by key
     /// (the JSON map abrew reads is alphabetical).
     pub environment_variables: Vec<(String, String)>,
+    /// An explicit macOS service name (`name macos: ...`),
+    /// overriding the default `sh.brew.<name>` label.
+    pub name: Option<String>,
+    /// `working_dir`, with `$HOMEBREW_PREFIX` placeholders.
+    pub working_dir: Option<String>,
+    /// `root_dir`, with `$HOMEBREW_PREFIX` placeholders.
+    pub root_dir: Option<String>,
+    /// `log_path`, with `$HOMEBREW_PREFIX` placeholders.
+    pub log_path: Option<String>,
+    /// `error_log_path`, with `$HOMEBREW_PREFIX` placeholders.
+    pub error_log_path: Option<String>,
+    /// `interval` seconds.
+    pub interval: Option<i64>,
+    /// `cron` schedule text.
+    pub cron: Option<String>,
+}
+
+/// A `livecheck` block reduced to data (see
+/// `tap::parse_livecheck_block` for the accepted grammar; the
+/// full brew DSL also allows a strategy block of arbitrary
+/// Ruby, recorded here only as `strategy_block`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LivecheckSpec {
+    /// The `url` argument: a `:symbol` (stored without the
+    /// colon) or a literal string. Extra url options
+    /// (`using: :post`, headers, …) set `url_options`.
+    pub url: Option<LivecheckUrl>,
+    pub url_options: bool,
+    /// The regex source verbatim (delimiters stripped) and the
+    /// option letters that followed it (e.g. `i`).
+    pub regex: Option<String>,
+    pub regex_flags: String,
+    /// The `strategy :symbol`, stored without the colon.
+    pub strategy: Option<String>,
+    /// The strategy carries a Ruby block (never data).
+    pub strategy_block: bool,
+    /// `skip` was declared; the string is its optional message.
+    pub skip: Option<String>,
+    /// `throttle <versions>` / `throttle days: <days>`.
+    pub throttle: Option<u64>,
+    pub throttle_days: Option<u64>,
+    /// `formula "name"` / `cask "token"` indirection (`:parent`
+    /// marks a resource's reference to its owning formula).
+    pub formula_ref: Option<String>,
+    pub cask_ref: Option<String>,
+}
+
+/// A livecheck `url` argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivecheckUrl {
+    /// `:stable`, `:homepage`, `:head`, `:url`, … (no colon).
+    Symbol(String),
+    Literal(String),
 }
 
 /// Parse the API `service` object; a service without a run command
@@ -112,6 +176,37 @@ fn parse_service(v: Option<&Value>) -> Option<ServiceInfo> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         environment_variables,
+        name: match v.get("name") {
+            Some(Value::String(one)) => Some(one.clone()),
+            Some(other) => other
+                .get("macos")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            None => None,
+        }
+        .filter(|n| !n.is_empty()),
+        working_dir: v
+            .get("working_dir")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        root_dir: v
+            .get("root_dir")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        log_path: v
+            .get("log_path")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        error_log_path: v
+            .get("error_log_path")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        interval: v.get("interval").and_then(Value::as_i64),
+        cron: v
+            .get("cron")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|c| !c.trim().is_empty()),
     })
 }
 
@@ -481,7 +576,13 @@ impl Formula {
                     .unwrap_or_default();
                 Some((reason.to_string(), explanation.to_string()))
             }),
-            service: parse_service(v.get("service")),
+            service: parse_service(v.get("service")).map(Box::new),
+            livecheck: None,
+            no_autobump: !v.get("autobump").and_then(Value::as_bool).unwrap_or(true),
+            skip_livecheck: v
+                .get("skip_livecheck")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             deprecate: v
                 .get("deprecated")
                 .and_then(Value::as_bool)
@@ -671,6 +772,13 @@ pub struct Cask {
     /// Qualified `user/repo/token` for tap-loaded records
     /// (install displays); empty for API records.
     pub full_name: String,
+    /// The `livecheck` block parsed as data from a tap file
+    /// (see [`Formula::livecheck`]).
+    pub livecheck: Option<Box<LivecheckSpec>>,
+    /// The cask opts out of autobump (see [`Formula::no_autobump`]).
+    pub no_autobump: bool,
+    /// See [`Formula::skip_livecheck`].
+    pub skip_livecheck: bool,
 }
 
 /// One cask `variations` entry.
@@ -1430,6 +1538,12 @@ impl Cask {
             old_tokens: str_list(v.get("old_tokens")),
             source_url: None,
             full_name: String::new(),
+            livecheck: None,
+            no_autobump: !v.get("autobump").and_then(Value::as_bool).unwrap_or(true),
+            skip_livecheck: v
+                .get("skip_livecheck")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 }

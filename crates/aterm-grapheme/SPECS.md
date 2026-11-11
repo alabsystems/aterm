@@ -3,12 +3,6 @@
 
 # aterm-grapheme: spec recovery from its 46 unit tests
 
-> Status 2026-10-28: this is the crate's migration worklist across its 29 specs and 46 live
-> `#[test]` fns (after the tests-and-gates audit deleted 93 redundant/non-spec tests and added
-> `P1-script-and-category-tables`, `H1-liang-hyphenation` and `L1-prose-and-code-line-breaks`
-> with their 14 tests). Each spec below is proved through Trust/Clean, then the tests it subsumes
-> are deleted.
-
 Source: `crates/aterm-grapheme` (read only). Every live `#[test]`
 (src/{grapheme_iter.rs 6, hyphenate.rs 2, line_break.rs 8, props.rs 4, tests.rs 14, word.rs 7},
 tests/{emoji_data.rs 2, uax29_conformance.rs 3} = 46) and the code they reach (`width.rs`,
@@ -18,7 +12,7 @@ tests/{emoji_data.rs 2, uax29_conformance.rs 3} = 46) and the code they reach (`
 Result: **29 specs**, covering **46 tests**. **0 remaining non-spec tests** (§4).
 
 Gap numbers in §1 are the rows of the gap table in
-the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 ## 0. Notation used in the statements
 
@@ -50,7 +44,7 @@ the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15
 
 `subsumes` names the primary tests (the rest are in §2), `difficulty` the Rust features the
 proof must handle, and `blocking_gaps` rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -84,43 +78,6 @@ P1-script-and-category-tables	table-property	props::{Script, GeneralCategory, sc
 H1-liang-hyphenation	contract	hyphenate::{hyphen_points, narrow_hyphen_points, syllable_points, syllable_points_leaving, letter_run_points, patterns}	hyphen_points(w) = [] whenever token_kind(w) ≠ TokenKind::Word; otherwise across each maximal alphabetic run of w (ASCII letters, length ≥ LEFT_MIN + RIGHT_MIN = 5), yields the byte offsets in LEFT_MIN ..= len − RIGHT_MIN from hyph-en-us's exception list if lower(run) is listed, else the odd inter-letter maximum levels from Liang's pattern table over "." ++ lower(run) ++ ".". narrow_hyphen_points uses NARROW_RIGHT_MIN = 2.	hyphenate::words_break_at_their_syllables, hyphenate::identifiers_take_no_hyphen	MEDIUM-HARD: OnceLock<Patterns>, HashMap lookups, nested slice loops over hyph-en-us.tex	0,1,3,5,7,13
 L1-prose-and-code-line-breaks	contract	line_break::{BreakKind, LineBreak, Piece, TokenKind, line_breaks, word_breaks, pieces, break_inside, break_into_line, token_kind, never_starts_a_line, is_break_space}	line_breaks(t) yields strictly ascending LineBreak{at, kind} with 0 < at < |t| on grapheme boundaries: Space after breaking whitespace (excluding glue U+00A0/U+2007/U+202F and tokens satisfying never_starts_a_line), Ideographic between CJK clusters respecting opening/closing kinsoku, and Joint after prose hyphens/slashes or before/after identifier path/URL joints. word_breaks(t) retains Space | Ideographic. pieces(t, keep) splits at kept breaks into non-empty trimmed Piece{text, at, spaced} slices. break_inside and break_into_line split overwide prose words along syllable tiers (marked) and identifiers along joint/extension/number/syllable tiers (unmarked), avoiding single-grapheme orphans when wider cuts exist.	line_break::latin_breaks_at_spaces_and_inside_prose_words, line_break::a_path_breaks_before_its_slashes_and_an_identifier_nowhere_else, line_break::a_piece_wider_than_its_line_breaks_where_a_typesetter_would, line_break::a_name_breaks_after_its_hyphens_and_keeps_its_extension, line_break::a_narrow_measure_keeps_a_word_to_its_syllables, line_break::cjk_breaks_between_characters_with_kinsoku, line_break::pieces_are_what_a_wrap_lays_down, line_break::word_breaks_are_spaces_and_cjk	HARD: grapheme_indices state machine, token classification, dyn Fn(&str)->bool measure callbacks, multi-tier fallback search	0,1,2,3,4,5,7,11,13
 ```
-
-### Distribution by kind (29)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 9 | S9, S14, S20, S21, W2, W3, W4, H1, L1 |
-| equivalence | 8 | S2, S3, S6, S8, S10, S11, S12, S19 |
-| table-property | 6 | S4, S5, S13, S15, S16, P1 |
-| refinement | 2 | S1, S17 |
-| invariant | 2 | S18, W1 |
-| no-panic/bounds | 1 | S7 |
-| other | 1 | W5 (cost bound) |
-
-Seven specs (S7, S8, S14, S16, S18, S20, W1) retire no test as primary. They are the lemmas the
-others are built on, and are kept because the tests sample their consequences.
-
-### Gap histogram (specs blocked by each audit §7 gap)
-
-| gap | specs |
-|---|---|
-| 0 (seal publishes no Clean row) | 29 |
-| 1 (non-scalar carriers) | 29 |
-| 2 (`&self`/`&mut self` views) | 15 |
-| 3 (E6 body widening) | 22 |
-| 4 (callee-ensures composition) | 5 |
-| 5 (quantified clauses) | 13 |
-| 7 (loops) | 20 |
-| 8 (pointer provenance model) | 1 |
-| 10 (model→code refinement surface) | 1 |
-| 11 (generics) | 7 |
-| 12 (cross-crate citation) | 2 |
-| 13 (closures, higher-order) | 20 |
-| 14 (Clean elaborator coverage) | 1 |
-| 15 (test→spec tooling; ghost cost) | 1 |
-
-No spec is blocked by gap 0 alone: every one needs at least `char`/`&str` as a carrier (gap 1).
-The cheapest set is gaps {0,1}: S16; then {0,1,3}: S6, S7.
 
 ## 2. Test → spec map (TSV)
 
@@ -205,22 +162,3 @@ None: all 46 live `#[test]` functions map to one of the 29 specs in §1.
 4. **A test seam stands in for a cost spec.** W5's test reads the `#[cfg(test)]` `ROLE_LOOKUPS`
    thread_local. The spec needs a ghost counter, which no gap row names (closest: 15); the seam
    goes once W5 is proved.
-
-## 6. Proof order
-
-Every spec needs `char`/`&str` carriers (gap 1) besides gap 0.
-
-1. **S16** (gaps 0, 1): range matches on `char`, the first `char`-carrier probe.
-2. **S7**, the bounds lemma for every width spec, then **S6** (gaps 0, 1, 3).
-3. **S5, S13, S15, S4, P1**: table equalities decidable by evaluation over every scalar once tables
-   are carriers. S13, S15 and P1 have their oracles; S5 and S4 wait on §5.3. **S14** is the shared
-   lemma for S13 and S15.
-4. **S8**, then **S9** (case analysis over S5, S6, S13 and S16 plus a `chars()` walk), then
-   **S10** (cross-crate `TextShapingConfig`, gap 12).
-5. **S2**, **S3**, then **S1**, the hardest pure spec, which fixes the sample values of S11, S12,
-   S20 and S21; then **S11** and **S12**.
-6. **S18**, **S20**, **S21**; **S19** after S9 and S17's local step cases; **S17** last, as a
-   cross-crate refinement against aterm-core's `handler_write` (gaps 10, 12).
-7. **W1 → W2 → W3 → W4** (generic closures, gap 11), then **W5** (ghost state).
-8. **H1** (Liang hyphenation patterns and identifier exclusion), then **L1** (prose and code
-   line-break opportunities over S1 and H1, generic width callback, gap 11).

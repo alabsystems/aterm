@@ -39,49 +39,38 @@ impl ObservationRead {
     }
 }
 
-/// One native read batch, including the subjects whose private readers were not admitted.
-/// An attempted read that fails remains an ordinary Unknown row, never an admission skip.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ObservationBatch {
-    /// Conservative readings for every requested subject, including skipped Unknown rows.
-    pub rows: Vec<Observation>,
-    /// Private subjects skipped before their reader ran.
-    pub not_admitted: Vec<Subject>,
-}
-
-impl From<Vec<Observation>> for ObservationBatch {
-    fn from(rows: Vec<Observation>) -> Self {
-        Self {
-            rows,
-            not_admitted: Vec::new(),
-        }
-    }
-}
-
 /// Read `subjects` for `plan` without changing anything. `network` adds the
 /// GitHub repositories row (the network and the token file); without it that row
 /// is left out. A row that cannot be read comes back Unknown with the reason in
 /// its detail; nothing is guessed. `admission` controls reads that can raise privacy dialogs.
+/// A private reader that was not admitted contributes no observation. An attempted read that
+/// fails contributes an Unknown row, so a caller can retire earlier evidence only for a read
+/// that actually ran.
 pub fn observe_initial_setup(
     plan: &Plan,
     subjects: &[Subject],
     network: bool,
     admission: ObservationRead,
-) -> ObservationBatch {
+) -> Vec<Observation> {
     let unread = |subject: Subject, why: &str| Observation {
         detail: Some(why.to_owned()),
         ..Observation::unknown(subject)
     };
     if let Err(why) = ensure_person_scope() {
-        return subjects
-            .iter()
-            .map(|subject| unread(*subject, &why))
-            .collect::<Vec<_>>()
-            .into();
+        return requested_subjects(subjects, network)
+            .map(|subject| unread(subject, &why))
+            .collect();
     }
     read_batches(subjects, network, admission, |subjects, network| {
         observe_subjects(plan, subjects, network)
     })
+}
+
+fn requested_subjects(subjects: &[Subject], network: bool) -> impl Iterator<Item = Subject> + '_ {
+    subjects
+        .iter()
+        .copied()
+        .filter(move |subject| network || *subject != Subject::Setting(Setting::Repositories))
 }
 
 /// Dispatch an observation's native reads under their own admission.
@@ -90,15 +79,29 @@ fn read_batches(
     network: bool,
     admission: ObservationRead,
     mut read: impl FnMut(&[Subject], bool) -> Vec<Observation>,
-) -> ObservationBatch {
+) -> Vec<Observation> {
+    // Each batch has independent admission and native state. An unwind retires only its
+    // attempted readings; completed batches and skipped private readers keep their evidence.
+    let mut read = |subjects: &[Subject], network| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(subjects, network)))
+            .unwrap_or_else(|_| {
+                subjects
+                    .iter()
+                    .map(|subject| Observation {
+                        note: Some("This reading did not finish. Check again.".into()),
+                        ..Observation::unknown(*subject)
+                    })
+                    .collect()
+            })
+    };
     let mut safe = Vec::new();
     let mut workstation = Vec::new();
     let mut spotlight = Vec::new();
-    for subject in subjects {
+    for subject in requested_subjects(subjects, network) {
         match subject {
-            Subject::Setting(setting) if setting.is_workstation() => workstation.push(*subject),
-            Subject::Setting(Setting::Spotlight) => spotlight.push(*subject),
-            _ => safe.push(*subject),
+            Subject::Setting(setting) if setting.is_workstation() => workstation.push(subject),
+            Subject::Setting(Setting::Spotlight) => spotlight.push(subject),
+            _ => safe.push(subject),
         }
     }
     let mut out = if safe.is_empty() {
@@ -106,7 +109,6 @@ fn read_batches(
     } else {
         read(&safe, network)
     };
-    let mut not_admitted = Vec::new();
     // A native batch may wait on another process or the network. Its entry needs the page's
     // current visibility, not the one a queue or an earlier batch saw. FDA and Plan mode
     // establish no permission to query another app's preferences or protected project paths.
@@ -116,21 +118,11 @@ fn read_batches(
         }
         if admission.admits_private() {
             out.extend(read(&private, false));
-        } else {
-            not_admitted.extend(private.iter().copied());
-            out.extend(private.into_iter().map(|subject| Observation {
-                note: Some("Not read in the background".into()),
-                ..Observation::unknown(subject)
-            }));
         }
     }
     let order = Subject::all();
     out.sort_by_key(|row| order.iter().position(|subject| *subject == row.subject));
-    not_admitted.sort_by_key(|subject| order.iter().position(|row| row == subject));
-    ObservationBatch {
-        rows: out,
-        not_admitted,
-    }
+    out
 }
 
 /// [`observe_initial_setup`] past its scope check.
@@ -988,31 +980,22 @@ mod tests {
                 "private readers must not be invoked without admission"
             );
             for subject in &subjects {
-                let row = seen
-                    .rows
-                    .iter()
-                    .find(|row| row.subject == *subject)
-                    .unwrap();
+                let row = seen.iter().find(|row| row.subject == *subject);
                 let was_read = safe.contains(subject)
                     || (ws_read && workstation.contains(subject))
                     || (sp_read && spotlight.contains(subject));
                 assert_eq!(
-                    row.standing,
+                    row.map(|row| row.standing),
                     if was_read {
-                        Standing::InPlace
+                        Some(Standing::InPlace)
                     } else {
-                        Standing::Unknown
+                        None
                     }
                 );
-                assert_eq!(row.now.is_some(), was_read);
-                assert_eq!(seen.not_admitted.contains(subject), !was_read);
+                assert_eq!(row.is_some_and(|row| row.now.is_some()), was_read);
             }
             assert_eq!(
-                seen.rows
-                    .iter()
-                    .find(|row| row.subject == fda)
-                    .unwrap()
-                    .standing,
+                seen.iter().find(|row| row.subject == fda).unwrap().standing,
                 Standing::InPlace,
                 "a verified FDA row never admits the other-app readers"
             );
@@ -1024,28 +1007,94 @@ mod tests {
             ObservationRead::Ordinary { page_front: front },
             |_, _| panic!("a hidden private-only refresh invoked its native reader"),
         );
-        assert!(
-            seen.rows
-                .iter()
-                .all(|row| row.standing == Standing::Unknown && row.now.is_none())
-        );
-        assert_eq!(seen.not_admitted, workstation);
+        assert!(seen.is_empty(), "a skipped reader produces no observation");
         let attempted = read_batches(
             &workstation,
             false,
             ObservationRead::ExplicitCheck,
             |subjects, _| subjects.iter().copied().map(Observation::unknown).collect(),
         );
-        assert!(
-            attempted.not_admitted.is_empty(),
-            "failed attempted reads remain invalidating observations"
-        );
+        assert_eq!(attempted.len(), workstation.len());
         assert!(
             attempted
-                .rows
                 .iter()
-                .all(|row| row.standing == Standing::Unknown)
+                .all(|row| row.standing == Standing::Unknown),
+            "failed attempted reads remain invalidating observations"
         );
+    }
+
+    #[test]
+    fn an_unwound_batch_retires_only_its_attempted_rows_and_preserves_independent_readings() {
+        let safe = Subject::Access(Access::FullDiskAccess);
+        let workstation = Subject::Setting(Setting::Dock);
+        let spotlight = Subject::Setting(Setting::Spotlight);
+        let subjects = [safe, workstation, spotlight];
+        for private in [false, true] {
+            for failed in subjects {
+                let mut calls = Vec::new();
+                let rows = read_batches(
+                    &subjects,
+                    true,
+                    ObservationRead::Ordinary {
+                        page_front: if private { || true } else { || false },
+                    },
+                    |batch, _| {
+                        calls.extend_from_slice(batch);
+                        assert!(!batch.contains(&failed), "injected native unwind");
+                        batch
+                            .iter()
+                            .map(|subject| Observation {
+                                standing: Standing::InPlace,
+                                ..Observation::unknown(*subject)
+                            })
+                            .collect()
+                    },
+                );
+                let expected: Vec<_> = subjects
+                    .into_iter()
+                    .filter(|subject| private || *subject == safe)
+                    .collect();
+                assert_eq!(calls, expected, "each admitted native reader runs once");
+                assert_eq!(rows.len(), expected.len());
+                for subject in subjects {
+                    let row = rows.iter().find(|row| row.subject == subject);
+                    if !expected.contains(&subject) {
+                        assert!(row.is_none(), "an unattempted private read stays absent");
+                    } else {
+                        let row = row.unwrap();
+                        assert_eq!(
+                            row.standing,
+                            if subject == failed {
+                                Standing::Unknown
+                            } else {
+                                Standing::InPlace
+                            }
+                        );
+                        assert_eq!(row.note.is_some(), subject == failed);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_batch_unwind_produces_no_repository_observation() {
+        let access = Subject::Access(Access::FullDiskAccess);
+        let repositories = Subject::Setting(Setting::Repositories);
+        let mut called = Vec::new();
+        let rows = read_batches(
+            &[access, repositories],
+            false,
+            ObservationRead::ExplicitCheck,
+            |batch, _| {
+                called.extend_from_slice(batch);
+                panic!("injected native unwind");
+            },
+        );
+        assert_eq!(called, [access]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, access);
+        assert_eq!(rows[0].standing, Standing::Unknown);
     }
 
     #[test]

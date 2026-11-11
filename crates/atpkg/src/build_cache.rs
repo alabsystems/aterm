@@ -1016,9 +1016,9 @@ struct Sweep<'a, 'r> {
     fence: &'a fence::Fence<'a>,
     /// Additional authority checked at every deletion boundary for registered roots.
     permitted: &'a dyn Fn() -> bool,
-    /// The live build directories a walk found, each (its mirror folder, its leaf), pruned once
-    /// the walk took what costs nothing ([`Self::finish_prunes`]).
-    pruning: Vec<(PathBuf, PathBuf)>,
+    /// Live build directories, with a complete first inventory where the whole-cache judge
+    /// kept one. Pruned once the walk took what costs nothing ([`Self::finish_prunes`]).
+    pruning: Vec<(PathBuf, PathBuf, Option<Seen>)>,
     /// The record declined a prune. A goal met or a ledger refusing says the same of the next in
     /// this walk, which would only move its parts aside and back and date its clocks now.
     declined: bool,
@@ -1053,8 +1053,8 @@ impl Sweep<'_, '_> {
     /// Each live build directory's stale parts, after the walk: a pass that stops at a goal must
     /// not cost a live worktree a cold compile while a dead directory would have covered it.
     fn finish_prunes(&mut self) {
-        for (dir, leaf) in std::mem::take(&mut self.pruning) {
-            let _ = self.prune(&dir, &leaf);
+        for (dir, leaf, seen) in std::mem::take(&mut self.pruning) {
+            let _ = self.prune(&dir, &leaf, seen);
         }
     }
 
@@ -1133,7 +1133,7 @@ impl Sweep<'_, '_> {
     /// every entry moves back, never over another entry, and one whose path was taken meanwhile
     /// stays staged for a later pass, which finishes it only while custody at `leaf` allows),
     /// and removed with the locks let go.
-    fn prune(&mut self, dir: &Path, leaf: &Path) -> bool {
+    fn prune(&mut self, dir: &Path, leaf: &Path, seen: Option<Seen>) -> bool {
         if !self
             .fence
             .admit(leaf, KeepReason::IntentDeclined, !self.declined)
@@ -1148,7 +1148,9 @@ impl Sweep<'_, '_> {
         {
             return false;
         }
-        let Some(seen) = look(leaf) else {
+        // A shared walk can supply the first observation. Its lock list is still rechecked
+        // under the acquired locks below, before the fresh stale-parts survey.
+        let Some(seen) = seen.or_else(|| look(leaf)) else {
             self.fence.note(leaf, KeepReason::InventoryUnavailable);
             return false;
         };
@@ -1302,20 +1304,27 @@ impl Sweep<'_, '_> {
             aterm_uds::progress::tick();
             let name = child.file_name().unwrap_or_default();
             if name == LEAF {
+                let mut first = None;
                 let judged = if self.moved {
                     unused(&child, &|seen| moved(seen, now), self.fence)
                 } else {
                     workspace_of(root, dir).and_then(|ws| {
-                        unused(
-                            &child,
-                            &|seen| whole(&ws, seen, home, now, self.after.whole(), self.placing),
-                            self.fence,
-                        )
+                        let Some(seen) = look(&child) else {
+                            self.fence.note(&child, KeepReason::InventoryUnavailable);
+                            return None;
+                        };
+                        match whole(&ws, &seen, home, now, self.after.whole(), self.placing) {
+                            Some(why) => unused_seen(&child, &seen, why, self.fence),
+                            None => {
+                                first = Some(seen);
+                                None
+                            }
+                        }
                     })
                 };
                 let Some((held, why)) = judged else {
                     if !self.moved {
-                        self.pruning.push((dir.to_path_buf(), child));
+                        self.pruning.push((dir.to_path_buf(), child, first));
                     }
                     continue;
                 };
@@ -1410,6 +1419,16 @@ fn unused(
         }
     };
     let why = judge(&seen)?;
+    unused_seen(leaf, &seen, why, fence)
+}
+
+/// Hold and recheck a whole-cache candidate using its complete initial inventory.
+fn unused_seen(
+    leaf: &Path,
+    seen: &Seen,
+    why: Unused,
+    fence: &fence::Fence<'_>,
+) -> Option<(Vec<crate::lock::Flock>, Unused)> {
     let held = match hold(&seen.locks) {
         Some(held) => held,
         None => {

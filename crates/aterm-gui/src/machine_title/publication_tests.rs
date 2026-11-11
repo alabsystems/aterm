@@ -10,7 +10,7 @@ use aterm_net::fleet_member::name_record::{ByKind, FLOOR_MS};
 use aterm_secrets::client::LabLabels;
 use aterm_types::machine_name::{Nickname, Number};
 
-use super::{change_number, naming};
+use super::{change_nickname, change_number, naming};
 
 const NOW: u64 = FLOOR_MS + 300 * 86_400_000;
 
@@ -51,6 +51,7 @@ enum Call {
 struct Names {
     values: RefCell<[Option<String>; 3]>,
     fail: Cell<bool>,
+    authorized: Cell<bool>,
     calls: RefCell<Vec<Call>>,
 }
 
@@ -59,6 +60,7 @@ impl Names {
         Self {
             values: RefCell::new(std::array::from_fn(|_| Some("m8".to_owned()))),
             fail: Cell::new(fail),
+            authorized: Cell::new(true),
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -70,12 +72,25 @@ impl publish::SystemNames for Names {
         self.values.borrow().clone()
     }
 
-    fn apply(&self, number: Number) -> Result<(), String> {
-        self.calls.borrow_mut().push(Call::Apply(number));
+    fn authorization(&self, _: &std::path::Path, _: &std::path::Path) -> Result<bool, String> {
+        Ok(self.authorized.get())
+    }
+
+    fn apply(
+        &self,
+        _: &std::path::Path,
+        _: &std::path::Path,
+        names: &aterm_types::machine_name::GeneratedNames,
+    ) -> Result<(), String> {
+        self.calls.borrow_mut().push(Call::Apply(names.number()));
         if self.fail.get() {
             return Err("inert OS publication refusal".to_owned());
         }
-        *self.values.borrow_mut() = std::array::from_fn(|_| Some(number.to_string()));
+        *self.values.borrow_mut() = [
+            Some(names.computer_name().to_owned()),
+            Some(names.host_name().to_owned()),
+            Some(names.host_name().to_owned()),
+        ];
         Ok(())
     }
 }
@@ -105,6 +120,17 @@ fn naming_policy_refuses_before_the_canonical_set_or_any_system_operation() {
                 &names,
                 || panic!("a rejected policy must not enter the canonical setter"),
                 || panic!("a rejected policy must not read the roster"),
+                NOW + 1,
+            )
+            .is_err()
+        );
+        assert!(
+            change_nickname(
+                &scratch.state,
+                &scratch.config,
+                &aterm_agent::machine_name::NickTo::Word(Nickname::parse("Dog").unwrap()),
+                &names,
+                || panic!("a rejected policy must not read the nickname roster"),
                 NOW + 1,
             )
             .is_err()
@@ -192,6 +218,25 @@ fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_ret
         crate::machine_rename_sheet::RenameTo::Synchronize(requested.num)
     );
 
+    // Missing/old permission is a separate explicit action carrying no captured name.
+    names.authorized.set(false);
+    let auth_preview = aterm_agent::machine_name::rename_preview(
+        &scratch.state,
+        || Ok(LabLabels::default()),
+        || Ok(None),
+        NOW + 1,
+    )
+    .unwrap();
+    let auth_status =
+        naming::NamingStatus::read(&scratch.state, &scratch.config, auth_preview.name(), &names);
+    assert!(auth_status.authorize());
+    let auth_snapshot = crate::machine_rename_sheet::Snapshot::named(auth_preview, auth_status);
+    assert_eq!(
+        crate::machine_rename_sheet::request(&auth_snapshot, &held, &number, &nickname).unwrap(),
+        crate::machine_rename_sheet::RenameTo::Authorize,
+    );
+    names.authorized.set(true);
+
     // A failed publication observation keeps the explicit retry available. The
     // execution still reads the current policy before reaching any system port.
     let good_config = std::fs::read(&scratch.config).unwrap();
@@ -240,7 +285,7 @@ fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_ret
             crate::machine_rename_sheet::request(&snapshot, &held, &number, &nick_only).unwrap(),
             crate::machine_rename_sheet::RenameTo::Nick(_)
         ),
-        "a nickname edit never borrows synchronization authority"
+        "a nickname edit is saved before its generated names are synchronized"
     );
 
     let applies = || {
@@ -278,6 +323,53 @@ fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_ret
         .unwrap(),
         publish::Publication::Current,
     );
+
+    // A Bonjour alias is visible drift, not a repair that repeatedly resets macOS.
+    let matching = names.values.borrow().clone();
+    names.values.borrow_mut()[1] = Some("m86-heron-2".to_owned());
+    let applied = applies();
+    assert!(matches!(
+        naming::synchronize(&scratch.state, &scratch.config, requested.num, &names),
+        Err(publish::Pending::SystemNames(_))
+    ));
+    assert_eq!(applies(), applied);
+    let preview = aterm_agent::machine_name::rename_preview(
+        &scratch.state,
+        || Ok(LabLabels::default()),
+        || Ok(None),
+        NOW + 1,
+    )
+    .unwrap();
+    let held_alias = crate::machine_rename_sheet::Held::of_read(&preview);
+    let status =
+        naming::NamingStatus::read(&scratch.state, &scratch.config, preview.name(), &names);
+    assert!(!status.retry());
+    assert!(
+        !status.authorize(),
+        "a collision alias never asks for naming permission"
+    );
+    let text = status.text("m86");
+    assert!(text.contains("expected m86-heron.local"));
+    assert!(text.contains("actual m86-heron-2.local (collision alias)"));
+    let snapshot = crate::machine_rename_sheet::Snapshot::named(preview, status);
+    let number = crate::machine_rename_sheet::Field::open(None, held_alias.number_text());
+    let nickname = crate::machine_rename_sheet::Field::open(None, &held_alias.word);
+    assert_eq!(
+        crate::machine_rename_sheet::request(&snapshot, &held_alias, &number, &nickname).unwrap(),
+        crate::machine_rename_sheet::RenameTo::Keep,
+    );
+    // Policy debt alongside an accepted alias needs ordinary synchronization, not a
+    // permission prompt for an OS setter that must not run.
+    let alias_config = std::fs::read(&scratch.config).unwrap();
+    std::fs::write(&scratch.config, "[identity]\nname = \"m1\"\n").unwrap();
+    names.authorized.set(false);
+    let alias_status =
+        naming::NamingStatus::read(&scratch.state, &scratch.config, &edited.name, &names);
+    assert!(alias_status.retry());
+    assert!(!alias_status.authorize());
+    std::fs::write(&scratch.config, alias_config).unwrap();
+    names.authorized.set(true);
+    *names.values.borrow_mut() = matching;
 
     // Matching bytes do not replace the writer's exact private-file permission contract.
     std::fs::set_permissions(&fleet_name, std::fs::Permissions::from_mode(0o400)).unwrap();
@@ -317,6 +409,93 @@ fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_ret
         names.calls.borrow().len(),
         calls,
         "a stale retry must not reach the system port"
+    );
+
+    let nick = change_nickname(
+        &scratch.state,
+        &scratch.config,
+        &aterm_agent::machine_name::NickTo::Word(Nickname::parse("dog").unwrap()),
+        &names,
+        || Ok(None),
+        NOW + 2,
+    )
+    .unwrap();
+    assert!(nick.publication.is_none());
+    assert_eq!(nick.name.num, Some(Number::new(87).unwrap()));
+    assert_eq!(nick.name.nick.as_str(), "dog");
+    assert_eq!(
+        *names.values.borrow(),
+        [
+            Some("m87 Dog".to_owned()),
+            Some("m87-dog".to_owned()),
+            Some("m87-dog".to_owned()),
+        ]
+    );
+    assert_eq!(
+        aterm_net::fleet_member::read_primary_name(&scratch.state)
+            .unwrap()
+            .as_deref(),
+        Some("m87")
+    );
+
+    // The person changed the saved choice while permission was pending. Completion reads
+    // the new number and nickname; it cannot replay the panel's prior m87 Dog target.
+    let newer = NameTo {
+        num: Number::new(88).unwrap(),
+        nick: Some(Nickname::parse("Otter").unwrap()),
+    };
+    aterm_agent::machine_name::set_name(
+        &scratch.state,
+        &newer,
+        || Ok(LabLabels::default()),
+        aterm_net::fleet_member::name_record::ByKind::Person,
+        || Ok(None),
+        NOW + 3,
+        false,
+    )
+    .unwrap();
+    let resumed_applies = || {
+        names
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| matches!(call, Call::Apply(_)))
+            .count()
+    };
+    let applied_before = resumed_applies();
+    names.authorized.set(false);
+    assert!(super::synchronize_current(&scratch.state, &scratch.config, &names).is_err());
+    assert_eq!(
+        resumed_applies(),
+        applied_before,
+        "lost permission cannot run the resumed publication"
+    );
+    names.authorized.set(true);
+    let current = super::synchronize_current(&scratch.state, &scratch.config, &names).unwrap();
+    assert!(current.publication.is_none());
+    assert_eq!(current.name.num, Some(newer.num));
+    assert_eq!(current.name.nick.as_str(), "Otter");
+    assert_eq!(resumed_applies(), applied_before + 1);
+    assert_eq!(
+        names
+            .calls
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|call| match call {
+                Call::Apply(number) => Some(*number),
+                Call::Read => None,
+            }),
+        Some(newer.num),
+        "authorization completion applies the current number"
+    );
+    assert_eq!(
+        *names.values.borrow(),
+        [
+            Some("m88 Otter".to_owned()),
+            Some("m88-otter".to_owned()),
+            Some("m88-otter".to_owned()),
+        ]
     );
 }
 

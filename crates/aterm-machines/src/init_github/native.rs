@@ -34,8 +34,29 @@ const GITHUB_STEP: &str = "github.sign-in";
 /// Preserved checkout work is separate from the credential's sign-in remedy.
 const REPOSITORIES_STEP: &str = "github.repositories";
 
-/// A nonempty automatic selection can publish a complete count only after the captured
-/// default source's pinned credential route also works. Empty selection checks no sign-in.
+/// What a local read of the private inventory found ([`automatic_inventory_counts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InventoryCounts {
+    /// Repositories present with their required dependencies.
+    pub(crate) present: usize,
+    /// Matching checkouts without a commit that no current empty-remote proof covers. A local
+    /// read cannot tell an empty remote from one with commits: only a read of the remote does.
+    pub(crate) unborn: usize,
+    /// Repositories the inventory selects.
+    pub(crate) total: usize,
+}
+
+impl InventoryCounts {
+    /// Every selected repository has a matching checkout here, ready or without a commit.
+    #[must_use]
+    pub(crate) const fn all_here(&self) -> bool {
+        self.present + self.unborn == self.total
+    }
+}
+
+/// A nonempty automatic selection can publish a count with every repository here
+/// ([`InventoryCounts::all_here`]) only after the captured default source's pinned credential
+/// route also works. Empty selection checks no sign-in.
 /// Missing work is left to the native
 /// batch's ordinary route check, rather than invoking the helper twice before cloning.
 /// # Errors
@@ -44,7 +65,7 @@ const REPOSITORIES_STEP: &str = "github.repositories";
 pub(crate) fn automatic_inventory_counts(
     sys: &dyn System,
     ctx: &Ctx,
-) -> Result<Option<(usize, usize)>, String> {
+) -> Result<Option<InventoryCounts>, String> {
     if !super::uses_vault_inventory(sys, ctx)? {
         return Ok(None);
     }
@@ -59,7 +80,7 @@ pub(crate) fn automatic_inventory_counts_captured(
     ctx: &Ctx,
     captured: &InitialRepositoryInputs,
     readback: Option<&RepositoryReadback>,
-) -> Result<Option<(usize, usize)>, String> {
+) -> Result<Option<InventoryCounts>, String> {
     captured.validate_default_context(sys, ctx)?;
     if captured.local.is_err()
         && let Some(selection) = super::RepositorySelection::capture(sys, ctx)?
@@ -67,7 +88,11 @@ pub(crate) fn automatic_inventory_counts_captured(
     {
         captured.validate_selection(sys, ctx)?;
         selection.ensure_current(sys)?;
-        return Ok(Some((0, 0)));
+        return Ok(Some(InventoryCounts {
+            present: 0,
+            unborn: 0,
+            total: 0,
+        }));
     }
     let local = captured.local.as_ref().map_err(|block| block.why.clone())?;
     let inventory = local
@@ -81,9 +106,13 @@ pub(crate) fn automatic_inventory_counts_captured(
         })
         .map_or(&[][..], |proof| proof.empty.as_slice());
     let standing = repos::partition_with_empty(sys, &captured.user, listed, empty)?;
-    let counts = (standing.present.len(), listed.len());
+    let counts = InventoryCounts {
+        present: standing.present.len(),
+        unborn: standing.unborn.len(),
+        total: listed.len(),
+    };
     // capture_ready released the shared materialization lock before any helper runs.
-    let lookups = if !listed.is_empty() && counts.0 == counts.1 {
+    let lookups = if !listed.is_empty() && counts.all_here() {
         let helper = super::helper(sys, &captured.user);
         Some(Git::for_user(sys, &captured.user).lookups(
             sys,
@@ -2201,7 +2230,11 @@ pub(super) mod tests {
             let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
             assert_eq!(
                 super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
-                Some((0, 1))
+                Some(super::InventoryCounts {
+                    present: 0,
+                    unborn: 0,
+                    total: 1
+                })
             );
             let rows = run(&sys, &ctx, Mode::Apply).unwrap();
             assert_eq!(
@@ -2219,7 +2252,11 @@ pub(super) mod tests {
             );
             assert_eq!(
                 super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
-                Some((1, 1))
+                Some(super::InventoryCounts {
+                    present: 1,
+                    unborn: 0,
+                    total: 1
+                })
             );
             assert_eq!(
                 sys.calls()
@@ -2263,7 +2300,11 @@ pub(super) mod tests {
         );
         assert_eq!(
             super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
-            Some((0, 1))
+            Some(super::InventoryCounts {
+                present: 0,
+                unborn: 0,
+                total: 1
+            })
         );
         assert!(sys.stat(&parent).is_ok());
         assert!(sys.stat(&parent.join("vendor/library")).is_err());
@@ -2275,7 +2316,11 @@ pub(super) mod tests {
         );
         assert_eq!(
             super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
-            Some((1, 1))
+            Some(super::InventoryCounts {
+                present: 1,
+                unborn: 0,
+                total: 1
+            })
         );
         assert_eq!(
             sys.calls()
@@ -3153,23 +3198,81 @@ pub(super) mod tests {
                 ..stat(false, 0o600)
             },
         );
-        let off_rows = run_with(
-            &cold.sys,
+        assert_eq!(
+            crate::init::owed_clone_control(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+            None,
+            "explicit opt-out still admits its current local request retirement"
+        );
+        let mut held = Holds::NONE;
+        held.off.set(Setting::Repositories, true);
+        assert!(
+            crate::init::owed_clone_control(&cold.sys, debt.path(), &held)
+                .unwrap()
+                .is_some(),
+            "a current hold still fences that local retirement"
+        );
+        assert_eq!(std::fs::read(&ledger_file).unwrap(), reenabled_bytes);
+        assert!(
+            crate::init::OwedCloneIntent::capture(&cold.sys, debt.path(), &held).is_err(),
+            "a named clone does not admit credential retirement over a held group"
+        );
+        let intent = Arc::new(
+            crate::init::OwedCloneIntent::capture(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+        );
+        assert!(
+            intent
+                .current(&cold.sys, debt.path(), &Holds::NONE)
+                .unwrap()
+        );
+        assert!(!intent.current(&cold.sys, debt.path(), &held).unwrap());
+        let mut stopped = Holds::NONE;
+        stopped.stopped = Some("a later Stop".into());
+        assert!(!intent.current(&cold.sys, debt.path(), &stopped).unwrap());
+        let mut newer = Holds::NONE;
+        newer.newer = true;
+        assert!(!intent.current(&cold.sys, debt.path(), &newer).unwrap());
+        let withdrawal =
+            super::super::RepositoryCredentialWithdrawal::capture(&cold.sys, &cold.ctx)
+                .unwrap()
+                .unwrap();
+        let sys = Arc::new(cold.sys);
+        let current_sys = Arc::clone(&sys);
+        let current_intent = Arc::clone(&intent);
+        let current_state = debt.path().to_path_buf();
+        let off_rows = run_withdrawal(
+            sys.as_ref(),
             &cold.ctx,
             Mode::Apply,
-            RepositoryWork::Repair,
-            None,
+            withdrawal,
+            Box::new(move || {
+                current_intent.current(current_sys.as_ref(), &current_state, &Holds::NONE)
+            }),
         )
         .unwrap();
         assert_eq!(off_rows.len(), 1);
         assert_eq!(stage(&off_rows).outcome, crate::model::Outcome::Changed);
+        assert!(
+            intent
+                .current(sys.as_ref(), debt.path(), &Holds::NONE)
+                .unwrap(),
+            "the captured cleanup remains current through its own completed retirement"
+        );
+        assert!(!intent.current(sys.as_ref(), debt.path(), &held).unwrap());
+        assert!(!intent.current(sys.as_ref(), debt.path(), &stopped).unwrap());
+        assert!(!intent.current(sys.as_ref(), debt.path(), &newer).unwrap());
         assert!(matches!(
-            changed_choice.probe(&cold.sys, &cold.ctx),
+            changed_choice.probe(sys.as_ref(), &cold.ctx),
             Probe::Ok { .. }
         ));
         let withdrawn = aterm_secrets::need::peek(&cold.paths).unwrap().remove(0);
         assert_eq!(withdrawn.id, reenabled.id);
         assert_eq!(withdrawn.state, aterm_secrets::need::State::Retired);
+        assert!(
+            crate::init::owed_clone_control(sys.as_ref(), debt.path(), &Holds::NONE)
+                .unwrap()
+                .is_some(),
+            "without pending retirement the explicit Off control still holds"
+        );
         assert_eq!(
             withdrawn.retired.as_ref().unwrap().reason,
             aterm_secrets::need::Reason::NotNeeded
@@ -3180,7 +3283,7 @@ pub(super) mod tests {
         assert!(client::config(&cold.paths).is_err());
         assert!(
             super::super::items_for_execution(
-                &cold.sys,
+                sys.as_ref(),
                 &cold.ctx,
                 None,
                 RepositoryWork::Repair,
@@ -3191,9 +3294,9 @@ pub(super) mod tests {
             "disabled setup without an active request needs no vault-source admission"
         );
         aterm_uds::atomic_file::write(&config_file, &config_bytes, 0o600).unwrap();
-        cold.sys.remove(&profile).unwrap();
+        sys.remove(&profile).unwrap();
         assert!(matches!(
-            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE, None).unwrap(),
+            crate::init::owed_clone(sys.as_ref(), debt.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Waiting(_)
         ));
 

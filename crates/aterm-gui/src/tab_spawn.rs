@@ -808,6 +808,48 @@ pub(crate) struct MenuOrigin {
     chooser: GestureMarks,
 }
 
+#[cfg(target_os = "macos")]
+impl MenuOrigin {
+    pub(crate) const fn window(self) -> WindowId {
+        self.window
+    }
+
+    /// A deferred person-owned operation may land only in the content that asked.
+    pub(crate) fn is_current(self, app: &App) -> bool {
+        app.frontmost_window == Some(self.window)
+            && self.content.is_some()
+            && app.palette_menu_origin(self.window).map(|now| now.content) == Some(self.content)
+    }
+
+    /// A completed child cannot act for a window or content that was closed or replaced.
+    pub(crate) fn is_retained(self, app: &App) -> bool {
+        let Some(content) = self.content else {
+            return false;
+        };
+        let view = content.view();
+        if !app.windows.get(&self.window).is_some_and(|window| {
+            window
+                .tab_set
+                .tabs()
+                .iter()
+                .any(|tab| tab.root.contains(view))
+        }) {
+            return false;
+        }
+        match (content, app.view_store.get(view).copied()) {
+            (
+                crate::front_content::FrontContent::Terminal { session, .. },
+                Some(crate::tab_model::View::Terminal(terminal)),
+            ) => terminal.session == session && app.pool.get(session).is_some(),
+            (
+                crate::front_content::FrontContent::Native { instance, .. },
+                Some(crate::tab_model::View::Native(native)),
+            ) => native.instance == instance,
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 impl MenuOrigin {
     /// Whether a control client's gesture chose the row.

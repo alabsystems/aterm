@@ -16,6 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod admission;
 pub(crate) mod command;
 mod descriptor;
 pub(crate) mod policy;
@@ -693,6 +694,7 @@ impl Directory {
             &Policy::default(),
         )
     }
+
     pub(crate) fn snapshot_existing_if_exists(
         &self,
         session: &Session<'_>,

@@ -29,12 +29,12 @@ fn machine_number(text: &str) -> Option<u32> {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Name(pub u32);
 impl Name {
-    /// Parse m1, M2, m100, etc.; zero, ambiguous leading zeroes and more than six digits are
+    /// Parse m0, M2, m100, etc.; ambiguous leading zeroes and more than six digits are
     /// refused (the grammar [`Label`] shares).
     pub fn parse(text: &str) -> Result<Self> {
         machine_number(text).map(Self).ok_or_else(|| {
             Error::new(
-                "machine name must be m followed by a positive number without leading zeroes",
+                "machine name must be m followed by a non-negative number without leading zeroes",
             )
         })
     }
@@ -59,7 +59,7 @@ fn legacy_number(digits: &str) -> bool {
 }
 
 /// A machine label as the lab stores it (docs/DESIGN-alab-lab-model-2026-11-01.md §3.3): `m`
-/// and a positive number with no leading zero (`m100` and up included), with the membership
+/// and a non-negative number with no leading zero (`m100` and up included), with the membership
 /// log's clash suffix `-xxxx` (four hex digits) where two Macs claimed one number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Label {
@@ -280,15 +280,14 @@ pub fn validate(key: &str, value: &Value) -> Result<()> {
     {
         return Err(Error::new("unknown machine assignment field"));
     }
-    // The grammar the writing builds checked, so a 0.146/0.147 assignment keeps validating.
-    if !Name::legacy(
-        value
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::new("machine needs a canonical name"))?,
-    ) {
+    let assignment_name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("machine needs a canonical name"))?;
+    // Current assignments include zero; retain the larger numbers older builds wrote.
+    if Name::parse(assignment_name).is_err() && !Name::legacy(assignment_name) {
         return Err(Error::new(
-            "machine name must be m followed by a positive number without leading zeroes",
+            "machine name must be m followed by a non-negative number without leading zeroes",
         ));
     }
     for field in ["legacy_names", "hostnames"] {
@@ -329,10 +328,11 @@ mod tests {
     #[test]
     fn legacy_names_and_account_slots_keep_their_meaning() {
         assert_eq!(Name::parse("M100").unwrap().canonical(), "m100");
+        assert_eq!(Name::parse("m0").unwrap().canonical(), "m0");
         assert_eq!(Slot::parse("m3.2").unwrap().number, 2);
         assert_eq!(Slot::parse("m27-2").unwrap().canonical(), "m27.2");
         assert_eq!(Slot::parse("m3").unwrap().number, 1);
-        for bad in ["m0", "m01", "m-1", "m3.2"] {
+        for bad in ["m01", "m-1", "m3.2"] {
             assert!(Name::parse(bad).is_err());
         }
     }
@@ -377,7 +377,6 @@ mod tests {
         for bad in [
             "",
             "m",
-            "m0",
             "m01",
             "x1",
             "m1234567",
@@ -436,7 +435,8 @@ mod tests {
         let key = "cd".repeat(16);
         validate(&key, &aterm_json::json!({"name": "m1234567"})).unwrap();
         validate(&key, &aterm_json::json!({"name": "M3"})).unwrap();
-        for bad in ["m0", "m01", "m", "x3", "m3-2"] {
+        validate(&key, &aterm_json::json!({"name": "m0"})).unwrap();
+        for bad in ["m01", "m", "x3", "m3-2"] {
             assert!(
                 validate(&key, &aterm_json::json!({"name": bad})).is_err(),
                 "{bad}"

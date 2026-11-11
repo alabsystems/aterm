@@ -3,9 +3,6 @@
 
 # aterm-windows-sys-052: spec recovery (1 compile-time-discharged spec, 0 unit tests)
 
-> Status 2026-10-28: `WSYS052-PF-VALUE` is discharged at compile time in `tests/recorded.rs`,
-> and its former `#[test]` fn is deleted, so the crate has zero runtime `#[test]` fns.
-
 Source: `crates/aterm-windows-sys-052` (read only). `tests/recorded.rs` checks all four
 recorded declarations at compile time (`0` `#[test]` fns), against `src/lib.rs` and
 `tests/oracle/conformance/src/lib.rs`.
@@ -27,7 +24,7 @@ Result: **1 spec** (discharged at compile time), **0 runtime `#[test]` fns**. **
 ## 1. Specs (TSV)
 
 `difficulty` is the Rust features a proof must handle; `blocking gaps` are rows of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -44,13 +41,6 @@ WSYS052-PF-VALUE	table-property	windows_sys::Win32::System::Threading::PF_ARM_V8
 file	test	primary	also
 ```
 
-## 3. Coverage
-
-- 0 runtime `#[test]` fns remain (1 original test converted to CTFE; 0 non-spec samples).
-- All four recorded declarations, including `WSYS052-PF-VALUE`, are checked by the compiler on
-  every build of `tests/recorded.rs`. Planted mismatches against the registry crate
-  stay with the oracle (`tests/oracle/`).
-
 ## 4. Tests that are not spec samples
 
 None. The one test samples a real (if degenerate) property.
@@ -61,13 +51,3 @@ None. The one test samples a real (if degenerate) property.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **(Fixed 2026-10-28.) `tests/recorded.rs` now checks all four declarations at compile time.**
-   `the_constant_holds_its_recorded_value` was replaced with
-   `const _: () = assert!(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE == 30);`, discharging
-   `WSYS052-PF-VALUE` on every build of `tests/recorded.rs` without needing a runtime test.
-
-## 6. Proof order (easiest, high value first)
-
-1. **`WSYS052-PF-VALUE`** *(discharged at compile time in `tests/recorded.rs`)*. A Clean island
-   binding adds nothing over CTFE for a closed scalar constant; add one only if a future policy
-   requires every spec row to carry a Trust-published entry after the gap 0 seal update.

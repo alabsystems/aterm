@@ -8,8 +8,8 @@
 //!
 //! * [`admit`] decides whether a commit can be carried: a non-merge commit of origin/main that
 //!   the line does not hold yet, moving no [`FROZEN`] path and not the release version. A
-//!   backport from the line's head may land through a neutral merge when main holds every
-//!   changed path at the backport's exact content and mode, deletions included.
+//!   backport from the line's head may land through a neutral merge when one landed commit
+//!   holds every changed path at the backport's exact content and mode, deletions included.
 //! * [`order`] puts the admitted fixes in ancestry order. [`carry`] makes one hop per fix
 //!   ([`hop_tree`]'s `git merge-tree` onto the head, then `git commit-tree` under the carried
 //!   commit's own author and committer, so a rebuild makes the same commit).
@@ -120,16 +120,14 @@ pub struct Supersession {
 
 const SUPERSESSION: &str = "Aterm-Line-Supersession: ";
 
-/// Every publication surface must be absent; a caller's failed read is an error,
-/// never an absent surface.
-pub fn require_unpublished(surfaces: [bool; 5]) -> Result<(), String> {
-    for (present, name) in surfaces.into_iter().zip([
-        "tag",
-        "ledger line",
-        "published source",
-        "release object",
-        "staged publication",
-    ]) {
+/// Every public release surface must be absent; a failed read is an error.
+/// Staging is append-only and may retain earlier, unpublished candidates of this version.
+pub fn require_unpublished(surfaces: [bool; 4]) -> Result<(), String> {
+    for (present, name) in
+        surfaces
+            .into_iter()
+            .zip(["tag", "ledger line", "published source", "release object"])
+    {
         if present {
             return Err(format!("the line has a {name}; cannot supersede"));
         }
@@ -705,8 +703,8 @@ pub fn admit(git: &dyn GitRunner, line: &Line, rev: &str) -> Result<Admitted, St
             "nothing to carry: drop it from --fix",
         ));
     }
-    if !landed_since(git, &line.base)?.contains(&commit)
-        && !backport_on_main(git, line.head(), &parent, &commit)?
+    let landed = landed_since(git, &line.base)?;
+    if !landed.contains(&commit) && !backport_on_main(git, line.head(), &parent, &commit, &landed)?
     {
         return Err(unlanded(&commit, &read.subject));
     }
@@ -980,7 +978,7 @@ pub fn carry(git: &dyn GitRunner, line: &Line, fixes: &[Fix]) -> Result<Vec<Hop>
                 before.extend(reauthor_plan(git, &prev, &fix.commit, &paths)?);
                 let remedy = if earlier.is_empty() {
                     format!(
-                        "author a backport on {} whose every changed path matches origin/main \
+                        "author a backport on {} whose every changed path matches one landed main commit \
                          in content and mode (including deletions), land it on main, then \
                          `{RELEASE_COMMAND} --fix <that non-merge commit>`",
                         short(head)
@@ -1134,8 +1132,8 @@ pub fn record(
 /// base is a commit this clone holds, named by its full sha, that declares the line's version and
 /// is on origin/main; each hop is such a commit whose one parent is the previous head, it
 /// carries, by its full sha, a non-merge commit of origin/main that no earlier hop carries and
-/// the previous head does not descend from, landed on main ([`landed_since`] the base), its
-/// tree is [`hop_tree`]'s for that commit onto the previous head and differs from it, its
+/// the previous head does not descend from, landed on main ([`landed_since`] the base) or
+/// proved by [`backport_on_main`]. Its tree is [`hop_tree`]'s for that commit onto the previous head and differs from it, its
 /// recorded paths are the ones it moves, none of them [`FROZEN`], and it declares the line's
 /// version; the head is on origin/main (its record merge landed). Ok is a one-line summary.
 ///
@@ -1279,7 +1277,13 @@ fn verify_with(git: &dyn GitRunner, line: &Line, recorded: bool) -> Result<Strin
         if !landed
             .as_ref()
             .is_some_and(|set| set.contains(&hop.carries))
-            && !backport_on_main(git, prev, &carried.parents[0], &hop.carries)?
+            && !backport_on_main(
+                git,
+                prev,
+                &carried.parents[0],
+                &hop.carries,
+                landed.as_ref().expect("landed history was read above"),
+            )?
         {
             let stop = unlanded(&hop.carries, &carried.subject);
             return Err(bad(stop.reason, format!("hop {k}: {}", stop.why)));
@@ -1461,23 +1465,34 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
 }
 
 /// An alternative to the history proof: a commit based exactly on the previous line head,
-/// already in main's history, whose every changed path main holds at the commit's content
-/// and mode (or absent for a deletion). Compare raw, NUL-delimited paths, including gitlinks;
-/// rename detection is off, so both sides of a rename are obligations. No patch heuristics,
+/// already in main's history, whose every changed path one landed commit holds at the
+/// backport's content and mode (or absent for a deletion). The witness is an immutable tree,
+/// so later edits on main do not invalidate the proof. A commit reached only through a
+/// content-neutral merge cannot witness content main never landed.
+/// Compare raw, NUL-delimited paths, including gitlinks.
+/// Rename detection is off, so both sides of a rename are obligations. No patch heuristics,
 /// text conversion, pathspecs or checkout state take part in this proof.
 fn backport_on_main(
     git: &dyn GitRunner,
     head: &str,
     parent: &str,
     commit: &str,
+    landed: &BTreeSet<String>,
 ) -> Result<bool, Stop> {
     if parent != head {
         return Ok(false);
     }
-    let main = out(git, &["rev-parse", "origin/main^{commit}"])?;
     let changed = moved_bytes(git, parent, commit)?;
-    let different: BTreeSet<Vec<u8>> = moved_bytes(git, commit, &main)?.into_iter().collect();
-    Ok(!changed.is_empty() && changed.iter().all(|path| !different.contains(path)))
+    if changed.is_empty() {
+        return Ok(false);
+    }
+    for witness in landed {
+        let different: BTreeSet<Vec<u8>> = moved_bytes(git, commit, witness)?.into_iter().collect();
+        if changed.iter().all(|path| !different.contains(path)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The refusal when neither the history nor the backport content proof holds.
@@ -1488,12 +1503,12 @@ fn unlanded(commit: &str, subject: &str) -> Stop {
             "{} ({subject}) is in origin/main's history only through a merge that keeps a \
              parent's tree (a release line's record merge, or one like it): its change never \
              landed in main's tree by that history, and it is not an exact backport from the \
-             line's head whose changed paths origin/main holds in content and mode",
+             line's head whose changed paths a landed main commit holds in content and mode",
             short(commit)
         ),
         format!(
             "name the main commit that landed the change (`git log origin/main`), or author a \
-             backport on the line's head whose every changed path matches origin/main in \
+             backport on the line's head whose every changed path matches one landed main commit in \
              content and mode (including deletions), land it on main, then \
              `{RELEASE_COMMAND} --fix <that non-merge commit>`"
         ),

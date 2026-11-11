@@ -188,7 +188,6 @@ fn the_owners_hold_releases_the_agent_and_forgets_its_answers() {
         Some(on_280.clone()),
         &version("2.1.280"),
         &target,
-        None,
         Proc::default(),
         30,
     );
@@ -200,30 +199,16 @@ fn the_owners_hold_releases_the_agent_and_forgets_its_answers() {
         "nothing owed: {:?}",
         in_place.release
     );
-    let other_model = St::for_target(
-        Some(St {
-            model_list: "claude-opus-5-5".to_string(),
-            ..on_280.clone()
-        }),
-        &version("2.1.280"),
-        &target,
-        None,
-        Proc::default(),
-        30,
-    );
     let moved = St::for_target(
         Some(on_280),
         &version("2.1.281"),
         &target,
-        None,
         Proc::default(),
         30,
     );
-    for retargeted in [other_model, moved] {
-        assert_eq!(retargeted.phase, Phase::Pending);
-        assert_eq!(retargeted.release, "retargeted");
-        assert!(retargeted.marker.is_empty() && retargeted.markers.is_empty());
-    }
+    assert_eq!(moved.phase, Phase::Pending);
+    assert_eq!(moved.release, "retargeted");
+    assert!(moved.marker.is_empty() && moved.markers.is_empty());
 }
 
 #[test]
@@ -339,7 +324,7 @@ impl Agent {
         let args = atpkg::caller_shell::process_args(self.sf.pid).expect("agent argv");
         let files = session_files(&opts.home);
         let script = Script::new(shell, foreground, None);
-        visit_with_claim(
+        visit_build(
             opts,
             &self.sf,
             files.as_deref(),
@@ -873,7 +858,6 @@ fn a_release_follows_only_the_process_the_notice_reached() {
             Some(prior.clone()),
             &version("2.1.280"),
             &target,
-            None,
             Proc::default(),
             30,
         );
@@ -951,7 +935,7 @@ fn a_release_is_dropped_where_it_is_no_longer_the_upgrades() {
         let table = vec![(shell, 1, "zsh".into())];
         let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
         let files = session_files(&opts.home);
-        let r = visit_with_claim(
+        let r = visit_build(
             &opts,
             &agent.sf,
             files.as_deref(),
@@ -1026,7 +1010,7 @@ fn a_dropped_release_leaves_no_owed_wait_behind() {
     let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
     let files = session_files(&opts.home);
     let visit = || {
-        visit_with_claim(
+        visit_build(
             &opts,
             &agent.sf,
             files.as_deref(),
@@ -1897,7 +1881,7 @@ fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
         ];
         let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
         let files = session_files(&opts.home);
-        visit_with_claim(
+        visit_build(
             opts,
             &agent.sf,
             files.as_deref(),

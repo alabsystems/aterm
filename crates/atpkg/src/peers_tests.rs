@@ -10,6 +10,67 @@ use super::*;
 /// A wait for something that must happen: a hang detector, never a latency budget.
 const HANG: Duration = Duration::from_secs(60);
 
+#[cfg(target_os = "macos")]
+#[test]
+fn a_named_peer_resolves_through_the_lan_broker_before_dialing() {
+    use aterm_uds::lan::{
+        self,
+        wire::{Frame, Reader, Request},
+    };
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let socket = root.path().join("broker.sock");
+    let listener = aterm_uds::CtlListener::bind(&socket).unwrap();
+    let served = std::thread::spawn(move || {
+        let (stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Until(Instant::now() + HANG),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
+        lan::wire::send(
+            &stream,
+            &Frame::Hello {
+                protocol: lan::PROTOCOL,
+                build: "peer-fixture".into(),
+            },
+        )
+        .unwrap();
+        let mut reader = Reader::new(0);
+        let deadline = Some(Instant::now() + HANG);
+        assert!(matches!(
+            reader.frame(&stream, deadline).unwrap(),
+            Some(Frame::Hello { .. })
+        ));
+        assert!(matches!(reader.frame(&stream, deadline).unwrap(),
+            Some(Frame::Request(Request::Resolve { name, .. })) if name == "peer-fixture.local"));
+        lan::wire::send(
+            &stream,
+            &Frame::Addresses(vec!["192.0.2.18".parse().unwrap()]),
+        )
+        .unwrap();
+    });
+    let attempted = std::sync::Mutex::new(Vec::new());
+    let result = lan::seam_here(
+        lan::Seam {
+            socket: Some(socket),
+            ..lan::Seam::default()
+        },
+        || {
+            connect_by("peer-fixture.local:18443", None, |addr| {
+                attempted.lock().unwrap().push(*addr);
+                Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+            })
+        },
+    );
+    served.join().unwrap();
+    assert!(result.is_err());
+    assert_eq!(
+        *attempted.lock().unwrap(),
+        vec!["192.0.2.18:18443".parse::<SocketAddr>().unwrap()]
+    );
+}
+
 /// A pace a peer the test serves keeps however loaded the machine: it always answers, so its
 /// race waits the hang detector, never [`PEER_PACE`]'s 5 s head and 2 s idle.
 const ANSWERS: Pace = Pace {

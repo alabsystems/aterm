@@ -6,7 +6,7 @@
 The specs are read from `src/lib.rs` and the mint's call sites. A spec proved through
 Trust/Clean about the compiled function (for `mint-launcher-only`, about the compiled call graph
 and feature graph) retires the tests §2 maps to it. Gap numbers are the rows of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 ## 0. Notation used in the statements
 
@@ -46,16 +46,6 @@ require-gate	contract	require, Cap::satisfies, Cap::tier	∀ E, cap: &Cap<E>, mi
 mint-launcher-only	invariant	Authority::root_authority, Authority's constructors, the workspace call graph and resolver-2 feature graph for aterm-cap/launcher-mint, Guard (aterm-census guards::mint::launcher_mint)	Establishes NoUntrustedTop on the tree. (a) Authority has no constructor other than Mint: its private _seal field rules out a struct literal elsewhere, and the only expression of type Authority in aterm-cap is Mint's body. (b) ∀ workspace crate k ∉ Launchers: ProdCalls(k) = ∅. (c) In the resolver-2 feature graph, the only production (non-dev) edges that enable aterm-cap/launcher-mint come from Launchers. This counts [dependencies], [target.*.dependencies], dotted [dependencies.aterm-cap] tables, renamed packages, [features] entries and workspace-inherited features. (d) Mint exists only under cfg(any(test, feature = "launcher-mint")) and is an unsafe fn: a crate whose build does not enable launcher-mint cannot name it, and every call site is an audited unsafe block. NoUntrustedTop follows from (a) and (b). Feature unification compiles aterm-cap with launcher-mint for every crate in a launcher's build graph, so (c) and (d) alone do not stop a non-launcher crate from naming Mint there (§5.1); in that build Guard checks (b) and (c) by source text today (§5.3 and §5.4 say where it falls short). The model's stronger claim also needs (e): no production call path from a non-launcher crate reaches a call of Mint, including transitively through a launcher library's API (§5.2).	-	Not a property of one function body. cfg and feature semantics plus the resolver-2 feature graph (from cargo metadata). Field privacy. A cross-crate MIR call graph under the production cfg for (b) and (e). Guard reads source text and manifests; the spec should not. Until Trust can state it, Guard is its interim home; cargo metadata resolved features and MIR call edges, plus a compile-fail negative control, would close §5.3 and §5.4.	0, 8, 12
 ```
 
-### Proof dependency order
-
-`cap-grant-tier` and `cap-satisfies-is-tier-order` come first and do not depend on each other;
-`require-gate` composes both. `cap-grant-tier` can sidestep gap 11 through the monomorphic
-instance `Cap<effects::Spawn>`, since the body does not depend on `E`, and
-`cap-satisfies-is-tier-order` is a 3×3 table, decidable by evaluation once stated.
-`mint-launcher-only` is independent of all three and is not a function-body proof: (b) and (c)
-wait on a workspace call-graph query and the resolver-2 feature graph, (e) on reachability
-through a launcher's library API.
-
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test
@@ -66,12 +56,6 @@ file	test	primary	also
 src/lib.rs	granted_cap_carries_its_tier	cap-satisfies-is-tier-order	cap-grant-tier
 src/lib.rs	require_gates_on_tier	require-gate	cap-grant-tier, cap-satisfies-is-tier-order
 ```
-
-## 3. Coverage
-
-`mint-launcher-only` has no test in this crate. The type holds clauses (a) and (d) at compile
-time, and `Guard`, with its own tests in `crates/aterm-census/src/guards/mint.rs`, checks (b)
-and (c) on the shipped build.
 
 ## 4. Tests that are not spec samples
 
@@ -103,24 +87,3 @@ None.
    `launcher-mint` the item does not exist. `#[doc(hidden)]` has no effect on reachability.
    Nothing compiles a crate without the feature and checks that naming the mint fails; that
    belongs in a compile-fail negative control.
-
-## 6. Proof order (easiest, high value first)
-
-No spec here is blocked by gap 0 alone. Every row also needs the non-scalar carriers (gap 1)
-or the effects and cross-crate surfaces (gaps 8, 12). The order runs from the smallest gap set up.
-
-1. **`cap-grant-tier`** (gaps 0, 1, 2, 11). A struct constructor and a field read with no
-   branches. Gap 11 can be sidestepped by proving the monomorphic instance `Cap<effects::Spawn>`
-   first, because `E` is phantom and the body does not depend on it. This is the smallest test of
-   an enum and struct carrier with an `&self` view in Trust.
-2. **`cap-satisfies-is-tier-order`** (gaps 0, 1, 2, 11). Same shape, plus the three-arm match in
-   `Tier::rank` and a `u8 >=` comparison (no derived `PartialOrd` call). Being a 3×3 table, it is
-   decidable by evaluation once stated. With item 1 it retires `granted_cap_carries_its_tier`.
-3. **`require-gate`** (gaps 0, 1, 2, 3, 4, 11). It adds the `Result`/`Denied` carriers and
-   callee-ensures composition. Once items 1 and 2 are Certified, it retires
-   `require_gates_on_tier`.
-4. **`mint-launcher-only`** (gaps 0, 8, 12). It has the highest security value, but it is not
-   a function-body proof. The type holds (a) and (d) now; (b) and (c) wait on a workspace
-   call-graph query and the resolver-2 feature graph, and (e) on reachability through a
-   launcher's library API. Meanwhile `Guard` holds the shipped build by text. Moving it onto `cargo metadata`
-   and MIR call edges with a compile-fail negative control fixes §5.3, §5.4 and §5.5.

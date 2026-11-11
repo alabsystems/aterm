@@ -1298,7 +1298,17 @@ fn tap_cask_unavailable(prefix: &Prefix, name: &str) -> Option<String> {
 /// Brew's factory trust gate on an already-resolved tap
 /// formula record (API records carry no qualified tap name
 /// and never gate).
-fn formula_load_refusal(prefix: &Prefix, f: &Formula) -> Option<ExitCode> {
+/// Silent form of the factory trust gate for skip-style
+/// callers (unnamed outdated, services list): true when the
+/// tap record would refuse. Never prints — `failed` prints
+/// on construction, so `formula_load_refusal(..).is_some()`
+/// as a predicate would leak the refusal text.
+pub(super) fn formula_load_would_refuse(prefix: &Prefix, f: &Formula) -> bool {
+    f.full_name.matches('/').count() == 2
+        && untrusted_load_message(prefix, super::trust::TrustType::Formula, &f.full_name).is_some()
+}
+
+pub(super) fn formula_load_refusal(prefix: &Prefix, f: &Formula) -> Option<ExitCode> {
     if f.full_name.matches('/').count() == 2 {
         untrusted_load_error(prefix, super::trust::TrustType::Formula, &f.full_name)
     } else {
@@ -4424,9 +4434,15 @@ fn info_json(
     let mut resolved = std::collections::BTreeSet::new();
     if !want_cask {
         for n in &fname {
-            match api.formula_value(n) {
+            // Core's API strips tap qualifiers. An explicit foreign identity must
+            // reach its tap and trust check even when core has the same leaf name.
+            match if foreign_qualified(n) {
+                Err(String::new())
+            } else {
+                api.formula_value(n)
+            } {
                 Ok(v) => {
-                    resolved.insert(Formula::short_name(n).to_string());
+                    resolved.insert(n.clone());
                     let order = api
                         .formula_value_bytes(n)
                         .ok()
@@ -4453,7 +4469,7 @@ fn info_json(
                             }
                             match tap_formula_json(prefix, &f) {
                                 Some(pair) => {
-                                    resolved.insert(Formula::short_name(n).to_string());
+                                    resolved.insert(n.clone());
                                     formulae.push(pair);
                                 }
                                 None if want_formula || installed => {
@@ -4474,17 +4490,16 @@ fn info_json(
     if !want_formula {
         for n in &cname {
             let short = Formula::short_name(n);
-            if !installed
-                && !want_cask
-                && formulae
-                    .iter()
-                    .any(|(v, _)| v.get("name").and_then(aterm_json::Value::as_str) == Some(short))
-            {
+            if !installed && !want_cask && resolved.contains(n) {
                 continue;
             }
-            match api.cask_value(n) {
+            match if foreign_qualified(n) {
+                Err(format!("abrew: no such cask: {n}"))
+            } else {
+                api.cask_value(n)
+            } {
                 Ok(v) => {
-                    resolved.insert(short.to_string());
+                    resolved.insert(n.clone());
                     let order = api
                         .cask_value_bytes(n)
                         .ok()
@@ -4503,7 +4518,7 @@ fn info_json(
                         }
                         match tap_cask_json(prefix, &c, &qualified) {
                             Some(pair) => {
-                                resolved.insert(short.to_string());
+                                resolved.insert(n.clone());
                                 casks.push(pair);
                             }
                             None if want_cask || installed => {
@@ -4527,7 +4542,7 @@ fn info_json(
     }
     if !installed {
         for n in names {
-            if !resolved.contains(Formula::short_name(n)) {
+            if !resolved.contains(n) {
                 return Err(format!(
                     "Error: {}",
                     if want_cask && let Some(m) = tap_cask_unavailable(prefix, n) {
@@ -8990,19 +9005,27 @@ fn has_log_files(dir: &std::path::Path) -> bool {
 
 /// brew `gist-logs`: without logs on disk the answer is brew's
 /// own error; uploading a gist is never native.
-/// The stderr lines one `Diagnostic.checks(type, fatal:)`
+/// One printed unit of a `Diagnostic.checks` group.
+#[derive(Debug, PartialEq, Eq)]
+enum DiagnosticLine {
+    Fail(String),
+    Warn(String),
+    Blank,
+}
+
+/// The stderr units one `Diagnostic.checks(type, fatal:)`
 /// group prints: `ofail` per finding when fatal, else `opoo`
 /// plus a blank line after a multiline finding.
-fn diagnostic_check_lines(findings: &[DoctorFinding], fatal: bool) -> Vec<String> {
+fn diagnostic_check_lines(findings: &[DoctorFinding], fatal: bool) -> Vec<DiagnosticLine> {
     let mut lines = Vec::new();
     for finding in findings {
         let text = finding.render();
         if fatal {
-            lines.push(format!("Error: {text}"));
+            lines.push(DiagnosticLine::Fail(format!("Error: {text}")));
         } else {
-            lines.push(format!("Warning: {text}"));
+            lines.push(DiagnosticLine::Warn(format!("Warning: {text}")));
             if text.contains('\n') {
-                lines.push(String::new());
+                lines.push(DiagnosticLine::Blank);
             }
         }
     }
@@ -9010,11 +9033,17 @@ fn diagnostic_check_lines(findings: &[DoctorFinding], fatal: bool) -> Vec<String
 }
 
 /// Brew's `Diagnostic.checks`: print the group's findings
-/// and, when fatal and any fired, exit 1 before later groups.
+/// (through the tty styling layer, like every other
+/// onoe/opoo) and, when fatal and any fired, exit 1 before
+/// later groups.
 fn diagnostic_checks(prefix: &Prefix, api: &Api, checks: &[&str], fatal: bool) -> Option<ExitCode> {
     let (findings, _infos, _unknown) = doctor_findings_for(prefix, api, checks, false);
     for line in diagnostic_check_lines(&findings, fatal) {
-        eprintln!("{line}");
+        match line {
+            DiagnosticLine::Fail(text) => super::tty::onoe!("{text}"),
+            DiagnosticLine::Warn(text) => super::tty::opoo!("{text}"),
+            DiagnosticLine::Blank => eprintln!(),
+        }
     }
     if fatal && !findings.is_empty() {
         Some(ExitCode::FAILURE)
@@ -9929,10 +9958,26 @@ fn doctor_findings_for(
 ) -> (Vec<DoctorFinding>, Vec<String>, bool) {
     let formulae = prefix.installed(Kind::Formula);
     let casks = prefix.installed(Kind::Cask);
-    // Index rows feed the deprecated/deleted checks; offline,
-    // those checks simply have nothing to say.
-    let formula_rows = api.search_index(false).ok();
-    let cask_rows = api.search_index(true).ok();
+    // Index rows feed only the deprecated/disabled checks;
+    // loading them costs a full index parse (and a possible
+    // fetch), so install-time groups never pay for them.
+    // Offline, those checks simply have nothing to say.
+    let needs_index = wanted.iter().any(|c| {
+        matches!(
+            *c,
+            "check_deprecated_disabled" | "check_cask_deprecated_disabled"
+        )
+    });
+    let formula_rows = if needs_index {
+        api.search_index(false).ok()
+    } else {
+        None
+    };
+    let cask_rows = if needs_index {
+        api.search_index(true).ok()
+    } else {
+        None
+    };
     let index_flags = |kind: Kind, name: &str| -> Option<bool> {
         let rows = (match kind {
             Kind::Formula => formula_rows.as_ref(),
@@ -12429,6 +12474,27 @@ pub(super) fn outdated_linked_formula(
     Some((f, inst.version))
 }
 
+/// Brew's install-class auto-trust step: explicitly
+/// fully-qualified names are trusted before anything loads,
+/// the item type forced by `--formula`/`--cask` when given.
+fn auto_trust_qualified(
+    prefix: &Prefix,
+    api: &Api,
+    rest: &[String],
+    names: &[String],
+) -> Option<ExitCode> {
+    let only = if has_flag(rest, "--formula", "") {
+        Some(super::trust::TrustType::Formula)
+    } else if has_flag(rest, "--cask", "") {
+        Some(super::trust::TrustType::Cask)
+    } else {
+        None
+    };
+    super::trust::trust_fully_qualified_items(prefix, api, names, only)
+        .err()
+        .map(|error| failed(&error))
+}
+
 pub(super) fn cmd_install(
     prefix: &Prefix,
     api: &Api,
@@ -12442,6 +12508,9 @@ pub(super) fn cmd_install(
     let opts = install_opts(rest);
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
+    if let Some(code) = auto_trust_qualified(prefix, api, rest, &names) {
+        return code;
+    }
     for name in &names {
         // Brew factory-loads each name first: an untrusted
         // tap record refuses before any other shaping.
@@ -12507,6 +12576,12 @@ pub(super) fn cmd_install(
     let mut upgrade_names: Vec<String> = Vec::new();
     let mut plain_names: Vec<String> = Vec::new();
     let mut blocked = 0;
+    // Brew's early return for the preinstall checks keys off
+    // whether any formula will actually install: track the
+    // request shape beside the classification.
+    let mut any_formula = false;
+    let mut any_cask = false;
+    let mut will_install_formula = false;
     let no_install_upgrade = super::env_set("HOMEBREW_NO_INSTALL_UPGRADE");
     for name in &names {
         let formula_candidate = if want_cask {
@@ -12521,6 +12596,11 @@ pub(super) fn cmd_install(
         } else {
             None
         };
+        if formula_candidate {
+            any_formula = true;
+        } else {
+            any_cask = true;
+        }
         match outdated {
             Some((f, have)) => {
                 let pinned = prefix.is_pinned(&f.name);
@@ -12543,15 +12623,35 @@ pub(super) fn cmd_install(
                         f.name
                     );
                     upgrade_names.push(name.clone());
+                    will_install_formula = true;
                 }
             }
-            None => plain_names.push(name.clone()),
+            None => {
+                // An installed-current formula is a warning,
+                // not an install (brew's install_formula?).
+                if formula_candidate
+                    && (opts.force
+                        || match (
+                            api.formula(name),
+                            prefix.installed_one(Kind::Formula, Formula::short_name(name)),
+                        ) {
+                            (Ok(f), Some(inst)) => inst.version != install::keg_version(&f),
+                            _ => true,
+                        })
+                {
+                    will_install_formula = true;
+                }
+                plain_names.push(name.clone());
+            }
         }
     }
     // Brew runs the preinstall check groups once something
     // will actually be installed or upgraded (dry runs
-    // included); an all-blocked batch returns before them.
-    if !(plain_names.is_empty() && upgrade_names.is_empty())
+    // included); a formulae-only batch where every formula
+    // is already current returns before them.
+    let brew_returns_early = any_formula && !will_install_formula && !any_cask;
+    if !brew_returns_early
+        && !(plain_names.is_empty() && upgrade_names.is_empty())
         && let Some(code) = perform_preinstall_checks(prefix, api, false)
     {
         return code;
@@ -14230,7 +14330,14 @@ fn present_and_upgrade_dependents(
     let rows: Vec<(String, String, String, Option<String>)> = dependents
         .upgradeable
         .iter()
-        .map(|(f, have)| (f.name.clone(), have.clone(), install::keg_version(f), None))
+        .map(|(f, have)| {
+            (
+                display_full_name(&f.full_name),
+                have.clone(),
+                install::keg_version(f),
+                None,
+            )
+        })
         .collect();
     for line in version_change_lines(&rows) {
         println!("{line}");
@@ -14443,11 +14550,59 @@ pub(super) fn cmd_reinstall(
     };
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
+    if let Some(code) = auto_trust_qualified(prefix, api, rest, &names) {
+        return code;
+    }
     if !want_cask {
         for name in &names {
             if let Err(code) = factory_formula(prefix, api, name) {
                 return code;
             }
+        }
+    }
+    // Brew resolves every name before the preinstall checks:
+    // unknown names error there, and names only a tap answers
+    // delegate like install's (the catalog is the core API).
+    // Installed kegs keep the loop's own handling.
+    for name in &names {
+        let short = Formula::short_name(name);
+        let cask_short = super::api::canonical_cask_token(short);
+        let formula_installed = prefix.installed_one(Kind::Formula, short).is_some();
+        let cask_installed = prefix.installed_one(Kind::Cask, cask_short).is_some();
+        if foreign_qualified(name)
+            && (foreign_formula(prefix, name).is_some() || foreign_cask_exists(prefix, name))
+        {
+            return not_native(prefix, args, "reinstall (tap-qualified name)");
+        }
+        let as_cask = if want_cask {
+            true
+        } else if want_formula || formula_installed {
+            false
+        } else if cask_installed {
+            true
+        } else {
+            api.formula(name).is_err()
+                && (api.cask(cask_short).is_ok() || tap::lookup_cask(prefix, name).is_some())
+        };
+        if as_cask {
+            if !cask_installed && api.cask(cask_short).is_err() {
+                // The cask factory's trust refusal preempts the
+                // tap-cask delegation, as brew's loader does.
+                match factory_cask(prefix, api, name) {
+                    Err(code) => return code,
+                    Ok(Some(_)) => {
+                        return not_native(prefix, args, "reinstall (tap cask)");
+                    }
+                    Ok(None) => {
+                        return failed(&format!("Error: {}", cask_unavailable(cask_short)));
+                    }
+                }
+            }
+        } else if !formula_installed && api.formula(name).is_err() {
+            if tap::lookup(prefix, name).is_some() {
+                return not_native(prefix, args, "reinstall (tap formula)");
+            }
+            return failed(&format!("Error: {}", formula_unavailable(api, name)));
         }
     }
     if let Some(code) = perform_preinstall_checks(prefix, api, false) {
@@ -14986,14 +15141,33 @@ fn outdated_rows(
     let mut out = Vec::new();
     if casks {
         for i in prefix.installed(Kind::Cask) {
-            let c = api.cask(&i.name)?;
+            // Kegs only a tap answers resolve there; untrusted
+            // or unresolvable kegs are skipped silently, as in
+            // brew's unnamed outdated.
+            let Some(c) = api.cask(&i.name).ok().or_else(|| {
+                let (c, _) = tap::lookup_cask(prefix, &i.name)?;
+                (c.full_name.is_empty()
+                    || super::trust::trusted(prefix, super::trust::TrustType::Cask, &c.full_name))
+                .then_some(c)
+            }) else {
+                continue;
+            };
             if cask_outdated(prefix, &i, &c, greedy) {
                 out.push((i.name, i.version, c.version));
             }
         }
     } else {
         for i in prefix.installed(Kind::Formula) {
-            let f = api.formula(&i.name)?;
+            let Some(f) = api
+                .formula(&i.name)
+                .ok()
+                .or_else(|| tap::lookup(prefix, &i.name))
+            else {
+                continue;
+            };
+            if formula_load_would_refuse(prefix, &f) {
+                continue;
+            }
             if formula_outdated(prefix, &i, &f) {
                 out.push((i.name, i.version, install::keg_version(&f)));
             }
@@ -15004,6 +15178,12 @@ fn outdated_rows(
 
 fn outdated_json_row(prefix: &Prefix, kind: Kind, name: &str, latest: &str) -> JVal {
     let installed = prefix.installed_one(kind, name);
+    // Brew's JSON names a formula by its specified name
+    // (tap formulae qualified, official taps stripped).
+    let shown = match (&installed, kind) {
+        (Some(inst), Kind::Formula) => prefix.specified_name(inst),
+        _ => name.to_string(),
+    };
     let versions: Vec<String> = installed
         .as_ref()
         .map(|i| i.versions.clone())
@@ -15014,7 +15194,7 @@ fn outdated_json_row(prefix: &Prefix, kind: Kind, name: &str, latest: &str) -> J
     };
     let pinned = pinned_version.is_some();
     JVal::Obj(vec![
-        ("name".to_string(), jstr(name)),
+        ("name".to_string(), jstr(shown)),
         ("installed_versions".to_string(), jstrs(versions)),
         ("current_version".to_string(), jstr(latest)),
         ("pinned".to_string(), jbool(pinned)),
@@ -15027,6 +15207,2356 @@ fn outdated_json_row(prefix: &Prefix, kind: Kind, name: &str, latest: &str) -> J
 
 const fn outdated_failed(any: bool, named: bool) -> bool {
     any && named
+}
+
+/// `brew livecheck` for named packages. Brew loads formulae
+/// and casks for livecheck without the API, so the spec
+/// comes from the checked-out tap file (r376's data parse);
+/// the record itself still comes from the factory, with a
+/// cross-check that the API record and the tap file agree on
+/// version/URL (a lagging tap clone delegates rather than
+/// guessing which brew-without-API would have used). Native
+/// strategies: Git, GithubLatest, Gnu, PageMatch. Anything
+/// outside — watchlist/--installed/--tap selection, other
+/// strategies, strategy blocks, throttles, references, url
+/// options, resources — delegates before any output, the
+/// usual fail-closed subset rule.
+pub(super) fn cmd_livecheck(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+    livecheck::run(prefix, api, rest)
+}
+
+mod livecheck {
+    use super::super::formula::{LivecheckSpec, LivecheckUrl, version_cmp};
+    use super::super::{fetch, has_flag, operands_without_flag_values, tap};
+    use super::{
+        Api, Cask, ExitCode, Formula, JVal, Kind, Path, PathBuf, Prefix, cask_unavailable,
+        factory_cask, factory_formula, failed, foreign_qualified, foreign_unavailable,
+        formula_unavailable, fs, jpretty, tap_cask_unavailable,
+    };
+    use std::cmp::Ordering;
+
+    const NO_CURRENT_MSG: &str = "Unable to identify current version";
+    const NO_VERSIONS_MSG: &str = "Unable to get versions";
+    const UNSTABLE_KEYWORDS: &[&str] = &[
+        "alpha",
+        "beta",
+        "bpo",
+        "dev",
+        "experimental",
+        "prerelease",
+        "preview",
+        "rc",
+    ];
+
+    /// Outside the native subset (delegates pre-narration).
+    #[derive(Debug)]
+    struct Outside;
+
+    pub(super) fn run(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+        let json = has_flag(rest, "--json", "");
+        let quiet = has_flag(rest, "--quiet", "-q");
+        let newer_only = has_flag(rest, "--newer-only", "");
+        let full_name_flag = has_flag(rest, "--full-name", "");
+        let want_formula = has_flag(rest, "--formula", "") || has_flag(rest, "--formulae", "");
+        let want_cask = has_flag(rest, "--cask", "") || has_flag(rest, "--casks", "");
+        if has_flag(rest, "--resources", "-r")
+            || has_flag(rest, "--extract-plist", "")
+            || has_flag(rest, "--verbose", "-v")
+            || has_flag(rest, "--debug", "-d")
+            || rest.iter().any(|a| a == "--tap" || a.starts_with("--tap="))
+        {
+            return super::super::unsupported("'livecheck' with these arguments is not native");
+        }
+        // Brew's selection order: --tap, --installed, named,
+        // watchlist file, else everything (delegated).
+        #[derive(PartialEq)]
+        enum Mode {
+            Named,
+            Watch,
+            Installed,
+        }
+        let named = operands_without_flag_values(rest, &["--tap"]);
+        let (mode, names, keg_versions): (Mode, Vec<String>, Vec<(bool, String)>) =
+            if has_flag(rest, "--installed", "") {
+                let mut names = Vec::new();
+                let mut keg_versions = Vec::new();
+                if !want_cask {
+                    let mut seen: Vec<String> = Vec::new();
+                    for inst in prefix.installed(Kind::Formula) {
+                        if !seen.contains(&inst.name) {
+                            seen.push(inst.name.clone());
+                        }
+                    }
+                    for n in seen {
+                        if let Some(inst) = prefix.installed_one(Kind::Formula, &n) {
+                            names.push(n);
+                            keg_versions.push((false, inst.version.clone()));
+                        }
+                    }
+                }
+                if !want_formula {
+                    let mut seen: Vec<String> = Vec::new();
+                    for inst in prefix.installed(Kind::Cask) {
+                        if !seen.contains(&inst.name) {
+                            seen.push(inst.name.clone());
+                        }
+                    }
+                    for n in seen {
+                        if let Some(inst) = prefix.installed_one(Kind::Cask, &n) {
+                            names.push(n);
+                            keg_versions.push((true, inst.version.clone()));
+                        }
+                    }
+                }
+                (Mode::Installed, names, keg_versions)
+            } else if !named.is_empty() {
+                (Mode::Named, named, Vec::new())
+            } else if let Some(path) = watchlist_path().filter(|p| p.is_file()) {
+                let Ok(text) = fs::read_to_string(&path) else {
+                    return super::super::unsupported("'livecheck' (watchlist) is not native");
+                };
+                let names = text
+                    .lines()
+                    .filter_map(|line| {
+                        let cut = line[..line.find('#').unwrap_or(line.len())].trim();
+                        (!cut.is_empty()).then(|| cut.to_string())
+                    })
+                    .collect();
+                (Mode::Watch, names, Vec::new())
+            } else {
+                return super::super::unsupported(
+                    "'livecheck' (all formulae and casks) is not native",
+                );
+            };
+        // Brew downcases + dedups named args (and watchlist
+        // names), then loads each as formula-or-cask.
+        let mut seen: Vec<String> = Vec::new();
+        for n in &names {
+            // Installed names are already unique per kind (a
+            // formula and cask may share a leaf).
+            if mode == Mode::Installed {
+                seen.push(n.clone());
+                continue;
+            }
+            let d = n.to_lowercase();
+            if !seen.contains(&d) {
+                seen.push(d);
+            }
+        }
+        let mut pkgs: Vec<Pkg> = Vec::new();
+        for (idx, name) in seen.iter().enumerate() {
+            let resolved = match mode {
+                Mode::Named => resolve(prefix, api, name, want_formula, want_cask).map(Some),
+                Mode::Watch => try_resolve(prefix, api, name, want_formula, want_cask, false),
+                Mode::Installed => {
+                    let as_cask = keg_versions[idx].0;
+                    match try_resolve(prefix, api, name, !as_cask, as_cask, true) {
+                        Ok(Some(mut pkg)) => {
+                            // Brew checks the keg-loaded
+                            // formula: its version is the
+                            // installed one.
+                            pkg.current = keg_versions[idx].1.clone();
+                            Ok(Some(pkg))
+                        }
+                        Ok(None) => {
+                            return super::super::unsupported(
+                                "'livecheck' for these packages is not native",
+                            );
+                        }
+                        Err(code) => Err(code),
+                    }
+                }
+            };
+            match resolved {
+                Ok(Some(pkg)) => {
+                    if !pkgs.iter().any(|p: &Pkg| p.key() == pkg.key()) {
+                        pkgs.push(pkg);
+                    }
+                }
+                Ok(None) => {}
+                Err(code) => return code,
+            }
+        }
+        // `to_formulae_and_casks_with_taps`: every package's
+        // tap must be checked out (livecheck reads tap files).
+        let mut without_taps: Vec<String> = Vec::new();
+        let mut types: Vec<&str> = Vec::new();
+        for pkg in &pkgs {
+            if mode == Mode::Named && pkg.tap_dir_missing {
+                without_taps.push(pkg.leaf.clone());
+                let t = if pkg.is_cask { "casks" } else { "formulae" };
+                if !types.contains(&t) {
+                    types.push(t);
+                }
+            }
+        }
+        if !without_taps.is_empty() {
+            without_taps.sort();
+            return failed(&format!(
+                "Error: These {} are not in any locally installed taps!\n\n  {}\n\n\
+                 You may need to run `brew tap` to install additional taps.",
+                types.join(" and "),
+                without_taps.join("\n  ")
+            ));
+        }
+        // Autobump filtering (brew silently drops them).
+        let env_autobump = std::env::var("HOMEBREW_LIVECHECK_AUTOBUMP")
+            .is_ok_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
+        let mut skipped_autobump = false;
+        if !has_flag(rest, "--autobump", "") && !env_autobump {
+            let before = pkgs.len();
+            pkgs.retain(|p| !p.autobump_skip);
+            skipped_autobump = pkgs.len() != before;
+        }
+        pkgs.sort_by(|a, b| a.leaf.cmp(&b.leaf));
+        if pkgs.is_empty() {
+            if skipped_autobump {
+                return ExitCode::SUCCESS;
+            }
+            return failed("Error: Invalid usage: No formulae or casks to check.");
+        }
+        // Subset gate: prepare every package (skip evaluation,
+        // URL plans, regex compiles) before anything is
+        // printed or fetched; any package outside delegates
+        // the whole run.
+        let mut prepared: Vec<Prepared> = Vec::new();
+        for pkg in &pkgs {
+            match prepare(pkg, pkgs.len()) {
+                Ok(p) => prepared.push(p),
+                Err(Outside) => {
+                    return super::super::unsupported(
+                        "'livecheck' for these packages is not native",
+                    );
+                }
+            }
+        }
+        // Name-conflict handling (only without a kind filter).
+        let handle_conflict = !want_formula && !want_cask;
+        let ambiguous_casks: Vec<usize> = if handle_conflict {
+            pkgs.iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    p.is_cask
+                        && pkgs
+                            .iter()
+                            .filter(|q| q.full_name() == p.full_name())
+                            .count()
+                            > 1
+                })
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let ambiguous_leaves: Vec<usize> = if full_name_flag {
+            Vec::new()
+        } else {
+            pkgs.iter()
+                .enumerate()
+                .filter(|(i, p)| {
+                    !ambiguous_casks.contains(i)
+                        && pkgs
+                            .iter()
+                            .enumerate()
+                            .filter(|(j, q)| !ambiguous_casks.contains(j) && q.leaf == p.leaf)
+                            .count()
+                            > 1
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let mut any_printed = false;
+        let mut failed_run = false;
+        let mut json_entries: Vec<JVal> = Vec::new();
+        for (i, pkg) in pkgs.iter().enumerate() {
+            let use_full = full_name_flag || ambiguous_leaves.contains(&i);
+            let display = if use_full {
+                pkg.full_name()
+            } else {
+                pkg.leaf.clone()
+            };
+            let outcome = check(pkg, &prepared[i], json);
+            match outcome {
+                Outcome::Skipped(status, messages) => {
+                    if json {
+                        if !newer_only {
+                            json_entries.push(status_json(pkg, &display, &status, &messages));
+                        }
+                    } else if !newer_only && !quiet {
+                        print_skip(&display, &status, &messages);
+                    }
+                }
+                Outcome::Checked(latest) => {
+                    let current = pkg.current.as_str();
+                    let latest = match latest.strip_suffix("-release") {
+                        Some(base) if !current.ends_with("-release") => base.to_string(),
+                        _ => latest,
+                    };
+                    let outdated = lc_cmp(pkg.is_cask, current, &latest) == Ordering::Less;
+                    let newer_up = (!pkg.head_only || pkg.is_cask)
+                        && lc_cmp(pkg.is_cask, current, &latest) == Ordering::Greater;
+                    if newer_only && !outdated {
+                        continue;
+                    }
+                    any_printed = true;
+                    if json {
+                        json_entries.push(JVal::Obj(vec![
+                            (
+                                if pkg.is_cask { "cask" } else { "formula" }.to_string(),
+                                jstr(&display),
+                            ),
+                            (
+                                "version".to_string(),
+                                JVal::Obj(vec![
+                                    ("current".to_string(), jstr(current)),
+                                    ("latest".to_string(), jstr(&latest)),
+                                    ("outdated".to_string(), jbool(outdated)),
+                                    ("newer_than_upstream".to_string(), jbool(newer_up)),
+                                ]),
+                            ),
+                        ]));
+                    } else {
+                        let name_s = format!(
+                            "{}{}",
+                            super::super::tty::blue_out(&display),
+                            if ambiguous_casks.contains(&i) {
+                                " (cask)"
+                            } else {
+                                ""
+                            }
+                        );
+                        let cur_s = if newer_up {
+                            super::super::tty::error(current)
+                        } else {
+                            current.to_string()
+                        };
+                        let lat_s = if outdated {
+                            super::super::tty::success(&latest)
+                        } else {
+                            latest.clone()
+                        };
+                        println!("{name_s}: {cur_s} ==> {lat_s}");
+                    }
+                }
+                Outcome::Errored(messages, raise_text) => {
+                    if json {
+                        if !quiet {
+                            json_entries.push(status_json(pkg, &display, "error", &Some(messages)));
+                        }
+                    } else {
+                        failed_run = true;
+                        if !quiet {
+                            let name_s = format!(
+                                "{}{}",
+                                super::super::tty::blue_err(&display),
+                                if ambiguous_casks.contains(&i) {
+                                    " (cask)"
+                                } else {
+                                    ""
+                                }
+                            );
+                            super::super::tty::onoe!("Error: {name_s}: {raise_text}");
+                        }
+                    }
+                }
+            }
+        }
+        if newer_only && !any_printed && !json && !quiet {
+            println!("No newer upstream versions.");
+        }
+        if json {
+            println!("{}", jpretty(&JVal::Arr(json_entries)));
+        }
+        if failed_run {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
+    }
+
+    fn jstr(s: &str) -> JVal {
+        JVal::Val(aterm_json::Value::String(s.to_string()))
+    }
+
+    fn jbool(b: bool) -> JVal {
+        JVal::Val(aterm_json::Value::Bool(b))
+    }
+
+    /// Brew's `status_hash` as JSON (meta always present on
+    /// this path; brew only strips it from version infos).
+    fn status_json(pkg: &Pkg, display: &str, status: &str, messages: &Option<Vec<String>>) -> JVal {
+        let mut fields = vec![
+            (
+                if pkg.is_cask { "cask" } else { "formula" }.to_string(),
+                jstr(display),
+            ),
+            ("status".to_string(), jstr(status)),
+        ];
+        if let Some(msgs) = messages {
+            fields.push((
+                "messages".to_string(),
+                JVal::Arr(msgs.iter().map(|m| jstr(m)).collect()),
+            ));
+        }
+        let mut meta = vec![("livecheck_defined".to_string(), jbool(pkg.spec_defined))];
+        if pkg.head_only {
+            meta.push(("head_only".to_string(), jbool(true)));
+        }
+        fields.push(("meta".to_string(), JVal::Obj(meta)));
+        JVal::Obj(fields)
+    }
+
+    fn print_skip(display: &str, status: &str, messages: &Option<Vec<String>>) {
+        let name = super::super::tty::error(display);
+        match messages {
+            Some(msgs) if !msgs.is_empty() => {
+                let joined = msgs.join("; ");
+                if status == "skipped" {
+                    println!("{name}: skipped - {joined}");
+                } else {
+                    println!("{name}: {joined}");
+                }
+            }
+            _ => println!("{name}: {status}"),
+        }
+    }
+
+    /// One resolved package with everything checks need.
+    struct Pkg {
+        is_cask: bool,
+        leaf: String,
+        full: String,
+        current: String,
+        homepage: String,
+        stable_url: String,
+        head_url: String,
+        head_only: bool,
+        has_stable: bool,
+        deprecated: bool,
+        deprecated_gatekeeper_pending_disable: bool,
+        disabled: bool,
+        versioned: bool,
+        version_latest: bool,
+        url_unversioned: bool,
+        installed: bool,
+        autobump_skip: bool,
+        tap_dir_missing: bool,
+        file_missing: bool,
+        spec: Option<LivecheckSpec>,
+        spec_defined: bool,
+        outside: bool,
+    }
+
+    impl Pkg {
+        fn key(&self) -> (bool, &str) {
+            (self.is_cask, self.full.as_str())
+        }
+        fn full_name(&self) -> String {
+            self.full.clone()
+        }
+    }
+
+    enum Outcome {
+        Skipped(String, Option<Vec<String>>),
+        Checked(String),
+        /// (JSON messages, text-mode raised message)
+        Errored(Vec<String>, String),
+    }
+
+    /// Brew's `load_formula_or_cask` for one named arg,
+    /// through the trust-gated factories.
+    /// Formula-or-cask resolution where a miss (unknown or
+    /// no tap file, brew's API-less load) is `None` and only
+    /// a trust refusal errors — the watchlist's
+    /// `ignore_unavailable` load.
+    fn try_resolve(
+        prefix: &Prefix,
+        api: &Api,
+        name: &str,
+        want_formula: bool,
+        want_cask: bool,
+        for_installed: bool,
+    ) -> Result<Option<Pkg>, ExitCode> {
+        if !want_cask && let Some(f) = factory_formula(prefix, api, name)? {
+            let pkg = pkg_from_formula(prefix, api, name, f, for_installed);
+            if !pkg.file_missing {
+                return Ok(Some(pkg));
+            }
+        }
+        if !want_formula && let Some(c) = factory_cask(prefix, api, name)? {
+            let pkg = pkg_from_cask(prefix, api, name, c, for_installed);
+            if !pkg.file_missing {
+                return Ok(Some(pkg));
+            }
+        }
+        Ok(None)
+    }
+
+    fn resolve(
+        prefix: &Prefix,
+        api: &Api,
+        name: &str,
+        want_formula: bool,
+        want_cask: bool,
+    ) -> Result<Pkg, ExitCode> {
+        match try_resolve(prefix, api, name, want_formula, want_cask, false)? {
+            Some(pkg) => Ok(pkg),
+            None if want_formula && !want_cask => Err(formula_miss(prefix, api, name, true)),
+            None if want_cask && !want_formula => Err(cask_miss(prefix, name)),
+            None => Err(formula_miss(prefix, api, name, false)),
+        }
+    }
+
+    /// Brew's livecheck watchlist path:
+    /// `$HOMEBREW_LIVECHECK_WATCHLIST`, else the user config
+    /// home's `livecheck_watchlist.txt`.
+    fn watchlist_path() -> Option<PathBuf> {
+        let env_nonempty = |key: &str| {
+            std::env::var_os(key)
+                .map(|v| v.to_string_lossy().into_owned())
+                .filter(|v| !v.is_empty())
+        };
+        if let Some(p) = env_nonempty("HOMEBREW_LIVECHECK_WATCHLIST") {
+            return Some(PathBuf::from(p));
+        }
+        if let Some(xdg) = env_nonempty("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(xdg).join("homebrew/livecheck_watchlist.txt"));
+        }
+        if let Some(xdg) = env_nonempty("HOMEBREW_XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(xdg).join("homebrew/livecheck_watchlist.txt"));
+        }
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        Some(home.join(".homebrew/livecheck_watchlist.txt"))
+    }
+
+    fn formula_miss(prefix: &Prefix, api: &Api, name: &str, formula_only: bool) -> ExitCode {
+        if foreign_qualified(name) {
+            return failed(&format!(
+                "Error: {}",
+                foreign_unavailable(prefix, api, name, false, formula_only)
+            ));
+        }
+        failed(&format!("Error: {}", formula_unavailable(api, name)))
+    }
+
+    fn cask_miss(prefix: &Prefix, name: &str) -> ExitCode {
+        failed(&format!(
+            "Error: {}",
+            tap_cask_unavailable(prefix, name)
+                .unwrap_or_else(|| cask_unavailable(Formula::short_name(name)))
+        ))
+    }
+
+    /// The tap`"user/repo"` + checked-out dir for a record
+    /// (brew's `formula.tap`): qualified records name theirs;
+    /// API records belong to the official taps.
+    fn record_tap(
+        prefix: &Prefix,
+        is_cask: bool,
+        qualified: Option<&str>,
+    ) -> (String, Option<PathBuf>) {
+        let (user, repo) = match qualified {
+            Some(q) => {
+                let mut parts = q.split('/');
+                (
+                    parts.next().unwrap_or_default().to_string(),
+                    parts.next().unwrap_or_default().to_string(),
+                )
+            }
+            None if is_cask => ("homebrew".to_string(), "cask".to_string()),
+            None => ("homebrew".to_string(), "core".to_string()),
+        };
+        let wanted = format!("{user}/{repo}");
+        let dir = tap::list(prefix)
+            .into_iter()
+            .find(|t| t.name() == wanted)
+            .map(|t| t.path);
+        (wanted, dir)
+    }
+
+    /// Read the package's tap file and derive (spec, defined,
+    /// outside, raw-url-unversioned, file version, file url).
+    struct FileFacts {
+        spec: Option<LivecheckSpec>,
+        defined: bool,
+        unparseable: bool,
+        file_version: String,
+        file_url: String,
+        url_unversioned: bool,
+    }
+
+    fn file_facts(path: &Path, is_cask: bool, leaf: &str, qualified: &str) -> FileFacts {
+        let Ok(text) = fs::read_to_string(path) else {
+            return FileFacts {
+                spec: None,
+                defined: false,
+                unparseable: false,
+                file_version: String::new(),
+                file_url: String::new(),
+                url_unversioned: false,
+            };
+        };
+        let defined = tap::livecheck_block_present(&text);
+        let spec = tap::parse_livecheck_block(&text);
+        let (file_version, file_url) = if is_cask {
+            let c = tap::parse_cask_rb_as_data(&text, leaf);
+            (c.version, c.url)
+        } else {
+            let f = tap::parse_rb_as_data(&text, qualified);
+            (f.version, f.stable_url)
+        };
+        // Brew's cask `url.unversioned?`: the raw `url "..."`
+        // string carries no interpolation (beyond `#{arch}`).
+        let url_unversioned = is_cask
+            && text
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    let rest = l.strip_prefix("url \"")?;
+                    let raw = &rest[..rest.find('"')?];
+                    Some(raw.replace("#{arch}", "").replace("#{ arch }", ""))
+                })
+                .is_some_and(|raw| !raw.contains("#{"));
+        FileFacts {
+            unparseable: defined && spec.is_none(),
+            spec,
+            defined,
+            file_version,
+            file_url,
+            url_unversioned,
+        }
+    }
+
+    fn spec_outside(spec: &Option<LivecheckSpec>) -> bool {
+        spec.as_ref().is_some_and(|s| {
+            s.strategy_block
+                || s.url_options
+                || s.throttle.is_some()
+                || s.throttle_days.is_some()
+                || s.formula_ref.is_some()
+                || s.cask_ref.is_some()
+        })
+    }
+
+    fn autobump_file_skip(dir: &Path, leaf: &str) -> bool {
+        fs::read_to_string(dir.join(".github/autobump.txt"))
+            .is_ok_and(|t| t.lines().any(|l| l == leaf))
+    }
+
+    fn pkg_from_formula(
+        prefix: &Prefix,
+        _api: &Api,
+        _typed: &str,
+        f: Formula,
+        for_installed: bool,
+    ) -> Pkg {
+        let from_api = !foreign_qualified(&f.full_name)
+            && f.full_name.starts_with("homebrew/core/")
+            || f.full_name == format!("homebrew/core/{}", f.name);
+        let qualified = foreign_qualified(&f.full_name).then_some(f.full_name.as_str());
+        let (tap_name, tap_dir) = record_tap(prefix, false, qualified);
+        let full = if f.full_name.is_empty() {
+            format!("homebrew/core/{}", f.name)
+        } else {
+            f.full_name.clone()
+        };
+        let mut file_missing = tap_dir.is_none();
+        let mut facts = FileFacts {
+            spec: None,
+            defined: f.livecheck.is_some(),
+            unparseable: false,
+            file_version: String::new(),
+            file_url: String::new(),
+            url_unversioned: false,
+        };
+        if let Some(dir) = &tap_dir {
+            let t = tap::Tap {
+                user: tap_name.split('/').next().unwrap_or_default().to_string(),
+                repo: tap_name.split('/').nth(1).unwrap_or_default().to_string(),
+                path: dir.clone(),
+            };
+            match tap::formula_file(&t, &f.name) {
+                Some(file) => facts = file_facts(&file, false, &f.name, &full),
+                None => file_missing = true,
+            }
+        }
+        let spec = match (&facts.spec, &f.livecheck) {
+            (Some(s), _) => Some(s.clone()),
+            (None, Some(s)) => Some((**s).clone()),
+            _ => None,
+        };
+        let spec_defined = facts.defined || f.livecheck.is_some();
+        let mut outside = facts.unparseable || spec_outside(&spec);
+        // API-vs-file agreement (brew livecheck reads the
+        // file; installed checks read the keg instead).
+        if from_api && !for_installed {
+            if !facts.file_url.is_empty() && facts.file_url != f.stable_url {
+                outside = true;
+            }
+            if !facts.file_version.is_empty() && facts.file_version != f.version {
+                outside = true;
+            }
+        }
+        if f.version.is_empty() && !for_installed {
+            outside = true;
+        }
+        let head_only = f.head && f.stable_url.is_empty();
+        if head_only && prefix.installed_one(Kind::Formula, &f.name).is_some() {
+            // Installed HEAD-only checks compare commit hashes
+            // via the head downloader: not native here.
+            outside = true;
+        }
+        let autobump_skip = if tap_name == "homebrew/core" {
+            !f.no_autobump && !f.skip_livecheck && !f.disable
+        } else if let Some(dir) = &tap_dir {
+            autobump_file_skip(dir, &f.name)
+        } else {
+            false
+        };
+        Pkg {
+            is_cask: false,
+            leaf: f.name.clone(),
+            full,
+            current: f.version.clone(),
+            homepage: f.homepage.clone(),
+            stable_url: f.stable_url.clone(),
+            head_url: f.head_url.clone(),
+            head_only,
+            has_stable: !f.stable_url.is_empty(),
+            deprecated: f.deprecate,
+            deprecated_gatekeeper_pending_disable: false,
+            disabled: f.disable,
+            versioned: f.name.contains('@'),
+            version_latest: false,
+            url_unversioned: false,
+            installed: prefix.installed_one(Kind::Formula, &f.name).is_some(),
+            autobump_skip,
+            tap_dir_missing: tap_dir.is_none(),
+            file_missing,
+            spec,
+            spec_defined,
+            outside,
+        }
+    }
+
+    fn pkg_from_cask(
+        prefix: &Prefix,
+        _api: &Api,
+        _typed: &str,
+        c: Cask,
+        for_installed: bool,
+    ) -> Pkg {
+        let from_api = c.full_name.is_empty();
+        let qualified = (!c.full_name.is_empty()).then_some(c.full_name.as_str());
+        let (tap_name, tap_dir) = record_tap(prefix, true, qualified);
+        let full = if c.full_name.is_empty() {
+            format!("homebrew/cask/{}", c.token)
+        } else {
+            c.full_name.clone()
+        };
+        let mut file_missing = tap_dir.is_none();
+        let mut facts = FileFacts {
+            spec: None,
+            defined: c.livecheck.is_some(),
+            unparseable: false,
+            file_version: String::new(),
+            file_url: String::new(),
+            url_unversioned: false,
+        };
+        if let Some(dir) = &tap_dir {
+            let t = tap::Tap {
+                user: tap_name.split('/').next().unwrap_or_default().to_string(),
+                repo: tap_name.split('/').nth(1).unwrap_or_default().to_string(),
+                path: dir.clone(),
+            };
+            match tap::cask_file(&t, &c.token) {
+                Some(file) => facts = file_facts(&file, true, &c.token, &full),
+                None => file_missing = true,
+            }
+        }
+        let spec = match (&facts.spec, &c.livecheck) {
+            (Some(s), _) => Some(s.clone()),
+            (None, Some(s)) => Some((**s).clone()),
+            _ => None,
+        };
+        let spec_defined = facts.defined || c.livecheck.is_some();
+        let mut outside = facts.unparseable || spec_outside(&spec);
+        if from_api && !for_installed {
+            if !facts.file_url.is_empty() && facts.file_url != c.url {
+                outside = true;
+            }
+            if !facts.file_version.is_empty() && facts.file_version != c.version {
+                outside = true;
+            }
+        }
+        let autobump_skip = if tap_name == "homebrew/cask" {
+            !c.no_autobump && !c.skip_livecheck && !c.disabled
+        } else if let Some(dir) = &tap_dir {
+            autobump_file_skip(dir, &c.token)
+        } else {
+            false
+        };
+        let gatekeeper = c.deprecated
+            && c.deprecate_disable.deprecation_reason.as_deref() == Some("fails_gatekeeper_check")
+            && c.deprecate_disable.disable_date.is_some();
+        Pkg {
+            is_cask: true,
+            leaf: c.token.clone(),
+            full,
+            current: c.version.clone(),
+            homepage: c.homepage.clone(),
+            stable_url: c.url.clone(),
+            head_url: String::new(),
+            head_only: false,
+            has_stable: true,
+            deprecated: c.deprecated,
+            deprecated_gatekeeper_pending_disable: gatekeeper,
+            disabled: c.disabled,
+            versioned: false,
+            version_latest: c.version == "latest",
+            url_unversioned: facts.url_unversioned,
+            installed: prefix.installed_one(Kind::Cask, &c.token).is_some(),
+            autobump_skip,
+            tap_dir_missing: tap_dir.is_none(),
+            file_missing,
+            spec,
+            spec_defined,
+            outside,
+        }
+    }
+
+    /// Brew's `SkipConditions.skip_information` for a package,
+    /// in brew's check order.
+    fn skip_info(pkg: &Pkg, total: usize) -> Option<(String, Option<Vec<String>>)> {
+        let defined = pkg.spec_defined;
+        let spec_skip = pkg.spec.as_ref().and_then(|s| s.skip.as_ref());
+        let mut message: Option<String> = None;
+        if let Some(msg) = spec_skip.filter(|m| !m.is_empty()) {
+            message = Some(msg.clone());
+        } else if !defined && !pkg.is_cask {
+            let u = pkg.stable_url.to_lowercase();
+            if u.starts_with("https://storage.googleapis.com/google-code-archive-downloads/")
+                || u.starts_with("http://storage.googleapis.com/google-code-archive-downloads/")
+            {
+                message = Some("Stable URL is from Google Code Archive".to_string());
+            } else if u.starts_with("https://web.archive.org/")
+                || u.starts_with("http://web.archive.org/")
+            {
+                message = Some("Stable URL is from Internet Archive".to_string());
+            } else if u.starts_with("https://gist.github.com/")
+                || u.starts_with("http://gist.github.com/")
+                || u.starts_with("https://gist.githubusercontent.com/")
+                || u.starts_with("http://gist.githubusercontent.com/")
+            {
+                message = Some("Stable URL is a GitHub Gist".to_string());
+            }
+        }
+        if spec_skip.is_some() || message.is_some() {
+            return Some(("skipped".to_string(), message.map(|m| vec![m])));
+        }
+        if !pkg.is_cask {
+            if pkg.head_only && !pkg.installed {
+                return Some((
+                    "error".to_string(),
+                    Some(vec![
+                        "HEAD only formula must be installed to be checkable".to_string(),
+                    ]),
+                ));
+            }
+            if pkg.disabled && !defined {
+                return Some(("disabled".to_string(), None));
+            }
+            if pkg.deprecated && !defined {
+                return Some(("deprecated".to_string(), None));
+            }
+            if pkg.versioned && !defined {
+                return Some(("versioned".to_string(), None));
+            }
+        } else {
+            if pkg.disabled && !defined {
+                return Some(("disabled".to_string(), None));
+            }
+            if pkg.deprecated && !defined && !pkg.deprecated_gatekeeper_pending_disable {
+                return Some(("deprecated".to_string(), None));
+            }
+            if pkg.spec.as_ref().and_then(|s| s.strategy.as_deref()) == Some("extract_plist") {
+                // Brew enables ExtractPlist for a lone cask (or
+                // with the flag, delegated): not native.
+                if total == 1 {
+                    return Some(("__outside__".to_string(), None));
+                }
+                return Some((
+                    "skipped".to_string(),
+                    Some(vec![
+                        "Use `--extract-plist` to enable checking multiple casks with \
+                         ExtractPlist strategy"
+                            .to_string(),
+                    ]),
+                ));
+            }
+            if pkg.version_latest && !defined {
+                return Some(("latest".to_string(), None));
+            }
+            if pkg.url_unversioned && !defined {
+                return Some(("unversioned".to_string(), None));
+            }
+        }
+        None
+    }
+
+    /// Brew `LivecheckVersion` ordering: formulae compare
+    /// whole; cask versions split on commas and compare
+    /// segment-wise, skipping null segments.
+    fn lc_cmp(is_cask: bool, a: &str, b: &str) -> Ordering {
+        if !is_cask {
+            return version_cmp(a, b);
+        }
+        let av: Vec<&str> = a.split(',').collect();
+        let bv: Vec<&str> = b.split(',').collect();
+        let max = av.len().max(bv.len());
+        let (mut l, mut r) = (0, 0);
+        while l < max {
+            let x = av.get(l).copied();
+            let y = bv.get(r).copied();
+            match (x, y) {
+                (Some(x), Some(y)) => match version_cmp(x, y) {
+                    Ordering::Equal => {
+                        l += 1;
+                        r += 1;
+                    }
+                    ord => return ord,
+                },
+                (Some(x), None) => {
+                    if version_cmp(x, "") == Ordering::Greater {
+                        return Ordering::Greater;
+                    }
+                    l += 1;
+                }
+                (None, Some(y)) => {
+                    if version_cmp(y, "") == Ordering::Greater {
+                        return Ordering::Less;
+                    }
+                    r += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// A Ruby livecheck regex compiled for `aterm_regex`,
+    /// plus where the version sits in a match.
+    struct LcRegex {
+        whole: aterm_regex::Regex,
+        /// Group 1's subpattern, re-searched inside each whole
+        /// match (`aterm_regex` has no captures). `None` = the
+        /// whole match is the version (Ruby scan form).
+        group1: Option<aterm_regex::Regex>,
+        has_group: bool,
+    }
+
+    /// Translate + compile a Ruby regex. Ruby changes: `^`/`$`
+    /// are always line anchors (`(?m)`), `\h` is hex. A
+    /// quantified first capture group (Ruby yields its last
+    /// iteration, unrecoverable by re-search) is outside.
+    fn lc_regex(pattern: &str, flags: &str) -> Result<LcRegex, Outside> {
+        let mut src = String::from("(?m)");
+        if flags.contains('i') {
+            src.push_str("(?i)");
+        }
+        if flags.contains('m') {
+            src.push_str("(?s)");
+        }
+        if flags.contains('x') {
+            return Err(Outside);
+        }
+        src.push_str(
+            &pattern
+                .replace("\\h", "[0-9A-Fa-f]")
+                .replace("\\H", "[^0-9A-Fa-f]"),
+        );
+        let compile = |p: &str| {
+            aterm_regex::RegexBuilder::new(p)
+                .size_limit(1024 * 1024)
+                .step_limit(1 << 26)
+                .build()
+                .map_err(|_| Outside)
+        };
+        let whole = compile(&src)?;
+        let body = &src["(?m)".len()..];
+        let (group1, has_group) = match first_capture(body) {
+            Some((sub, quantified)) => {
+                if quantified {
+                    return Err(Outside);
+                }
+                let mut g = String::from("(?m)");
+                if flags.contains('i') {
+                    g.push_str("(?i)");
+                }
+                if flags.contains('m') {
+                    g.push_str("(?s)");
+                }
+                g.push_str(
+                    &sub.replace("\\h", "[0-9A-Fa-f]")
+                        .replace("\\H", "[^0-9A-Fa-f]"),
+                );
+                (Some(compile(&g)?), true)
+            }
+            None => (None, false),
+        };
+        Ok(LcRegex {
+            whole,
+            group1,
+            has_group,
+        })
+    }
+
+    /// The first capturing group's subpattern and whether a
+    /// `+`/`*`/`{` quantifier follows it. Skips escapes,
+    /// classes, `(?:…)`/`(?=…)` etc.; `(?<name>…)` captures.
+    fn first_capture(pattern: &str) -> Option<(String, bool)> {
+        let bytes = pattern.as_bytes();
+        let mut i = 0;
+        let mut in_class = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                b'[' => in_class = true,
+                b']' => in_class = false,
+                b'(' if !in_class => {
+                    let rest = &pattern[i..];
+                    let inner_start = if rest.starts_with("(?<")
+                        && !rest.starts_with("(?<=")
+                        && !rest.starts_with("(?<!")
+                    {
+                        rest.find('>')? + 1
+                    } else if rest.starts_with("(?") {
+                        i += 1;
+                        continue;
+                    } else {
+                        1
+                    };
+                    // Balanced scan for the matching close.
+                    let mut depth = 1usize;
+                    let mut j = i + inner_start;
+                    let mut class = false;
+                    while j < bytes.len() {
+                        match bytes[j] {
+                            b'\\' => j += 1,
+                            b'[' => class = true,
+                            b']' => class = false,
+                            b'(' if !class => depth += 1,
+                            b')' if !class => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    let sub = pattern[i + inner_start..j].to_string();
+                                    let quantified = matches!(
+                                        bytes.get(j + 1).copied(),
+                                        Some(b'+' | b'*' | b'{')
+                                    );
+                                    return Some((sub, quantified));
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Ruby `String#scan` version extraction over content:
+    /// group 1 when the pattern captures, else whole matches.
+    fn scan_versions(re: &LcRegex, content: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for m in re.whole.find_iter(content) {
+            let whole = m.as_str();
+            let v = match &re.group1 {
+                Some(g) => g.find(whole).map(|m2| m2.as_str().to_string()),
+                None => Some(whole.to_string()),
+            };
+            if let Some(v) = v
+                && !out.contains(&v)
+            {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    /// Ruby `tag[regex, 1]`: the first capture of a search,
+    /// `None` when there is no capture group or it doesn't
+    /// participate.
+    fn search_group1(re: &LcRegex, text: &str) -> Option<String> {
+        if !re.has_group {
+            return None;
+        }
+        let m = re.whole.find(text)?;
+        re.group1
+            .as_ref()?
+            .find(m.as_str())
+            .map(|g| g.as_str().to_string())
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Strat {
+        Git,
+        GithubLatest,
+        GithubReleases,
+        Gnu,
+        PageMatch,
+        HeaderMatch,
+        Sparkle,
+    }
+
+    const KNOWN_STRATEGIES: &[&str] = &[
+        "apache",
+        "bitbucket",
+        "cpan",
+        "crate",
+        "electron_builder",
+        "extract_plist",
+        "git",
+        "github_latest",
+        "github_releases",
+        "gnome",
+        "gnu",
+        "hackage",
+        "header_match",
+        "json",
+        "launchpad",
+        "npm",
+        "page_match",
+        "pypi",
+        "ruby_gems",
+        "sourceforge",
+        "sparkle",
+        "xml",
+        "xorg",
+        "yaml",
+    ];
+
+    /// Every `find_versions` result: version strings and/or
+    /// failure messages (brew's `messages` channel), or a
+    /// raised error text (exceptions).
+    enum Found {
+        Versions(Vec<String>),
+        Messages(Vec<String>),
+        Raised(String),
+    }
+
+    fn url_host(url: &str) -> String {
+        let after = url.split("://").nth(1).unwrap_or(url);
+        let host = after.split(['/', '?', '#']).next().unwrap_or_default();
+        host.rsplit('@').next().unwrap_or_default().to_lowercase()
+    }
+
+    /// Brew `Git.preprocess_url`.
+    fn git_preprocess(url: &str) -> String {
+        let Some((scheme, rest)) = url.split_once("://") else {
+            return url.to_string();
+        };
+        let (hostport, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
+        };
+        let host = hostport.rsplit('@').next().unwrap_or_default();
+        if host.is_empty() || path.is_empty() {
+            return url.to_string();
+        }
+        let host = if host == "github.s3.amazonaws.com" {
+            "github.com"
+        } else {
+            host
+        };
+        let path_clean = path.strip_suffix(".git").unwrap_or(path);
+        let two = |p: &str| -> Option<(String, String)> {
+            let mut it = p.split('/');
+            Some((it.next()?.to_string(), it.next()?.to_string()))
+        };
+        if host == "github.com" {
+            if path_clean.ends_with("/releases/latest") || path_clean.ends_with("/releases/latest/")
+            {
+                return url.to_string();
+            }
+            let p = path_clean.strip_prefix("downloads/").unwrap_or(path_clean);
+            if let Some((owner, repo)) = two(p) {
+                return format!("{scheme}://{host}/{owner}/{repo}.git");
+            }
+        } else if ["codeberg.org", "gitea.com", "opendev.org", "tildegit.org"].contains(&host) {
+            if path_clean.ends_with("/releases/latest") {
+                return url.to_string();
+            }
+            if let Some((owner, repo)) = two(path_clean) {
+                return format!("{scheme}://{host}/{owner}/{repo}.git");
+            }
+        } else if host == "lolg.it" {
+            if let Some((owner, repo)) = two(path_clean) {
+                return format!("{scheme}://{host}/{owner}/{repo}.git");
+            }
+        } else if host == "git.sr.ht" {
+            if let Some((owner, repo)) = two(path_clean) {
+                return format!("{scheme}://{host}/{owner}/{repo}");
+            }
+        } else if let Some(idx) = url.to_lowercase().find("/-/archive/") {
+            return format!("{}.git", &url[..idx]);
+        }
+        url.to_string()
+    }
+
+    /// Brew `Git.match?`: the download-strategy detector's
+    /// git shapes, on the preprocessed URL.
+    fn git_match(url: &str) -> Option<String> {
+        let p = git_preprocess(url);
+        let http = p.starts_with("https://") || p.starts_with("http://");
+        let ok = (http && p.ends_with(".git"))
+            || p.starts_with("git://")
+            || p.starts_with("ssh://git")
+            || (http
+                && url_host(&p) == "git.sr.ht"
+                && p.split("://")
+                    .nth(1)
+                    .is_some_and(|r| r.split('/').filter(|s| !s.is_empty()).count() == 3));
+        ok.then_some(p)
+    }
+
+    /// GithubReleases' repo regex on `url` (`.git` stripped):
+    /// (username, repository).
+    fn github_repo(url: &str) -> Option<(String, String)> {
+        let stripped = url.strip_suffix(".git").unwrap_or(url);
+        let rest = stripped
+            .strip_prefix("https://github.com/")
+            .or_else(|| stripped.strip_prefix("http://github.com/"))?;
+        let rest = rest.strip_prefix("downloads/").unwrap_or(rest);
+        let mut it = rest.split('/');
+        let user = it.next().filter(|s| !s.is_empty())?;
+        let repo = it.next().filter(|s| !s.is_empty())?;
+        Some((user.to_string(), repo.to_string()))
+    }
+
+    /// Gnu's URL regex, simplified to its host/path shapes.
+    /// Returns the project name.
+    fn gnu_project(url: &str) -> Option<String> {
+        if url.contains("savannah.") {
+            return None;
+        }
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))?;
+        let (host, path) = rest.split_once('/')?;
+        let host = host.to_lowercase();
+        let seg: Vec<&str> = path.split('/').collect();
+        if host == "ftpmirror.gnu.org" {
+            if seg.first() == Some(&"non-gnu") {
+                return None;
+            }
+            return seg.first().filter(|s| !s.is_empty()).map(|s| s.to_string());
+        }
+        if host == "gnu.org" || host.ends_with(".gnu.org") {
+            if seg.len() >= 2 && (seg[0] == "gnu" || seg[0] == "software") && !seg[1].is_empty() {
+                return Some(seg[1].to_string());
+            }
+            // `<project>.gnu.org` root form.
+            if let Some(proj) = host.strip_suffix(".gnu.org")
+                && !proj.is_empty()
+                && !proj.contains('.')
+                && path.is_empty()
+            {
+                return Some(proj.to_string());
+            }
+        }
+        None
+    }
+
+    /// Hosts of the priority-5 URL-pinned strategies abrew
+    /// does not run: brew would pick one of them over
+    /// PageMatch, so such URLs are outside the subset.
+    fn other_strategy_host(url: &str) -> bool {
+        let host = url_host(url);
+        let h = host.as_str();
+        h == "www.apache.org"
+            || h == "archive.apache.org"
+            || h == "dlcdn.apache.org"
+            || h == "downloads.apache.org"
+            || h == "bitbucket.org"
+            || h == "cpan.metacpan.org"
+            || h == "www.cpan.org"
+            || h == "static.crates.io"
+            || h == "download.gnome.org"
+            || h == "downloads.haskell.org"
+            || h == "hackage.haskell.org"
+            || h == "launchpad.net"
+            || h.ends_with(".launchpad.net")
+            || h == "registry.npmjs.org"
+            || h == "files.pythonhosted.org"
+            || h == "rubygems.org"
+            || h == "sourceforge.net"
+            || h.ends_with(".sourceforge.net")
+            || h == "sf.net"
+            || h.ends_with(".sf.net")
+            || h == "x.org"
+            || h.ends_with(".x.org")
+            || h == "freedesktop.org"
+            || h.ends_with(".freedesktop.org")
+            || h == "archive.mesa3d.org"
+    }
+
+    enum UrlPlan {
+        Run(Strat, String, Option<LcRegex>),
+        SkipUrl,
+        Raised(String),
+    }
+
+    /// Brew's per-URL strategy choice (`from_symbol` explicit
+    /// win, else `from_url` priority order), restricted to
+    /// the native strategies.
+    fn plan_url(pkg: &Pkg, url: &str) -> Result<UrlPlan, Outside> {
+        let spec = pkg.spec.as_ref();
+        let explicit = spec.and_then(|s| s.strategy.as_deref());
+        let spec_regex = || -> Result<Option<LcRegex>, Outside> {
+            match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+                Some((p, f)) => Ok(Some(lc_regex(p, f)?)),
+                None => Ok(None),
+            }
+        };
+        if let Some(sym) = explicit {
+            match sym {
+                "page_match" => {
+                    return Ok(match spec_regex()? {
+                        Some(re) => UrlPlan::Run(Strat::PageMatch, url.to_string(), Some(re)),
+                        None => UrlPlan::Raised(
+                            "PageMatch requires a regex or `strategy` block".to_string(),
+                        ),
+                    });
+                }
+                "git" => {
+                    return Ok(match git_match(url) {
+                        Some(processed) => {
+                            UrlPlan::Run(Strat::Git, processed, Some(git_regex(spec)?))
+                        }
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
+                "github_latest" => {
+                    return Ok(if github_repo(url).is_some() {
+                        UrlPlan::Run(
+                            Strat::GithubLatest,
+                            url.to_string(),
+                            Some(github_regex(spec)?),
+                        )
+                    } else {
+                        UrlPlan::SkipUrl
+                    });
+                }
+                "gnu" => {
+                    return Ok(if gnu_project(url).is_some() {
+                        UrlPlan::Run(Strat::Gnu, url.to_string(), spec_regex()?)
+                    } else {
+                        UrlPlan::SkipUrl
+                    });
+                }
+                "github_releases" => {
+                    return Ok(if github_repo(url).is_some() {
+                        UrlPlan::Run(
+                            Strat::GithubReleases,
+                            url.to_string(),
+                            Some(github_regex(spec)?),
+                        )
+                    } else {
+                        UrlPlan::SkipUrl
+                    });
+                }
+                "header_match" => {
+                    if !url.starts_with("https://") && !url.starts_with("http://") {
+                        return Ok(UrlPlan::SkipUrl);
+                    }
+                    // Without a regex brew falls back to URL
+                    // version detection, which abrew lacks.
+                    return Ok(match spec_regex()? {
+                        Some(re) => UrlPlan::Run(Strat::HeaderMatch, url.to_string(), Some(re)),
+                        None => return Err(Outside),
+                    });
+                }
+                "sparkle" => {
+                    if !url.starts_with("https://") && !url.starts_with("http://") {
+                        return Ok(UrlPlan::SkipUrl);
+                    }
+                    if spec.is_some_and(|s| s.regex.is_some()) {
+                        return Ok(UrlPlan::Raised(
+                            "Sparkle only supports a regex when using a `strategy` block"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(UrlPlan::Run(Strat::Sparkle, url.to_string(), None));
+                }
+                other if KNOWN_STRATEGIES.contains(&other) => return Err(Outside),
+                // Unknown symbol: brew's `from_symbol` is nil
+                // and the URL-derived strategy is used instead.
+                _ => {}
+            }
+        }
+        if let Some(processed) = git_match(url) {
+            return Ok(UrlPlan::Run(Strat::Git, processed, Some(git_regex(spec)?)));
+        }
+        if gnu_project(url).is_some() {
+            return Ok(UrlPlan::Run(Strat::Gnu, url.to_string(), spec_regex()?));
+        }
+        if other_strategy_host(url) {
+            return Err(Outside);
+        }
+        if let Some(re) = spec_regex()? {
+            return Ok(UrlPlan::Run(Strat::PageMatch, url.to_string(), Some(re)));
+        }
+        Ok(UrlPlan::SkipUrl)
+    }
+
+    fn git_regex(spec: Option<&LivecheckSpec>) -> Result<LcRegex, Outside> {
+        match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+            Some((p, f)) => lc_regex(p, f),
+            None => lc_regex(r"\D*(.+)", ""),
+        }
+    }
+
+    fn github_regex(spec: Option<&LivecheckSpec>) -> Result<LcRegex, Outside> {
+        match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+            Some((p, f)) => lc_regex(p, f),
+            None => lc_regex(r"v?(\d+(?:\.\d+)+)", "i"),
+        }
+    }
+
+    /// All URLs brew would try for the package, or the
+    /// ArgumentError text for a bad `url` symbol.
+    fn checkable_urls(pkg: &Pkg) -> Result<Vec<String>, String> {
+        if let Some(spec) = &pkg.spec
+            && let Some(u) = &spec.url
+        {
+            let resolved = match u {
+                LivecheckUrl::Literal(s) => Some(s.clone()),
+                LivecheckUrl::Symbol(sym) => match sym.as_str() {
+                    "url" if pkg.is_cask => Some(pkg.stable_url.clone()),
+                    "head" if !pkg.is_cask && !pkg.head_url.is_empty() => {
+                        Some(pkg.head_url.clone())
+                    }
+                    "stable" if !pkg.is_cask && pkg.has_stable => Some(pkg.stable_url.clone()),
+                    "homepage" if !pkg.homepage.is_empty() => Some(pkg.homepage.clone()),
+                    _ => None,
+                },
+            };
+            return match (u, resolved) {
+                // A literal URL is used as-is (even empty: no
+                // strategy matches it, brew's NO_VERSIONS path).
+                (LivecheckUrl::Literal(_), Some(s)) => Ok(vec![s]),
+                (LivecheckUrl::Symbol(_), Some(s)) if !s.is_empty() => Ok(vec![s]),
+                (LivecheckUrl::Symbol(sym), _) => {
+                    Err(format!("`url :{sym}` does not reference a checkable URL"))
+                }
+                (LivecheckUrl::Literal(_), None) => Ok(vec![]),
+            };
+        }
+        let mut urls: Vec<String> = Vec::new();
+        if !pkg.stable_url.is_empty() {
+            urls.push(pkg.stable_url.clone());
+        }
+        if !pkg.is_cask && !pkg.head_url.is_empty() {
+            urls.push(pkg.head_url.clone());
+        }
+        if !pkg.homepage.is_empty() {
+            urls.push(pkg.homepage.clone());
+        }
+        urls.dedup();
+        Ok(urls)
+    }
+
+    /// Prepared per-package work after the subset gate.
+    enum Prepared {
+        Skipped(String, Option<Vec<String>>),
+        Ready(Result<Vec<(String, UrlPlan)>, String>),
+    }
+
+    fn prepare(pkg: &Pkg, total: usize) -> Result<Prepared, Outside> {
+        if let Some((status, messages)) = skip_info(pkg, total) {
+            if status == "__outside__" {
+                return Err(Outside);
+            }
+            return Ok(Prepared::Skipped(status, messages));
+        }
+        if pkg.outside || spec_outside(&pkg.spec) {
+            return Err(Outside);
+        }
+        let urls = match checkable_urls(pkg) {
+            Ok(u) => u,
+            Err(msg) => return Ok(Prepared::Ready(Err(msg))),
+        };
+        let mut plans = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        for url in urls {
+            if seen.contains(&url) {
+                continue;
+            }
+            seen.push(url.clone());
+            plans.push((url.clone(), plan_url(pkg, &url)?));
+        }
+        Ok(Prepared::Ready(Ok(plans)))
+    }
+
+    fn check(pkg: &Pkg, prepared: &Prepared, json: bool) -> Outcome {
+        match prepared {
+            Prepared::Skipped(status, messages) => {
+                Outcome::Skipped(status.clone(), messages.clone())
+            }
+            Prepared::Ready(Err(msg)) => Outcome::Errored(vec![msg.clone()], msg.clone()),
+            Prepared::Ready(Ok(plans)) => check_plans(pkg, plans, json),
+        }
+    }
+
+    fn check_plans(pkg: &Pkg, plans: &[(String, UrlPlan)], json: bool) -> Outcome {
+        if pkg.current.is_empty() {
+            return Outcome::Errored(vec![NO_CURRENT_MSG.to_string()], NO_CURRENT_MSG.to_string());
+        }
+        let mut last_messages: Option<Vec<String>> = None;
+        for (_url, plan) in plans.iter() {
+            let (strat, run_url, re) = match plan {
+                UrlPlan::SkipUrl => continue,
+                UrlPlan::Raised(msg) => {
+                    return Outcome::Errored(vec![msg.clone()], msg.clone());
+                }
+                UrlPlan::Run(s, u, re) => (*s, u, re),
+            };
+            let found = match strat {
+                Strat::Git => git_versions(run_url, re.as_ref().unwrap()),
+                Strat::GithubLatest => github_latest_versions(run_url, re.as_ref().unwrap()),
+                Strat::GithubReleases => github_releases_versions(run_url, re.as_ref().unwrap()),
+                Strat::HeaderMatch => header_versions(run_url, re.as_ref().unwrap()),
+                Strat::Sparkle => sparkle_versions(run_url),
+                Strat::PageMatch => page_versions(run_url, re.as_ref().unwrap()),
+                Strat::Gnu => gnu_versions(pkg, run_url, re.as_ref()),
+            };
+            let mut versions = match found {
+                Found::Versions(v) => v,
+                Found::Messages(msgs) => {
+                    if !json {
+                        for m in &msgs {
+                            println!("{m}");
+                        }
+                    }
+                    last_messages = Some(msgs);
+                    continue;
+                }
+                Found::Raised(msg) => return Outcome::Errored(vec![msg.clone()], msg),
+            };
+            versions.retain(|v| !v.is_empty());
+            if !pkg.spec_defined {
+                versions.retain(|v| !UNSTABLE_KEYWORDS.iter().any(|k| v.contains(k)));
+            }
+            if versions.is_empty() {
+                continue;
+            }
+            let latest = versions
+                .into_iter()
+                .max_by(|a, b| lc_cmp(pkg.is_cask, a, b))
+                .unwrap_or_default();
+            return Outcome::Checked(latest);
+        }
+        match last_messages {
+            Some(msgs) => Outcome::Errored(msgs, NO_VERSIONS_MSG.to_string()),
+            None => Outcome::Errored(
+                vec![NO_VERSIONS_MSG.to_string()],
+                NO_VERSIONS_MSG.to_string(),
+            ),
+        }
+    }
+
+    /// `curl` a page the way brew's `page_content` does
+    /// (without the user-agent fallback): body on success,
+    /// `curl:` stderr lines as messages on failure.
+    fn page_get(url: &str) -> Result<String, Vec<String>> {
+        let args = [
+            "--fail-with-body",
+            "--location",
+            "--max-redirs",
+            "10",
+            "--silent",
+            "--show-error",
+            "--compressed",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "15",
+            "--",
+            url,
+        ];
+        match fetch::run_capture("curl", &args) {
+            Ok(out) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let msgs: Vec<String> = stderr
+                    .lines()
+                    .filter(|l| l.starts_with("curl:"))
+                    .map(str::to_string)
+                    .collect();
+                Err(if msgs.is_empty() {
+                    vec!["cURL failed without a detectable error".to_string()]
+                } else {
+                    msgs
+                })
+            }
+            Err(_) => Err(vec!["cURL failed without a detectable error".to_string()]),
+        }
+    }
+
+    fn page_versions(url: &str, re: &LcRegex) -> Found {
+        match page_get(url) {
+            Ok(content) => Found::Versions(scan_versions(re, &content)),
+            Err(msgs) => Found::Messages(msgs),
+        }
+    }
+
+    fn gnu_versions(_pkg: &Pkg, url: &str, re: Option<&LcRegex>) -> Found {
+        let Some(project) = gnu_project(url) else {
+            return Found::Versions(Vec::new());
+        };
+        let list_url = format!("https://ftpmirror.gnu.org/{project}/");
+        let default_re;
+        let re = match re {
+            Some(r) => r,
+            None => {
+                let name = aterm_regex::escape(&project);
+                match lc_regex(
+                    &format!(r"href=.*?{name}[._-]v?(\d+(?:\.\d+)*)(?:\.[a-z]+|/)"),
+                    "i",
+                ) {
+                    Ok(r) => {
+                        default_re = r;
+                        &default_re
+                    }
+                    Err(_) => return Found::Versions(Vec::new()),
+                }
+            }
+        };
+        page_versions(&list_url, re)
+    }
+
+    /// `git ls-remote --tags` with brew's 20s timeout (the
+    /// worker thread is detached on timeout; process exit
+    /// does not wait for it).
+    fn git_versions(url: &str, re: &LcRegex) -> Found {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let url_owned = url.to_string();
+        std::thread::spawn(move || {
+            let mut cmd = aterm_uds::spawnfd::command("git");
+            cmd.args([
+                "ls-remote",
+                "--tags",
+                "--end-of-options",
+                url_owned.as_str(),
+            ])
+            .env("GIT_TERMINAL_PROMPT", "0");
+            let _ = tx.send(cmd.output());
+        });
+        let out = match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Found::Messages(vec![e.to_string()]),
+            Err(_) => {
+                return Found::Messages(vec![
+                    "git ls-remote timed out after 20 seconds.".to_string(),
+                ]);
+            }
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.is_empty() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Found::Messages(stderr.lines().map(str::to_string).collect());
+        }
+        let mut versions: Vec<String> = Vec::new();
+        for line in stdout.lines() {
+            let Some((hash, refer)) = line.split_once([' ', '\t']) else {
+                continue;
+            };
+            if hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let Some(tag) = refer.trim().strip_prefix("refs/tags/") else {
+                continue;
+            };
+            let tag = tag.strip_suffix("^{}").unwrap_or(tag);
+            if let Some(v) = search_group1(re, tag)
+                && !versions.contains(&v)
+            {
+                versions.push(v);
+            }
+        }
+        Found::Versions(versions)
+    }
+
+    fn github_latest_versions(url: &str, re: &LcRegex) -> Found {
+        github_latest_versions_with(url, re, |slug| {
+            let github = github_client()?;
+            github.releases(slug).latest()
+        })
+    }
+
+    fn github_latest_versions_with(
+        url: &str,
+        re: &LcRegex,
+        read: impl FnOnce(&agh::Slug) -> agh::Result<agh::model::ReleaseObject>,
+    ) -> Found {
+        let Some((user, repo)) = github_repo(url) else {
+            return Found::Versions(Vec::new());
+        };
+        let slug = match agh::Slug::parse(&format!("{user}/{repo}")) {
+            Ok(slug) => slug,
+            Err(error) => return Found::Raised(format!("GitHub API Error: {error}")),
+        };
+        match read(&slug) {
+            Ok(release) => {
+                let mut versions = Vec::new();
+                if !release.draft
+                    && !release.prerelease
+                    && let Some(v) = search_group1(re, &release.tag_name)
+                {
+                    versions.push(v);
+                }
+                Found::Versions(versions)
+            }
+            Err(error) => Found::Raised(format!("GitHub API Error: {error}")),
+        }
+    }
+
+    fn github_releases_versions(url: &str, re: &LcRegex) -> Found {
+        github_releases_versions_with(url, re, |slug| {
+            let github = github_client()?;
+            // Brew reads one default page of `/releases`.
+            let opts = agh::page::ListOpts {
+                per_page: 30,
+                max_pages: 1,
+                partial: true,
+                ..agh::page::ListOpts::STANDARD
+            };
+            Ok(github.releases(slug).list(&opts)?.items)
+        })
+    }
+
+    fn github_releases_versions_with(
+        url: &str,
+        re: &LcRegex,
+        read: impl FnOnce(&agh::Slug) -> agh::Result<Vec<agh::model::ReleaseObject>>,
+    ) -> Found {
+        let Some((user, repo)) = github_repo(url) else {
+            return Found::Versions(Vec::new());
+        };
+        let slug = match agh::Slug::parse(&format!("{user}/{repo}")) {
+            Ok(slug) => slug,
+            Err(error) => return Found::Raised(format!("GitHub API Error: {error}")),
+        };
+        match read(&slug) {
+            Ok(releases) => {
+                let mut versions: Vec<String> = Vec::new();
+                for release in &releases {
+                    if release.draft || release.prerelease {
+                        continue;
+                    }
+                    if let Some(v) = search_group1(re, &release.tag_name)
+                        && !versions.contains(&v)
+                    {
+                        versions.push(v);
+                    }
+                }
+                Found::Versions(versions)
+            }
+            Err(error) => Found::Raised(format!("GitHub API Error: {error}")),
+        }
+    }
+
+    /// The routed GitHub client brew-parity reads go
+    /// through (fleet journal/rate book when dirs exist).
+    fn github_client() -> agh::Result<agh::Github> {
+        let mut builder =
+            agh::GithubBuilder::new(agh::policy::Router::empty()).caller("abrew-livecheck");
+        let dirs = agh::config::Dirs::from_env();
+        if let Some(dirs) = &dirs {
+            builder = builder
+                .journal(dirs.clone())
+                .rate_book(agh::rate::RateBook::at(dirs.rate()));
+        }
+        let base = builder.build();
+        Ok(match dirs {
+            Some(dirs) => agh::routing::adopt(&base, &dirs)?.bind(&base)?,
+            None => base,
+        })
+    }
+
+    /// Brew `HeaderMatch`: merge `location` /
+    /// `content-disposition` across redirect responses (last
+    /// wins), run the regex over each wanted header.
+    fn header_versions(url: &str, re: &LcRegex) -> Found {
+        let merged = page_headers(url);
+        let mut versions: Vec<String> = Vec::new();
+        for name in ["content-disposition", "location"] {
+            if let Some(value) = merged.get(name)
+                && let Some(v) = search_group1(re, value)
+                && !versions.contains(&v)
+            {
+                versions.push(v);
+            }
+        }
+        Found::Versions(versions)
+    }
+
+    /// `curl_headers` shape: HEAD first, GET retry when no
+    /// wanted header arrived; failures yield no headers.
+    fn page_headers(url: &str) -> std::collections::BTreeMap<String, String> {
+        let base = [
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--head",
+            "--max-redirs",
+            "10",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "15",
+        ];
+        for extra in [&[][..], &["--request", "GET"][..]] {
+            let mut args: Vec<&str> = base.to_vec();
+            args.extend_from_slice(extra);
+            args.extend(["--", url]);
+            let Ok(out) = fetch::run_capture("curl", &args) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&out.stdout);
+            let merged = merge_response_headers(&text);
+            if !merged.is_empty() {
+                return merged;
+            }
+        }
+        std::collections::BTreeMap::new()
+    }
+
+    fn merge_response_headers(text: &str) -> std::collections::BTreeMap<String, String> {
+        let mut merged = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim().to_lowercase();
+            if name == "location" || name == "content-disposition" {
+                merged.insert(name, value.trim().to_string());
+            }
+        }
+        merged
+    }
+
+    /// Brew `Sparkle` without a strategy block: newest
+    /// appcast item's bundle version (nice form).
+    fn sparkle_versions(url: &str) -> Found {
+        match page_get(url) {
+            Ok(content) => Found::Versions(sparkle_newest(&content).into_iter().collect()),
+            Err(msgs) => Found::Messages(msgs),
+        }
+    }
+
+    struct SparkleItem {
+        pub_date: i64,
+        short: Option<String>,
+        version: Option<String>,
+        os: Option<String>,
+        min_sys: Option<String>,
+        any_field: bool,
+    }
+
+    fn sparkle_newest(content: &str) -> Option<String> {
+        let mut items: Vec<SparkleItem> = sparkle_items(content)
+            .into_iter()
+            .filter(|it| {
+                if let Some(os) = &it.os
+                    && os != "macos"
+                    && os != "osx"
+                {
+                    return false;
+                }
+                if let Some(min) = &it.min_sys {
+                    let newest_unsupported = std::env::var("HOMEBREW_MACOS_NEWEST_UNSUPPORTED")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "28".to_string());
+                    let strip_patch =
+                        |v: &str| -> String { v.split('.').take(2).collect::<Vec<_>>().join(".") };
+                    if version_cmp(&strip_patch(min), &strip_patch(&newest_unsupported))
+                        != Ordering::Less
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+        items.sort_by(|a, b| a.pub_date.cmp(&b.pub_date).then_with(|| bundle_cmp(a, b)));
+        let item = items.last()?;
+        bundle_nice(item.short.as_deref(), item.version.as_deref())
+    }
+
+    fn bundle_cmp(a: &SparkleItem, b: &SparkleItem) -> Ordering {
+        let ord = version_cmp(
+            a.version.as_deref().unwrap_or_default(),
+            b.version.as_deref().unwrap_or_default(),
+        );
+        if ord != Ordering::Equal {
+            return ord;
+        }
+        version_cmp(
+            a.short.as_deref().unwrap_or_default(),
+            b.short.as_deref().unwrap_or_default(),
+        )
+    }
+
+    /// `BundleVersion#nice_version`.
+    fn bundle_nice(short: Option<&str>, version: Option<&str>) -> Option<String> {
+        let short = match (short, version) {
+            (Some(s), Some(v)) => {
+                let suffix = format!(" ({v})");
+                Some(s.strip_suffix(&suffix).unwrap_or(s).trim_end().to_string())
+            }
+            (s, _) => s.map(str::to_string),
+        };
+        let short = short.filter(|s| !s.is_empty());
+        let version = version.filter(|s| !s.is_empty()).map(str::to_string);
+        let dotted = |v: &str, plus: bool| {
+            let ok = |c: char| c.is_ascii_digit() || c == '.';
+            !v.is_empty()
+                && v.chars().all(ok)
+                && !v.starts_with('.')
+                && !v.ends_with('.')
+                && (!plus || v.contains('.'))
+        };
+        match (short, version) {
+            (Some(s), Some(v)) => {
+                if s == v {
+                    Some(s)
+                } else if dotted(&v, true) && v.starts_with(&format!("{s}.")) {
+                    Some(v)
+                } else if dotted(&s, true) && s.starts_with(&format!("{v}.")) {
+                    Some(s)
+                } else if dotted(&s, false)
+                    && !v.is_empty()
+                    && v.bytes().all(|b| b.is_ascii_digit())
+                {
+                    if s.starts_with(&format!("{v}.")) || s.ends_with(&format!(".{v}")) {
+                        Some(s)
+                    } else {
+                        Some(format!("{s},{v}"))
+                    }
+                } else {
+                    Some(format!("{s},{v}"))
+                }
+            }
+            (Some(s), None) => Some(s),
+            (None, Some(v)) => Some(v),
+            (None, None) => None,
+        }
+    }
+
+    fn xml_unescape(s: &str) -> String {
+        let s = s.trim();
+        let inner = s
+            .strip_prefix("<![CDATA[")
+            .and_then(|r| r.strip_suffix("]]>"))
+            .unwrap_or(s);
+        inner
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
+
+    /// First `<name …>` element's text inside `item`
+    /// (namespace prefix optional, as brew strips prefixes).
+    fn xml_elem_text(item: &str, name: &str) -> Option<String> {
+        for (open, _) in item.match_indices('<') {
+            let rest = &item[open + 1..];
+            let tag_end = rest.find(['>', ' ', '\t', '\n', '/'])?;
+            let tag = &rest[..tag_end];
+            let bare = tag.rsplit(':').next().unwrap_or(tag);
+            if bare != name {
+                continue;
+            }
+            let Some(gt) = rest.find('>') else { continue };
+            if rest[..gt].trim_end().ends_with('/') {
+                return Some(String::new());
+            }
+            let body = &rest[gt + 1..];
+            let close = format!("</{tag}>");
+            let end = body.find(&close)?;
+            let text = xml_unescape(&body[..end]);
+            return (!text.is_empty()).then_some(text);
+        }
+        None
+    }
+
+    /// One attribute of the first `<enclosure …>` element.
+    fn xml_enclosure_attr(item: &str, attr: &str) -> Option<String> {
+        let enc = item.find("<enclosure")?;
+        let rest = &item[enc..];
+        let end = rest.find('>')?;
+        let tag = &rest[..end];
+        for cand in [attr.to_string(), format!("sparkle:{attr}")] {
+            for q in ['\"', '\''] {
+                let needle = format!("{cand}={q}");
+                if let Some(pos) = tag.find(&needle) {
+                    let val = &tag[pos + needle.len()..];
+                    if let Some(vend) = val.find(q) {
+                        let v = xml_unescape(&val[..vend]);
+                        if !v.is_empty() {
+                            return Some(v);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// RFC 2822 / ISO 8601 pubDate to epoch seconds (0 when
+    /// unparsable, brew's sort default).
+    fn pubdate_epoch(s: &str) -> i64 {
+        fn to_epoch(y: i64, m: i64, d: i64, hms: (i64, i64, i64), offset: i64) -> i64 {
+            if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+                return 0;
+            }
+            // Days since epoch (civil algorithm).
+            let yy = if m <= 2 { y - 1 } else { y };
+            let era = yy.div_euclid(400);
+            let yoe = yy - era * 400;
+            let mp = if m > 2 { m - 3 } else { m + 9 };
+            let doy = (153 * mp + 2) / 5 + d - 1;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            let days = era * 146097 + doe - 719468;
+            days * 86400 + hms.0 * 3600 + hms.1 * 60 + hms.2 - offset
+        }
+        fn hms_of(t: &str) -> Option<(i64, i64, i64)> {
+            let t = t.trim_end_matches('Z');
+            let mut it = t.split(':');
+            let h: i64 = it.next()?.parse().ok()?;
+            let m: i64 = it.next()?.parse().ok()?;
+            let sec = it
+                .next()
+                .map(|x| {
+                    x.trim_end_matches(|c: char| !c.is_ascii_digit())
+                        .parse()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            Some((h, m, sec))
+        }
+        let s = s.trim();
+        // ISO 8601: YYYY-MM-DD[T| ]hh:mm:ss([+-]hh:mm|Z)?
+        let iso_digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+        if s.len() >= 10 && s.as_bytes().get(4) == Some(&b'-') && iso_digits(&s[..4]) {
+            let (date, time) = match s.find(['T', ' ']) {
+                Some(i) => (&s[..i], &s[i + 1..]),
+                None => (s, ""),
+            };
+            let dp: Vec<i64> = date.split('-').filter_map(|x| x.parse().ok()).collect();
+            if dp.len() == 3 {
+                let (time, offset) = if let Some(z) = time.rfind(['+', '-']) {
+                    let off = &time[z..];
+                    let sign = if off.starts_with('-') { -1 } else { 1 };
+                    let op: Vec<i64> = off[1..].split(':').filter_map(|x| x.parse().ok()).collect();
+                    (
+                        &time[..z],
+                        if op.len() == 2 {
+                            sign * (op[0] * 3600 + op[1] * 60)
+                        } else {
+                            0
+                        },
+                    )
+                } else {
+                    (time, 0)
+                };
+                return to_epoch(
+                    dp[0],
+                    dp[1],
+                    dp[2],
+                    hms_of(time).unwrap_or_default(),
+                    offset,
+                );
+            }
+        }
+        // RFC 2822: [Wed, ]01 Jan 2025 10:00:00 +0000
+        let months = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let clean: String = s.chars().map(|c| if c == ',' { ' ' } else { c }).collect();
+        let toks: Vec<&str> = clean.split_whitespace().collect();
+        let mut day: Option<i64> = None;
+        let mut mon: Option<i64> = None;
+        let mut year: Option<i64> = None;
+        let mut hms = (0i64, 0i64, 0i64);
+        let mut offset: i64 = 0;
+        for t in &toks {
+            if let Some(m) = months.iter().position(|x| x == t) {
+                mon = Some(m as i64 + 1);
+            } else if t.len() == 4 && iso_digits(t) && year.is_none() {
+                year = t.parse().ok();
+            } else if t.contains(':')
+                && let Some(h) = hms_of(t)
+            {
+                hms = h;
+            } else if (t.starts_with('+') || t.starts_with('-'))
+                && t.len() == 5
+                && iso_digits(&t[1..])
+            {
+                let sign = if t.starts_with('-') { -1 } else { 1 };
+                offset = sign
+                    * (t[1..3].parse::<i64>().unwrap_or(0) * 3600
+                        + t[3..5].parse::<i64>().unwrap_or(0) * 60);
+            } else if day.is_none() && iso_digits(t) && t.len() <= 2 {
+                day = t.parse().ok();
+            }
+        }
+        match (year, mon, day) {
+            (Some(y), Some(m), Some(d)) => to_epoch(y, m, d, hms, offset),
+            _ => 0,
+        }
+    }
+
+    fn sparkle_items(content: &str) -> Vec<SparkleItem> {
+        let mut items = Vec::new();
+        let mut rest = content;
+        while let Some(start) = rest.find("<item") {
+            let after = &rest[start..];
+            let Some(end) = after.find("</item>") else {
+                break;
+            };
+            let item = &after[..end];
+            rest = &after[end..];
+            let mut short = xml_enclosure_attr(item, "shortVersionString");
+            let mut version = xml_enclosure_attr(item, "version");
+            let os = xml_enclosure_attr(item, "os");
+            let title = xml_elem_text(item, "title");
+            let any_field = title.is_some()
+                || xml_elem_text(item, "link").is_some()
+                || xml_elem_text(item, "channel").is_some()
+                || os.is_some()
+                || xml_enclosure_attr(item, "url").is_some();
+            if short.is_none() {
+                short = xml_elem_text(item, "shortVersionString");
+            }
+            if version.is_none() {
+                version = xml_elem_text(item, "version");
+            }
+            if (short.is_none() || version.is_none())
+                && let Some(t) = &title
+            {
+                // `1.2.3 (4567)` title fallback.
+                let t = t.trim_end();
+                let num_end = t
+                    .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let tail = &t[num_end..];
+                if !tail.is_empty() && tail.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+                    if short.is_none() {
+                        short = Some(tail.to_string());
+                    }
+                } else if t.ends_with(')')
+                    && let Some(open) = t.rfind('(')
+                {
+                    let before = t[..open].trim_end();
+                    let n_end = before
+                        .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    let num = &before[n_end..];
+                    if !num.is_empty() && num.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+                        if short.is_none() {
+                            short = Some(num.to_string());
+                        }
+                        if version.is_none() {
+                            version = Some(t[open..].to_string());
+                        }
+                    }
+                }
+            }
+            let min_sys = xml_elem_text(item, "minimumSystemVersion").map(|v| {
+                v.trim_start_matches(|c: char| !c.is_ascii_digit())
+                    .trim_end_matches(|c: char| !c.is_ascii_digit())
+                    .to_string()
+            });
+            let pub_date = xml_elem_text(item, "pubDate").map_or(0, |d| pubdate_epoch(&d));
+            items.push(SparkleItem {
+                pub_date,
+                any_field: any_field || short.is_some() || version.is_some(),
+                short,
+                version,
+                os,
+                min_sys,
+            });
+        }
+        items.into_iter().filter(|it| it.any_field).collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn github_latest_reads_the_routed_repository_and_refuses_nonstable_releases() {
+            let fake = agh_fake::FakeGithub::start();
+            fake.add_repo("sample/tool", agh_fake::RepoSpec::public());
+            let id = fake.add_release(
+                "sample/tool",
+                agh_fake::ReleaseSpec::published("v1.2.3", "2026-11-11T00:00:00Z"),
+            );
+            fake.set_latest("sample/tool", Some(id));
+            let ports = fake.ports();
+            let github = agh::GithubBuilder::new(agh::policy::Router::empty())
+                .endpoints(agh::wire::Endpoints::loopback(
+                    ports.api,
+                    ports.uploads,
+                    ports.web,
+                    ports.cdn,
+                ))
+                .build();
+            let re = lc_regex(r"v(\d+(?:\.\d+)+)", "").unwrap();
+            for reject in [None, Some("draft"), Some("prerelease")] {
+                let found = github_latest_versions_with(
+                    "https://github.com/sample/tool.git",
+                    &re,
+                    |slug| {
+                        assert_eq!(slug.to_string(), "sample/tool");
+                        let mut release = github.releases(slug).latest()?;
+                        release.draft = reject == Some("draft");
+                        release.prerelease = reject == Some("prerelease");
+                        Ok(release)
+                    },
+                );
+                let Found::Versions(versions) = found else {
+                    panic!("the release read did not return versions");
+                };
+                assert_eq!(
+                    versions,
+                    if reject.is_none() {
+                        vec!["1.2.3"]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+            assert!(matches!(
+                github_latest_versions_with("https://github.com/sample/missing", &re, |slug| {
+                    github.releases(slug).latest()
+                }),
+                Found::Raised(_)
+            ));
+        }
+
+        #[test]
+        fn regex_scan_and_search_extract_group1() {
+            let re = lc_regex(r"^(?:jq[._-])?v?(\d+(?:\.\d+)+)$", "i").unwrap();
+            assert_eq!(search_group1(&re, "jq-1.8.2").as_deref(), Some("1.8.2"));
+            assert_eq!(search_group1(&re, "v1.7").as_deref(), Some("1.7"));
+            assert_eq!(search_group1(&re, "other"), None);
+            let page = lc_regex(r"href=.*?foo[._-]v?(\d+(?:\.\d+)*)(?:\.[a-z]+|/)", "i").unwrap();
+            let got = scan_versions(&page, "<a href=\"foo-1.2.tar.gz\">x</a> foo-9.9.zip");
+            assert_eq!(got, ["1.2"]);
+            // No capture: whole matches are the versions.
+            let plain = lc_regex(r"\d+\.\d+", "").unwrap();
+            assert_eq!(scan_versions(&plain, "a 1.2 b 3.4"), ["1.2", "3.4"]);
+            assert_eq!(search_group1(&plain, "1.2"), None);
+            // A quantified first group is outside the subset.
+            assert!(lc_regex(r"(\d)+", "").is_err());
+            // Ruby line anchors on a page.
+            let anchored = lc_regex(r"^version (\d+)$", "").unwrap();
+            assert_eq!(scan_versions(&anchored, "x\nversion 3\ny"), ["3"]);
+        }
+
+        #[test]
+        fn git_url_shapes() {
+            assert_eq!(
+                git_match("https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq.tar.gz")
+                    .as_deref(),
+                Some("https://github.com/jqlang/jq.git")
+            );
+            assert_eq!(git_match("file:///tmp/repo.git"), None);
+            assert_eq!(
+                git_match("https://gitlab.com/x/y/-/archive/1.0/y.tar.gz").as_deref(),
+                Some("https://gitlab.com/x/y.git")
+            );
+            assert_eq!(git_match("https://example.com/foo-1.0.tar.gz"), None);
+        }
+
+        #[test]
+        fn gnu_and_github_url_shapes() {
+            assert_eq!(
+                gnu_project("https://ftpmirror.gnu.org/wget/wget-1.25.0.tar.gz").as_deref(),
+                Some("wget")
+            );
+            assert_eq!(gnu_project("https://ftpmirror.gnu.org/non-gnu/x/"), None);
+            assert_eq!(
+                github_repo("https://github.com/jqlang/jq.git"),
+                Some(("jqlang".to_string(), "jq".to_string()))
+            );
+            assert_eq!(github_repo("https://example.com/a/b"), None);
+        }
+
+        #[test]
+        fn sparkle_newest_item_wins() {
+            let cast = r#"<?xml version="1.0"?>
+<rss><channel>
+<item><title>1.0</title><pubDate>Wed, 01 Jan 2025 10:00:00 +0000</pubDate>
+<enclosure url="https://example.com/a.zip" sparkle:shortVersionString="1.0" sparkle:version="100"/></item>
+<item><title>2.0 (200)</title><pubDate>Thu, 02 Jan 2025 10:00:00 +0000</pubDate>
+<enclosure url="https://example.com/b.zip" sparkle:shortVersionString="2.0" sparkle:version="200"/></item>
+<item><title>win</title><pubDate>Fri, 03 Jan 2025 10:00:00 +0000</pubDate>
+<enclosure url="https://example.com/c.zip" sparkle:shortVersionString="9.9" sparkle:os="windows"/></item>
+</channel></rss>"#;
+            assert_eq!(sparkle_newest(cast).as_deref(), Some("2.0,200"));
+            assert_eq!(
+                bundle_nice(Some("1.2"), Some("1.2.3")).as_deref(),
+                Some("1.2.3")
+            );
+            assert_eq!(
+                bundle_nice(Some("1.2 (34)"), Some("34")).as_deref(),
+                Some("1.2,34")
+            );
+        }
+
+        #[test]
+        fn pubdate_epoch_handles_rfc2822_and_iso() {
+            let rfc = pubdate_epoch("Wed, 01 Jan 2025 10:00:00 +0000");
+            assert_eq!(rfc, 1_735_725_600);
+            assert_eq!(pubdate_epoch("2025-01-01T10:00:00Z"), rfc);
+            assert_eq!(pubdate_epoch("2025-01-01T12:00:00+02:00"), rfc);
+            assert_eq!(pubdate_epoch("2025-01-01"), 1_735_689_600);
+            assert_eq!(pubdate_epoch("not a date"), 0);
+            assert!(pubdate_epoch("2025-06-01T00:00:00Z") > rfc);
+        }
+
+        #[test]
+        fn header_merge_last_value_wins() {
+            let text = "HTTP/2 302\r\nlocation: https://x.test/a-1.0.tgz\r\n\r\nHTTP/2 200\r\ncontent-disposition: attachment; filename=\"a-2.0.tgz\"\r\n";
+            let merged = merge_response_headers(text);
+            assert_eq!(merged["location"], "https://x.test/a-1.0.tgz");
+            assert!(merged["content-disposition"].contains("a-2.0.tgz"));
+        }
+
+        #[test]
+        fn cask_comma_versions_compare_segmentwise() {
+            assert_eq!(lc_cmp(true, "1.2,300", "1.2,400"), Ordering::Less);
+            assert_eq!(lc_cmp(true, "1.3,1", "1.2,999"), Ordering::Greater);
+            assert_eq!(lc_cmp(false, "1.0", "1.0.1"), Ordering::Less);
+        }
+    }
 }
 
 pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
@@ -15042,16 +17572,24 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
     for op in operands_without_flag_values(rest, &["--minimum-version", "--min-version"]) {
         if foreign_qualified(&op) {
             let cask_only = has_flag(rest, "--cask", "") && !has_flag(rest, "--formula", "");
-            if foreign_formula(prefix, &op).is_some() && !cask_only {
-                return not_native(prefix, rest, "outdated (tap-qualified name)");
-            }
-            return failed(&format!(
-                "Error: {}",
-                if cask_only {
-                    // Outdated's cask resolution shorts the name
-                    // before the factory ever sees it.
-                    cask_unavailable(Formula::short_name(&op))
-                } else {
+            // Resolvable qualified names flow through by leaf;
+            // the factory gate above already refused untrusted
+            // formulae, and cask resolution names the file.
+            if cask_only {
+                match factory_cask(prefix, api, &op) {
+                    Err(code) => return code,
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return failed(&format!(
+                            "Error: {}",
+                            tap_cask_unavailable(prefix, &op)
+                                .unwrap_or_else(|| { cask_unavailable(Formula::short_name(&op)) })
+                        ));
+                    }
+                }
+            } else if foreign_formula(prefix, &op).is_none() && !foreign_cask_exists(prefix, &op) {
+                return failed(&format!(
+                    "Error: {}",
                     foreign_unavailable(
                         prefix,
                         api,
@@ -15059,8 +17597,8 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
                         false,
                         has_flag(rest, "--formula", "") && !has_flag(rest, "--cask", ""),
                     )
-                }
-            ));
+                ));
+            }
         }
     }
     let scope: Vec<String> =
@@ -15373,6 +17911,18 @@ fn row_formulae(api: &Api, prefix: &Prefix, names: &[&str]) -> Vec<Formula> {
 /// name and version columns padded to their widest entry, a
 /// two-space separator (one space for a single change), and the
 /// download size in parentheses when known.
+/// Brew's table display for a formula record:
+/// `full_specified_name` — tap formulae stay qualified,
+/// official tap prefixes are stripped.
+fn display_full_name(full: &str) -> String {
+    for tap in ["homebrew/core/", "homebrew/cask/"] {
+        if let Some(rest) = full.strip_prefix(tap) {
+            return rest.to_string();
+        }
+    }
+    full.to_string()
+}
+
 fn version_change_lines(rows: &[(String, String, String, Option<String>)]) -> Vec<String> {
     let name_width = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
     let sep = if rows.len() == 1 { " " } else { "  " };
@@ -15438,6 +17988,9 @@ pub(super) fn cmd_upgrade(
         super::minimum_version_value(rest).filter(|v| v.chars().any(|c| !c.is_whitespace()));
     let minimum = minimum.as_deref();
     let names = operands_without_flag_values(rest, &["--minimum-version", "--min-version"]);
+    if let Some(code) = auto_trust_qualified(prefix, api, rest, &names) {
+        return code;
+    }
     if has_flag(rest, "--cask", "") {
         return cmd_upgrade_casks(prefix, api, args, rest, &opts, names, false, minimum);
     }
@@ -15478,6 +18031,9 @@ pub(super) fn cmd_upgrade(
                 if tap::lookup(prefix, name).is_some() {
                     return false;
                 }
+                if tap::lookup_cask(prefix, name).is_some() {
+                    return true;
+                }
                 prefix.installed_one(Kind::Cask, cask_short).is_some()
             });
         if !formula_names.is_empty() {
@@ -15517,6 +18073,15 @@ pub(super) fn cmd_upgrade(
         let (pinned, rows): (Vec<_>, Vec<_>) = rows
             .into_iter()
             .partition(|(name, _, _)| prefix.is_pinned(name));
+        // A real upgrade only a tap answers delegates before
+        // any fetch narration (dry runs report it natively).
+        if !opts.dry_run
+            && rows.iter().any(|(name, _, _)| {
+                api.formula(name).is_err() && tap::lookup(prefix, name).is_some()
+            })
+        {
+            return not_native(prefix, args, "upgrade (tap formula)");
+        }
         // An unnamed upgrade covers casks too (unless --formula):
         // one combined preview and prompt for both kinds.
         let want_casks = !has_flag(rest, "--formula", "");
@@ -15581,7 +18146,9 @@ pub(super) fn cmd_upgrade(
                     .iter()
                     .map(|(name, have, latest)| {
                         (
-                            name.clone(),
+                            prefix
+                                .installed_one(Kind::Formula, name)
+                                .map_or_else(|| name.clone(), |i| prefix.specified_name(&i)),
                             have.clone(),
                             latest.clone(),
                             upgrade_bottle_size(prefix, api, name),
@@ -15612,7 +18179,16 @@ pub(super) fn cmd_upgrade(
                     );
                     let changes: Vec<_> = section
                         .iter()
-                        .map(|(n, h, l)| (n.clone(), h.clone(), l.clone(), None))
+                        .map(|(n, h, l)| {
+                            let shown = if word == "formula" {
+                                prefix
+                                    .installed_one(Kind::Formula, n)
+                                    .map_or_else(|| n.clone(), |i| prefix.specified_name(&i))
+                            } else {
+                                n.clone()
+                            };
+                            (shown, h.clone(), l.clone(), None)
+                        })
                         .collect();
                     for line in version_change_lines(&changes) {
                         println!("{line}");
@@ -15668,12 +18244,22 @@ pub(super) fn cmd_upgrade(
             )
             .collect();
         for (name, have, latest) in rows {
+            // A real upgrade only a tap answers delegates like
+            // install's tap formulae (the catalog is the core
+            // API); dry runs report it natively above.
+            if !opts.dry_run && api.formula(&name).is_err() && tap::lookup(prefix, &name).is_some()
+            {
+                return not_native(prefix, args, "upgrade (tap formula)");
+            }
+            let shown = prefix
+                .installed_one(Kind::Formula, &name)
+                .map_or_else(|| name.clone(), |i| prefix.specified_name(&i));
             // Brew's per-formula upgrade message: the headline,
             // then the indented version change (with the older
             // version only for an opt-linked keg).
             println!(
                 "{}",
-                super::tty::oh1(&format!("Upgrading {}", super::tty::ident(&name)))
+                super::tty::oh1(&format!("Upgrading {}", super::tty::ident(&shown)))
             );
             match prefix.optlinked_version(&name) {
                 Some(opt) => println!("  {opt} -> {latest} "),
@@ -15681,7 +18267,7 @@ pub(super) fn cmd_upgrade(
             }
             match install::install(api, prefix, &name, &opts) {
                 Ok(now) if now != have => {
-                    upgraded.push((name.clone(), have, now, None));
+                    upgraded.push((shown, have, now, None));
                     if !opts.dry_run
                         && let Err(error) =
                             auto_cleanup_old_versions(prefix, api, false, &[name.as_str()])
@@ -15738,7 +18324,16 @@ pub(super) fn cmd_upgrade(
             );
             let changes: Vec<_> = pinned
                 .iter()
-                .map(|(n, h, l)| (n.clone(), h.clone(), l.clone(), None))
+                .map(|(n, h, l)| {
+                    (
+                        prefix
+                            .installed_one(Kind::Formula, n)
+                            .map_or_else(|| n.clone(), |i| prefix.specified_name(&i)),
+                        h.clone(),
+                        l.clone(),
+                        None,
+                    )
+                })
                 .collect();
             for line in version_change_lines(&changes) {
                 println!("{line}");
@@ -16297,7 +18892,7 @@ fn upgrade_formula_names(
                 .iter()
                 .map(|f| {
                     (
-                        f.name.clone(),
+                        display_full_name(&f.full_name),
                         prefix
                             .installed_one(Kind::Formula, &f.name)
                             .map(|i| i.version)
@@ -16381,6 +18976,15 @@ fn upgrade_formula_names(
         effective.ask = false;
     }
     let opts = &effective;
+    // A real upgrade only a tap answers delegates before
+    // any fetch narration (dry runs report it natively).
+    if !opts.dry_run
+        && planned
+            .iter()
+            .any(|f| api.formula(&f.name).is_err() && tap::lookup(prefix, &f.name).is_some())
+    {
+        return not_native(prefix, args, "upgrade (tap formula)");
+    }
     let mut prelude: Vec<Formula> = planned.clone();
     prelude.extend(dependents.upgradeable.iter().map(|(f, _)| f.clone()));
     if !opts.quiet && !prelude.is_empty() {
@@ -16392,9 +18996,17 @@ fn upgrade_formula_names(
     for name in names {
         let short = Formula::short_name(name);
         let Some((canon, before)) = installed_for(name) else {
+            // Brew names the resolved formula: tap formulae by
+            // qualified full name, core formulae by leaf.
+            let display = api
+                .formula(name)
+                .ok()
+                .or_else(|| tap::lookup(prefix, name))
+                .map(|f| f.full_name.clone())
+                .unwrap_or_else(|| short.to_string());
             eprintln!(
                 "{}",
-                absent_error(api, prefix, name, format!("{short} not installed"))
+                absent_error(api, prefix, name, format!("{display} not installed"))
             );
             failures += 1;
             continue;
@@ -16435,7 +19047,7 @@ fn upgrade_formula_names(
             match latest {
                 Some(latest) if version_cmp(&before.version, &latest) == Ordering::Less => {
                     changes.push((
-                        canon.clone(),
+                        prefix.specified_name(&before),
                         before.version.clone(),
                         latest,
                         upgrade_bottle_size(prefix, api, &canon),
@@ -16460,9 +19072,15 @@ fn upgrade_formula_names(
         if let Some(latest) = &latest
             && version_cmp(&before.version, latest) == Ordering::Less
         {
+            if !opts.dry_run && api.formula(name).is_err() && tap::lookup(prefix, name).is_some() {
+                return not_native(prefix, args, "upgrade (tap formula)");
+            }
             println!(
                 "{}",
-                super::tty::oh1(&format!("Upgrading {}", super::tty::ident(&canon)))
+                super::tty::oh1(&format!(
+                    "Upgrading {}",
+                    super::tty::ident(&prefix.specified_name(&before))
+                ))
             );
             match prefix.optlinked_version(&canon) {
                 Some(opt) => println!("  {opt} -> {latest} "),
@@ -16475,7 +19093,7 @@ fn upgrade_formula_names(
             Ok(installed_now) => {
                 if installed_now != before.version {
                     changes.push((
-                        canon.clone(),
+                        prefix.specified_name(&before),
                         before.version.clone(),
                         installed_now.clone(),
                         None,
@@ -16524,7 +19142,7 @@ fn upgrade_formula_names(
             .iter()
             .map(|(f, have)| {
                 (
-                    f.name.clone(),
+                    display_full_name(&f.full_name),
                     have.clone(),
                     install::keg_version(f),
                     upgrade_bottle_size(prefix, api, &f.name),
@@ -16577,7 +19195,12 @@ fn upgrade_formula_names(
             match install::install(api, prefix, &f.name, opts) {
                 Ok(now) => {
                     if now != *have {
-                        dependent_changes.push((f.name.clone(), have.clone(), now.clone(), None));
+                        dependent_changes.push((
+                            display_full_name(&f.full_name),
+                            have.clone(),
+                            now.clone(),
+                            None,
+                        ));
                         if let Err(error) =
                             auto_cleanup_old_versions(prefix, api, false, &[f.name.as_str()])
                         {
@@ -16719,7 +19342,9 @@ fn cmd_upgrade_casks(
             let short = Formula::short_name(name);
             let cask_short = super::api::canonical_cask_token(short);
             let Some(inst) = prefix.installed_one(Kind::Cask, cask_short) else {
-                if package_definitively_unknown(prefix, api, cask_short, false, true) {
+                if package_definitively_unknown(prefix, api, cask_short, false, true)
+                    && tap::lookup_cask(prefix, name).is_none()
+                {
                     super::tty::onoe!("Error: {}", cask_unavailable(cask_short));
                     failures += 1;
                 } else if let Some(minimum) = minimum {
@@ -23418,11 +26043,11 @@ pub(super) fn cmd_bundle(
             None => failed("abrew: Brewfile was not admitted"),
         },
         "exec" => match prepared {
-            Some(entries) => bundle_exec(prefix, api, args, rest, &entries, false),
+            Some(entries) => bundle_exec(prefix, api, rest, &entries, false),
             None => failed("abrew: Brewfile was not admitted"),
         },
         "sh" => match prepared {
-            Some(entries) => bundle_exec(prefix, api, args, rest, &entries, true),
+            Some(entries) => bundle_exec(prefix, api, rest, &entries, true),
             None => failed("abrew: Brewfile was not admitted"),
         },
         "list" => bundle_list(rest),
@@ -23672,13 +26297,16 @@ fn bundle_cleanup_force(
             .installed_one(Kind::Formula, short)
             .map(|i| i.name.clone())
             .or_else(|| {
-                bundle_possible_formula_names(api, &entry.name).and_then(|names| {
-                    names.iter().find_map(|n| {
-                        prefix
-                            .installed_one(Kind::Formula, Formula::short_name(n))
-                            .map(|i| i.name.clone())
+                bundle_possible_formula_names(api, &entry.name)
+                    .ok()
+                    .flatten()
+                    .and_then(|names| {
+                        names.iter().find_map(|n| {
+                            prefix
+                                .installed_one(Kind::Formula, Formula::short_name(n))
+                                .map(|i| i.name.clone())
+                        })
                     })
-                })
             });
         if let Some(name) = target
             && let Some(inst) = prefix.installed_one(Kind::Formula, &name)
@@ -23831,8 +26459,21 @@ fn bundle_edit_path(file: Option<&std::path::Path>) -> std::path::PathBuf {
 fn bundle_add_entries(api: &Api, rest: &[String]) -> ExitCode {
     let edit = bundle_edit(rest, "add");
     let kind = edit.kind.unwrap_or("brew");
-    if matches!(kind, "brew" | "cask") && edit.names.iter().any(|n| !super::valid_component(n)) {
+    if matches!(kind, "brew" | "cask") && edit.names.iter().any(|n| !super::valid_name(n)) {
         return super::unsupported("bundle arguments or Brewfile rows are not native");
+    }
+    // Brew's bundle adder trusts fully-qualified names for
+    // brew/cask adds before touching the Brewfile.
+    let only = match kind {
+        "brew" => Some(super::trust::TrustType::Formula),
+        "cask" => Some(super::trust::TrustType::Cask),
+        _ => None,
+    };
+    if only.is_some()
+        && let Err(error) =
+            super::trust::trust_fully_qualified_items(api.prefix(), api, &edit.names, only)
+    {
+        return failed(&error);
     }
     let path = bundle_edit_path(edit.file.as_deref());
     let to_stdout = bundle_stdout_path(&path);
@@ -23852,14 +26493,27 @@ fn bundle_add_entries(api: &Api, rest: &[String]) -> ExitCode {
         });
     let mut entries: Vec<String> = Vec::new();
     for name in &edit.names {
+        // Brew's adder factory-loads each name for its desc:
+        // tap records count (the qualified ones were just
+        // auto-trusted above), untrusted plain names refuse.
         let desc = match kind {
-            "brew" => match api.formula(name) {
-                Ok(f) => f.desc,
-                Err(_) => return failed(&format!("Error: {}", formula_unavailable(api, name))),
+            "brew" => match factory_formula(api.prefix(), api, name) {
+                Ok(Some(f)) => f.desc,
+                Ok(None) => {
+                    return failed(&format!("Error: {}", formula_unavailable(api, name)));
+                }
+                Err(code) => return code,
             },
-            "cask" => match api.cask(name) {
-                Ok(c) => c.desc,
-                Err(_) => return failed(&format!("Error: {}", cask_unavailable(name))),
+            "cask" => match factory_cask(api.prefix(), api, name) {
+                Ok(Some(c)) => c.desc,
+                Ok(None) => {
+                    return failed(&format!(
+                        "Error: {}",
+                        tap_cask_unavailable(api.prefix(), name)
+                            .unwrap_or_else(|| cask_unavailable(name))
+                    ));
+                }
+                Err(code) => return code,
             },
             _ => String::new(),
         };
@@ -23899,12 +26553,14 @@ fn bundle_add_entries(api: &Api, rest: &[String]) -> ExitCode {
 
 /// Every name `bundle remove --formula` matches for `arg`
 /// (brew's `Remover.possible_names`).
-fn bundle_possible_formula_names(api: &Api, arg: &str) -> Option<Vec<String>> {
-    let f = api
-        .formula(arg)
-        .ok()
-        .or_else(|| api.formula_by_oldname(arg))
-        .or_else(|| {
+/// Brew remover's `possible_names`: the typed name plus the
+/// factory-resolved formula's name, full name, aliases and
+/// old names. Unavailable resolves to `None` (brew rescues
+/// it); an untrusted tap record's refusal propagates.
+fn bundle_possible_formula_names(api: &Api, arg: &str) -> Result<Option<Vec<String>>, ExitCode> {
+    let f = match factory_formula(api.prefix(), api, arg)? {
+        Some(f) => Some(f),
+        None => api.formula_by_oldname(arg).or_else(|| {
             let short = Formula::short_name(arg);
             let canonical = api
                 .search_index(false)
@@ -23913,9 +26569,14 @@ fn bundle_possible_formula_names(api: &Api, arg: &str) -> Option<Vec<String>> {
                 .find(|r| r.aliases.iter().any(|a| a == short))?
                 .name;
             api.formula(&canonical).ok()
-        })?;
+        }),
+    };
+    let Some(f) = f else {
+        return Ok(None);
+    };
     let mut names = vec![arg.to_owned(), f.name.clone(), f.full_name.clone()];
     names.extend(f.aliases.iter().cloned());
+    names.extend(f.oldnames.iter().cloned());
     if let Ok(rows) = api.index_rows_fresh(false)
         && let Some(row) = rows.iter().find(|r| r.name == f.name)
     {
@@ -23927,7 +26588,7 @@ fn bundle_possible_formula_names(api: &Api, arg: &str) -> Option<Vec<String>> {
             seen.push(n);
         }
     }
-    Some(seen)
+    Ok(Some(seen))
 }
 
 /// Whether `line` carries an entry for one of `names`, in
@@ -23984,8 +26645,11 @@ fn bundle_remove_entries(api: &Api, rest: &[String]) -> ExitCode {
         let mut all = Vec::new();
         for arg in &edit.names {
             match bundle_possible_formula_names(api, arg) {
-                Some(mut ns) => all.append(&mut ns),
-                None => return failed(&format!("Error: {}", formula_unavailable(api, arg))),
+                Ok(Some(mut ns)) => all.append(&mut ns),
+                Ok(None) => {
+                    return failed(&format!("Error: {}", formula_unavailable(api, arg)));
+                }
+                Err(code) => return code,
             }
         }
         all
@@ -24006,11 +26670,18 @@ fn bundle_remove_entries(api: &Api, rest: &[String]) -> ExitCode {
                         .map(str::trim_start)
                         .filter(|d| !d.is_empty());
                     if let Some(desc) = comment {
-                        let pkg_desc = api
-                            .formula(&matched)
-                            .map(|f| f.desc)
-                            .or_else(|_| api.cask(&matched).map(|c| c.desc))
-                            .unwrap_or_default();
+                        // Brew resolves the matched package the
+                        // same factory way (its untrusted refusal
+                        // propagates before any write).
+                        let pkg_desc = match factory_formula(api.prefix(), api, &matched) {
+                            Ok(Some(f)) => f.desc,
+                            Ok(None) => match factory_cask(api.prefix(), api, &matched) {
+                                Ok(Some(c)) => c.desc,
+                                Ok(None) => String::new(),
+                                Err(code) => return code,
+                            },
+                            Err(code) => return code,
+                        };
                         if !pkg_desc.is_empty() && pkg_desc == desc {
                             new_lines.pop();
                         }
@@ -24025,13 +26696,16 @@ fn bundle_remove_entries(api: &Api, rest: &[String]) -> ExitCode {
     } else {
         format!("{}\n", new_lines.join("\n"))
     };
-    if content.trim_end_matches('\n') == new_content.trim_end_matches('\n')
-        && edit.kind.is_none()
-        && edit
-            .names
-            .iter()
-            .any(|a| bundle_possible_formula_names(api, a).is_some_and(|ns| ns.len() > 1))
-    {
+    let mut any_expanded = false;
+    if content.trim_end_matches('\n') == new_content.trim_end_matches('\n') && edit.kind.is_none() {
+        for a in &edit.names {
+            match bundle_possible_formula_names(api, a) {
+                Ok(ns) => any_expanded |= ns.is_some_and(|ns| ns.len() > 1),
+                Err(code) => return code,
+            }
+        }
+    }
+    if any_expanded {
         super::tty::opoo!(
             "Warning: No matching entries found in Brewfile. Try again with `--formula` \
              to match formula aliases and old formula names."
@@ -24761,10 +27435,17 @@ fn bundle_prompt_script(
     Ok(path)
 }
 
+struct BundleShell {
+    command: Vec<String>,
+    env: std::collections::BTreeMap<String, String>,
+    // Keep private startup files alive until the shell has exited.
+    scratch: aterm_tempfile::TempDir,
+}
+
 fn bundle_shell_command(
     prefix: &Prefix,
     mut env: std::collections::BTreeMap<String, String>,
-) -> Result<(Vec<String>, std::collections::BTreeMap<String, String>), ExitCode> {
+) -> Result<BundleShell, ExitCode> {
     env.remove("HOMEBREW_FORCE_API_AUTO_UPDATE");
     let preferred = env
         .get("SHELL")
@@ -24789,10 +27470,18 @@ fn bundle_shell_command(
         .filter(|path| !path.is_empty())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(brew_temp);
+    // Shared temp roots cannot safely hold predictable, writable startup files.
+    // A private directory also separates simultaneous shells' startup state.
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("brew-shell-")
+        .suffix(".noindex")
+        .tempdir_in(&temp)
+        .map_err(|error| failed(&format!("abrew: cannot prepare bundle shell: {error}")))?;
+    let temp = scratch.path();
     let command = match shell_name.as_str() {
         "zsh" => {
             let zdotdir = temp.join(format!("brew-zsh-prompt-{}", bundle_effective_uid()));
-            let script = bundle_prompt_script(prefix, &temp, "zsh")?;
+            let script = bundle_prompt_script(prefix, temp, "zsh")?;
             std::fs::create_dir_all(&zdotdir).map_err(|e| {
                 failed(&format!(
                     "abrew: cannot prepare bundle shell prompt {}: {e}",
@@ -24834,7 +27523,7 @@ fn bundle_shell_command(
             vec![preferred]
         }
         "bash" => {
-            let script = bundle_prompt_script(prefix, &temp, "bash")?;
+            let script = bundle_prompt_script(prefix, temp, "bash")?;
             vec![
                 preferred,
                 "--rcfile".to_string(),
@@ -24855,7 +27544,11 @@ fn bundle_shell_command(
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
     }
-    Ok((command, env))
+    Ok(BundleShell {
+        command,
+        env,
+        scratch,
+    })
 }
 
 /// `brew bundle exec` / `brew bundle sh` without service
@@ -24866,7 +27559,6 @@ fn bundle_shell_command(
 fn bundle_exec(
     prefix: &Prefix,
     api: &Api,
-    args: &[String],
     rest: &[String],
     entries: &[bundle::BrewfileEntry],
     shell: bool,
@@ -24882,7 +27574,8 @@ fn bundle_exec(
         }
     }
     if invocation.install {
-        let code = bundle_file(prefix, api, args, entries);
+        let options = &rest[..super::bundle_option_boundary(rest)];
+        let code = bundle_file(prefix, api, options, entries);
         if code != ExitCode::SUCCESS {
             return code;
         }
@@ -24913,12 +27606,17 @@ fn bundle_exec(
         }
     }
 
+    let _shell_scratch;
     let (command, env) = if shell {
         match bundle_shell_command(prefix, env) {
-            Ok(pair) => pair,
+            Ok(prepared) => {
+                _shell_scratch = Some(prepared.scratch);
+                (prepared.command, prepared.env)
+            }
             Err(code) => return code,
         }
     } else {
+        _shell_scratch = None;
         let command = invocation.command;
         if !command[0].contains('/') {
             let path_value = env.get("PATH").cloned().unwrap_or_default();
@@ -25132,6 +27830,112 @@ fn bundle_file(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn info_json_qualified_tap_cannot_be_satisfied_by_core_cache() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(temp.path());
+        prefix.ensure_api_cache().unwrap();
+        std::fs::write(
+            prefix.cache().join("api/formula-demo.json"),
+            br#"{"name":"demo","full_name":"demo","versions":{"stable":"1"}}"#,
+        )
+        .unwrap();
+        let tap = prefix
+            .taps_dir()
+            .join("hostilereviewfixture")
+            .join("homebrew-other");
+        std::fs::create_dir_all(tap.join("Formula")).unwrap();
+        std::fs::write(
+            tap.join("Formula/demo.rb"),
+            "class Demo < Formula\n  version \"2\"\nend\n",
+        )
+        .unwrap();
+        let api = Api::new(prefix.clone());
+        let flags = vec!["--json=v1".into()];
+        assert!(info_json(&prefix, &api, &flags, &["demo".into()]).is_ok());
+        let result = info_json(
+            &prefix,
+            &api,
+            &flags,
+            &["hostilereviewfixture/other/demo".into()],
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|why| why.contains("untrusted tap")),
+            "qualified untrusted tap was replaced by core: {result:?}"
+        );
+        let flags = vec!["--json=v2".into()];
+        let result = info_json(
+            &prefix,
+            &api,
+            &flags,
+            &["demo".into(), "hostilereviewfixture/missing/demo".into()],
+        );
+        assert!(
+            result.is_err(),
+            "core masked a missing qualified package: {result:?}"
+        );
+        std::fs::write(
+            prefix.cache().join("api/cask-demo.json"),
+            br#"{"token":"demo","name":["Demo"],"version":"1","url":"https://example.invalid/demo.dmg","sha256":"no_check","artifacts":[{"app":["Demo.app"]}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tap.join("Casks")).unwrap();
+        std::fs::write(
+            tap.join("Casks/demo.rb"),
+            "cask \"demo\" do\n  version \"2\"\nend\n",
+        )
+        .unwrap();
+        let flags = vec!["--json=v2".into(), "--cask".into()];
+        assert!(info_json(&prefix, &api, &flags, &["demo".into()]).is_ok());
+        let result = info_json(
+            &prefix,
+            &api,
+            &flags,
+            &["hostilereviewfixture/other/demo".into()],
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|why| why.contains("untrusted tap")),
+            "qualified cask was replaced by core: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundle_shell_does_not_overwrite_a_preexisting_prompt_symlink() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = super::super::prefix::Prefix::at(&temp.path().join("prefix"));
+        let victim = temp.path().join("unrelated-file");
+        std::fs::write(&victim, "keep this").unwrap();
+        let predictable = temp.path().join(format!(
+            "brew-bash-prompt-{}.bash",
+            super::bundle_effective_uid()
+        ));
+        std::os::unix::fs::symlink(&victim, &predictable).unwrap();
+        let env = std::collections::BTreeMap::from([
+            ("SHELL".to_string(), "/bin/bash".to_string()),
+            (
+                "HOMEBREW_TEMP".to_string(),
+                temp.path().display().to_string(),
+            ),
+        ]);
+        let prepared = super::bundle_shell_command(&prefix, env.clone()).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep this");
+        let second = super::bundle_shell_command(&prefix, env).unwrap();
+        assert_ne!(prepared.scratch.path(), second.scratch.path());
+        let startup = std::path::PathBuf::from(&prepared.command[2]);
+        assert!(
+            startup.is_file(),
+            "startup lives until the child has exited"
+        );
+        drop(prepared);
+        assert!(!startup.exists(), "private startup files are reclaimed");
+        assert!(std::path::Path::new(&second.command[2]).is_file());
+    }
+
     #[cfg(unix)]
     use std::path::Path;
 
@@ -25914,6 +28718,43 @@ end
                 ],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn outdated_rows_resolve_tap_kegs_and_skip_the_rest() {
+        // Kegs only a tap answers resolve there (trusted taps
+        // only — brew's unnamed outdated skips untrusted kegs
+        // silently); kegs nothing answers are skipped too,
+        // never an error poisoning the whole listing.
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(temp.path());
+        let tap_formula = |user: &str, repo: &str, name: &str| {
+            let dir = temp
+                .path()
+                .join(format!("Library/Taps/{user}/homebrew-{repo}/Formula"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{name}.rb")),
+                format!(
+                    "class {} < Formula\n  url \"https://example.com/{name}.tgz\"\n  version \"2\"\nend\n",
+                    name.chars().next().unwrap().to_uppercase().collect::<String>()
+                        + &name[1..]
+                ),
+            )
+            .unwrap();
+        };
+        tap_formula("homebrew", "fixture", "fixtap");
+        tap_formula("zzfixture999", "other", "othertool");
+        owned_keg(&prefix, "fixtap", "1");
+        owned_keg(&prefix, "othertool", "1");
+        owned_keg(&prefix, "ghost", "1");
+        let api = Api::new(prefix.clone());
+        let rows = outdated_rows(&prefix, &api, false, Greedy::default()).unwrap();
+        assert_eq!(
+            rows,
+            [("fixtap".to_string(), "1".to_string(), "2".to_string())],
+            "official-tap keg resolves; untrusted zzfixture999/othertool and unresolvable ghost skip"
+        );
     }
 
     #[test]
@@ -26744,16 +29585,20 @@ end
         assert_eq!(
             diagnostic_check_lines(&[multi(), single()], false),
             [
-                "Warning: The following taps are not trusted:\n  probeuser/probe",
-                "",
-                "Warning: one liner",
+                DiagnosticLine::Warn(
+                    "Warning: The following taps are not trusted:\n  probeuser/probe".to_string()
+                ),
+                DiagnosticLine::Blank,
+                DiagnosticLine::Warn("Warning: one liner".to_string()),
             ]
         );
         assert_eq!(
             diagnostic_check_lines(&[multi(), single()], true),
             [
-                "Error: The following taps are not trusted:\n  probeuser/probe",
-                "Error: one liner",
+                DiagnosticLine::Fail(
+                    "Error: The following taps are not trusted:\n  probeuser/probe".to_string()
+                ),
+                DiagnosticLine::Fail("Error: one liner".to_string()),
             ]
         );
         assert!(diagnostic_check_lines(&[], true).is_empty());
@@ -27934,8 +30779,9 @@ end
             "HOMEBREW_FORCE_API_AUTO_UPDATE".to_string(),
             "1".to_string(),
         );
-        let (command, shell_env) = super::bundle_shell_command(&prefix, shell_env).unwrap();
-        assert_eq!(command, ["/bin/sh"]);
+        let prepared = super::bundle_shell_command(&prefix, shell_env).unwrap();
+        let (command, shell_env) = (&prepared.command, &prepared.env);
+        assert_eq!(command.as_slice(), ["/bin/sh"]);
         assert!(!shell_env.contains_key("HOMEBREW_FORCE_API_AUTO_UPDATE"));
         assert!(!shell_env.contains_key("BREW_PROMPT_PATH"));
         assert_eq!(
@@ -28214,27 +31060,11 @@ end
                 .is_err()
             );
         }
-        let installed = p.installed_checked(Kind::Formula).unwrap();
-        let revised = |name: &str| {
-            super::super::api::dependency_formula(
-                &aterm_json::json!({"name": name, "versions": {"stable": "1"}, "revision": 2, "dependencies": []}),
-                name,
-                super::super::machine::Machine::this(),
-            )
-        };
-        assert!(
-            install::dependency_books(&installed, revised).is_err(),
-            "unqualified base does not prove revision2"
-        );
-        let mut qualified = installed.clone();
-        for i in &mut qualified {
-            i.version = "1_2".into();
-            i.versions = vec!["1_2".into()];
-        }
-        assert!(
-            install::dependency_books(&qualified, revised).is_ok(),
-            "actual revision suffix is matched"
-        );
+        // (The revision-coverage gate this block used to assert
+        // lived in install::dependency_books, removed in r370:
+        // dependents now read receipt tab closures, exact per
+        // keg, so metadata revision skew proves nothing either
+        // way.)
         let receipt = p.keg("app", "1").join("INSTALL_RECEIPT.json");
         let saved = std::fs::read(&receipt).unwrap();
         std::fs::remove_file(&receipt).unwrap();
@@ -28514,6 +31344,13 @@ end
                 ("PATH".to_string(), "/usr/bin".to_string()),
                 ("FOO".to_string(), "$HOMEBREW_PREFIX/var".to_string()),
             ],
+            name: None,
+            working_dir: None,
+            root_dir: None,
+            log_path: None,
+            error_log_path: None,
+            interval: None,
+            cron: None,
         };
         assert_eq!(
             service_manual_command("/p", &service),
@@ -28667,6 +31504,25 @@ end
             ExitCode::FAILURE
         );
         assert_eq!(bundle_check(&p, &api, &args, &[]), ExitCode::SUCCESS);
+    }
+
+    /// r375: brew's bundle editors accept fully qualified and
+    /// `user/tap` names — the gate must use the same component
+    /// rule `brew edit`/`tap` use, not the plain-name one (the
+    /// live pair matrix covers resolution/trust/files).
+    #[test]
+    fn bundle_edit_gate_accepts_qualified_names() {
+        for n in ["probeuser/probe/custool", "homebrew/core/wget", "wget"] {
+            assert!(super::super::valid_name(n), "{n}");
+        }
+        for n in ["a/../x", "/abs", "a/b/c/d", "a//b"] {
+            assert!(!super::super::valid_name(n), "{n}");
+        }
+        let names = vec!["probeuser/probe/custool".to_owned()];
+        assert_eq!(
+            bundle_remove_match("brew \"probeuser/probe/custool\"", None, &names).as_deref(),
+            Some("probeuser/probe/custool")
+        );
     }
 
     #[test]

@@ -74,6 +74,7 @@ fn short_base() -> PathBuf {
 }
 
 fn root_under(temp: PathBuf, prefix: &'static str) -> PathBuf {
+    let temp = aterm_tempfile::quiet_in(&temp);
     let mut roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((_, root)) = roots.iter().find(|(known, _)| *known == prefix) {
         return root.clone();

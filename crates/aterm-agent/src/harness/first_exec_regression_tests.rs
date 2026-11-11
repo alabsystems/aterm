@@ -278,7 +278,7 @@ fn both_probe_descriptors_keep_a_complete_factory_twin_after_normal_publication(
         // Ordinary positives above precede the actual normal publication race.
         atpkg::lay::write_in_process(&rendered(&b)).unwrap();
         assert_eq!(
-            super::super::upgrade_catalog::twin_binary(&std::fs::read_to_string(&wrapper).unwrap()),
+            super::super::twin::twin_binary(&std::fs::read_to_string(&wrapper).unwrap()),
             Some(b.clone())
         );
         match &hold.launch {

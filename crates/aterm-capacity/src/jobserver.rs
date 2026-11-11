@@ -26,15 +26,19 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
 #[cfg(unix)]
-use std::time::Instant;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// The variable a release hands its branch children its pool in: `<slots>:<absolute FIFO path>`,
 /// the slots a decimal count in `1..=4096` and the path free of whitespace, as
 /// [`Jobserver::new`] requires ([`Jobserver::hand_to`], [`Jobserver::inherited`]).
 pub const POOL_ENV: &str = "ATERM_RELEASE_POOL";
+
+/// A pool delegated to a worker child while its caller retains one charged implicit job.
+/// Same value format as [`POOL_ENV`]. One worker inherits that job; auxiliaries borrow tokens.
+/// This advertisement creates no credit: the caller keeps its token through the child wait.
+pub const IMPLICIT_POOL_ENV: &str = "ATERM_IMPLICIT_POOL";
 
 /// The most tokens a pool holds.
 const MAX_SLOTS: u32 = 4096;
@@ -74,11 +78,13 @@ pub struct Jobserver {
     wait: File,
     slots: u32,
     observed_slots: AtomicU32,
+    /// The release grant an isolated branch can eventually receive. The coordinator publishes
+    /// it beside the FIFO; unlike `observed_slots`, this is a Cargo dispatch ceiling, not the
+    /// number of tokens currently assigned to the branch.
+    observed_grant: AtomicU32,
     /// Whether this handle made the FIFO ([`Self::new`]), and so removes it when dropped; a
     /// handle adopted from [`POOL_ENV`] leaves it to its creator.
     created: bool,
-    /// Held across [`Self::acquire_many`]: this handle's one partial holder.
-    partial: Mutex<()>,
     /// This handle's waits for a token now ([`Self::acquire`]).
     #[cfg(unix)]
     waiters: Mutex<Waiters>,
@@ -251,14 +257,16 @@ impl Jobserver {
             wait,
             slots,
             observed_slots: AtomicU32::new(slots),
+            observed_grant: AtomicU32::new(slots),
             created,
-            partial: Mutex::new(()),
             waiters: Mutex::default(),
             turn: Condvar::new(),
         }
     }
 
-    /// The Release grant this pool bounds.
+    /// The tokens currently assigned to this handle's branch. A plain or creating handle owns
+    /// its whole pool; an adopted isolated branch observes monotonic allocation growth from the
+    /// coordinator's side record. Use [`Self::grant`] for Cargo's eventual dispatch ceiling.
     #[must_use]
     pub fn slots(&self) -> u32 {
         if self.created {
@@ -266,18 +274,39 @@ impl Jobserver {
         }
         // An isolated branch's allocation only grows while it is alive. Its coordinator
         // publishes that growth so later test plans can use returned shares as Cargo does.
-        let observed = std::fs::read_to_string(self.path.with_extension("slots"))
-            .ok()
-            .and_then(|value| {
-                let (grant, allocated) = value.split_once(':')?;
-                let grant = grant.parse::<u32>().ok()?;
-                let allocated = allocated.parse::<u32>().ok()?;
-                (grant <= MAX_SLOTS && allocated <= grant && grant >= self.slots)
-                    .then_some(allocated.max(self.slots))
+        let observed = self
+            .published_share()
+            .map(|(grant, allocated)| {
+                self.observed_grant.fetch_max(grant, Ordering::Relaxed);
+                allocated.max(self.slots)
             })
             .unwrap_or(self.slots);
         self.observed_slots.fetch_max(observed, Ordering::Relaxed);
         self.observed_slots.load(Ordering::Relaxed)
+    }
+
+    /// The release grant this FIFO can eventually receive. An isolated branch starts with only
+    /// [`Self::slots`] tokens, but Cargo must retain this wider dispatch ceiling so the same live
+    /// client can consume tokens reminted when another branch ends. The FIFO, not this ceiling,
+    /// remains the concurrency bound. A plain pool has no side record and returns its own slots.
+    #[must_use]
+    pub fn grant(&self) -> u32 {
+        if self.created {
+            return self.slots;
+        }
+        if let Some((grant, _)) = self.published_share() {
+            self.observed_grant.fetch_max(grant, Ordering::Relaxed);
+        }
+        self.observed_grant.load(Ordering::Relaxed)
+    }
+
+    fn published_share(&self) -> Option<(u32, u32)> {
+        let value = std::fs::read_to_string(self.path.with_extension("slots")).ok()?;
+        let (grant, allocated) = value.split_once(':')?;
+        let grant = grant.parse::<u32>().ok()?;
+        let allocated = allocated.parse::<u32>().ok()?;
+        (grant <= MAX_SLOTS && allocated <= grant && grant >= self.slots)
+            .then_some((grant, allocated))
     }
 
     /// The FIFO this pool's tokens are in, by the one absolute path every child of this handle is
@@ -365,7 +394,7 @@ impl Jobserver {
             .env("MAKEFLAGS", &flags)
             .env("CARGO_MAKEFLAGS", flags)
             .arg("-j")
-            .arg(self.slots().to_string());
+            .arg(self.grant().to_string());
         Ok(token)
     }
 
@@ -676,6 +705,7 @@ impl Jobserver {
             }
             None => {
                 let _ = (&self.file).write_all(&[byte]);
+                self.turn.notify_all();
             }
         }
     }
@@ -683,26 +713,110 @@ impl Jobserver {
     /// Take `n` tokens, at most the pool's slots, for one process that is no GNU client (a test
     /// binary, whose threads and children run on its charge), returned when the guards drop.
     ///
-    /// ONE PARTIAL HOLDER. This handle's callers take their charges one at a time: a second
-    /// waits on the first's lock while the first, holding part of its charge, waits for the
-    /// rest. Two partial holds that each wait on what the other holds would deadlock once the
-    /// FIFO ran dry; one cannot, since every other holder of the pool holds whole charges for
-    /// work that ends (Cargo runs each job on a token it already holds), so the tokens the one
-    /// waiter needs keep coming back; one this handle's other holders return goes to the
-    /// handle's oldest wait ([`Self::give`]), the partial holder's or one for a whole charge of
-    /// work that ends. Across processes the same holds while at most one process
-    /// waits holding part of a charge: the release takes a branch's fixed reservation at once,
-    /// before any branch starts, and a build's Cargo clients take one token each.
+    /// A whole charge is one nonblocking FIFO read. A short read is returned before waiting,
+    /// so a large test cannot park idle tokens behind a live compiler's implicit job, and
+    /// competing whole charges cannot deadlock by each retaining a fraction. Single-token
+    /// requests keep [`Self::acquire`]'s fairness against Cargo's blocked readers.
     /// # Errors
     /// FIFO IO fails, or the caller ends the wait; the tokens taken so far are returned.
     pub fn acquire_many(&self, n: u32, stopped: &dyn Fn() -> bool) -> io::Result<Vec<Token<'_>>> {
-        let n = n.min(self.slots()) as usize;
-        let _one = self.partial.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut held = Vec::with_capacity(n);
-        while held.len() < n {
-            held.push(self.acquire(stopped)?);
+        self.acquire_batch(n.min(self.slots()) as usize, stopped, &|| {})
+    }
+
+    fn acquire_batch(
+        &self,
+        n: usize,
+        stopped: &dyn Fn() -> bool,
+        waiting: &dyn Fn(),
+    ) -> io::Result<Vec<Token<'_>>> {
+        if n == 0 {
+            return Ok(Vec::new());
         }
-        Ok(held)
+        if n == 1 {
+            return self.acquire(stopped).map(|token| vec![token]);
+        }
+        let mut bytes = vec![0; n];
+        let began = Instant::now();
+        let mut stated = false;
+        loop {
+            if stopped() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "jobserver wait ended",
+                ));
+            }
+            let count = match (&self.file).read(&mut bytes) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "jobserver FIFO closed",
+                    ));
+                }
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    0
+                }
+                Err(error) => return Err(error),
+            };
+            let taken = if count == n {
+                Some(
+                    bytes
+                        .iter()
+                        .map(|&byte| Token { pool: self, byte })
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                // This restores availability rather than completing a job. Return directly
+                // to the FIFO: notifying batch waiters here would let short reads wake each
+                // other forever without any new capacity becoming free.
+                if count != 0 {
+                    (&self.file).write_all(&bytes[..count])?;
+                }
+                None
+            };
+            // Short reads are back already; guards return a full grant on a stop or panic.
+            if stopped() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "jobserver wait ended",
+                ));
+            }
+            if let Some(taken) = taken {
+                return Ok(taken);
+            }
+            waiting();
+            if !stated && began.elapsed() >= Duration::from_secs(30) {
+                stated = true;
+                let allocation = std::fs::read_to_string(self.path.with_extension("allocation"))
+                    .unwrap_or_else(|error| format!("allocation_record_unavailable={error}"));
+                eprintln!(
+                    "jobserver whole-charge wait: waited_s={} requested_tokens={n} waiter_pid={} dispatch_slots={} fifo={} {allocation}",
+                    began.elapsed().as_secs(),
+                    std::process::id(),
+                    self.slots(),
+                    self.path.display()
+                );
+            }
+            // Local returns wake this wait. External GNU writers are observed at the stop
+            // interval: readability alone cannot wait for a whole charge while a fraction sits
+            // unread, and returning a short read must not become a busy reacquisition loop.
+            #[cfg(unix)]
+            {
+                let waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+                drop(
+                    self.turn
+                        .wait_timeout(waiters, WAKE_EVERY)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+            }
+            #[cfg(not(unix))]
+            std::thread::sleep(WAKE_EVERY);
+        }
     }
 
     /// Take a token only if one is currently available.

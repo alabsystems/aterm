@@ -301,6 +301,10 @@ pub fn publish_initial_setup_status(status: SetupStatus) {
 pub struct SetupReadings {
     /// The current typed readings, with at most one per subject.
     pub observed: Vec<aterm_types::macos_setup::Observation>,
+    /// Last useful readings for display alone, separate from current evidence.
+    pub last_known: Vec<aterm_types::macos_setup::Observation>,
+    pub unconfirmed_observations: Vec<aterm_types::macos_setup::Subject>,
+    pub observing: Vec<(aterm_types::macos_setup::Subject, Option<String>, bool)>,
     /// Change notification for the readings, independent of stage activity.
     pub observed_generation: u64,
     /// Current live HID-service evidence; no saved-setting readiness is inferred.
@@ -314,6 +318,9 @@ pub struct SetupReadings {
 impl SetupReadings {
     fn overlay(self, status: &mut SetupStatus) {
         status.observed = self.observed;
+        status.last_known = self.last_known;
+        status.unconfirmed_observations = self.unconfirmed_observations;
+        status.observing = self.observing;
         status.observed_generation = self.observed_generation;
         status.caps_live = self.caps_live;
         status.observed_vault_url = self.observed_vault_url;
@@ -722,7 +729,7 @@ impl Host {
                 };
                 // A record lost to a crash only starts the quiet again: no flush is owed.
                 if let Err(error) =
-                    aterm_agent::harness::upgrade_models::write_atomic(path, &then.to_string())
+                    aterm_agent::harness::atomic_write::write_atomic(path, &then.to_string())
                 {
                     aterm_log::info!("system state: the join's asking start was not kept: {error}");
                 }

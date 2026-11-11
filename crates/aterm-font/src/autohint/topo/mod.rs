@@ -271,16 +271,5 @@ impl Edge {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn segment_adjust_height_extreme_values_do_not_panic() {
-        let mut segment = Segment {
-            height: i16::MAX,
-            ..Default::default()
-        };
-        segment.adjust_height(i32::MIN, i32::MAX);
-        segment.adjust_height(i32::MAX, i32::MIN);
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

@@ -75,6 +75,8 @@ pub(crate) struct Family {
     /// (`unheld_keys_the_fold_reads`), and aterm-agent's step tests hold `TRANSCRIPT_KEYS` to the
     /// keys the fold's projections keep (`the_fold_reads_what_the_transcript_keys_name`).
     pub read: &'static [Anchor],
+    /// Whether an anchored key is consumed on this record kind. Unspecified keys stay conservative.
+    pub read_scope: fn(&str, &str) -> bool,
     /// Whether the fold acts on no row of the record kind `kind` (`<type>/<…>`): a new key or
     /// record kind there is only noted.
     pub inert: fn(&str) -> bool,
@@ -351,14 +353,6 @@ impl Shows {
         Ok(s)
     }
 
-    /// Whether a row of a record kind the fold acts on ([`Family::inert`]) carries `key`.
-    #[must_use]
-    pub(crate) fn acted_on(&self, f: &Family, key: &str) -> bool {
-        self.on
-            .get(key)
-            .is_some_and(|kinds| kinds.iter().any(|kind| !(f.inert)(kind)))
-    }
-
     /// Add what `text` shows.
     /// # Errors
     /// A row is no JSON value.
@@ -573,8 +567,8 @@ pub(crate) struct Drift {
 /// A key is new to the fold when no measured build showed it on a row kind the fold acts on,
 /// whatever rows it showed it on that the fold does not act on: a key first noted on an inert row
 /// is still held to rules (b) and (c) the first time a build writes it where the fold acts. GONE
-/// holds a build to the keys the fold reads that the previous build showed on rows it acts on,
-/// and only to those rows.
+/// holds a build to keys the previous build showed in their consumed scopes. Presence on an
+/// active row where a key is ignored cannot admit a new read or mask a lost consumed key.
 /// # Errors
 /// A row is no JSON value.
 pub(crate) fn drift(
@@ -585,29 +579,42 @@ pub(crate) fn drift(
     prev: Option<(&str, &str)>,
 ) -> Result<Drift, String> {
     let now = Shows::of(f, text).map_err(|e| format!("{leg}: {e}"))?;
-    let read = |k: &str| f.read.iter().any(|a| a.text == k);
+    let read =
+        |key: &str, kind: &str| f.read.iter().any(|a| a.text == key) && (f.read_scope)(key, kind);
+    let seen = |shows: &Shows, key: &str, consumed: bool| {
+        shows.on.get(key).is_some_and(|kinds| {
+            kinds
+                .iter()
+                .any(|kind| !(f.inert)(kind) && read(key, kind) == consumed)
+        })
+    };
     let mut d = Drift::default();
     for (k, kinds) in &now.on {
         let (inert, acted): (Vec<&String>, Vec<&String>) =
             kinds.iter().partition(|kind| (f.inert)(kind));
-        if !acted.is_empty() && !union.acted_on(f, k) {
+        let consumed: Vec<&String> = acted.iter().copied().filter(|kind| read(k, kind)).collect();
+        if !consumed.is_empty() && !seen(union, k, true) {
             let before = if union.keys.contains(k) {
-                ", shown before only on rows the fold does not act on"
+                ", shown before only on rows the fold does not act on or consume this key"
             } else {
                 ""
             };
-            if read(k) {
-                d.new.push(format!(
-                    "{leg}: key {k:?} on {}, a key the fold reads{before}",
-                    join(&acted)
-                ));
-            } else {
-                d.pending.extend(acted.iter().map(|kind| Pending {
-                    leg: leg.to_string(),
-                    kind: (*kind).clone(),
-                    key: Some(k.clone()),
-                }));
-            }
+            d.new.push(format!(
+                "{leg}: key {k:?} on {}, a key the fold reads{before}",
+                join(&consumed)
+            ));
+        }
+        if !seen(union, k, false) {
+            d.pending.extend(
+                acted
+                    .iter()
+                    .filter(|kind| !read(k, kind))
+                    .map(|kind| Pending {
+                        leg: leg.to_string(),
+                        kind: (*kind).clone(),
+                        key: Some(k.clone()),
+                    }),
+            );
         }
         if !inert.is_empty() && !union.keys.contains(k) {
             d.noted.push(format!(
@@ -632,19 +639,14 @@ pub(crate) fn drift(
     let Some((build, before)) = prev else {
         return Ok(d);
     };
-    let (was_acted, now_acted) = (
-        acted_rows(f, before).map_err(|e| format!("{leg} of {build}: {e}"))?,
-        acted_rows(f, text).map_err(|e| format!("{leg}: {e}"))?,
-    );
+    let was = Shows::of(f, before).map_err(|e| format!("{leg} of {build}: {e}"))?;
     let mut lost = BTreeSet::new();
     for a in f.read {
-        let quoted = format!("\"{}\"", a.text);
-        if was_acted.contains(&quoted) && !now_acted.contains(&quoted) {
+        if consumed_word(f, before, a.text)? && !consumed_word(f, text, a.text)? {
             lost.insert(a.text);
             d.gone.push(format!("{leg}: {} ({build} showed it)", a.id));
         }
     }
-    let was = Shows::of(f, before).map_err(|e| format!("{leg} of {build}: {e}"))?;
     d.noted.extend(
         was.keys
             .difference(&now.keys)
@@ -667,20 +669,18 @@ pub(crate) fn drift(
     Ok(d)
 }
 
-/// The rows of `text` of a record kind the fold acts on ([`Family::inert`]), one a line: what
-/// GONE reads a key the fold reads in, since a row of any other kind changes nothing it makes.
-/// # Errors
-/// A row is no JSON value.
-fn acted_rows(f: &Family, text: &str) -> Result<String, String> {
-    let mut out = String::new();
+/// Anchors include closed words as well as object keys. Preserve both in GONE checks,
+/// restricting each occurrence to rows on which the decoder consumes it.
+fn consumed_word(f: &Family, text: &str, word: &str) -> Result<bool, String> {
+    let quoted = format!("\"{word}\"");
     for (n, row) in rows(text).enumerate() {
-        let v: Value = aterm_json::from_str(row).map_err(|e| format!("row {}: {e}", n + 1))?;
-        if !(f.inert)(&(f.kind)(&v)) {
-            out.push_str(row);
-            out.push('\n');
+        let value: Value = aterm_json::from_str(row).map_err(|e| format!("row {}: {e}", n + 1))?;
+        let kind = (f.kind)(&value);
+        if !(f.inert)(&kind) && (f.read_scope)(word, &kind) && row.contains(&quoted) {
+            return Ok(true);
         }
     }
-    Ok(out)
+    Ok(false)
 }
 
 /// A build's release numbers and dev count (`<release>[-dev.<count>][+g<sha>]`), to order builds

@@ -3,85 +3,14 @@
 
 # aterm-primer: spec recovery from its 67 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 43 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
->
-> 2026-10-17: `primer-budget` subsumes no test now, §4's two tests are deleted, and §5 lost the
-> five items whose tests are deleted or whose fix landed; the rest are renumbered.
->
-> Status 2026-10-17: §2 lacked 15 of the crate's 37 tests (src/lib.rs 33, src/settings_json.rs
-> 4). They are added, each spec that retires one cites it in §1, and the test counts in §3 and §6
-> are taken from the new map. The 66 in the title and in the Source and Result lines is the count
-> when this file was written.
-> `find-block`, `upsert-block`, `cli-status-report` and `status-line` now state
-> `BlockState::Newer` (a later aterm's block is left as is), which `a_newer_block_is_left_as_is`
-> pins.
-
-> 2026-10-25: `retired-skill-sweep` is new (the Gemini CLI command an earlier aterm wrote is deleted by
-> the automatic pass, `install` and `remove`, a user's own file there kept), and `fold-outcome`,
-> `auto-prime-pass`, `auto-prime-idempotent`, `cli-install-gate`, `cli-status-report` and
-> `cli-remove` state it. Its test is mapped in §2; the counts elsewhere were taken before.
-
-> 2026-10-27: codex gets the six skills Claude Code gets, at `.codex/skills/<n>/SKILL.md`, and the
-> custom prompt it no longer reads is a second `RETIRED_SKILLS` row. `xdg` became `roots`
-> (`Roots { xdg, codex }`): `$CODEX_HOME` moves `.codex` as `$XDG_CONFIG_HOME` moves `.config/`, so
-> `xdg-join-and-display`, `skill-registry`, `retired-skill-sweep`, `bundled-docs-valid` and the
-> rows naming the `_with_xdg` seams (now `_with`) state it. `summary-log-cap` lost the corollary
-> that a fresh claude+codex first pass fits the cap. Three tests are new and mapped in §2, and
-> `only_a_dot_config_row_follows_xdg_config_home` is now `each_variable_moves_only_its_own_rows`;
-> the counts elsewhere were taken before.
-
-> 2026-10-27, review: one fabric body for every agent with a skills folder (Codex's sandbox note in
-> it; `CODEX_FABRIC_BODY` is gone), so a skills folder two agents share settles; `remove <agent>`
-> keeps a skill file another detected agent's row lands on; the window's pass follows
-> `Roots::window` (`$CODEX_HOME` never), retired rows are looked for at `retired_places` (`~` and
-> where `$CODEX_HOME` moves them), and `remove` under `$CODEX_HOME` also clears `~/.codex`.
-> `bundled-docs-valid`, `skill-registry`, `retired-skill-sweep`, `auto-prime-pass`,
-> `cli-status-report`, `cli-remove` and `xdg-join-and-display` state it, `skill-one-body` is
-> new, and two tests are new and mapped in §2; the counts elsewhere were taken before.
-
-> 2026-10-28: `open-in-amacs` (opening a file for the person in amacs, waiting or not, and reading
-> back what they wrote) is a seventh skill Claude Code and Codex get, so `skill-registry` names it;
-> the tests that counted six skills now count `skills_for`'s rows.
-
-> 2026-10-28: `primer-budget` is now `primer-gate-line`. Its bound (`primer_block(None)` at most
-> 20 lines, every agent's block at most 2,400 bytes) was false: `primer_block(None)` is 27 lines and
-> 8,337 bytes, Codex's block 35 lines and 8,974 bytes. Nothing enforced it, because the test that
-> did was deleted as a word pin (44f2f4b090, c04b399914), so the row now states that nothing bounds
-> the block and keeps its one true clause, the first fact line's gate.
-
-> 2026-10-28: Claude Code has its own part too (`CLAUDE_ADDENDUM`: the background Bash a wait runs
-> as, and the `rm` box its harness answers, both out of the shared body), and an agent's part now
-> sits between the body and the Rust note, so `primer-block-shape` states both. A file two agents
-> share carries each one's part (`Readers::block`), since every part is said of the agent it
-> names, so Claude Code keeps both lines in a file Codex reads too. One test is new
-> (`each_program_is_taught_the_wait_its_shell_can_do`), mapped in §2 and cited by that row; the
-> counts elsewhere were taken before.
-
-> Status 2026-10-16: this file is the crate's migration worklist. Each spec below is proved
-> through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted.
->
-> **Re-measured on Trust seal `150efe4a`: `top-effort-key-spelling` is still blocked** (2026-10-16).
-> Any fn that reads `CLAUDE_TOP_EFFORT_KEY` must go through `str::as_bytes` and a `&[u8]` local, and
-> E6 refuses both probes tried (`CLAUDE_TOP_EFFORT_KEY.as_bytes() == b"ultra\x63ode"` returning
-> `bool`, and a `usize -> u8` byte reader) at the FACET gate: "local `b` has type
-> `Ref { .. Slice { elem: Int { width: 8 } } }`, outside the v1 scalar fragment; the construct outside
-> the E6 fragment is the call to `core::str::<impl str>::as_bytes`". No `trust_import_aterm_primer__*`
-> is minted, so a Clean theorem naming it fails as an unknown (auto-bound) name. Gaps 1 (`&str`/`&[u8]`
-> carriers) and 3 (a call in the reflected body). A scalar `match` table would be admitted, but it
-> would be a restated copy of the key and not the constant, so it was not used. The code is unchanged
-> and no test was deleted.
-
 Source: `crates/aterm-primer` (read only). Every live `#[test]` (`src/lib.rs` 63,
 `src/settings_json.rs` 4 = 67) and every production fn they reach are mapped below.
 
 Result: **48 specs**, covering **67 tests**. **0 remaining non-spec tests** (§4).
 
-The plan is `PLAN-tests-to-specs-2026-10-15.md` (historical internal plan),
+The plan is `docs/TRUST-LANE.md`,
 and the gap numbers are §7 of
-`AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit).
+`docs/TRUST-LANE.md` (Blocking gaps).
 Gap 0 (the installed seal publishes no Lean-discharged row) blocks every spec, so the
 blocking-gaps column lists it on every row. No spec is blocked by gap 0 alone.
 
@@ -129,7 +58,7 @@ export baseline bans the joined word in every exported file; any proof or clause
 ## 1. Specs (TSV)
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary in §2),
-`blocking_gaps` (rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7),
+`blocking_gaps` (rows of the gap table in `docs/TRUST-LANE.md` (Blocking gaps)),
 `difficulty` (Rust features the proof must handle). Test names are in src/lib.rs unless prefixed
 `settings_json::`. Gap 0 (the installed seal publishes no Lean-discharged row) is on every row, and
 no row is blocked by gap 0 alone.
@@ -262,21 +191,6 @@ src/lib.rs	shell_prime_pending_reads_a_shared_skill_folder_once	shell-prime-pend
 src/lib.rs	skill_and_statusline_readers_refuse_non_regular_files	install-skill-file	restore-harness-statusline
 ```
 
-## 3. Coverage
-
-- The crate has 67 live tests (`src/lib.rs` 63, `src/settings_json.rs` 4). Every one maps to one of
-  the 48 specs; none is a non-spec sample (§4).
-- The biggest collapses: `shared-file-readers` (8 primary), `taught-surface-and-retired-names` (8
-  primary), `auto-prime-pass` (5 primary, 10 more shared), `compact-offers-kept` (4 primary),
-  `add-claude-defaults-file` (3 primary, 4 shared), `atomic-write` (3), `install-skill-file` (2),
-  `shell-prime-pending` (2).
-- Four specs are lemmas with no primary test: `fold-outcome`, `sh-word-round-trip`,
-  `rewrite-compare-and-swap` and `upsert-primer-file`. Their tests are retired by the composed specs above them, so they must be
-  proved first in their chains, but no test is deleted on their account alone.
-- `the_pass_removes_the_hook_entries_aterm_wrote_and_leaves_the_foreign_ones` samples five specs, so
-  it goes last. `relocated_config_drives_detection_install_and_remove_in_one_root` sampled six
-  before the audit cut its status half; it now samples `auto-prime-pass` and `cli-remove`.
-
 ## 4. Tests that are not spec samples
 
 None: all 67 live `#[test]` functions map to one of the 48 specs in §1.
@@ -305,39 +219,3 @@ None: all 67 live `#[test]` functions map to one of the 48 specs in §1.
 7. **The vendor's key must not be written joined.** Any SPECS.md, proof or clause text that states
    `top-effort-key-spelling` must spell the key with the hex escape (`b"ultra\x63ode"`), as the test
    does, because the export baseline bans the joined word in every exported file.
-
-## 6. Proof order (easiest high-value first)
-
-Every row also needs gap 1 (`&str`/`String`/enum carriers) or gap 8 (effects). The order takes the
-pure string core first, since most later specs compose it.
-
-1. **`top-effort-key-spelling`** (gaps 0, 1). A byte-slice equality over a `concat!` constant,
-   decidable by evaluation. It is the smallest probe of gap 1 on this crate and retires its test outright.
-2. **The constant-table properties: `primer-gate-line`, `skill-registry`, `bundled-docs-valid`**
-   (gaps 0, 1, 3, 5; `bundled-docs-valid` also 7, 14). All are facts about `include_str!`/`concat!`
-   constants and a `match` returning const slices, so they close by evaluation once string carriers
-   exist. Together they retire 1 test.
-3. **`primer-block-shape`, `off-switch-phrase`, `harness-state-of`, `skill-state`** (gaps 0, 1, 3,
-   plus 13 for the closures, 8 for the Path model). Straight-line string building and matching with
-   no loops over input, each retiring its own tests.
-4. **`find-block` → `upsert-block` → `remove-block-round-trip`** (gaps 0, 1, 3, 4, 5, 7). The pure
-   core of the crate: one line loop with an obvious invariant, then two string transforms by
-   composition. It retires 3 tests and is the lemma under `upsert-primer-file`, `cli-remove` and
-   `auto-prime-pass` (§5.1).
-5. **`fold-outcome`** and **`doc-label`** (gaps 0, 1, 3, 7, 13). Small enum and slice folds; the
-   lemmas `auto-prime-pass` and `status-line` need.
-6. **`sh-word-round-trip` → `aterm-hook-command`** (gaps 0, 1, 3, 5, 7, 13). High value: it is the
-   predicate that decides which hook entries in a person's settings are deleted.
-7. **JSON: `json-grammar`, `json-dupkeys`, `json-render-round-trip`** (adds gaps 2, 11), then the
-   pure settings edits `efforts-set-by-hand`, `survey-rate-set-by-hand`, `claude-defaults-edit`,
-   `strip-marked-hooks`, and `compact-offers-kept` (its file read needs gap 8).
-8. **Effects (gap 8): `atomic-write`, `settings-backup`, `dangling-link-one-answer`,
-   `install-skill-file`, `upsert-primer-file`, `restore-harness-statusline`,
-   `remove-aterm-hooks-file`, `add-claude-defaults-file`, `rewrite-compare-and-swap`,
-   `shared-file-readers`, `shell-prime-pending`**, then the compositions `auto-prime-pass`,
-   `auto-prime-idempotent`, the `cli-*` specs and `status-line`. `settings-rmw-serialized` (gap 13,
-   threads) and `summary-log-cap` / `primer-names-env-deny-prefixes` /
-   `taught-surface-and-retired-names` (gap 12, cross-crate constants) go when those gaps close.
-
-Gap histogram (number of the 48 specs each gap blocks): 0 → 48, 1 → 44, 3 → 42, 7 → 25,
-8 → 22, 13 → 22, 4 → 19, 5 → 19, 2 → 8, 11 → 4, 12 → 3, 14 → 1.

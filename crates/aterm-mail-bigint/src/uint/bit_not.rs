@@ -43,12 +43,5 @@ impl<const LIMBS: usize> Not for Wrapping<Uint<LIMBS>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::U128;
-
-    #[test]
-    fn bitnot_ok() {
-        assert_eq!(U128::ZERO.not(), U128::MAX);
-        assert_eq!(U128::MAX.not(), U128::ZERO);
-    }
-}
+#[path = "bit_not_tests.rs"]
+mod tests;

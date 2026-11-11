@@ -420,7 +420,11 @@ fn sweep(ctx: &Ctx, bin: &Path, groups: &[(String, Vec<String>)], write: bool) -
         files: groups.iter().map(|(_, f)| f.len()).sum(),
         ..Sweep::default()
     });
-    let workers = ctx.parallelism().max(1) as usize;
+    let workers = ctx
+        .pool
+        .as_deref()
+        .map_or_else(|| ctx.parallelism(), aterm_capacity::Jobserver::slots)
+        .max(1) as usize;
     let canonical_root = std::fs::canonicalize(&ctx.root).ok();
     std::thread::scope(|scope| {
         for _ in 0..workers.min(jobs.len()) {
@@ -433,14 +437,28 @@ fn sweep(ctx: &Ctx, bin: &Path, groups: &[(String, Vec<String>)], write: bool) -
                     }) else {
                         return;
                     };
-                    let out = exec::run(&trustfmt_cmd(bin, edition, chunk, write), ctx.exec_env());
-                    let read = read_run(
-                        &out,
-                        edition,
-                        chunk.len(),
-                        &ctx.root,
-                        canonical_root.as_deref(),
+                    // Each pooled formatter process spends one token beside compiler and test
+                    // workers. The coordinator holds none while its workers wait for theirs.
+                    let out = crate::compile_width::run(
+                        ctx.pool.as_deref(),
+                        ctx.pool.as_deref().map(|_| 1),
+                        None,
+                        &crate::stopping,
+                        || exec::run(&trustfmt_cmd(bin, edition, chunk, write), ctx.exec_env()),
                     );
+                    let read = match out {
+                        Ok(out) => read_run(
+                            &out,
+                            edition,
+                            chunk.len(),
+                            &ctx.root,
+                            canonical_root.as_deref(),
+                        ),
+                        Err(error) => Sweep {
+                            unread: vec![format!("trustfmt CPU admission: {error}")],
+                            ..Sweep::default()
+                        },
+                    };
                     if let Ok(mut f) = found.lock() {
                         f.drifted.extend(read.drifted);
                         f.unread.extend(read.unread);

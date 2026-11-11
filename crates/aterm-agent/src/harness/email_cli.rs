@@ -140,16 +140,18 @@ fn valid_account(value: &str) -> bool {
         })
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Failure {
     message: String,
     retry: bool,
+    retry_at: Option<Instant>,
 }
 impl From<String> for Failure {
     fn from(message: String) -> Self {
         Self {
             message,
             retry: false,
+            retry_at: None,
         }
     }
 }
@@ -162,7 +164,41 @@ fn transient(message: impl Into<String>) -> Failure {
     Failure {
         message: message.into(),
         retry: true,
+        retry_at: None,
     }
+}
+
+#[cfg(unix)]
+impl Failure {
+    fn proton(
+        message: String,
+        detail: Option<&aterm_mail::proton_error::Failure>,
+        now: Instant,
+    ) -> Self {
+        use aterm_mail::proton_error::Recovery;
+        let mut failure = Self::from(message);
+        match detail.map(|detail| (detail.recovery(), detail.retry_after_seconds)) {
+            Some((Recovery::RetryRead, delay)) => {
+                failure.retry_at = now.checked_add(Duration::from_secs(delay.unwrap_or(30).max(1)));
+                failure.retry = failure.retry_at.is_some();
+            }
+            Some((Recovery::Reauthenticate, _)) => failure.retry = true,
+            _ => {}
+        }
+        failure
+    }
+}
+
+#[cfg(unix)]
+impl From<super::mail_browser::MailboxOpenError> for Failure {
+    fn from(error: super::mail_browser::MailboxOpenError) -> Self {
+        Self::proton(error.message, error.proton_failure.as_ref(), Instant::now())
+    }
+}
+
+fn reconnect_delay(failures: u32, retry_at: Option<Instant>, now: Instant) -> Duration {
+    Duration::from_secs(2u64.saturating_pow(failures.min(5)).min(30))
+        .max(retry_at.unwrap_or(now).saturating_duration_since(now))
 }
 fn remaining(end: Instant) -> Result<Duration, Failure> {
     let left = end.saturating_duration_since(Instant::now());
@@ -277,6 +313,7 @@ impl Connection {
                         session.renew_until(end).map_err(|error| Failure {
                             retry: error.retryable(),
                             message: error.to_string(),
+                            retry_at: None,
                         })?;
                         break session
                             .authentication()
@@ -410,15 +447,8 @@ impl Connection {
             match shared.try_lock() {
                 Ok(mut mailbox) => {
                     let result = mailbox.run_until(end, operation);
-                    return result.map_err(|message| Failure {
-                        message,
-                        retry: mailbox.last_failure().is_some_and(|failure| {
-                            matches!(
-                                failure.recovery(),
-                                aterm_mail::proton_error::Recovery::RetryRead
-                                    | aterm_mail::proton_error::Recovery::Reauthenticate
-                            )
-                        }),
+                    return result.map_err(|message| {
+                        Failure::proton(message, mailbox.last_failure().as_ref(), Instant::now())
                     });
                 }
                 Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -481,6 +511,7 @@ impl Connection {
                     .map_err(|error| Failure {
                         retry: error.retryable(),
                         message: String::from(error),
+                        retry_at: None,
                     })
             }
         }
@@ -526,6 +557,7 @@ impl Connection {
                         return Err(Failure {
                             retry: error.retryable(),
                             message: String::from(error),
+                            retry_at: None,
                         });
                     }
                 }
@@ -562,9 +594,13 @@ fn run(home: &Path, options: &Options, output: &mut impl Write) -> Result<(), Fa
         );
     }
     let end = Instant::now() + options.timeout;
+    let mut retry_at = None;
     let mut connection = match Connection::open(home, options, end) {
         Ok(connection) => Some(connection),
-        Err(failure) if failure.retry && options.command == Command::Watch => None,
+        Err(failure) if failure.retry && options.command == Command::Watch => {
+            retry_at = failure.retry_at;
+            None
+        }
         Err(failure) => return Err(failure),
     };
     if options.command == Command::Session {
@@ -632,7 +668,7 @@ fn run(home: &Path, options: &Options, output: &mut impl Write) -> Result<(), Fa
                 )?;
                 reconnecting = true;
             }
-            let delay = Duration::from_secs(2u64.saturating_pow(failures.min(5)).min(30));
+            let delay = reconnect_delay(failures, retry_at, Instant::now());
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
@@ -645,9 +681,11 @@ fn run(home: &Path, options: &Options, output: &mut impl Write) -> Result<(), Fa
                 Err(_) if end <= Instant::now() => break,
                 Ok(opened) => {
                     connection = Some(opened);
+                    retry_at = None;
                     should_poll = true;
                 }
                 Err(failure) if failure.retry => {
+                    retry_at = failure.retry_at;
                     failures = failures.saturating_add(1);
                     continue;
                 }
@@ -668,6 +706,7 @@ fn run(home: &Path, options: &Options, output: &mut impl Write) -> Result<(), Fa
                 Err(_) if options.command == Command::Watch && end <= Instant::now() => break,
                 Ok(messages) => messages,
                 Err(failure) if failure.retry && options.command == Command::Watch => {
+                    retry_at = failure.retry_at;
                     failures = failures.saturating_add(1);
                     connection = None;
                     continue;
@@ -861,6 +900,48 @@ mod tests {
     #[test]
     fn expired_operation_is_retryable_without_network_work() {
         assert!(remaining(Instant::now()).unwrap_err().retry);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn proton_read_recovery_keeps_classification_and_server_waits() {
+        use aterm_mail::proton_error::{Kind, Operation};
+        let now = Instant::now();
+        for (kind, seconds, unparsed, retry, wait) in [
+            (Kind::Network, None, false, true, Some(30)),
+            (Kind::RateLimited, Some(47), false, true, Some(47)),
+            (Kind::RateLimited, Some(0), false, true, Some(1)),
+            (Kind::RateLimited, None, true, false, None),
+            (Kind::Credentials, None, false, false, None),
+            (Kind::Verification, None, false, false, None),
+            (Kind::AccessDenied, None, false, false, None),
+            (Kind::SessionExpired, None, false, true, None),
+            (Kind::RateLimited, Some(u64::MAX), false, false, None),
+        ] {
+            let detail = aterm_mail::proton_error::Failure {
+                operation: Operation::Addresses,
+                kind,
+                http_status: None,
+                api_code: None,
+                retry_after_seconds: seconds,
+                retry_after_unparsed: unparsed,
+                phase: None,
+            };
+            let failure = Failure::proton("owned read failure".into(), Some(&detail), now);
+            assert_eq!(failure.retry, retry, "{kind:?}: {seconds:?}");
+            assert_eq!(
+                failure.retry_at,
+                wait.map(|seconds| now + Duration::from_secs(seconds))
+            );
+            if let Some(seconds) = wait {
+                assert!(reconnect_delay(0, failure.retry_at, now) >= Duration::from_secs(seconds));
+            }
+        }
+        let unknown = Failure::from(super::super::mail_browser::MailboxOpenError::from(
+            "owned network setup failure",
+        ));
+        assert!(!unknown.retry);
+        assert_eq!(unknown.retry_at, None);
     }
 
     #[test]

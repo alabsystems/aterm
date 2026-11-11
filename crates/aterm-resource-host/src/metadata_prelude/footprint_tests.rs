@@ -10,6 +10,106 @@ use std::os::unix::process::ExitStatusExt as _;
 const PAYLOAD: &str = "metadata_prelude::footprint_tests::native_footprint_target";
 const ACTOR: &str = "metadata_prelude::tests::native_prelude_actor";
 const ROLE: &str = "ATERM_TEST_PRELUDE_FOOTPRINT";
+const ENV_ROLE: &str = "ATERM_TEST_PRELUDE_LOADER_ENVIRONMENT";
+const ENV_CANARY: &str = "LD_ATERM_FINAL_ENV_CANARY";
+
+pub(super) fn observe_first_image_environment() {
+    if std::env::var_os(ENV_ROLE).is_some() {
+        println!(
+            "first-image-loader-present={}",
+            std::env::var_os(ENV_CANARY).is_some()
+        );
+        std::io::stdout().flush().unwrap();
+    }
+}
+
+#[test]
+fn native_final_loader_environment_target() {
+    if std::env::var_os(ENV_ROLE).is_some() {
+        assert_eq!(
+            std::env::var(ENV_CANARY).as_deref(),
+            Ok("selected-image-only")
+        );
+        println!("final-image-loader-value=selected-image-only");
+    }
+}
+
+#[test]
+fn actual_prelude_keeps_selected_loader_environment_for_final_exec_only() {
+    const TEST: &str = "metadata_prelude::footprint_tests::actual_prelude_keeps_selected_loader_environment_for_final_exec_only";
+    const FINAL: &str = "metadata_prelude::footprint_tests::native_final_loader_environment_target";
+    if !aterm_uds::test_binary::isolated_lifecycle(TEST) {
+        return;
+    }
+    crate::runtime::test_endpoint().unwrap();
+    let mut target = spawnfd::command(std::env::current_exe().unwrap());
+    target
+        .args(["--exact", FINAL, "--nocapture"])
+        .env_clear()
+        .env(ENV_ROLE, "observe")
+        .env(ENV_CANARY, "selected-image-only")
+        .current_dir(std::env::current_dir().unwrap());
+    let deadline = crate::fixture_deadline(Instant::now());
+    let (mut invalid_owner, mut invalid_prelude) = Owner::new(&target, &[], deadline).unwrap();
+    invalid_prelude.env(ENV_CANARY, "late-first-image-value");
+    assert!(invalid_owner.configured(&mut invalid_prelude).is_err());
+    assert!(invalid_owner.payload.is_empty());
+    drop((invalid_owner, invalid_prelude));
+    let (mut owner, mut prelude) = Owner::new(&target, &[], deadline).unwrap();
+    prelude
+        .inherit_guards_at(vec![owner.extra().unwrap()])
+        .unwrap();
+    owner.configured(&mut prelude).unwrap();
+    prelude.stdout(spawnfd::Stdio::piped());
+    let mut child = OwnedChild(prelude.spawn().unwrap());
+    let original = process::read_lineage(child.0.id() as i32).unwrap();
+    loop {
+        if owner
+            .poll(&mut child.0, |pid| {
+                assert_eq!(pid, original.identity.pid as u32);
+                Ok(())
+            })
+            .unwrap()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "actual final native hold");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let selected = process::read_lineage(child.0.id() as i32).unwrap();
+    assert_eq!(selected.identity.birth, original.identity.birth);
+    assert_eq!(selected.uniqueid, original.uniqueid);
+    assert_ne!(selected.identity.idversion, original.identity.idversion);
+    child.0.resume().unwrap();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "actual final image exited");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let mut stdout = String::new();
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert!(status.success(), "{status:?}: {stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "first-image-loader-present=false"),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "final-image-loader-value=selected-image-only"),
+        "{stdout}"
+    );
+}
 
 #[test]
 fn native_footprint_target() {

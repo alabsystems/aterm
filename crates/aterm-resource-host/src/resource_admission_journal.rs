@@ -35,6 +35,8 @@ pub(super) struct Journal {
     debt: ExternalDebt,
     readiness: Value,
     faults: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    #[cfg(all(test, target_os = "macos"))]
+    lose_running_ack: std::sync::atomic::AtomicBool,
 }
 fn private(path: &std::path::Path, directory: bool) -> io::Result<File> {
     let file = std::fs::OpenOptions::new()
@@ -138,6 +140,8 @@ impl Journal {
             debt: debt.clone(),
             readiness: expected,
             faults: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            #[cfg(all(test, target_os = "macos"))]
+            lose_running_ack: std::sync::atomic::AtomicBool::new(false),
         })
     }
     /// Called only while preparing a fresh, unadopted namespace. Runtime open
@@ -238,6 +242,11 @@ impl Journal {
     pub(super) fn update(&self, binding: &Binding, phase: &str, fields: Value) -> io::Result<()> {
         self.edit(binding, Some(phase), fields)
     }
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn lose_running_ack_once(&self) {
+        self.lose_running_ack
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     /// Update retained bookkeeping without resurrecting the native life phase.
     pub(super) fn patch(&self, binding: &Binding, fields: Value) -> io::Result<()> {
         self.edit(binding, None, fields)
@@ -267,7 +276,18 @@ impl Journal {
             .join(format!(".stage-{}", aterm_uds::rand::hex_token::<16>()?));
         write_new(&stage, &record)?;
         std::fs::rename(stage, &path)?;
-        aterm_durable::durable(&private(&self.active, true)?)
+        aterm_durable::durable(&private(&self.active, true)?)?;
+        #[cfg(all(test, target_os = "macos"))]
+        if phase == Some("running")
+            && self
+                .lose_running_ack
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(io::Error::other(
+                "controlled Root running commit acknowledgement lost",
+            ));
+        }
+        Ok(())
     }
     /// Publish only the attempt's durable bookkeeping after the caller has already proved
     /// actual resource closure or that no ARM occurred. A tombstone is never CPU/memory

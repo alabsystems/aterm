@@ -4166,7 +4166,6 @@ fn auto(max_s: u64) -> SuperviseOpts {
             continue_policy: false,
             retry_api_errors: false,
             resume_limits: false,
-            model_fallback: None,
             compact_on_context_wall: false,
             ..owners_policy()
         },

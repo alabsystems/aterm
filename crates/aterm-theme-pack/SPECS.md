@@ -18,7 +18,7 @@ the build); none is proved yet.
 ## 1. Specs (TSV)
 
 `difficulty` is the Rust features a proof must handle; `blocking gaps` is a row number of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7 or, in words, what else a proof lacks.
+`docs/TRUST-LANE.md` (Blocking gaps) or, in words, what else a proof lacks.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -46,17 +46,6 @@ src/tests.rs	an_earlier_copy_reads_installed_and_an_edit_does_not	TP-INSTALL
 src/tests.rs	find_answers_the_id_then_the_name_shown	TP-FIND	
 ```
 
-## 3. Coverage
-
-- The strict-check law over the pack lives in `aterm-cli`
-  (`theme_author.rs::pack_themes_pass_the_strict_check`), where the checker is; the catalog round
-  trip lives in `aterm-gui` (`settings_themes_host.rs::pack_themes_load_through_the_catalog`).
-- `build.rs` also refuses (panics on) a malformed manifest: an inadmissible licence, an id
-  `validate_user_theme_name` rejects, a duplicate id or name, a name that is its row's id, a
-  withdrawn id still in use or standing for no pack id or built-in, a bad appearance, an empty
-  field, or a missing upstream or licence file. These are build-time checks, not tests.
-- All 8 live `#[test]` functions in `src/tests.rs` map to §1's specs in §2.
-
 ## 4. Tests that are not spec samples
 
 None.
@@ -64,10 +53,3 @@ None.
 ## 5. Implied specs that look wrong, or disagree with the code
 
 None.
-
-## 6. Proof order (easiest, high value first)
-
-1. TP-PAIRS, TP-PORTS, TP-FIND: closed-table lookups; a `const` evaluation in the build script could
-   discharge them.
-2. TP-NOTICE, TP-IDS: need the native parser's spec (aterm-types) first.
-3. TP-DERIVED and TP-FOLDER read files, and TP-INSTALL writes them; they stay tests.

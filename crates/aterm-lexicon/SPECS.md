@@ -3,24 +3,6 @@
 
 # aterm-lexicon: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 19 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-17: the rows of the 2 tests §4 deleted are gone too, and the spec rows no longer
-> cite the audit's other deleted tests. The corpus table test `listed_surfaces_reach_their_class`
-> stands in for the five tests it replaced.
-
-> Status 2026-10-27: the embedded tricks vocabulary is decoded at build time too
-> (builtin-build-time-decode now covers `TrickLexicon::with_languages` and `all_rows`), and a
-> resource spec, builtin-tricks-compile-peak, bounds the heap that compile holds at once. Three
-> tests were added: one per spec and the allocator harness's peak self-check (§4).
-
-> Status 2026-10-16: this file is the crate's migration worklist. Each of the 40 specs
-> below is proved through Trust/Clean about the compiled Rust function, and then the tests
-> it subsumes are deleted. The 4 tests in §4 sample no spec and can be deleted now. No spec
-> is proved yet.
-
 Source: `crates/aterm-lexicon` (read only). Every `#[test]` was read, along with the code it
 reaches: `src/fold.rs` 7, `src/lib.rs` 10, `src/tricks.rs` 0,
 `tests/{animal_multilingual 8, animal_species 4, corpus 51, english_fold_collisions 4,
@@ -106,7 +88,7 @@ Trick views (`tl: TrickLexicon`, `src/tricks.rs`):
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; §2 lists every test),
 `rust_features` (what the proof must handle), and `blocking_gaps` (rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7). Gap 0, an installed seal that publishes
+`docs/TRUST-LANE.md` (Blocking gaps)). Gap 0, an installed seal that publishes
 no Clean row, blocks every spec, so the column leaves it out.
 
 Test paths in `subsumes` are relative to `crates/aterm-lexicon`. A bare test name is in the file
@@ -157,33 +139,6 @@ tricks-embedded-wellformed	table-property	TrickLexicon::with_languages, TrickLex
 tricks-embedded-coverage	table-property	TrickLexicon::with_languages, TrickLexicon::shared_en, TrickLexicon::classify, TrickLexicon::all_rows	For the embedded file: ∀ t ∈ ALL, some en words-surface classifies under ["en"] to Trick{t, needs_vocative:false}; ∀ L ∈ {["en"], [], ["ja"]}, en reaches every t; ∀ file lang x, ∀ t, some (t,x) surface classifies to t under [x] (CORE_GAPS = ∅); no plain en word folds into LINE_OPENERS \ PLAIN_ON_PURPOSE, and every PLAIN_ON_PURPOSE word is both an opener and a plain en word; the pinned role table holds (iconic plain verbs, address openers, praise/scold, cat-speak, vocatives, fillers, natural-phrase words, purity-ending words); the pinned inflections and lookalikes classify None under ["all"]. Recommended: move the pinned word lists into a data file the spec quantifies over.	tests/tricks.rs::every_trick_has_a_plain_english_word, the_iconic_bare_verbs_answer_unaddressed_and_the_everyday_openers_do_not, praise_and_scolding_never_fire_without_the_pet_being_named, the_cat_speak_the_internet_knows_is_understood, the_natural_phrases_are_made_of_vocabulary_words_only, inflections_and_lookalikes_never_classify, every_language_in_the_file_reaches_every_trick, no_plain_english_word_opens_ordinary_command_lines_or_chat_messages	evaluation over the embedded constant plus pinned lists	1, 3, 7, 9
 tricks-lexicon-disjoint	table-property	TrickLexicon::all_rows, Lexicon::with_languages, Lexicon::classify_token, Lexicon::scan	Let S(s) = classify_token(Builtin(["all"]), s) orElse the class of the first match of scan(Builtin(["all"]), s, all opts on). For every embedded trick row r: if r.kind ≠ Vocative, ∀ surface s of r: S(s) = None, unless r.kind = Trick(Speak) ∧ S(s) = Feline ∧ Fold(s) ∈ {meow, mew, miaow}; and ∀ r, ∀ s: S(s) ≠ Profanity. Non-vacuity: S("meow") = Feline, S("bat") = Animal, S("fuck") = Profanity, and each of meow/mew/miaow classifies as plain Speak.	tests/tricks.rs::no_trick_address_or_filler_surface_is_a_shared_sparkle_lexicon_surface, nothing_in_the_vocabulary_is_profanity_in_any_language	evaluation of both builds over embedded constants	1, 3, 7, 9
 ```
-
-### Distribution by kind (42)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 21 | fold-denotation, tokenization-whole-word, code-context-guard, classify-token-fallbacks, scan-policy-guards, marks-required-gate, cjk-maximal-munch, build-surface-bounds, build-key-set, insert-class-merge, ambiguous-gating, lang-interning, form-identity, every-key-round-trips, build-conflicts-channel, row-line-format, trick-row-order, trick-compile-laws, trick-classify-denotation, trick-elongation-fold, trick-authored-round-trip |
-| table-property | 11 | fold-decomposition-invariant, char-class-tables, builtin-lexicon-wellformed, builtin-lexicon-coverage, builtin-lexicon-false-positive-avoidance, english-dictionary-collision-gates, trick-code-bijection, trick-blurb-table, tricks-embedded-wellformed, tricks-embedded-coverage, tricks-lexicon-disjoint |
-| invariant | 3 | fold-idempotent, cjk-prefilter-sound, species-iff-animal |
-| equivalence | 3 | ascii-early-out-equivalence, scan-scratch-stateless, builtin-build-time-decode |
-| refinement | 2 | langset-finite-set, toml-schema-decoding |
-| other | 2 | warm-path-allocation-free, builtin-tricks-compile-peak (allocator resource contracts) |
-
-
-### Proof dependency order
-
-`char-class-tables`, `ascii-early-out-equivalence`, `langset-finite-set`, `trick-code-bijection`,
-`trick-blurb-table` → `fold-denotation` → `fold-idempotent`, `fold-decomposition-invariant` →
-`tokenization-whole-word`, `code-context-guard`, `classify-token-fallbacks`, `trick-elongation-fold` →
-the build specs (`build-surface-bounds`, `build-key-set`, `insert-class-merge`, `marks-required-gate`,
-`ambiguous-gating`, `lang-interning`, `species-iff-animal`, `cjk-prefilter-sound`, `form-identity`,
-`build-conflicts-channel`) → the scan specs (`scan-policy-guards`, `cjk-maximal-munch`,
-`scan-scratch-stateless`) → `every-key-round-trips`. The tricks specs follow the same pattern:
-`trick-row-order` → `trick-compile-laws` → `trick-classify-denotation` → `trick-authored-round-trip`.
-The embedded-data table properties (`builtin-lexicon-*`, `tricks-embedded-*`, `tricks-lexicon-disjoint`,
-`english-dictionary-collision-gates`) come last. They are evaluations of the proved build and scan
-over the embedded constants, and they need `toml-schema-decoding` (gap 9) for the decode step.
-`warm-path-allocation-free` waits on the effects lane (gap 8).
 
 ## 2. Test → spec map (TSV)
 
@@ -313,41 +268,6 @@ tests/tricks.rs	one_claimant_keeping_a_surface_out_of_the_glued_reading_keeps_it
 tests/tricks_alloc.rs	a_warmed_classify_is_allocation_free_on_every_lane	warm-path-allocation-free	
 tests/tricks_alloc.rs	compiling_the_embedded_vocabulary_peaks_under_2_mib	builtin-tricks-compile-peak	
 ```
-
-## 3. Proof order
-
-- 131 tests read. 128 map to one of the 41 specs, and 3 are not spec samples (§4).
-- The biggest collapses are:
-  - `trick-compile-laws`: 11 primary;
-  - `builtin-lexicon-coverage`: 11;
-  - `tricks-embedded-coverage`: 9;
-  - `cjk-maximal-munch`: 7;
-  - `scan-policy-guards`: 7;
-  - `insert-class-merge`: 7;
-  - `builtin-lexicon-false-positive-avoidance`: 6.
-- Each of the five embedded-data table properties (`builtin-lexicon-*`, `tricks-embedded-*`,
-  `tricks-lexicon-disjoint`) is an evaluation over the shipped data, not a theorem about
-  arbitrary input. That holds 31 tests together. They are worth proving only after the build
-  and scan contracts are proved, because then the evaluation runs on the reflected code
-  rather than on a copy.
-- No spec here is blocked only by gap 0. Every one needs at least non-scalar carriers (gap 1), E6 body
-  widening (gap 3), quantified clauses (gap 5), or build-script codegen (gap 9). So the order goes by
-  the smallest set of gaps beyond 0:
-
-| gap | specs |
-|---|---|
-| 0 | 42 (prerequisite for all; closed locally by seal `150efe4a`, owner-gated) |
-| 1 | 39 |
-| 2 | 14 |
-| 3 | 38 |
-| 4 | 4 |
-| 5 | 28 |
-| 7 | 37 |
-| 8 | 3 |
-| 9 | 13 |
-| 12 | 1 |
-| 13 | 9 |
-| 14 | 2 |
 
 ## 4. Tests that are not spec samples
 

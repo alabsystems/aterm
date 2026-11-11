@@ -190,30 +190,5 @@ pub use crate::__registry_collect as collect;
 pub use crate::__registry_submit as submit;
 
 #[cfg(test)]
-mod tests {
-    use super::{Node, Registry};
-
-    struct Seen(u32);
-
-    crate::registry::collect!(Seen);
-    crate::registry::submit!(Seen => Seen(1));
-    crate::registry::submit!(Seen => Seen(2));
-
-    #[test]
-    fn the_load_time_constructors_collected_both_submits() {
-        let mut seen: Vec<u32> = super::iter::<Seen>().map(|s| s.0).collect();
-        seen.sort_unstable();
-        assert_eq!(seen, [1, 2]);
-    }
-
-    #[test]
-    fn a_node_submitted_twice_is_linked_once() {
-        static LIST: Registry<u8> = Registry::new();
-        static ONE: Node<u8> = Node::new(1);
-        static TWO: Node<u8> = Node::new(2);
-        LIST.submit(&ONE);
-        LIST.submit(&TWO);
-        LIST.submit(&ONE);
-        assert_eq!(LIST.iter().copied().collect::<Vec<_>>(), [2, 1]);
-    }
-}
+#[path = "registry_tests.rs"]
+mod tests;

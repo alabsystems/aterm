@@ -151,7 +151,7 @@ impl RingFile {
             text.push_str(&row.line());
             text.push('\n');
         }
-        aterm_agent::harness::upgrade_models::write_atomic_ordered(&self.path, &text)?;
+        aterm_agent::harness::atomic_write::write_atomic_ordered(&self.path, &text)?;
         self.rows = Some(keep.len());
         Ok(())
     }

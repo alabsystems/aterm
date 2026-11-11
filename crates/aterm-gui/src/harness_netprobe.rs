@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read as _, Write as _};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -364,13 +364,28 @@ pub(crate) fn http_answer(
     }
 }
 
-/// Production probe using the system resolver, timed TCP connect, and platform TLS verification.
+/// Production probe using LAN-aware resolution, timed TCP connect, and platform TLS verification.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct SystemProbe;
 
 impl Probe for SystemProbe {
     fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-        Ok((host, port).to_socket_addrs()?.collect())
+        #[cfg(unix)]
+        {
+            aterm_uds::lan::resolve(host, netwatch::PROBE_BUDGET)
+                .map(|addresses| {
+                    addresses
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect()
+                })
+                .map_err(io::Error::from)
+        }
+        #[cfg(windows)]
+        {
+            use std::net::ToSocketAddrs as _;
+            Ok((host, port).to_socket_addrs()?.collect())
+        }
     }
 
     fn connect(&self, addr: SocketAddr, within: Duration) -> io::Result<TcpStream> {
@@ -1199,6 +1214,62 @@ mod tests {
     use std::sync::mpsc;
 
     const BUDGET: Duration = Duration::from_secs(2);
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_local_endpoint_probe_resolves_through_the_lan_broker() {
+        use aterm_uds::lan::{
+            self,
+            wire::{Frame, Reader, Request},
+        };
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let socket = root.path().join("broker.sock");
+        let listener = aterm_uds::CtlListener::bind(&socket).unwrap();
+        let served = std::thread::spawn(move || {
+            let hang = Duration::from_secs(60);
+            let (stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(Instant::now() + hang),
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
+            lan::wire::send(
+                &stream,
+                &Frame::Hello {
+                    protocol: lan::PROTOCOL,
+                    build: "probe-fixture".into(),
+                },
+            )
+            .unwrap();
+            let mut reader = Reader::new(0);
+            let deadline = Some(Instant::now() + hang);
+            assert!(matches!(
+                reader.frame(&stream, deadline).unwrap(),
+                Some(Frame::Hello { .. })
+            ));
+            assert!(matches!(reader.frame(&stream, deadline).unwrap(),
+                Some(Frame::Request(Request::Resolve { name, .. })) if name == "probe-fixture.local"));
+            lan::wire::send(
+                &stream,
+                &Frame::Addresses(vec!["192.0.2.17".parse().unwrap()]),
+            )
+            .unwrap();
+        });
+        let addresses = lan::seam_here(
+            lan::Seam {
+                socket: Some(socket),
+                ..lan::Seam::default()
+            },
+            || SystemProbe.resolve("probe-fixture.local", 8443),
+        )
+        .unwrap();
+        served.join().unwrap();
+        assert_eq!(
+            addresses,
+            vec!["192.0.2.17:8443".parse::<SocketAddr>().unwrap()]
+        );
+    }
 
     /// Which publisher of a wake (a stop, or a path's nudge) the fixture runs: the shipping
     /// mutex-guarded one, or the unlocked negative control.

@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::snapshot;
@@ -32,9 +31,9 @@ const LIPO_X86_64: &str = "x86_64";
 /// The cut's persistent log directory, supplied to its build child.
 pub(crate) const SLICE_LOGS_ENV: &str = "ATERM_RELEASE_SLICE_LOGS";
 
-/// Platform policy, independent of the shared core pool and per-slice memory admission.
+/// Platform policy, independent of the bounded core allocation and per-slice memory admission.
 pub enum Sequencing {
-    /// macOS slices borrow from one Release jobserver.
+    /// Both macOS slices borrow from the build branch's private FIFO.
     Parallel,
     /// Linux's native build remains explicitly serial.
     OneAtATime,
@@ -426,7 +425,6 @@ impl Take {
     pub(crate) fn prepare(repo_root: &Path, commit: &str) -> Result<Self, String> {
         let hold = snapshot::CacheRoot::for_repo(repo_root)?.hold()?;
         let cache = hold.cache();
-        retire_moved_dirs(cache);
         refuse_held_stage(&cache.stage())?;
         let targo = crate::gates::trust_stage2_bin()
             .map_err(|e| e.to_string())?
@@ -509,33 +507,6 @@ impl Take {
 /// The stage's shipped binary's directory: its first exec is stamped there ([`run_with_take`]).
 fn ship_stage(stage: &Path) -> PathBuf {
     stage.join("universal").join("ship")
-}
-
-/// The build's folders where a take of an earlier version laid them, beside `snapshot/`
-/// ([`snapshot::CacheRoot::moved_from`]): removed under this take's hold of the cache, which no
-/// other take of the clone builds through, each said in a line; the stage only once the binary
-/// an earlier build started there showed it ran ([`refuse_held_stage`]'s rule), else it stays for
-/// a later take. What fails to go stays, said, and the take goes on.
-fn retire_moved_dirs(cache: &snapshot::CacheRoot) {
-    for old in cache.moved_from() {
-        if !std::fs::symlink_metadata(&old).is_ok_and(|m| m.is_dir()) {
-            continue;
-        }
-        if old.file_name() == Some(std::ffi::OsStr::new("stage"))
-            && let Err(why) = refuse_held_stage(&old)
-        {
-            println!("    kept {}: {why}", old.display());
-            continue;
-        }
-        match std::fs::remove_dir_all(&old) {
-            Ok(()) => println!(
-                "    removed {}: the build's folders are in {} now, out of fseventsd's stream",
-                old.display(),
-                cache.quiet().display()
-            ),
-            Err(e) => println!("    kept {}: it could not be removed ({e})", old.display()),
-        }
-    }
 }
 
 /// Refuse to clear `stage` while the shipped binary an earlier build started there never
@@ -699,6 +670,180 @@ fn own_slice_pool(temporary: &Path) -> Result<SlicePool, String> {
     })
 }
 
+/// Admit at most one complete shared slice budget. With incomplete records, `None` makes each
+/// worker learn its toolchain's footprints under an exclusive driver claim.
+fn admit_shared_parent<T>(
+    need: Option<aterm_capacity::Need>,
+    admit: impl FnOnce(aterm_capacity::Need) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    need.map(admit).transpose()
+}
+
+/// Only a continuously normal, unclaimed memory shortage earns the serial escape.
+/// A minute is a patience bound, not evidence that the OS load will ever end.
+const SLICE_MEMORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn serial_escape(short: &aterm_capacity::Shortfall, reading: &aterm_capacity::Reading) -> bool {
+    reading.pressure == Some(aterm_sysprobe::MemoryLevel::Normal)
+        && short.holders.is_empty()
+        && !short.shorts.is_empty()
+        && short.shorts.iter().all(|short| {
+            matches!(
+                short,
+                aterm_capacity::Short::Memory {
+                    reserved: 0,
+                    passes: None,
+                    ..
+                }
+            )
+        })
+}
+
+/// Keep the exact admission sample for the patience clock. A separate earlier read
+/// can repeatedly see normal pressure while admission sees warning pressure.
+struct SliceMemorySample<'a> {
+    machine: &'a dyn aterm_capacity::Machine,
+    normal_required: bool,
+    reading: std::cell::RefCell<Option<aterm_capacity::Reading>>,
+}
+
+impl<'a> SliceMemorySample<'a> {
+    fn new(machine: &'a dyn aterm_capacity::Machine, normal_required: bool) -> Self {
+        Self {
+            machine,
+            normal_required,
+            reading: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+impl aterm_capacity::Machine for SliceMemorySample<'_> {
+    fn read(&self, path: Option<&Path>) -> aterm_capacity::Reading {
+        let mut reading = self.machine.read(path);
+        *self.reading.borrow_mut() = Some(reading.clone());
+        if self.normal_required && reading.pressure != Some(aterm_sysprobe::MemoryLevel::Normal) {
+            reading.available = Some(0);
+        }
+        reading
+    }
+
+    fn procs(&self) -> Option<aterm_capacity::Procs> {
+        self.machine.procs()
+    }
+
+    fn lineage(&self, pid: u32) -> Option<aterm_capacity::Procs> {
+        self.machine.lineage(pid)
+    }
+
+    fn waits(&self) -> Vec<aterm_toolchain::waits::Waiting> {
+        self.machine.waits()
+    }
+}
+
+fn admit_slice_parent_in(
+    ledger: &aterm_capacity::Ledger,
+    machine: &dyn aterm_capacity::Machine,
+    need: aterm_capacity::Need,
+    serial: aterm_capacity::Need,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut pause: impl FnMut() -> bool,
+    mut say: impl FnMut(&str),
+) -> Result<(aterm_capacity::Claim, bool), String> {
+    use aterm_capacity::{Polled, Waiter};
+    let mut waiter = Waiter::enter(ledger, machine, need).map_err(|e| e.to_string())?;
+    let mut eligible_since = None;
+    let mut last_line = None;
+    let mut degraded = false;
+    loop {
+        let now = elapsed();
+        let sample = SliceMemorySample::new(machine, degraded);
+        match waiter.poll(&sample) {
+            Polled::Admitted(claim) => return Ok((claim, degraded)),
+            Polled::Gone(error) => return Err(error.to_string()),
+            Polled::Unqualified(issue) => {
+                return Err(format!("slice memory unqualified: {issue:?}"));
+            }
+            Polled::Waiting(next, short) => {
+                waiter = next;
+                let reading = sample.reading.borrow();
+                let pressure_wait = degraded
+                    && reading.as_ref().is_some_and(|reading| {
+                        reading.pressure != Some(aterm_sysprobe::MemoryLevel::Normal)
+                    });
+                if last_line.is_none_or(|at| now.saturating_sub(at) >= SLICE_MEMORY_PATIENCE) {
+                    if pressure_wait {
+                        say(&format!(
+                            "capacity: release serial slice memory budget waits ({}s): normal pressure is required while the driver spends compiler margin; admission sample pressure={:?}, available={:?} bytes",
+                            now.as_secs(),
+                            reading.as_ref().and_then(|r| r.pressure),
+                            reading.as_ref().and_then(|r| r.available),
+                        ));
+                    } else {
+                        say(&format!(
+                            "capacity: {} waits ({}s): {short}",
+                            waiter.record().need.what,
+                            now.as_secs()
+                        ));
+                    }
+                    last_line = Some(now);
+                }
+                if reading
+                    .as_ref()
+                    .is_some_and(|reading| serial_escape(&short, reading))
+                {
+                    let since = *eligible_since.get_or_insert(now);
+                    if now.saturating_sub(since) >= SLICE_MEMORY_PATIENCE {
+                        if degraded || serial.mem >= waiter.record().need.mem {
+                            let why = format!(
+                                "==> release slices: memory admission refused after 60s of normal pressure and unclaimed shortage for {} (total waiting_s={}): {short}; refusing to override available memory for this safe envelope",
+                                waiter.record().need.what,
+                                now.as_secs()
+                            );
+                            say(&why);
+                            return Err(why);
+                        }
+                        say(&format!(
+                            "==> release slices: degraded after 60s of normal pressure and unclaimed memory shortage: one slice at a time, {} parent; one driver spends existing compiler margin, compiler claims unchanged, an unmeasured unit compiles alone; tree waits for both slices",
+                            aterm_capacity::size(serial.mem)
+                        ));
+                        drop(waiter);
+                        waiter = Waiter::enter(ledger, machine, serial.clone())
+                            .map_err(|e| e.to_string())?;
+                        degraded = true;
+                        eligible_since = None;
+                        continue;
+                    }
+                } else {
+                    eligible_since = None;
+                }
+            }
+        }
+        if !pause() {
+            return Err("slice memory admission interrupted".into());
+        }
+    }
+}
+
+fn admit_slice_parent(
+    need: aterm_capacity::Need,
+    serial: aterm_capacity::Need,
+) -> Result<(aterm_capacity::Claim, bool), String> {
+    let ledger = aterm_capacity::Ledger::user().ok_or("no account capacity ledger")?;
+    let started = Instant::now();
+    admit_slice_parent_in(
+        &ledger,
+        &aterm_capacity::Live,
+        need,
+        serial,
+        || started.elapsed(),
+        || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            crate::interrupt::caught().is_none()
+        },
+        |line| println!("{line}"),
+    )
+}
+
 fn build_slices(
     plan: &BuildPlan,
     take: &Take,
@@ -728,14 +873,47 @@ fn build_slices(
             "upstream stable (+r): --target compat slice",
         ),
     ];
-    // Both slices' claims are this process's: each slice's compilers claim their own memory only
-    // where both slices' last units are on record ([`crate::slice_units::Units::of`]).
+    // Exact or same-metric prior final-link records give both slices one global parent and one
+    // private compiler ledger. Otherwise each slice learns under an exclusive claim.
     let at_once = if matches!(plan.sequencing, Sequencing::OneAtATime) {
         1
     } else {
         2
     };
-    let units = crate::slice_units::Units::live(&slices.map(|(triple, _, _)| triple), at_once);
+    let budget_ledger = aterm_tempfile::Builder::new()
+        .prefix("release-slice-budget-")
+        .suffix(".noindex")
+        .tempdir_in(&take.temporary_dir)
+        .map_err(|error| format!("release slice budget ledger: {error}"))?;
+    let mut units = crate::slice_units::Units::live(
+        &slices.map(|(triple, _, _)| triple),
+        at_once,
+        budget_ledger.path(),
+    );
+    if units.len() != slices.len() {
+        return Err("no account state directory for release compiler admission".to_owned());
+    }
+    let mut serial = matches!(plan.sequencing, Sequencing::OneAtATime);
+    let shared_parent =
+        admit_shared_parent(crate::slice_units::shared_need(&units, at_once), |need| {
+            println!(
+                "==> release slices: reserve one {} shared memory budget before either slice",
+                aterm_capacity::size(need.mem)
+            );
+            let (claim, degraded) = admit_slice_parent(
+                need,
+                crate::slice_units::serial_need(&units).ok_or("no serial slice budget")?,
+            )?;
+            serial |= degraded;
+            Ok(claim)
+        })?;
+    if shared_parent
+        .as_ref()
+        .is_some_and(|claim| claim.record().need.what == crate::slice_units::SERIAL_PARENT)
+    {
+        crate::slice_units::use_serial_margin(&mut units);
+    }
+    let shared = shared_parent.is_some();
     let one = |(triple, target, lane): (&'static str, Option<&'static str>, &str),
                admitted: Option<std::sync::mpsc::Sender<()>>| {
         let log = logs.join(format!("{triple}.log"));
@@ -751,20 +929,32 @@ fn build_slices(
                 .iter()
                 .find(|u| u.triple() == triple)
                 .ok_or("no account state directory for release compiler admission")?;
-            let need = crate::slice_units::slice_need(triple, Some(units));
-            println!(
-                "==> [{triple}] memory: claims {} for its driver; compilers claim recorded or cold bounds; only an unrecorded final link learns alone",
-                aterm_capacity::size(need.mem),
-            );
-            let memory = aterm_capacity::admit(need, aterm_capacity::Admit::Wait)
-                .map_err(|e| e.to_string())?;
+            let memory = if shared {
+                println!(
+                    "==> [{triple}] memory: compiler units spend the shared {} budget",
+                    aterm_capacity::size(units.budget_bytes().unwrap_or(0))
+                );
+                None
+            } else {
+                let need = crate::slice_units::slice_need(triple, Some(units));
+                println!(
+                    "==> [{triple}] memory: claims {} for its driver, alone while its compilers learn this toolchain's footprints",
+                    aterm_capacity::size(need.mem)
+                );
+                Some(
+                    aterm_capacity::admit(need, aterm_capacity::Admit::Wait)
+                        .map_err(|error| error.to_string())?,
+                )
+            };
             if let Some(admitted) = admitted {
                 let _ = admitted.send(());
             }
-            println!(
-                "==> [{triple}] memory waiting_s={:.3}",
-                memory.waited().as_secs_f64()
-            );
+            if let Some(memory) = &memory {
+                println!(
+                    "==> [{triple}] memory waiting_s={:.3}",
+                    memory.waited().as_secs_f64()
+                );
+            }
             let run = SliceRun {
                 verb: "build",
                 pkg: "aterm",
@@ -775,7 +965,9 @@ fn build_slices(
                 static_crt: false,
                 units: Some(units),
             };
-            run_slice_profile(take, &run, Some(&log), None, Some(pool), false)
+            let result = run_slice_profile(take, &run, Some(&log), None, Some(pool), false);
+            drop(memory);
+            result
         })();
         let secs = t.elapsed().as_secs();
         match built {
@@ -800,27 +992,30 @@ fn build_slices(
             Err(error) => Err(format!("[{triple}] {error}\n{}", log_tail(&log, 40))),
         }
     };
-    let results: Vec<Result<SliceBuild, String>> =
-        if matches!(plan.sequencing, Sequencing::OneAtATime) {
-            slices.into_iter().map(|slice| one(slice, None)).collect()
-        } else {
-            std::thread::scope(|scope| {
-                // The native slice is the longest measured chain. Admit it before
-                // the compat slice asks; the latter still runs beside it when it fits.
-                let (admitted, ready) = std::sync::mpsc::channel();
-                let native = scope.spawn(move || one(slices[0], Some(admitted)));
-                let _ = ready.recv(); // A failed native admission closes the channel too.
-                let compat = scope.spawn(move || one(slices[1], None));
-                let handles = [native, compat];
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| Err("a slice build's thread panicked".to_string()))
-                    })
-                    .collect()
-            })
-        };
+    let results: Vec<Result<SliceBuild, String>> = if serial {
+        slices.into_iter().map(|slice| one(slice, None)).collect()
+    } else {
+        std::thread::scope(|scope| {
+            // The native slice is the longest measured chain. Admit it before
+            // the compat slice asks; the latter still runs beside it when it fits.
+            let (admitted, ready) = std::sync::mpsc::channel();
+            let native = scope.spawn(move || one(slices[0], Some(admitted)));
+            let _ = ready.recv(); // A failed native admission closes the channel too.
+            let compat = scope.spawn(move || one(slices[1], None));
+            let handles = [native, compat];
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("a slice build's thread panicked".to_string()))
+                })
+                .collect()
+        })
+    };
+    // The shared parent and its private ledger outlive both driver waits and every compiler each
+    // driver reaps. An exclusive learning claim lives in its `one` call for the same span.
+    drop(shared_parent);
+    drop(budget_ledger);
     let mut builds = Vec::new();
     let mut failed = Vec::new();
     for result in results {
@@ -1173,9 +1368,9 @@ struct ReleaseEnv<'a> {
     rustup_home: Option<OsString>,
     /// [`BuildPlan::index_hint`].
     index_hint: Option<&'a str>,
-    /// A release slice's units and this executable, their compilers' wrapper
-    /// ([`crate::slice_units::Units::env`]); `None` for every other build.
-    units: Option<(&'a crate::slice_units::Units, &'a Path)>,
+    /// A release slice's units, this executable (their compilers' wrapper) and the slice's
+    /// source root ([`crate::slice_units::Units::env`]); `None` for every other build.
+    units: Option<(&'a crate::slice_units::Units, &'a Path, &'a Path)>,
 }
 
 fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
@@ -1241,8 +1436,8 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
     if cfg!(target_os = "linux") {
         env.push(("CARGO_BUILD_JOBS", "4".into()));
     }
-    if let Some((units, wrapper)) = e.units {
-        env.extend(units.env(wrapper));
+    if let Some((units, wrapper, root)) = e.units {
+        env.extend(units.env(wrapper, root));
     }
     env
 }
@@ -1283,36 +1478,128 @@ pub(crate) fn contention_slices(
     root: &Path,
     pool: &aterm_capacity::Jobserver,
     demoted: bool,
+    ready: Option<std::sync::mpsc::Sender<aterm_json::Value>>,
 ) -> Result<Vec<aterm_json::Value>, String> {
     require_rustup_target(X86_64)?;
-    let units = crate::slice_units::Units::live(&[ARM64, X86_64], 2);
-    std::thread::scope(|scope| {
-        let handles = [(ARM64, None), (X86_64, Some(X86_64))].map(|(triple, target)| {
-            let units = units.iter().find(|u| u.triple() == triple);
-            scope.spawn(move || {
-                let units = units.ok_or("no account state directory for release compiler admission")?;
-                let _memory = aterm_capacity::admit(
-                    crate::slice_units::slice_need(triple, Some(units)),
-                    aterm_capacity::Admit::Wait,
-                ).map_err(|e| e.to_string())?;
-                let run = SliceRun {
-                    verb: "build", pkg: "aterm", target,
-                    target_dir: root.join(triple).join("build.noindex"),
-                    build_number: 0, index_hint: None, static_crt: false, units: Some(units),
-                };
-                let started = Instant::now();
-                let usage = run_slice_profile(take, &run, Some(&root.join(format!("{triple}.log"))), None, Some(pool), demoted)?;
-                Ok(aterm_json::json!({"triple":triple, "wall_s":started.elapsed().as_secs_f64(), "cpu_ns":usage.cpu_ns, "peak_bytes":usage.peak_bytes}))
-            })
-        });
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .map_err(|_| "contention slice panicked".to_owned())?
-            })
-            .collect()
-    })
+    let budget_ledger = root.join("slice-memory-budget");
+    snapshot::private_dir(&budget_ledger, "contention slice memory budget ledger")?;
+    let units = crate::slice_units::Units::live(&[ARM64, X86_64], 2, &budget_ledger);
+    if units.len() != 2 {
+        return Err("no account state directory for release compiler admission".to_owned());
+    }
+    let shared_parent = admit_shared_parent(crate::slice_units::shared_need(&units, 2), |need| {
+        aterm_capacity::admit(need, aterm_capacity::Admit::Wait).map_err(|error| error.to_string())
+    })?;
+    let shared = shared_parent.is_some();
+    if let Some(parent) = &shared_parent
+        && let Some(ready) = &ready
+    {
+        let record = parent.record();
+        ready
+            .send(aterm_json::json!({
+                "event":"slice-memory-ready",
+                "mode":"shared",
+                "label":record.need.what,
+                "held":record.held.is_some(),
+                "mem":record.need.mem,
+                "waiting_s":parent.waited().as_secs_f64(),
+                "claim":{"pid":record.pid,"start_ms":record.start_ms,"seq":record.seq},
+            }))
+            .map_err(|_| "qualify pilot stopped before shared slice memory admission".to_owned())?;
+    }
+    let result = std::thread::scope(|scope| -> Result<Vec<aterm_json::Value>, String> {
+        let one = |triple: &'static str,
+                   target: Option<&'static str>,
+                   admitted: Option<std::sync::mpsc::Sender<()>>| {
+            let units = units
+                .iter()
+                .find(|units| units.triple() == triple)
+                .ok_or("no account state directory for release compiler admission")?;
+            let memory = if shared {
+                None
+            } else {
+                Some(
+                    aterm_capacity::admit(
+                        crate::slice_units::slice_need(triple, Some(units)),
+                        aterm_capacity::Admit::Wait,
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+            };
+            if let Some(admitted) = admitted {
+                admitted.send(()).map_err(|_| {
+                    "qualify pilot stopped before learning slice admission".to_owned()
+                })?;
+            }
+            let run = SliceRun {
+                verb: "build",
+                pkg: "aterm",
+                target,
+                target_dir: root.join(triple).join("build.noindex"),
+                build_number: 0,
+                index_hint: None,
+                static_crt: false,
+                units: Some(units),
+            };
+            let started = Instant::now();
+            let usage = run_slice_profile(
+                take,
+                &run,
+                Some(&root.join(format!("{triple}.log"))),
+                None,
+                Some(pool),
+                demoted,
+            )?;
+            drop(memory);
+            Ok(
+                aterm_json::json!({"triple":triple, "wall_s":started.elapsed().as_secs_f64(), "cpu_ns":usage.cpu_ns, "peak_bytes":usage.peak_bytes}),
+            )
+        };
+        let join = |handle: std::thread::ScopedJoinHandle<'_, Result<_, String>>| {
+            handle
+                .join()
+                .map_err(|_| "contention slice panicked".to_owned())?
+        };
+        if shared {
+            // Match the real cut's admission handoff: native announces the already-held shared
+            // parent before compat starts. Keeping the same launch edge preserves the private
+            // unit ledger's FIFO order in the contention instrument.
+            let (native_held, native_admission) = std::sync::mpsc::channel();
+            let native = scope.spawn(move || one(ARM64, None, Some(native_held)));
+            native_admission
+                .recv()
+                .map_err(|_| "native shared slice ended before admission".to_owned())?;
+            let compat = scope.spawn(move || one(X86_64, Some(X86_64), None));
+            return [native, compat].into_iter().map(join).collect();
+        }
+
+        // Preserve native-first order for exclusive learning: compat waits until native's ALONE
+        // claim and slice end, rather than borrowing an unmeasured envelope.
+        let (native_held, native_admission) = std::sync::mpsc::channel();
+        let native = scope.spawn(move || one(ARM64, None, Some(native_held)));
+        native_admission
+            .recv()
+            .map_err(|_| "native learning slice ended before admission".to_owned())?;
+        let compat = scope.spawn(move || one(X86_64, Some(X86_64), None));
+        [native, compat].into_iter().map(join).collect()
+    });
+    // No global reservation can disappear while either driver or compiler is live. The private
+    // ledger remains under the take for the qualify sampler; learning workers similarly retain
+    // their exclusive guards through their waits.
+    drop(shared_parent);
+    if !shared
+        && result.is_ok()
+        && let Some(ready) = &ready
+    {
+        ready
+            .send(aterm_json::json!({
+                "event":"slice-memory-ready",
+                "mode":"build-ended",
+                "held":true,
+            }))
+            .map_err(|_| "qualify pilot stopped before learning slices ended".to_owned())?;
+    }
+    result
 }
 
 /// Build one pilot arm with the same sealed source and environment as a cut.
@@ -1823,7 +2110,10 @@ fn run_slice_profile(
             target_dir: run.target_dir.clone(),
             rustup_home,
             index_hint: run.index_hint,
-            units: run.units.zip(wrapper.as_deref()),
+            units: run
+                .units
+                .zip(wrapper.as_deref())
+                .map(|(units, wrapper)| (units, wrapper, take.snapshot.src.as_path())),
         },
     );
     if let Some((trial, cores)) = trial {
@@ -2523,35 +2813,16 @@ fn validate_final_slice_records(
     Ok(())
 }
 
-static TEMP_SLICE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 struct PrivateSliceDir(PathBuf);
 
 impl PrivateSliceDir {
     fn create() -> Result<Self, String> {
-        for _ in 0..128 {
-            let sequence = TEMP_SLICE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "aterm-update-pin-proof-{}-{sequence}.noindex",
-                std::process::id()
-            ));
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                builder.mode(0o700);
-            }
-            match builder.create(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(format!(
-                        "create private updater-pin proof directory: {error}"
-                    ));
-                }
-            }
-        }
-        Err("could not allocate a unique updater-pin proof directory".into())
+        aterm_tempfile::Builder::new()
+            .prefix("aterm-update-pin-proof-")
+            .suffix(".noindex")
+            .tempdir()
+            .map(|dir| Self(dir.keep()))
+            .map_err(|error| format!("create private updater-pin proof directory: {error}"))
     }
 }
 
@@ -2827,23 +3098,12 @@ fn x86_64_slice_runs(
 
 /// A fresh, private (0700) scratch directory for a slice's probes (`--diagnose`, then the session turn), under `/tmp` so the control socket's path stays inside `sun_path`.
 pub(crate) fn private_slice_scratch() -> Result<PathBuf, String> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    for _ in 0..128 {
-        let sequence = TEMP_SLICE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(format!(
-            "/tmp/aterm-slice-probe-{}-{nanos}-{sequence}.noindex",
-            std::process::id()
-        ));
-        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("create {}: {error}", dir.display())),
-        }
-    }
-    Err("could not allocate a unique slice probe directory under /tmp".into())
+    aterm_tempfile::Builder::new()
+        .prefix("aterm-sp-")
+        .suffix(".noindex")
+        .tempdir_in("/tmp")
+        .map(aterm_tempfile::TempDir::keep)
+        .map_err(|error| format!("create private slice probe directory: {error}"))
 }
 
 /// A slice of `universal` DRIVES A SESSION.
@@ -3190,6 +3450,375 @@ fn fmt_elapsed(start: Instant) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn alternating_pressure_reads_do_not_earn_a_normal_minute() {
+        use aterm_capacity::{Ledger, Machine, Need, Reading};
+        use std::cell::Cell;
+        use std::time::Duration;
+        struct Flipping<'a> {
+            reads: Cell<usize>,
+            elapsed: &'a Cell<Duration>,
+            flip_at: Duration,
+        }
+        impl Machine for Flipping<'_> {
+            fn read(&self, _: Option<&std::path::Path>) -> Reading {
+                let n = self.reads.get();
+                self.reads.set(n + 1);
+                let mut reading = Reading::of_gib(96, 35, 28);
+                reading.pressure = Some(if self.elapsed.get() < self.flip_at || n % 2 == 0 {
+                    aterm_sysprobe::MemoryLevel::Normal
+                } else {
+                    aterm_sysprobe::MemoryLevel::Warn
+                });
+                reading
+            }
+            fn procs(&self) -> Option<aterm_capacity::Procs> {
+                None
+            }
+        }
+        // Exercise both the initial degradation clock and the post-degradation
+        // refusal clock. Every other admission sample invalidates continuity.
+        for seconds in [0, 60] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let ledger = Ledger::at(dir.path());
+            let elapsed = Cell::new(Duration::ZERO);
+            let mut lines = Vec::new();
+            let machine = Flipping {
+                reads: Cell::new(0),
+                elapsed: &elapsed,
+                flip_at: Duration::from_secs(seconds),
+            };
+            let why = super::admit_slice_parent_in(
+                &ledger,
+                &machine,
+                Need::new("release slice memory budget")
+                    .mem_gib(44)
+                    .margin(1),
+                Need::new(crate::slice_units::SERIAL_PARENT)
+                    .mem_gib(40)
+                    .margin(1),
+                || elapsed.get(),
+                || {
+                    elapsed.set(elapsed.get() + Duration::from_secs(2));
+                    elapsed.get() < Duration::from_secs(180)
+                },
+                |line| lines.push(line.to_owned()),
+            )
+            .unwrap_err();
+            assert!(why.contains("interrupted"), "{why}");
+            assert_eq!(
+                lines.iter().any(|line| line.contains("degraded after")),
+                seconds == 60,
+            );
+            assert!(ledger.list().unwrap().is_empty());
+        }
+        // The fixed-normal permanent-shortage test is the negative control: it must
+        // still degrade and refuse instead of disabling the patience clock outright.
+    }
+
+    #[test]
+    fn an_unclaimed_shortage_below_the_reduced_safe_envelope_ends_without_a_compiler() {
+        use aterm_capacity::{Fixed, Ledger, Need, Polled, Reading, Waiter};
+        use std::time::Duration;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path());
+        let mut reading = Reading::of_gib(96, 35, 28);
+        reading.pressure = Some(aterm_sysprobe::MemoryLevel::Normal);
+        let machine = Fixed::new(reading);
+        let need = Need::new("release slice memory budget")
+            .mem_gib(44)
+            .margin(1);
+        // Fixed readings and no other ledger writer make this today's permanent wait.
+        let mut old = Waiter::enter(&ledger, &machine, need.clone()).unwrap();
+        for _ in 0..64 {
+            old = match old.poll(&machine) {
+                Polled::Waiting(next, _) => next,
+                other => panic!("old control escaped its permanent shortage: {other:?}"),
+            };
+        }
+        drop(old);
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut lines = Vec::new();
+        let why = super::admit_slice_parent_in(
+            &ledger,
+            &machine,
+            need,
+            Need::new(crate::slice_units::SERIAL_PARENT)
+                .mem_gib(40)
+                .margin(1),
+            || elapsed.get(),
+            || {
+                elapsed.set(elapsed.get() + Duration::from_secs(2));
+                assert!(elapsed.get() <= Duration::from_secs(122));
+                true
+            },
+            |line| lines.push(line.to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(elapsed.get(), Duration::from_secs(120));
+        assert!(why.contains("refusing to override available memory"));
+        assert!(lines.iter().any(|line| line.contains("degraded after 60s")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("memory admission refused after 60s"))
+        );
+        assert!(
+            ledger.list().unwrap().is_empty(),
+            "no memory was force-admitted"
+        );
+    }
+
+    #[test]
+    fn pressure_after_degradation_cancels_the_unclaimed_refusal_clock() {
+        use aterm_capacity::{Fixed, Ledger, Need, Reading};
+        use std::time::Duration;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path());
+        let mut reading = Reading::of_gib(96, 35, 28);
+        reading.pressure = Some(aterm_sysprobe::MemoryLevel::Normal);
+        let machine = Fixed::new(reading.clone());
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut lines = Vec::new();
+        let why = super::admit_slice_parent_in(
+            &ledger,
+            &machine,
+            Need::new("release slice memory budget")
+                .mem_gib(44)
+                .margin(1),
+            Need::new(crate::slice_units::SERIAL_PARENT)
+                .mem_gib(40)
+                .margin(1),
+            || elapsed.get(),
+            || {
+                elapsed.set(elapsed.get() + Duration::from_secs(2));
+                reading.pressure = Some(if (90..150).contains(&elapsed.get().as_secs()) {
+                    aterm_sysprobe::MemoryLevel::Warn
+                } else {
+                    aterm_sysprobe::MemoryLevel::Normal
+                });
+                machine.set(reading.clone());
+                elapsed.get() < Duration::from_secs(180)
+            },
+            |line| lines.push(line.to_owned()),
+        )
+        .unwrap_err();
+        assert!(why.contains("interrupted"));
+        assert_eq!(elapsed.get(), Duration::from_secs(180));
+        assert!(lines.iter().any(|line| line.contains("degraded after 60s")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("memory admission refused"))
+        );
+    }
+
+    #[test]
+    fn a_claim_after_degradation_cancels_the_unclaimed_refusal_clock() {
+        use aterm_capacity::{Fixed, Ledger, Need, Polled, Reading, Waiter};
+        use std::time::Duration;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path());
+        let mut reading = Reading::of_gib(96, 35, 28);
+        reading.pressure = Some(aterm_sysprobe::MemoryLevel::Normal);
+        let machine = Fixed::new(reading);
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut holder = None;
+        let mut lines = Vec::new();
+        let why = super::admit_slice_parent_in(
+            &ledger,
+            &machine,
+            Need::new("release slice memory budget")
+                .mem_gib(44)
+                .margin(1),
+            Need::new(crate::slice_units::SERIAL_PARENT)
+                .mem_gib(40)
+                .margin(1),
+            || elapsed.get(),
+            || {
+                elapsed.set(elapsed.get() + Duration::from_secs(2));
+                if elapsed.get() == Duration::from_secs(90) {
+                    let claimant = Waiter::enter(
+                        &ledger,
+                        &machine,
+                        Need::new("competing link")
+                            .rank(aterm_capacity::Rank::Release)
+                            .mem_gib(8)
+                            .margin(1),
+                    )
+                    .unwrap();
+                    holder = Some(match claimant.poll(&machine) {
+                        Polled::Admitted(claim) => claim,
+                        other => panic!("competing fixture was not admitted: {other:?}"),
+                    });
+                }
+                if elapsed.get() == Duration::from_secs(150) {
+                    drop(holder.take());
+                }
+                elapsed.get() < Duration::from_secs(180)
+            },
+            |line| lines.push(line.to_owned()),
+        )
+        .unwrap_err();
+        assert!(why.contains("interrupted"));
+        assert_eq!(elapsed.get(), Duration::from_secs(180));
+        assert!(lines.iter().any(|line| line.contains("degraded after 60s")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("memory admission refused"))
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn packed_slice_admission_rechecks_pressure_and_requires_a_reading() {
+        use aterm_capacity::{Fixed, Machine, Reading};
+        use aterm_sysprobe::MemoryLevel;
+        let mut reading = Reading::of_gib(96, 80, 28);
+        let machine = Fixed::new(reading.clone());
+        for pressure in [None, Some(MemoryLevel::Warn), Some(MemoryLevel::Critical)] {
+            reading.pressure = pressure;
+            machine.set(reading.clone());
+            assert_eq!(
+                super::SliceMemorySample::new(&machine, true)
+                    .read(None)
+                    .available,
+                Some(0)
+            );
+        }
+        reading.pressure = Some(MemoryLevel::Normal);
+        machine.set(reading.clone());
+        assert_eq!(
+            super::SliceMemorySample::new(&machine, true)
+                .read(None)
+                .available,
+            reading.available
+        );
+    }
+
+    #[test]
+    fn permanent_unclaimed_slice_shortage_converges_without_trimming_compiler_claims() {
+        use aterm_capacity::{Fixed, Ledger, Machine, Need, Polled, Reading, Waiter};
+        use std::time::Duration;
+        const GIB: u64 = 1 << 30;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path());
+        let mut reading = Reading::of_gib(96, 40, 28);
+        // m3 during 0.198.0's cut, 2026-11-10: 39.7 GiB available, and a 40 GiB serial
+        // parent (the pool itself) refused after its second minute.
+        reading.available = Some(397 * GIB / 10);
+        reading.pressure = Some(aterm_sysprobe::MemoryLevel::Normal);
+        let machine = Fixed::new(reading);
+        let full = Need::new("release slice memory budget")
+            .rank(aterm_capacity::Rank::Release)
+            .mem_gib(44)
+            .margin(1);
+        let serial = Need::new(crate::slice_units::SERIAL_PARENT)
+            .rank(aterm_capacity::Rank::Release)
+            .mem(crate::slice_units::serial_parent_bytes(40 * GIB))
+            .margin(1);
+        // m3's kept arm64 link peak (32.92 GiB) with the driver and the floor fits the parent,
+        // and the parent stays below the 40 GiB pool, which m3's 39.7 GiB could not admit.
+        assert!(serial.mem >= 3292 * GIB / 100 + crate::slice_units::DRIVER + GIB);
+        assert!(serial.mem < 37 * GIB);
+
+        // Today's unchanging admission has no transition out of this state: even
+        // a year of injected time would see exactly this same fixed shortfall.
+        let mut old = Waiter::enter(&ledger, &machine, full.clone()).unwrap();
+        for _ in 0..64 {
+            match old.poll(&machine) {
+                Polled::Waiting(next, short) => {
+                    assert!(super::serial_escape(&short, &machine.read(None)));
+                    old = next;
+                }
+                other => panic!("negative control admitted: {other:?}"),
+            }
+        }
+        drop(old);
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut lines = Vec::new();
+        let (claim, degraded) = super::admit_slice_parent_in(
+            &ledger,
+            &machine,
+            full,
+            serial,
+            || elapsed.get(),
+            || {
+                let next = elapsed.get() + Duration::from_secs(2);
+                assert!(
+                    next <= Duration::from_secs(62),
+                    "permanent shortage did not converge"
+                );
+                elapsed.set(next);
+                true
+            },
+            |line| lines.push(line.to_owned()),
+        )
+        .unwrap();
+        assert!(degraded);
+        assert_eq!(elapsed.get(), Duration::from_secs(60));
+        assert_eq!(
+            claim.record().need.mem,
+            crate::slice_units::serial_parent_bytes(40 * GIB)
+        );
+        assert!(lines.iter().any(|line| line.contains("degraded after 60s")
+            && line.contains("compiler claims unchanged")));
+    }
+
+    #[test]
+    fn pressure_and_claimed_shortages_never_earn_the_serial_escape() {
+        use aterm_capacity::{Admit, Fixed, Ledger, Need, Pace, Reading};
+        use aterm_sysprobe::MemoryLevel;
+        use std::time::Duration;
+        for (pressure, claimed) in [
+            (MemoryLevel::Warn, false),
+            (MemoryLevel::Critical, false),
+            (MemoryLevel::Normal, true),
+        ] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let ledger = Ledger::at(dir.path());
+            let mut reading = Reading::of_gib(96, 80, 28);
+            reading.pressure = Some(MemoryLevel::Normal);
+            let machine = Fixed::new(reading.clone());
+            let holder = claimed.then(|| {
+                aterm_capacity::admit_with(
+                    &ledger,
+                    &machine,
+                    Need::new("competing link").mem_gib(8).margin(1),
+                    Admit::Wait,
+                    Pace::default(),
+                    &mut |_| {},
+                )
+                .unwrap()
+            });
+            reading.available = Some(409 * (1 << 30) / 10);
+            reading.pressure = Some(pressure);
+            machine.set(reading);
+            let elapsed = std::cell::Cell::new(Duration::ZERO);
+            let mut lines = Vec::new();
+            let result = super::admit_slice_parent_in(
+                &ledger,
+                &machine,
+                Need::new("release slice memory budget")
+                    .mem_gib(44)
+                    .margin(1),
+                Need::new(crate::slice_units::SERIAL_PARENT)
+                    .mem_gib(40)
+                    .margin(1),
+                || elapsed.get(),
+                || {
+                    elapsed.set(elapsed.get() + Duration::from_secs(2));
+                    elapsed.get() < Duration::from_secs(180)
+                },
+                |line| lines.push(line.to_owned()),
+            );
+            assert!(result.is_err(), "{pressure:?}, claimed={claimed}");
+            assert!(!lines.iter().any(|line| line.contains("degraded")));
+            assert_eq!(elapsed.get(), Duration::from_secs(180));
+            drop(holder);
+        }
+    }
+    #[test]
     fn wrapped_compilers_keep_cargos_stdout_in_the_run_before_the_driver_finishes() {
         use std::io::Write as _;
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -3288,6 +3917,31 @@ mod tests {
         assert!(
             matches!(&refused, Err(why) if why.contains(aterm_capacity::POOL_ENV) && why.contains("no FIFO"))
         );
+    }
+
+    /// A complete record's shared need invokes global admission exactly once. NEGATIVE CONTROL:
+    /// incomplete records invoke no shared admission; each worker instead learns exclusively.
+    #[test]
+    fn a_complete_slice_budget_takes_exactly_one_global_parent() {
+        let admissions = std::cell::Cell::new(0);
+        let need = aterm_capacity::Need::new("release slice memory budget")
+            .rank(aterm_capacity::Rank::Release)
+            .mem_gib(46);
+        let parent = super::admit_shared_parent(Some(need), |need| {
+            admissions.set(admissions.get() + 1);
+            Ok(need)
+        })
+        .unwrap()
+        .expect("the complete budget has one parent");
+        assert_eq!(admissions.get(), 1);
+        assert_eq!(parent.what, "release slice memory budget");
+
+        let learning = super::admit_shared_parent::<()>(None, |_| {
+            panic!("an incomplete record has no shared parent")
+        })
+        .unwrap();
+        assert!(learning.is_none());
+        assert_eq!(admissions.get(), 1);
     }
 
     /// The profile pilot's removable cold target is a scratch claim. Negative control: removing
@@ -4019,10 +4673,15 @@ mod tests {
     #[test]
     fn a_slices_cargo_names_this_executable_its_compiler_wrapper_and_gains_nothing_else() {
         let dir = aterm_tempfile::tempdir().unwrap();
-        let units =
-            crate::slice_units::Units::of(&dir.path().join("units.json"), &[super::ARM64], 1)
-                .remove(0);
+        let units = crate::slice_units::Units::of(
+            &dir.path().join("units.json"),
+            &[super::ARM64],
+            1,
+            &dir.path().join("budget-ledger"),
+        )
+        .remove(0);
         let wrapper = std::path::Path::new("/r/aterm-release");
+        let root = std::path::Path::new("/private/take/snapshot/src");
         let env = |units| ReleaseEnv {
             path: "/t/bin:/usr/bin".into(),
             home: std::ffi::OsStr::new("/h"),
@@ -4037,10 +4696,10 @@ mod tests {
             units,
         };
         let plain = release_env(&env(None));
-        let slice = release_env(&env(Some((&units, wrapper))));
+        let slice = release_env(&env(Some((&units, wrapper, root))));
         let mut gained: Vec<_> = slice.into_iter().filter(|kv| !plain.contains(kv)).collect();
         gained.sort();
-        let mut want = units.env(wrapper);
+        let mut want = units.env(wrapper, root);
         want.sort();
         assert_eq!(gained, want);
         assert!(

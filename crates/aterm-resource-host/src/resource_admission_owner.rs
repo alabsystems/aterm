@@ -30,6 +30,8 @@ pub(super) mod bootstrap_graph;
 #[path = "resource_admission_bootstrap_object.rs"]
 pub(super) mod bootstrap_object;
 
+#[path = "resource_admission_ay.rs"]
+mod ay;
 #[path = "resource_admission_bootstrap_query.rs"]
 mod bootstrap_query;
 #[path = "resource_admission_compiler.rs"]
@@ -163,6 +165,7 @@ enum Custody {
     Cooperative(Claim),
 }
 struct Failed {
+    _ay: Option<std::sync::Arc<ay::Selection>>,
     _compiler: Option<compiler::Selection>,
     binding: Binding,
     custody: Option<Custody>,
@@ -175,6 +178,7 @@ struct Failed {
     settled: bool,
 }
 struct Job {
+    ay: Option<std::sync::Arc<ay::Selection>>,
     #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
     control_eof_before_reap_test: bool,
     binding: Binding,

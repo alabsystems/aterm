@@ -481,7 +481,7 @@ fn managed_alab_twin() -> Option<PathBuf> {
 /// The atpkg twin `twin`, where the build it execs is ALab's ([`codex_alab::alab_bytes`]).
 pub(crate) fn alab_twin(twin: PathBuf) -> Option<PathBuf> {
     let raw = super::accounts::read_bounded(&twin, 256 * 1024).ok()??;
-    let exe = super::upgrade_catalog::twin_binary(&raw)?;
+    let exe = super::twin::twin_binary(&raw)?;
     codex_alab::alab_bytes(&exe).then_some(twin)
 }
 

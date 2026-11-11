@@ -3,6 +3,8 @@
 
 //! Keep accepted keyboard defaults across service arrival and effective mapping drift.
 
+mod watch;
+
 use aterm_cli::macos_doctor::{InputServiceSet, InputSetupScope};
 use aterm_machines::init::{KeyboardAttachmentActivation, KeyboardAttachmentReceipt};
 use aterm_machines::port::KeyboardServiceObservation;
@@ -67,6 +69,7 @@ struct Supervisor {
     clock: Instant,
     actor: Arc<Mutex<Actor>>,
     stop: Arc<AtomicBool>,
+    wake: Arc<watch::Control>,
     ending: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     retry: RunnerRetry,
@@ -79,6 +82,7 @@ impl Supervisor {
             clock: Instant::now(),
             actor: Arc::default(),
             stop: Arc::new(AtomicBool::new(false)),
+            wake: Arc::default(),
             ending: Arc::new(AtomicBool::new(false)),
             worker: None,
             retry: RunnerRetry::default(),
@@ -91,8 +95,9 @@ impl Supervisor {
     fn maintain(&mut self) -> Option<Instant> {
         let clock = self.clock;
         let notifications = self.notifications.clone();
+        let wake = Arc::clone(&self.wake);
         self.maintain_with(|actor, stop, ending| {
-            spawn_worker(actor, stop, ending, clock, notifications)
+            spawn_worker(actor, stop, ending, clock, notifications, wake)
         })
     }
 
@@ -180,6 +185,7 @@ impl Supervisor {
 impl Drop for Supervisor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.wake.wake();
     }
 }
 
@@ -638,6 +644,7 @@ fn spawn_worker(
     ending: Arc<AtomicBool>,
     clock: Instant,
     notifications: Notifications,
+    wake: Arc<watch::Control>,
 ) -> std::io::Result<JoinHandle<()>> {
     spawn_worker_with(
         actor,
@@ -645,10 +652,13 @@ fn spawn_worker(
         ending,
         clock,
         notifications,
-        |actor, stop, clock, notifications| {
+        move |actor, stop, clock, notifications| {
             use aterm_machines::port::System as _;
             let _ = aterm_log::wait_for_logger(super::EARLY_LOG_WAIT);
             let sys = aterm_machines::port::Live::new();
+            // Arm lifecycle notifications before the first full census. This worker
+            // owns their run loop and context; events only interrupt its fallback wait.
+            let mut watch = watch::Watch::new(wake, &stop);
             while !stop.load(Ordering::Acquire) {
                 if matches!(notifications.pending, PendingOwner::Window(_)) {
                     super::maintain_observation_dispatch();
@@ -739,7 +749,9 @@ fn spawn_worker(
                 if matches!(notifications.pending, PendingOwner::Window(_)) {
                     super::publish_caps_live(live_scope, live);
                 }
-                std::thread::sleep(Duration::from_secs(2));
+                // Property drift and console changes need the complete original timer
+                // even when a device family emits no usable lifecycle notification.
+                watch.wait_until(&stop, Instant::now() + Duration::from_secs(2));
             }
         },
     )
@@ -1936,6 +1948,109 @@ mod tests {
                 )
                 .is_err()
         );
+
+        // A retained native wake runs the SAME full census/receipt path, rather than
+        // treating a notification or its registry identity as proof of a mapping.
+        use std::sync::mpsc;
+
+        let wake = Arc::<watch::Control>::default();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let services = Arc::new(Mutex::new(vec![1]));
+        let (sampled, samples) = mpsc::channel();
+        let (at_wait, waiting) = mpsc::sync_channel(1);
+        let (proceed, proceed_rx) = mpsc::sync_channel(1);
+        let worker_wake = Arc::clone(&wake);
+        let worker_stop = Arc::clone(&stopped);
+        let worker_services = Arc::clone(&services);
+        let worker = std::thread::spawn(move || {
+            let mut at_wait = Some(at_wait);
+            let mut watch = watch::Watch::private(worker_wake, &worker_stop, move || {
+                if let Some(at_wait) = at_wait.take() {
+                    at_wait.send(()).unwrap();
+                    proceed_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                }
+            });
+            let mut keeper = Keeper::default();
+            let mut reads = 0;
+            let mut applied = Vec::new();
+            let first = keeper.round(
+                0,
+                Some(7),
+                || {
+                    reads += 1;
+                    observations(&worker_services.lock().unwrap())
+                },
+                |_, ids| {
+                    applied.push(ids.to_vec());
+                    verified(ids)
+                },
+            );
+            sampled
+                .send((false, first, reads, applied.clone()))
+                .unwrap();
+            let hinted = watch.wait_until(&worker_stop, Instant::now() + Duration::from_secs(60));
+            let second = keeper.round(
+                1,
+                Some(7),
+                || {
+                    reads += 1;
+                    observations(&worker_services.lock().unwrap())
+                },
+                |_, ids| {
+                    applied.push(ids.to_vec());
+                    verified(ids)
+                },
+            );
+            sampled.send((hinted, second, reads, applied)).unwrap();
+        });
+        let first = samples.recv_timeout(Duration::from_secs(60));
+        let entered = waiting.recv_timeout(Duration::from_secs(60));
+        *services.lock().unwrap() = vec![1, 2];
+        // This is after every predicate check and before native wait entry: the real
+        // source must retain the signal, even when it arrives before the kernel waits.
+        wake.wake();
+        let released = proceed.send(());
+        let second = samples.recv_timeout(Duration::from_secs(60));
+        stopped.store(true, Ordering::Release);
+        wake.wake();
+        let ended = worker.join();
+        // Release and join the only worker before any verdict, including a failed wake.
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(entered.is_ok(), "{entered:?}");
+        assert!(released.is_ok(), "{released:?}");
+        assert_eq!(first.unwrap(), (false, Ok(true), 1, vec![vec![1]]));
+        assert_eq!(
+            second.unwrap(),
+            (true, Ok(true), 2, vec![vec![1], vec![2]]),
+            "native wake, then fresh complete census; the unchanged fallback is not a hint"
+        );
+
+        // Setup/wait gaps retain hints and stop; a consumed hint does not create a
+        // repeating wake. These use the native source without live device subscription.
+        let early = Arc::<watch::Control>::default();
+        early.wake();
+        early.wake();
+        let native = Arc::clone(&early);
+        let before_setup = std::thread::spawn(move || {
+            let stopped = AtomicBool::new(false);
+            let mut watch = watch::Watch::private(native, &stopped, || {
+                panic!("a queued hint needs no blocking wait")
+            });
+            assert!(watch.wait_until(&stopped, Instant::now() + Duration::from_secs(60)));
+            assert!(!watch.wait_until(&stopped, Instant::now()));
+        });
+        assert!(before_setup.join().is_ok());
+        // A late wake after teardown only latches state, never reaches freed CF handles.
+        early.wake();
+        let native = Arc::clone(&early);
+        let before_setup = std::thread::spawn(move || {
+            let stopped = AtomicBool::new(true);
+            let mut watch = watch::Watch::private(native, &stopped, || {
+                panic!("prelatched stop needs no blocking wait")
+            });
+            assert!(!watch.wait_until(&stopped, Instant::now() + Duration::from_secs(60)));
+        });
+        assert!(before_setup.join().is_ok());
     }
 
     #[test]

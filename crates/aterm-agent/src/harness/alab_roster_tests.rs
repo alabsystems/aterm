@@ -93,7 +93,12 @@ fn registry_keys_survive_label_collisions_and_missing_labels_across_roster_opera
     );
     assert_eq!(kept.rows[0].class, Class::Pool);
     assert_eq!(
-        holdings(&lab, Cli::Claude, &existing),
+        holdings(
+            &lab,
+            Cli::Claude,
+            &existing,
+            &observe::places(Cli::Claude, &existing, None)
+        ),
         [(lab.accounts[0].pk.clone(), "borrow")]
     );
     let digest = with_lab(lab.clone(), || fleet_digest(Cli::Claude).unwrap());
@@ -116,7 +121,15 @@ fn registry_keys_survive_label_collisions_and_missing_labels_across_roster_opera
         let fleet = fleet_for(&lab, Cli::Claude, None).unwrap();
         assert_eq!(fleet.accounts_for_machine(me.key.as_str()).len(), 1);
         assert!(fleet.accounts_for_machine("m3").is_empty());
-        assert!(holdings(&lab, Cli::Claude, &existing).is_empty());
+        assert!(
+            holdings(
+                &lab,
+                Cli::Claude,
+                &existing,
+                &observe::places(Cli::Claude, &existing, None)
+            )
+            .is_empty()
+        );
         let kept = retain(
             Roster::default(),
             &existing,
@@ -1361,6 +1374,94 @@ fn the_labs_mailbox_decides_the_route_first() {
     });
 }
 
+/// A place is held by the account its login file names, row or no row: the default home of a
+/// Mac that lists no account is held by the login found there, a default row whose place holds
+/// another account reports that one and not its own, and only a place nothing was read of is
+/// held by its row.
+/// NEGATIVE CONTROL: with `holdings` taking each place's row and never `place.login.seen` (the
+/// loop over `roster.rows` it replaced), the stale default row reports its own account
+/// (`left: [("ac-0000000000000bob", "borrow")] right: [("ac-0000000000000uni", "fill")]`) and
+/// the Mac with no roster reports nothing (`left: [] right: [("ac-0000000000000uni", "fill")]`).
+#[test]
+fn holdings_follow_the_login_each_place_holds() {
+    use crate::harness::accounts::{AuthRoute, ProcessLogin};
+    use crate::harness::journal::ObservedSrc;
+    use crate::harness::observe::{Login, Observation, Observed, Place};
+    let keyed = |local: &str, preferred: &[(&str, Option<u64>)]| LabAccount {
+        pk: format!("ac-{local:0>16}"),
+        ..account(local, Cli::Claude, &format!("claude-{local}"), preferred)
+    };
+    let lab = Lab {
+        me: Some(test_machine("m22")),
+        accounts: vec![
+            keyed("ann", &[("m22", Some(1))]),
+            keyed("bob", &[("m3", Some(1))]),
+            keyed("uni", &[]),
+        ],
+        ..Lab::default()
+    };
+    fn default_home<'a>(row: Option<&'a Row>, seen: Option<&str>) -> Place<'a> {
+        Place {
+            row,
+            login: Login {
+                who: ProcessLogin {
+                    login: None,
+                    default_home: true,
+                    route: AuthRoute::Stored,
+                },
+                seen: seen.map_or(Observation::Unread, |local| {
+                    Observation::Seen(Observed {
+                        cli: crate::harness::journal::ObservedCli::Pool(Cli::Claude),
+                        region: None,
+                        email: email(local),
+                        key: None,
+                        src: ObservedSrc::Profile,
+                        path: PathBuf::from("/scratch/home/.claude.json"),
+                        mtime: None,
+                    })
+                }),
+            },
+        }
+    }
+    let uni = [("ac-0000000000000uni".to_owned(), "fill")];
+    let bob = [("ac-0000000000000bob".to_owned(), "borrow")];
+    let listed = Roster {
+        rows: vec![row("m22-row", None, "bob", Cli::Claude)],
+    };
+    let held = |roster: &Roster, seen: Option<&str>| {
+        holdings(
+            &lab,
+            Cli::Claude,
+            roster,
+            &[default_home(roster.rows.first(), seen)],
+        )
+    };
+    assert_eq!(held(&listed, Some("uni")), uni, "the stale default row");
+    assert_eq!(held(&listed, None), bob, "unread: the belief");
+    assert_eq!(held(&listed, Some("bob")), bob, "the row's own login");
+    assert_eq!(held(&Roster::default(), Some("uni")), uni, "no roster");
+    assert!(held(&Roster::default(), None).is_empty());
+    assert!(
+        held(&listed, Some("ann")).is_empty(),
+        "an account this Mac prefers is no holding"
+    );
+    assert!(
+        held(&listed, Some("zed")).is_empty(),
+        "an address the lab does not know"
+    );
+    let unaddressed = Roster {
+        rows: vec![Row {
+            label: "plain".into(),
+            ..Row::default()
+        }],
+    };
+    assert_eq!(
+        held(&unaddressed, Some("uni")),
+        uni,
+        "a row that names no address is held by the login found there"
+    );
+}
+
 /// What this Mac runs that it does not prefer is reported by account key with the place row's
 /// reason: `borrow` where another Mac prefers it, `fill` where nobody does and it may be signed
 /// in, `stranded` where the lab bars it; a row this Mac prefers, a row the lab does not know and
@@ -1404,7 +1505,12 @@ fn holdings_report_each_unpreferred_account_with_its_reason() {
             row("eve", Some(Path::new("/scratch/eve")), "eve", Cli::Claude),
         ],
     };
-    let held = holdings(&lab, Cli::Claude, &roster);
+    let held = holdings(
+        &lab,
+        Cli::Claude,
+        &roster,
+        &observe::places(Cli::Claude, &roster, None),
+    );
     assert_eq!(
         held,
         [
@@ -1417,7 +1523,15 @@ fn holdings_report_each_unpreferred_account_with_its_reason() {
         me: None,
         ..lab.clone()
     };
-    assert!(holdings(&unbound, Cli::Claude, &roster).is_empty());
+    assert!(
+        holdings(
+            &unbound,
+            Cli::Claude,
+            &roster,
+            &observe::places(Cli::Claude, &roster, None)
+        )
+        .is_empty()
+    );
     assert_eq!(
         lab.holders(&lab.accounts[1]),
         ["m3"],

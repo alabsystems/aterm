@@ -8,7 +8,7 @@ Rust function, and the tests it subsumes then deleted. The claims come from read
 the code they reach, not from running them.
 
 `blocking gaps` numbers are rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes
+`docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (a seal that publishes
 Lean-discharged rows) blocks every spec and is left out of the column.
 
 ## 0. Notation used in the statements
@@ -220,23 +220,6 @@ tests/windows_input_release.rs	a_tabs_close_releases_a_frame_blocked_in_writefil
 tests/windows_input_release.rs	a_released_write_reports_every_byte_the_program_reads	sink-waiters-escape	write-metered
 ```
 
-## 3. Coverage
-
-- 116 live tests mapped across 39 specs (plus 4 historical non-spec tests deleted in §4).
-- The biggest collapses: `sink-ordered-egress` (9 primary, plus 4 shared), `decide-edge-denotation`
-  (6 primary, including all three real-code conformance tests), `immediate-write` (10, four added 2026-10-16 with the whole guarded write),
-  `input-backlog-reading` (6), `edge-table-ops` (5), `discard-and-read-evidence` (7, two added 2026-10-16: a discard never splits a frame) and
-  `gate-classify-refine-input-unread-model` (6).
-- The pure core is `edge.rs`, `id.rs` and `input_backlog.rs`: 16 specs (all but the model refinement), 35 tests. It needs no effect lane
-  (gap 8) except `session-id-format` (FFI CSPRNG) and the skipped `grant`/`insert` bodies in
-  `edge-table-ops`. Everything in `sink.rs` beyond `bulk-stop-cut`, `write-metered` and
-  `receipt-constructors` needs gap 13 (threads), and most need gap 8 (fd effects).
-- `sink.rs` already has a `clean { namespace SinkSpillOrder }` island. It proves `rfl` theorems
-  about a hand-written Lean `OrderState`, not about a `trust_import_*` of `next_accepted_order` or
-  `direct_order_if_spill_empty`, so under the plan's "about the compiled function" rule it migrates
-  nothing yet (§5.8). Clause (2) of `sink-ordered-egress` should replace it with a theorem over
-  the imported bodies.
-
 ## 4. Tests that are not spec samples
 
 None remain (the 4 historical non-spec tests were deleted during the 2026-10-16..2026-10-28 audits).
@@ -265,28 +248,3 @@ None remain (the 4 historical non-spec tests were deleted during the 2026-10-16.
    `direct_order_if_spill_empty`. The plan does not accept that as migrated (§3).
 9. **The test census over-counts.** A naive `#[test]` substring grep finds 117 hits; the extra hit is a doc comment
    in `tests/session_suite.rs`, which only declares modules. The live `#[test]` count is 116.
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone: every one needs at least gap 1 (non-scalar carriers), because each
-returns or reads an enum, a `&str`, a slice or a struct. The order below starts with the specs whose
-only other gaps are 1 and 3 (enum matches, casts, std calls in reflected bodies), which are the
-smallest Trust widening, and whose finite or table form allows decide-by-evaluation proofs.
-
-1. **`gate-table` and `classify-table`** (gaps 1, 3; `classify` adds 4 for the `stretch` call).
-   Straight-line `bool`/`Duration` logic over a struct, with no loops and no heap. They retire 4 tests
-   directly and are the pure half of `gate-classify-refine-input-unread-model`, which retires the 5
-   `conformance_input_unread` tests once the model is imported as a Lean predicate (gap 10).
-2. **`input-word-wire`, `connection-kind-ops`, `op-wire-roundtrip`**: table properties over small
-   enums, decidable by evaluation once `&'static str` and `&'static [Op]` have content models.
-3. **`ledger-discard-mark` and `receipt-constructors`**: field updates with saturating arithmetic
-   and `Option`. `ledger-discard-mark` is the lemma `discard-and-read-evidence` needs.
-4. **`decide-edge-denotation`**: a finite-map content model for `HashMap`, citing astream-digest's `ct_eq`;
-   it covers the real-code conformance tests, and `edge-table-ops` and `grant-connection` are
-   stated against it.
-5. **`bulk-stop-cut`**: slice arithmetic with one bounded `while` loop, the well-formedness lemma
-   under `write-metered` and `metered-frame`.
-6. `contention-arith` (f64 semantics), then `input-ledger-run-invariant` →
-   `ledger-oldest-unread-lower-bound` → `ledger-merge-relative-accuracy`.
-7. The `sink.rs` concurrency and effect specs (gaps 8, 13), starting with `write-metered`
-   (higher-order, no threads) and `reply-budget` (one CAS loop).

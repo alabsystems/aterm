@@ -1184,6 +1184,7 @@ pub fn native_update_worker_queue_model() -> Model {
     aterm_spec::ty_model! {
         NativeUpdateWorkerQueue {
             const Buggy = 0;
+            var accepted = 0;
             var connected = 1;
             var filler = 0;
             var queued_intent = 0;
@@ -1224,6 +1225,7 @@ pub fn native_update_worker_queue_model() -> Model {
                 connected == 1 && filler == 0 && queued_intent == 0 &&
                 live_intent == 0 && delivered == 0 && failed_explicitly == 0
             ) {
+                accepted = 1;
                 queued_intent = 1;
                 live_intent = 1;
                 purpose = 1;
@@ -1232,6 +1234,7 @@ pub fn native_update_worker_queue_model() -> Model {
                 connected == 1 && filler == 0 && queued_intent == 0 &&
                 live_intent == 0 && delivered == 0 && failed_explicitly == 0
             ) {
+                accepted = 1;
                 queued_intent = 1;
                 live_intent = 1;
                 purpose = 2;
@@ -1240,6 +1243,7 @@ pub fn native_update_worker_queue_model() -> Model {
                 connected == 1 && filler == 1 && queued_intent == 0 &&
                 live_intent == 0 && delivered == 0 && failed_explicitly == 0
             ) {
+                accepted = 1;
                 live_intent = 1;
                 purpose = 1;
                 pending = 1;
@@ -1248,6 +1252,7 @@ pub fn native_update_worker_queue_model() -> Model {
                 connected == 1 && filler == 1 && queued_intent == 0 &&
                 live_intent == 0 && delivered == 0 && failed_explicitly == 0
             ) {
+                accepted = 1;
                 live_intent = 1;
                 purpose = 2;
                 pending = 1;
@@ -1256,6 +1261,7 @@ pub fn native_update_worker_queue_model() -> Model {
                 Buggy == 1 && connected == 1 && filler == 1 && queued_intent == 0 &&
                 live_intent == 0 && delivered == 0 && failed_explicitly == 0
             ) {
+                accepted = 1;
                 live_intent = 1;
                 purpose = 2;
                 pending = 0;
@@ -1329,6 +1335,15 @@ pub fn native_update_worker_queue_model() -> Model {
                 failed_explicitly = 1;
                 restarts = 1;
             }
+            action RefreshPendingUnavailable when (
+                connected == 0 && pending == 1 && purpose == 2 && restarts == 0
+            ) {
+                pending = 0;
+                live_intent = 0;
+                purpose = 0;
+                failed_explicitly = if Buggy == 2 { 0 } else { 1 };
+                restarts = 1;
+            }
             action ReportUnavailableKeepingLatch when (
                 Buggy == 1 && connected == 0 && pending == 1 && restarts == 0 &&
                 failed_explicitly == 0
@@ -1350,6 +1365,7 @@ pub fn native_update_worker_queue_model() -> Model {
                 connected == 0 && live_intent == 0 && restarts == 0 &&
                 delivered == 0 && failed_explicitly == 0
             ) {
+                accepted = 1;
                 connected = 1;
                 queued_intent = 1;
                 live_intent = 1;
@@ -1360,6 +1376,7 @@ pub fn native_update_worker_queue_model() -> Model {
                 connected == 0 && live_intent == 0 && restarts == 0 &&
                 delivered == 0 && failed_explicitly == 0
             ) {
+                accepted = 1;
                 failed_explicitly = 1;
                 restarts = 1;
             }
@@ -1370,6 +1387,8 @@ pub fn native_update_worker_queue_model() -> Model {
                 connected = connected;
             }
 
+            invariant AcceptedIntentHasAnOutcome:
+                accepted == live_intent + delivered + failed_explicitly;
             invariant NoSilentlyLostAcceptedIntent:
                 if live_intent == 1 {
                     pending + queued_intent + completion_ready == 1

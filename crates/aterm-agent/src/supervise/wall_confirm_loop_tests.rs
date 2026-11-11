@@ -2407,11 +2407,8 @@ fn the_transcript_names_the_limit_a_generic_footer_does_not() {
         "seven_day_sonnet",
     ));
     assert!(
-        matches!(
-            &action,
-            TurnEndAction::Restart { why: crate::supervise::policy::turn_end::Restart::Model { to }, .. } if to == "opus"
-        ),
-        "{action:?}"
+        matches!(&action, TurnEndAction::WaitUntil { .. }),
+        "the bucket's wait: {action:?}"
     );
     assert_eq!(
         wall,
@@ -2433,11 +2430,8 @@ fn the_transcript_names_the_limit_a_generic_footer_does_not() {
         "seven_day_sonnet",
     ));
     assert!(
-        matches!(
-            &action,
-            TurnEndAction::Restart { why: crate::supervise::policy::turn_end::Restart::Model { to }, .. } if to == "opus"
-        ),
-        "{action:?}"
+        matches!(&action, TurnEndAction::WaitUntil { .. }),
+        "the bucket's wait: {action:?}"
     );
     assert_eq!(
         wall,
@@ -2450,7 +2444,7 @@ fn the_transcript_names_the_limit_a_generic_footer_does_not() {
     ));
     assert!(
         matches!(&action, TurnEndAction::WaitUntil { .. }),
-        "the fallback is the bucket at its limit: {action:?}"
+        "the bucket's wait: {action:?}"
     );
     assert_eq!(
         wall,
@@ -2705,7 +2699,7 @@ fn shifted(jsonl: &str, by: i64) -> String {
         let (head, tail) = rest.split_at(i + KEY.len());
         out.push_str(head);
         let end = tail.find('"').expect("a closed stamp");
-        let at = crate::harness::upgrade_models::parse_utc(&tail[..end]).expect("a stamp");
+        let at = crate::harness::unix_time::parse_utc(&tail[..end]).expect("a stamp");
         let moved = i64::try_from(at).expect("a small stamp") + by;
         out.push_str(&aterm_types::rfc3339::format_rfc3339(
             u64::try_from(moved).expect("after the epoch"),
@@ -3603,7 +3597,6 @@ fn a_bucket_only_its_rate_limit_type_named_is_that_bucket_for_a_loop_that_follow
         };
         let host = TranscriptHost::of(&[Some(t.as_str())]);
         let mut opts = hosted_by(&host);
-        opts.policy.model_fallback = None;
         opts.policy.continue_policy = true;
         let mut m = Mock::new(vec![wall.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
@@ -3643,7 +3636,6 @@ fn a_bucket_only_its_rate_limit_type_named_is_that_bucket_for_a_loop_that_follow
         let decide_at = try_at + 60;
         let host2 = TranscriptHost::of(&[Some(t.as_str())]);
         let mut opts2 = hosted_by(&host2);
-        opts2.policy.model_fallback = None;
         opts2.policy.continue_policy = true;
         let mut m2 = Mock::new(vec![resumed()]);
         let mut s2 = session(&mut m2, Some("@s-1".to_string()));
@@ -3814,7 +3806,6 @@ fn a_buckets_cancel_under_the_limit_dialog_answers_the_act_and_nothing_is_typed_
         idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
         policy: SupervisorConfig {
             answer_questions: false,
-            model_fallback: None,
             ..SupervisorConfig::default()
         },
         ..auto(30)

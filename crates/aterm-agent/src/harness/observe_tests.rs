@@ -264,7 +264,7 @@ fn account_note_writes_wrong_account_once() {
         let tab = Tab::of("machine", "s-41a2");
         let mut kept = Sightings::default();
         let first = sighting(
-            &roster,
+            Some(&roster),
             &stored(),
             &unicorn_seen(),
             &mut kept,
@@ -282,7 +282,7 @@ fn account_note_writes_wrong_account_once() {
         assert_eq!(login.email, UNICORN);
         assert_eq!(login.state, LoginState::Running);
         let again = sighting(
-            &roster,
+            Some(&roster),
             &stored(),
             &unicorn_seen(),
             &mut kept,
@@ -327,11 +327,19 @@ fn an_agreeing_tab_writes_its_sighting_alone() {
             ..unicorn_seen().seen().unwrap().clone()
         });
         let mut kept = Sightings::default();
-        let got = sighting(&roster, &stored(), &bronto, &mut kept, tab, "claude", 1_000);
+        let got = sighting(
+            Some(&roster),
+            &stored(),
+            &bronto,
+            &mut kept,
+            tab,
+            "claude",
+            1_000,
+        );
         assert_eq!(kinds(&got), ["seen"]);
         let mut kept = Sightings::default();
         let got = sighting(
-            &roster,
+            Some(&roster),
             &stored(),
             &Observation::Unread,
             &mut kept,
@@ -360,7 +368,7 @@ fn an_unlisted_session_ends_when_the_tab_moves_or_ends() {
         });
         let mut kept = Sightings::default();
         let first = sighting(
-            &roster,
+            Some(&roster),
             &stored(),
             &unicorn_seen(),
             &mut kept,
@@ -369,7 +377,15 @@ fn an_unlisted_session_ends_when_the_tab_moves_or_ends() {
             10,
         );
         assert_eq!(kinds(&first), ["seen", "wrong-account", "session-start"]);
-        let moved = sighting(&roster, &stored(), &bronto, &mut kept, tab, "claude", 20);
+        let moved = sighting(
+            Some(&roster),
+            &stored(),
+            &bronto,
+            &mut kept,
+            tab,
+            "claude",
+            20,
+        );
         assert_eq!(kinds(&moved), ["seen", "session-end"]);
         let end = moved.notes[1];
         assert_eq!(end.account.unwrap().as_str(), "ac-00000000000000a1");
@@ -387,7 +403,7 @@ fn an_unlisted_session_ends_when_the_tab_moves_or_ends() {
         );
         let mut kept = Sightings::default();
         let _ = sighting(
-            &roster,
+            Some(&roster),
             &stored(),
             &unicorn_seen(),
             &mut kept,
@@ -402,6 +418,110 @@ fn an_unlisted_session_ends_when_the_tab_moves_or_ends() {
     });
 }
 
+/// The login places of a Mac are its default home, where no row names it, and each row's
+/// directory, each read as a process started there would read it; a CLI with no observer, and a
+/// Mac whose home is not known, read nothing.
+/// NEGATIVE CONTROL: with `places` leaving out the default home no row names (the row-only loop
+/// the holdings report had), the Mac that lists no account has no place: `left: 0 right: 1`.
+#[test]
+fn places_are_the_default_home_and_each_rows_directory() {
+    let home = home("places");
+    write(&home.path().join(".claude.json"), &profile(UNICORN));
+    let dir = home.path().join("logins").join("m22");
+    write(&dir.join(".claude.json"), &profile(BRONTO));
+    let row = |dir: Option<&str>| Row {
+        label: "m22".into(),
+        email: Some(BRONTO.into()),
+        dir: dir.map(str::to_owned),
+        ..Row::default()
+    };
+    let none = Roster::default();
+    let got = places(Cli::Claude, &none, Some(home.path()));
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].row, None);
+    assert_eq!(got[0].login.seen.email(), Some(UNICORN));
+    assert_eq!(got[0].login.name(&none).as_deref(), Some(UNICORN));
+
+    let rows = Roster {
+        rows: vec![row(Some(dir.to_str().unwrap()))],
+    };
+    let got = places(Cli::Claude, &rows, Some(home.path()));
+    let seen: Vec<_> = got
+        .iter()
+        .map(|place| {
+            (
+                place.row.map(|row| row.label.as_str()),
+                place.login.seen.email(),
+            )
+        })
+        .collect();
+    assert_eq!(seen, [(None, Some(UNICORN)), (Some("m22"), Some(BRONTO))]);
+    assert!(matches!(
+        got[1].login.reconciled(&rows),
+        Reconciled::Agrees(row) if row.label == "m22"
+    ));
+
+    let default_row = Roster {
+        rows: vec![row(None)],
+    };
+    let got = places(Cli::Claude, &default_row, Some(home.path()));
+    assert_eq!(got.len(), 1, "the default home is the row's place");
+    assert!(matches!(
+        got[0].login.reconciled(&default_row),
+        Reconciled::Unlisted(seen) if seen.email == UNICORN
+    ));
+
+    for place in places(Cli::Codex, &rows, Some(home.path()))
+        .iter()
+        .chain(&places(Cli::Claude, &rows, None))
+    {
+        assert_eq!(place.login.seen, Observation::Unread);
+    }
+}
+
+/// A tab on a Mac that lists no account is sighted like any other: its `seen`, the login for the
+/// registry, and its session journaled under the observed account, since no row records it; a
+/// later pass in the hour writes nothing, and the tab's end closes the session. A roster that
+/// could not be read still gives the `seen` and the login, and opens no session a row may be
+/// recording. The synthetic own row is never a believed account to contradict.
+/// NEGATIVE CONTROL: with `sighting` returning nothing for a roster that lists no row (the gate
+/// its one caller sat behind), the first pass is empty: `` left: [] right: ["seen",
+/// "session-start"] ``.
+#[test]
+fn a_tab_on_a_mac_that_lists_no_account_is_sighted() {
+    crate::harness::journal::with_keyer(keyer, || {
+        let tab = Tab::of("machine", "s-41a2");
+        let none = Roster::default();
+        let mut kept = Sightings::default();
+        let pass = |kept: &mut Sightings, roster: Option<&Roster>, now| {
+            sighting(roster, &stored(), &unicorn_seen(), kept, tab, "claude", now)
+        };
+        let first = pass(&mut kept, Some(&none), 10);
+        assert_eq!(kinds(&first), ["seen", "session-start"]);
+        assert_eq!(
+            first.notes[1].account.unwrap().as_str(),
+            "ac-00000000000000a1"
+        );
+        let login = first.login.unwrap();
+        assert_eq!(
+            (login.email.as_str(), login.state, login.tab),
+            (UNICORN, LoginState::Running, Some(tab))
+        );
+        let again = pass(&mut kept, Some(&none), 70);
+        assert_eq!((kinds(&again), again.login), (Vec::new(), None));
+        assert_eq!(kinds(&kept.end(90)), ["session-end"]);
+
+        let mut kept = Sightings::default();
+        let unread = pass(&mut kept, None, 10);
+        assert_eq!(kinds(&unread), ["seen"]);
+        assert_eq!(unread.login.unwrap().state, LoginState::Running);
+        assert_eq!(kinds(&kept.end(20)), Vec::<&str>::new());
+
+        let mut kept = Sightings::default();
+        let own = pass(&mut kept, Some(&Roster::own()), 10);
+        assert_eq!(kinds(&own), ["seen"], "no `wrong-account` against `main`");
+    });
+}
 const ACCOUNT_ID: &str = "acct-fixture-0001";
 const USER_ID: &str = "user-fixture-0001";
 
@@ -693,7 +813,15 @@ fn a_codex_tab_makes_the_same_marks() {
         let tab = Tab::of("machine", "s-c0de");
         let mut kept = Sightings::default();
         let seen = observed_of(Cli::Codex.into(), UNICORN, ObservedSrc::AuthFile);
-        let first = sighting(&roster, &stored(), &seen, &mut kept, tab, "codex", 1_000);
+        let first = sighting(
+            Some(&roster),
+            &stored(),
+            &seen,
+            &mut kept,
+            tab,
+            "codex",
+            1_000,
+        );
         assert_eq!(kinds(&first), ["seen", "wrong-account", "session-start"]);
         assert_eq!(first.notes[0].cli, "codex");
         assert_eq!(first.notes[0].src, "auth-file");
@@ -710,7 +838,15 @@ fn a_codex_tab_makes_the_same_marks() {
         // The row's own account agrees: its sighting, and nothing against the row.
         let mut kept = Sightings::default();
         let agrees = observed_of(Cli::Codex.into(), BRONTO, ObservedSrc::AuthFile);
-        let first = sighting(&roster, &stored(), &agrees, &mut kept, tab, "codex", 1_000);
+        let first = sighting(
+            Some(&roster),
+            &stored(),
+            &agrees,
+            &mut kept,
+            tab,
+            "codex",
+            1_000,
+        );
         assert_eq!(kinds(&first), ["seen"]);
     });
 }
@@ -727,7 +863,15 @@ fn an_agy_tab_is_keyed_by_its_providers_realm() {
         let tab = Tab::of("machine", "s-a61a");
         let mut kept = Sightings::default();
         let seen = observed_of(Cli::Agy.into(), UNICORN, ObservedSrc::CliLog);
-        let first = sighting(&roster, &stored(), &seen, &mut kept, tab, "agy", 1_000);
+        let first = sighting(
+            Some(&roster),
+            &stored(),
+            &seen,
+            &mut kept,
+            tab,
+            "agy",
+            1_000,
+        );
         assert_eq!(kinds(&first), ["seen", "wrong-account", "session-start"]);
         assert_eq!(first.notes[0].cli, "agy");
         assert_eq!(first.notes[0].src, "cli-log");
@@ -790,7 +934,15 @@ fn a_routed_process_keeps_the_belief_unverified() {
     let mut kept = Sightings::default();
     let tab = Tab::of("machine", "s-a61a");
     assert_eq!(
-        sighting(&roster, &stored(), &routed, &mut kept, tab, "agy", 1_000),
+        sighting(
+            Some(&roster),
+            &stored(),
+            &routed,
+            &mut kept,
+            tab,
+            "agy",
+            1_000
+        ),
         Sighted::default()
     );
 }
@@ -1249,7 +1401,15 @@ fn a_kimi_tab_is_keyed_and_matched_by_its_region() {
         ));
         let tab = Tab::of("machine", "s-71a1");
         let mut kept = Sightings::default();
-        let first = sighting(&roster, &stored(), &mainland, &mut kept, tab, "kimi", 1_000);
+        let first = sighting(
+            Some(&roster),
+            &stored(),
+            &mainland,
+            &mut kept,
+            tab,
+            "kimi",
+            1_000,
+        );
         assert_eq!(kinds(&first), ["seen", "wrong-account", "session-start"]);
         assert_eq!(first.notes[0].cli, "kimi");
         assert_eq!(
@@ -1277,7 +1437,15 @@ fn a_key_only_login_keeps_the_belief_unverified() {
     let mut kept = Sightings::default();
     let tab = Tab::of("machine", "s-960c");
     assert_eq!(
-        sighting(&roster, &stored(), &keyed, &mut kept, tab, "grok", 1_000),
+        sighting(
+            Some(&roster),
+            &stored(),
+            &keyed,
+            &mut kept,
+            tab,
+            "grok",
+            1_000
+        ),
         Sighted::default()
     );
 }

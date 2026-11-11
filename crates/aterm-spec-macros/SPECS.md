@@ -3,20 +3,12 @@
 
 # aterm-spec-macros: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 4 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 7 specs below is
-> proved through Trust/Clean about the compiled Rust functions, and then the tests it
-> subsumes are deleted. No test has been deleted yet.
-
 Source: `crates/aterm-spec-macros` (read only). All 10 `#[test]` fns live in
 `tests/anchors/suite.rs` (9, mounted by `tests/derive_and_attrs.rs`) and
 `tests/anchors/repeated.rs` (1, mounted by `tests/repeated_action.rs`); `src/lib.rs` has none. The macro side is
 `crates/aterm-spec-macros/src/lib.rs` (`refines`, `spec_unmodeled`,
 `entry_probe`, `anchored`, `entry_id_for`, `refusal`), with the fn reader
-`FnItem` (`with_prelude`) in `src/item.rs`; since SP.8 (docs/AUDIT-third-party-2026-10-15.md §7) both read std
+`FnItem` (`with_prelude`) in `src/item.rs`; since SP.8 both read std
 `proc_macro` tokens through `aterm-macro-support`, not syn. The runtime side is
 `crates/aterm-spec-anchor/src/xref.rs` and `crates/aterm-spec-anchor/src/registry.rs`. Nothing was compiled or
 run. The claims below come from reading the code.
@@ -24,7 +16,7 @@ run. The claims below come from reading the code.
 Result: **7 specs**, covering **all 10 tests**. **0 tests are not spec samples** (§4).
 
 Gap numbers in this file are the rows of the gap table in
-`AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 ## 0. Notation used in the statements
 
@@ -81,41 +73,9 @@ tests/anchors/suite.rs	stacked_waivers_are_each_collected	macro-expansion-shape	
 tests/anchors/suite.rs	the_registry_collects_every_record_this_file_submits_exactly_once	registry-collects-each-submit-once	macro-expansion-shape
 ```
 
-## 3. Coverage
-
-- All 10 live `#[test]` functions across `src/lib.rs` and `tests/anchors/suite.rs` map to the 7
-  specs in §1.
-
 ## 4. Tests that are not spec samples
 
 None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **(Fixed 2026-10-28.) Vacuous final check in `a_const_fn_anchor_reports_itself_unprobed_rather_than_lying`.**
-   Now asserts `entered_anchor_count() == Some(0)`, matching `open_window` and
-   `evidence-window-state-machine`.
-2. **(Fixed 2026-10-28.) Stale "unchanged" wording.** The misleading "left 100% unchanged at
-   runtime" comment was removed from `src/lib.rs`; the property is `probe-preserves-semantics`.
-
-## 6. Proof order
-
-No spec is blocked by gap 0 alone, so the order goes by the fewest and smallest remaining gaps.
-
-1. **`anchor-entry-id`** (gaps 0, 1, 9). `entry_id_for` is a pure `format!` over three strings, and the
-   rest is an `Option` match. It retires 2 tests and fixes the record contents every other spec uses.
-   Moving `entry_id_for` and the `Probeable` decision into a plain library crate that
-   the proc-macro crate calls would drop gap 9 for this spec and for `macro-expansion-shape`.
-2. **`evidence-window-state-machine`** (gaps 0, 1, 2, 5, 8, 13). Six small fns over two thread-locals
-   with an obvious two-state view. It needs removing the `trust::skip` on all six, a set-valued carrier
-   and a TLS effect model. It retires 2 tests and is the lemma for three other specs.
-3. **`macro-expansion-shape`** (gaps 0, 1, 3, 9). Syntactic and finite: one splice into the body
-   group after its inner attributes (`item::prepend`). It needs a token-tree model. It retires 1 test
-   and is the syntactic half of `probe-preserves-semantics`.
-4. **`probed-call-records-its-anchors`** (gaps 0, 1, 2, 4, 8, 9). Composition only, once 1–3 hold.
-5. **`step-evidence-refuses-nesting`** (gaps 0, 1, 2, 4, 8, 11, 13). Restate the `should_panic` as a
-   `requires` on `step` (audit §8).
-6. **`registry-collects-each-submit-once`** (gaps 0, 1, 8, 11, 13). A whole-program linker property
-   over unsafe load-time constructors.
-7. **`probe-preserves-semantics`** (gaps 0, 1, 2, 3, 4, 8, 9, 11, 13). Quantifies over the semantics of
-   every Rust fn, so it waits on proven-core SemR. Until then, keep its test.

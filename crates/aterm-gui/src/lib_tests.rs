@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 use super::{
-    App, DEMO_TICK_INTERVAL, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT, WindowId, find_url_span,
-    is_safe_url, native_preview_deadline, native_preview_may_tick, run_capture_present_barrier,
-    should_dispatch_boot_health_confirmation,
+    App, BootHealthConfirmation, DEMO_TICK_INTERVAL, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
+    WindowId, find_url_span, is_safe_url, native_preview_deadline, native_preview_may_tick,
+    run_capture_present_barrier, should_dispatch_boot_health_confirmation,
 };
 use crate::app_config::Config;
 
@@ -17,7 +17,7 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
             app.headless,
             app.headless_boot_health_checkpoint(),
             app.first_present_done,
-            app.boot_health_confirmation_dispatched,
+            app.boot_health_confirmation != BootHealthConfirmation::Pending,
             true,
             app.windows.values().any(|ws| ws.os_window.is_some()),
             app.incoming_handoff_pending,
@@ -25,7 +25,7 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
     }
 
     let mut app = App::headless_for_test();
-    app.boot_health_confirmation_dispatched = false;
+    app.boot_health_confirmation = BootHealthConfirmation::Pending;
     assert!(
         app.headless,
         "negative control: this fixture IS the headless lane"
@@ -59,7 +59,7 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
         "a bound control socket is the headless health proof"
     );
 
-    app.boot_health_confirmation_dispatched = true;
+    app.boot_health_confirmation = BootHealthConfirmation::InFlight;
     assert!(
         !would_dispatch(&app),
         "the same boundary cannot enqueue a second confirmation"
@@ -70,7 +70,7 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
 fn boot_health_never_folds_a_past_deadline() {
     use std::time::{Duration, Instant};
     let mut app = App::headless_for_test();
-    app.boot_health_confirmation_dispatched = false;
+    app.boot_health_confirmation = BootHealthConfirmation::Pending;
     let now = Instant::now();
     let past = now.checked_sub(Duration::from_secs(5)).unwrap_or(now);
     app.boot_health_confirmation_retry_at = Some(past);
@@ -105,7 +105,10 @@ fn boot_health_never_folds_a_past_deadline() {
     assert!(app.boot_health_retry_deadline(now).is_some_and(|d| d > now));
 
     app.note_boot_health_dispatch(crate::app_native::NativeUpdateDispatch::Queued, now);
-    assert!(app.boot_health_confirmation_dispatched);
+    assert_eq!(
+        app.boot_health_confirmation,
+        BootHealthConfirmation::InFlight
+    );
     assert_eq!(app.boot_health_retry_deadline(now), None);
     app.finish_native_boot_health_confirmation(false, now);
     assert_eq!(

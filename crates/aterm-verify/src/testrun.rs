@@ -823,7 +823,7 @@ where
 /// THE CHARGE IN TOKENS. The plan's share is the pool's slots, so the charges the dispatcher
 /// admits never pass them; the pool's other holders (the release's build and export) are not in
 /// the dispatcher's books, so a binary the share admits also takes its charge's tokens
-/// ([`aterm_capacity::Jobserver::acquire_many`], one partial holder at a time) before its clock
+/// ([`aterm_capacity::Jobserver::acquire_many`], retaining no partial grant while waiting) before its clock
 /// starts, its wait queue time ([`Ran::waiting`]), and gives them back as its process ends,
 /// before `completed` and before its share. The tokens the running binaries hold are thus their
 /// charges, and with the pool's other holders never more than its slots. A wait `stop()` ends
@@ -1966,7 +1966,7 @@ pub fn run_tests(
         ));
         return;
     }
-    if let Err(why) = crate::test_workers::share(&ctx.env, ctx.pool.as_ref()) {
+    if let Err(why) = crate::test_workers::share(&ctx.env, ctx.pool.as_deref()) {
         r.cannot_run(format!("{why}; no test was run"));
         return;
     }
@@ -2942,7 +2942,7 @@ fn run_planned_observed(
         &bins,
         &plan,
         memory,
-        ctx.pool.as_ref(),
+        ctx.pool.as_deref(),
         &live,
         &stop,
         |b, planned, local_halt| {

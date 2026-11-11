@@ -703,8 +703,8 @@ pub struct Ctx {
     /// run's own compile, are COULD NOT RUN behind it and start no cargo, since a recompile of
     /// what failed would run under a claim learned when it passed, or none.
     pub test_compile_failed: std::sync::atomic::AtomicBool,
-    /// What the run's first proven red ends (A3): under `release` and `--fail-fast` the rest of
-    /// the run, which then says NOT RUN with the halt's words; in a bare run nothing.
+    /// What the run's first proven red ends ([`halt_of`]): the tree half finishes its sweep
+    /// unless explicitly fail-fast; other releases halt, and ordinary runs halt at preflight.
     pub halt: sched::Halt,
     /// What resolves a call's unit graph for the test compile's planner ([`shape::shape`]): its
     /// `--unit-graph` document, or why not; [`stages::unit_graph`] (resolved, never built) but
@@ -717,13 +717,14 @@ pub struct Ctx {
     /// names ([`disk::keep_used`]): a unit of the main lane's build directory written since is one
     /// some compile of the run built.
     pub began: std::time::SystemTime,
-    /// What names each compiler of a test compile or a lint for its unit, its span and, where it
-    /// is heavy, its unit's record ([`memory::read_unit`] but in a test).
+    /// What names each compiler of a test compile for its unit, its span and, where it is heavy,
+    /// its unit's record ([`memory::read_unit`] but in a test).
     pub unit_reader: memory::UnitReader,
     /// The release's pool this run adopted from [`EnvSnapshot::release_pool`] ([`run_cli`]):
     /// the test run's share, its binaries' charges held in its tokens
-    /// ([`testrun::dispatch_pooled`]); `None` outside a release.
-    pub pool: Option<aterm_capacity::Jobserver>,
+    /// ([`testrun::dispatch_pooled`]); `None` without an adopted pool. Shared ownership keeps
+    /// bounded workers' tokens alive until their actual completion.
+    pub pool: Option<std::sync::Arc<aterm_capacity::Jobserver>>,
 }
 
 /// A `CARGO_BUILD_JOBS` value as a job count.
@@ -992,7 +993,7 @@ impl Ctx {
     /// request without granting capacity; the execution stage can receive less from admission.
     #[must_use]
     pub fn test_share(&self) -> u32 {
-        let available = match test_workers::share(&self.env, self.pool.as_ref()) {
+        let available = match test_workers::share(&self.env, self.pool.as_deref()) {
             Ok(test_workers::Share::Pool(slots)) => slots,
             Ok(test_workers::Share::Claim(share)) => share.unwrap_or_else(|| self.parallelism()),
             Err(_) => 1,
@@ -1048,7 +1049,7 @@ impl Ctx {
     /// binary its builders and recording pass are pinned to is drawn from it.
     #[must_use]
     pub fn with_pool(mut self, pool: Option<aterm_capacity::Jobserver>) -> Self {
-        self.pool = pool;
+        self.pool = pool.map(std::sync::Arc::new);
         self.refresh_test_threads();
         self
     }
@@ -1517,17 +1518,20 @@ const fn stopping() -> bool {
     false
 }
 
-/// What a proven red ends ([`Ctx::halt`]): every red for a release or `--fail-fast`,
-/// and only source/type preflight failures for an ordinary run. Test failures retain the
-/// complete sweep required by `verify land`'s inheritance rule.
-fn halt_of(release: bool, fail_fast: bool) -> sched::Halt {
+/// What a proven red ends ([`Ctx::halt`]): the tree half collects the complete sweep unless
+/// `--fail-fast` is named. Other releases and explicitly fail-fast runs stop at every red;
+/// ordinary runs stop only at source/type preflight failures, retaining the test sweep
+/// required by `verify land`'s inheritance rule.
+fn halt_of(args: &cli::Args) -> sched::Halt {
     #[cfg(unix)]
     let end: fn(&str) = exec::group::halt;
     #[cfg(not(unix))]
     let end: fn(&str) = |_| {};
-    if release {
+    if args.release && args.tree_only && !args.fail_fast {
+        sched::Halt::off()
+    } else if args.release {
         sched::Halt::at_first_red("the release", end)
-    } else if fail_fast {
+    } else if args.fail_fast {
         sched::Halt::at_first_red("the run", end)
     } else {
         sched::Halt::after_preflight(end)
@@ -1804,6 +1808,7 @@ fn measured(
     report: &Report,
     meter: Option<&memory::Meter>,
     compile_jobs: Option<u32>,
+    units: Option<&compile_width::Units>,
 ) -> Option<String> {
     let book = ctx.memory.as_ref()?;
     if !memory::metered(spec) {
@@ -1842,27 +1847,25 @@ fn measured(
         ),
         Err(e) => format!("memory: peaked {size}, not kept: {e}"),
     };
-    // The book's unit rows are the test compile's: a lint's compilers hold other peaks.
-    let unit_peaks = if spec.id == plan::StageId::TestCompile {
-        meter.unit_peaks()
-    } else {
-        std::collections::BTreeMap::new()
-    };
-    match book.keep_units(&key.checkout, &unit_peaks) {
-        Ok(kept) if !kept.is_empty() => {
-            let heaviest: Vec<String> = kept
-                .iter()
-                .take(3)
-                .map(|(n, p)| format!("{} {}", n.kind, aterm_capacity::size(*p)))
-                .collect();
-            let more = if kept.len() > 3 { ", …" } else { "" };
-            said.push_str(&format!(
-                "; its heaviest units kept: {}{more}",
-                heaviest.join(", ")
-            ));
+    // The shaping book remains meter-derived and independent of release pooling. It is what a
+    // later test compile uses to split heavy packages even in ordinary, unpooled verification.
+    if spec.id == plan::StageId::TestCompile
+        && let Err(error) = book.keep_units(&key.checkout, &meter.unit_peaks())
+    {
+        said.push_str(&format!("; test compiler shapes not kept: {error}"));
+    }
+    if spec.id == plan::StageId::TestCompile
+        && let Some(units) = units
+    {
+        let unit_peaks = meter.unit_claim_peaks();
+        match compile_width::keep_meter_units(book, spec.id, units, &unit_peaks) {
+            Ok(kept) if kept > 0 => said.push_str(&format!(
+                "; {kept} compiler footprint peak{} merged into its unit book",
+                if kept == 1 { "" } else { "s" }
+            )),
+            Ok(_) => {}
+            Err(error) => said.push_str(&format!("; compiler footprint peaks not kept: {error}")),
         }
-        Ok(_) => {}
-        Err(e) => said.push_str(&format!("; its units' peaks not kept: {e}")),
     }
     Some(said)
 }
@@ -1902,6 +1905,8 @@ pub(crate) struct ResourceClaim {
     pub(crate) claim: Arc<aterm_capacity::Claim>,
     /// What it claimed, why, and how it was admitted.
     pub(crate) said: String,
+    /// Unit admission configured by the early claim, installed only on the stage's own thread.
+    pub(crate) units: Option<compile_width::Units>,
 }
 
 impl ResourceClaim {
@@ -1909,6 +1914,55 @@ impl ResourceClaim {
     pub(crate) fn cover(&self) -> Option<std::sync::Arc<str>> {
         (self.claim.record().need.mem > 0)
             .then(|| std::sync::Arc::from(self.claim.record().cover_marker()))
+    }
+}
+
+/// Resource claims a pooled release run takes before any stage starts. The qualify graph holds
+/// its CPU tokens until the build has reserved its slice memory and this verifier has reserved
+/// lint's whole-stage memory. Hold that reservation until lint starts, then transfer it into
+/// the stage without a second claim.
+#[derive(Default)]
+struct EarlyClaims {
+    claim: Mutex<Option<(plan::StageId, Option<ResourceClaim>)>>,
+}
+
+impl EarlyClaims {
+    /// Pre-admit lint for a release running inside the qualify pool. An ordinary verifier, a
+    /// release with no lint stage, and an unpooled release retain stage-time admission.
+    fn for_run(
+        ctx: &Ctx,
+        stages: &[plan::StageSpec],
+        admit: Admitter,
+    ) -> Result<EarlyClaims, String> {
+        let claim = (ctx.release && ctx.pool.is_some() && ctx.scope.is_workspace())
+            .then(|| stages.iter().find(|stage| stage.id == plan::StageId::Tippy))
+            .flatten()
+            .map(|stage| {
+                // Branded Tippy deliberately excludes outer compiler wrappers, so its retained
+                // whole-stage history is the only enforceable memory envelope. Its pooled claim
+                // applies the measured floor after this normally planned estimate.
+                let early = stage.clone();
+                before_stage_claim(ctx)
+                    .and_then(|()| claim_memory(ctx, &early, admit))
+                    .map(|claim| (stage.id, claim))
+            })
+            .transpose()?;
+        Ok(EarlyClaims {
+            claim: Mutex::new(claim),
+        })
+    }
+
+    /// Take `stage`'s pre-admitted claim exactly once. A different stage leaves it in place.
+    fn take(&self, stage: plan::StageId) -> Option<Option<ResourceClaim>> {
+        let mut claim = self
+            .claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if claim.as_ref().is_some_and(|(id, _)| *id == stage) {
+            claim.take().map(|(_, claim)| claim)
+        } else {
+            None
+        }
     }
 }
 
@@ -2107,6 +2161,7 @@ fn claim_bytes(
                     "{}: {what}{how}",
                     if cores > 0 { "resources" } else { "memory" }
                 ),
+                units: None,
             })
         }
         Err(aterm_capacity::Error::Stopped { .. }) if ctx.halted().is_some() => {
@@ -2162,7 +2217,7 @@ fn staged(
     spec: &plan::StageSpec,
     held: Option<String>,
     seams: Seams,
-    on_started: impl Fn(),
+    early: &EarlyClaims,
     run_stage: impl Fn() -> Report,
 ) -> (Report, Instant, String, Option<memory::ObservedCpu>) {
     let could_not_run = |why: String, held: Option<String>| {
@@ -2170,12 +2225,12 @@ fn staged(
         report.cannot_run(format!("{} — {why}", spec.title));
         (report, Instant::now(), held.unwrap_or_default(), None)
     };
-    // Every child can contribute CPU observations; only metered stages keep memory
-    // records. The test compile's and the lint's meters attribute each compiler to its unit,
-    // which dates their compile lines' spans; only the test compile's keeps unit peaks, and only
-    // into the memory book ([`measured`]).
+    // Every child can contribute CPU observations; only metered stages keep memory records. The
+    // test compile's meter attributes each compiler to its unit to date compile-line spans. Its
+    // wrapper keeps maxrss pending until a passing stage promotes it with footprint; branded
+    // Tippy admits and records only its enforceable whole-stage envelope.
     let meter = Some({
-        if matches!(spec.id, plan::StageId::TestCompile | plan::StageId::Tippy) {
+        if spec.id == plan::StageId::TestCompile {
             memory::Meter::attributing(ctx.unit_reader, memory::UNIT_FLOOR)
         } else {
             memory::Meter::new()
@@ -2183,37 +2238,28 @@ fn staged(
     });
     let run = || {
         before_stage_claim(ctx)?;
-        let claim = claim_memory(ctx, spec, seams.admit_memory)?;
+        let claim = match early.take(spec.id) {
+            Some(claim) => claim,
+            None => claim_memory(ctx, spec, seams.admit_memory)?,
+        };
         let _reservation =
             holding_resource_claim(claim.as_ref().map(|held| Arc::clone(&held.claim)));
         if let Some(why) = ended(ctx) {
             return Err(why);
         }
-        let admission = format!(
-            "verify-event: {}\n",
-            aterm_json::json!({
-                "schema": 1,
-                "event": "stage-admitted",
-                "stage_id": format!("{:?}", spec.id),
-                "memory_bytes": claim.as_ref().map_or(0, |held| held.claim.record().need.mem),
-                "memory_waiting_s": claim.as_ref().map(|held| held.claim.waited().as_secs_f64()),
-                "at_unix_ms": aterm_time::unix_millis(),
-            })
-        );
-        let _ = event_log::emit(ctx.events.as_ref(), &admission);
         let _metering = memory::metering(meter.clone());
         let _covering = memory::covering(claim.as_ref().and_then(ResourceClaim::cover));
         let jobs = compile_width::jobs_for(ctx, spec.id);
+        let units = claim.as_ref().and_then(|held| held.units.as_ref());
         let (report, begun, machine) =
-            compile_width::run(ctx.pool.as_ref(), jobs, &stopping, || {
+            compile_width::run_stage(spec.id, ctx.pool.as_deref(), jobs, units, &stopping, || {
                 let begun = Instant::now();
                 let from = aterm_capacity::Live.read(None);
-                on_started();
                 let report = run_stage();
                 let to = aterm_capacity::Live.read(None);
                 (report, begun, aterm_capacity::between(&from, &to))
             })
-            .map_err(|e| format!("compiler tokens could not be acquired: {e}"))?;
+            .map_err(|e| format!("CPU tokens could not be acquired: {e}"))?;
         Ok((report, begun, machine, claim, jobs))
     };
     let ran = if takes_quiet(ctx, spec.id) {
@@ -2230,9 +2276,16 @@ fn staged(
         machine.push_str("; ");
         machine.push_str(&said);
     }
-    if let Some(said) = measured(ctx, spec, &report, meter.as_deref(), jobs) {
+    let units = claim.as_ref().and_then(|claim| claim.units.as_ref());
+    if let Some(said) = measured(ctx, spec, &report, meter.as_deref(), jobs, units) {
         machine.push_str("; ");
         machine.push_str(&said);
+    }
+    if let Some(units) = units
+        && let Err(error) = compile_width::discard_pending(units)
+    {
+        machine.push_str("; compiler pending peaks not removed: ");
+        machine.push_str(&error.to_string());
     }
     if let Some(part) = &spec.part
         && let Some(said) = ctx
@@ -2372,7 +2425,7 @@ fn run_with(
         aterm_json::json!({"schema":1,"event":"measure-driver","sha256":report::running_driver()})
     ));
     if let Err(why) = test_workers::admitted_share(&ctx.env)
-        .and_then(|_| test_workers::share(&ctx.env, ctx.pool.as_ref()))
+        .and_then(|_| test_workers::share(&ctx.env, ctx.pool.as_deref()))
     {
         writeln!(out, "verify: {why}; no check was run")?;
         let _ = writeln!(log, "verify: {why}; no check was run");
@@ -2391,6 +2444,22 @@ fn run_with(
     let _ = write!(log, "{}", toolchain_lines(ctx));
 
     let stages = plan::plan(ctx);
+    // Qualify's build branch has not started a compiler yet: reserve lint now, while its known
+    // claim still fits around the build's already-admitted slice envelope. `staged` consumes the
+    // same claim later, after the source preflight, and drops it when lint ends.
+    let early = match EarlyClaims::for_run(ctx, &stages, seams.admit_memory) {
+        Ok(early) => early,
+        Err(why) => {
+            let line = format!(
+                "verify: COULD NOT RUN — early tippy memory admission could not run: {why}; no check was run"
+            );
+            ctx.record_event(&report::run_event(&[], exit::COULD_NOT_RUN));
+            let _ = writeln!(log, "\n{line}");
+            writeln!(out, "{line}")?;
+            out.flush()?;
+            return Ok(exit::COULD_NOT_RUN);
+        }
+    };
     // Readiness is diagnostic, not a success dependency of any native stage. Keep the captured
     // stock and terminal unready-cell results owned by this invocation, not by reusable Ctx.
     let cell_stage = stages
@@ -2479,19 +2548,12 @@ fn run_with(
                 .unwrap_or_default();
             let owner = owners[i].and_then(|c| ctx.checks.iter().position(|k| *k == c));
             let held = held_note(&stages, i, held, budget);
-            let (report, begun_at, machine, cpu) = staged(
-                ctx,
-                &quiet,
-                spec,
-                held,
-                seams,
-                || {
+            let (report, begun_at, machine, cpu) =
+                staged(ctx, &quiet, spec, held, seams, &early, || {
                     let event = ctx.record_event(&report::stage_started(i, &spec.title));
                     if let Ok(mut o) = out.lock() {
                         let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
                     }
-                },
-                || {
                     let prepared = if spec.id == plan::StageId::ForeignCells {
                         preparation
                             .lock()
@@ -2505,8 +2567,7 @@ fn run_with(
                     } else {
                         (seams.stage)(ctx, spec)
                     }
-                },
-            );
+                });
             let waiting = begun_at.saturating_duration_since(t0);
             let execution = begun_at.elapsed();
             // The ordered log and aggregate check result can wait for other stages;
@@ -3089,7 +3150,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_cells(parsed.cells.clone())
         .with_cells_pulled(cells_pulled)
         .with_no_windows(parsed.no_windows)
-        .with_halt(halt_of(parsed.release, parsed.fail_fast))
+        .with_halt(halt_of(&parsed))
         .with_cursor_pacing(parsed.cursor_pacing)
         .with_compile_only(parsed.compile_only)
         .with_measure_artifact(measure_artifact)
@@ -4372,6 +4433,50 @@ mod tests {
         let mut r = Report::new(spec.title.clone());
         r.pass("ran");
         r
+    }
+
+    #[test]
+    fn the_tree_half_collects_every_report_after_a_red() {
+        let args = cli::parse(["release", "--tree"]).unwrap();
+        assert!(args.tree_only);
+        let halt = halt_of(&args);
+        assert!(!halt.armed());
+        let ctx = Ctx::new(
+            PathBuf::from("/repo"),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            PathBuf::from("/tmp"),
+        )
+        .with_checks(&args.checks);
+        let specs = plan::plan(&ctx);
+        let mut seen = Vec::new();
+        let reports = sched::run_stages(
+            &specs,
+            u64::MAX,
+            &halt,
+            |spec, _| {
+                let mut report = Report::new(spec.title.clone());
+                if spec.id == plan::StageId::Formatting {
+                    assert!(!halt.red("fmt"));
+                    report.fail("planted formatting red");
+                } else {
+                    report.pass("ran after or beside the red");
+                }
+                report
+            },
+            |i, _| seen.push(i),
+        );
+        assert_eq!(seen, (0..specs.len()).collect::<Vec<_>>());
+        assert_eq!(reports.len(), specs.len());
+        assert!(halt.words().is_none());
+        for words in [
+            vec!["release", "--tree", "--fail-fast"],
+            vec!["release", "--bundle", "--app", "/a.app"],
+            vec!["release", "--tree", "--bundle", "--app", "/a.app"],
+            vec!["--fail-fast"],
+        ] {
+            assert!(halt_of(&cli::parse(words).unwrap()).armed());
+        }
     }
 
     #[test]

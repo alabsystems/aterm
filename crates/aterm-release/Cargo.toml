@@ -141,6 +141,8 @@ libc = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-release = { workspace = true }
+# Binds incomplete-history slice admission to its bounded serial escape model.
+aterm-models-capacity = { workspace = true }
 # Tests hold every ask the release can raise (`notice ask`) to the wire's own parse.
 aterm-messages = { workspace = true }
 # A loopback GitHub (api, uploads, web and CDN origins): the release's REST lane

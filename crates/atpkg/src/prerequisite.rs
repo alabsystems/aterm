@@ -81,6 +81,38 @@ pub fn configured_in(
     admitted_in(layout, wants, who, false).map(|(held, _)| held)
 }
 
+/// Authenticate one installed executable from the caller's selected store,
+/// retaining its signed payload and original lease without installing anything.
+/// Unlike a command namespace this does not create replacement shim paths.
+///
+/// # Errors
+/// Signed source, freshness, payload, selection or original-lease validation fails.
+pub fn selected_in(
+    layout: &Layout,
+    want: Prerequisite,
+    who: &str,
+    lease_wait: std::time::Duration,
+) -> Result<HeldTool, String> {
+    let fetcher = crate::source::resolve_fetcher(layout, None);
+    let session = Session::resolve(
+        fetcher.as_ref(),
+        layout,
+        &crate::source::effective_anchor(layout),
+        crate::source::build_floor(layout),
+        crate::flow::now_unix(),
+        crate::cli::current_triple(),
+    )
+    .map_err(admission_error)?;
+    let session = session.with_description(who);
+    let held = session.acquire_with_lease_wait(want, lease_wait)?;
+    crate::source::advance_floors(
+        layout,
+        session.index.index_build,
+        session.index.roster_seq(),
+    );
+    Ok(held)
+}
+
 fn admitted_in(
     layout: &Layout,
     wants: &[Prerequisite],
@@ -143,6 +175,8 @@ pub enum Prerequisite {
     Lake,
     /// ALab's separately packaged release-signing helper.
     AtpkgKeys,
+    /// AY's maintained solver and campaign executable.
+    Ay,
 }
 
 impl Prerequisite {
@@ -155,7 +189,7 @@ impl Prerequisite {
             Self::Python => Some(&upstream::CPYTHON),
             Self::OpenSslSigning => Some(&upstream::OPENSSL_SIGNING),
             Self::Lake => Some(&upstream::LEAN4),
-            Self::AtpkgKeys => None,
+            Self::AtpkgKeys | Self::Ay => None,
         }
     }
 
@@ -168,6 +202,7 @@ impl Prerequisite {
             Self::OpenSslSigning => upstream::OPENSSL_SIGNING.name,
             Self::Lake => upstream::LEAN4.name,
             Self::AtpkgKeys => "atpkg-keys",
+            Self::Ay => "ay",
         }
     }
 
@@ -180,6 +215,7 @@ impl Prerequisite {
             Self::OpenSslSigning => "openssl-signing",
             Self::Lake => "lake",
             Self::AtpkgKeys => "atpkg-keys",
+            Self::Ay => "ay",
         }
     }
 
@@ -192,6 +228,7 @@ impl Prerequisite {
             Self::OpenSslSigning,
             Self::Lake,
             Self::AtpkgKeys,
+            Self::Ay,
         ]
         .into_iter()
         .find(|want| want.executable() == name)
@@ -477,6 +514,20 @@ impl<'a> Session<'a> {
     /// Unsupported targets, missing or withdrawn pins, invalid signed package
     /// identity, unmanaged shims, missing leases, mutated bytes or selection races.
     pub fn acquire(&self, want: Prerequisite) -> Result<HeldTool, String> {
+        self.acquire_with_lease_wait(want, crate::lease::DEFAULT_WAIT)
+    }
+
+    /// Authenticate an installed selection without waiting longer than the
+    /// caller permits for its original lease. Zero refuses a reclaiming build
+    /// before any executable is offered to the caller.
+    ///
+    /// # Errors
+    /// The same authentication failures as [`Self::acquire`], or lease contention.
+    pub fn acquire_with_lease_wait(
+        &self,
+        want: Prerequisite,
+        lease_wait: std::time::Duration,
+    ) -> Result<HeldTool, String> {
         let program = want.program();
         let prepared = self.package(want)?;
         let (build, package) = (prepared.build, prepared.package);
@@ -488,7 +539,14 @@ impl<'a> Session<'a> {
         let signed_env = crate::shim_env::ShimEnv::admit(&package.shim_env)?;
         let selected = crate::lookup::read(Some(self.layout), want.executable());
         admit_selection(&selected, want, build)?;
-        let (lease, held) = hold_selection(self.layout, want, build, &selected, self.description)?;
+        let (lease, held) = hold_selection(
+            self.layout,
+            want,
+            build,
+            &selected,
+            self.description,
+            lease_wait,
+        )?;
         let expected_env: std::collections::BTreeMap<_, _> =
             signed_env.entries().iter().cloned().collect();
         if held.shim_env != expected_env {
@@ -648,16 +706,12 @@ fn hold_selection(
     build: u64,
     selected: &Record,
     description: &str,
+    wait: std::time::Duration,
 ) -> Result<(Lease, Record), String> {
     let subject = Subject::build(want.program(), build)
         .ok_or("the prerequisite lease identity is invalid")?;
-    let lease = crate::lease::take(
-        &layout.prefix,
-        &subject,
-        description,
-        crate::lease::DEFAULT_WAIT,
-    )
-    .map_err(|e| format!("{} prerequisite lease: {e}", want.program()))?;
+    let lease = crate::lease::take(&layout.prefix, &subject, description, wait)
+        .map_err(|e| format!("{} prerequisite lease: {e}", want.program()))?;
     let held = crate::lookup::read(Some(layout), want.executable());
     admit_selection(&held, want, build)?;
     if !same_selection(selected, &held) {
@@ -714,6 +768,21 @@ pub struct HeldTool {
 }
 
 impl HeldTool {
+    /// Duplicate the original GC lease for explicit payload lifetime custody.
+    /// The copy neither authenticates new bytes nor grants execution resources.
+    ///
+    /// # Errors
+    /// Original lease custody changed or duplication failed.
+    #[cfg(unix)]
+    pub fn lease_descriptor(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        self.lease.try_clone_descriptor()
+    }
+
+    /// The already authenticated physical executable, while this guard is held.
+    #[must_use]
+    pub fn physical_path(&self) -> &Path {
+        &self.physical
+    }
     /// The signed package identity retained by this guard.
     #[must_use]
     pub const fn program(&self) -> &'static str {

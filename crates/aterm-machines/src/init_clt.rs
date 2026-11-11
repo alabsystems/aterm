@@ -30,10 +30,10 @@ pub enum Found {
 /// The probe [`CommandLineTools`] reads.
 pub type ProbeClt = Box<dyn Fn(&dyn System) -> Found + Send + Sync>;
 
-/// The reader of the swarm `m<N>` label the vault's roster gave this Mac at admission
+/// The reader of generated OS names from the canonical number and nickname
 /// ([`CommandLineTools::with_name`]), `None` before admission: read as the root half is about to
-/// run, so the label rides the one password wherever the roster gave it by then.
-pub type NameMac = Box<dyn Fn() -> Option<String> + Send + Sync>;
+/// run, so that same naming choice rides the one password.
+pub type NameMac = Box<dyn Fn() -> Option<aterm_types::machine_name::GeneratedNames> + Send + Sync>;
 
 /// Why the install the Mac Setup tab runs did not finish
 /// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB`]): the plain words the tab ends on
@@ -247,6 +247,66 @@ pub const TAB_PROMPT: &str = aterm_types::macos_setup::MAC_SETUP_PASSWORD_PROMPT
 pub const TAB_INSTALLED: &str =
     "Successfully completed: Apple's Command Line Tools are in place. This tab closes by itself.";
 
+/// Clear the admitted tab's screen and scrollback after its go line was received.
+pub(crate) const TAB_CLEAR: &str = "\x1b[H\x1b[2J\x1b[3J";
+
+/// The same landing handshake for every explicit root-operation tab, before any elevation.
+pub(crate) fn await_tab_go(sys: &dyn System, out: &Tab) -> bool {
+    let go = sys.ask_kept("");
+    if !matches!(&go, Ok(Some(line))
+        if line.bytes() == aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO.as_bytes())
+    {
+        return false;
+    }
+    drop(go);
+    out.write(TAB_CLEAR);
+    true
+}
+
+/// The nonroot half of the fixed naming-permission tab. It carries no naming target.
+pub(crate) fn name_rule_tab_entry(sys: &dyn System) -> u8 {
+    let out = Tab::new(Arc::new(|text: &str| {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(text.as_bytes());
+        let _ = stdout.flush();
+    }));
+    if !await_tab_go(sys, &out) {
+        return aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_STARTED;
+    }
+    let result = if crate::sessions::is_live_account() {
+        std::env::current_exe()
+            .map_err(|_| Unfinished::Other)
+            .and_then(|aterm| {
+                let item = CommandLineTools::new(
+                    Box::new(|_| Found::Unknown("naming permission only".into())),
+                    aterm,
+                );
+                *item
+                    .root_plan
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = RootPlan::NameRuleOnly;
+                item.apply_in_tab(sys, &out)
+                    .map_err(|_| out.unfinished().unwrap_or(Unfinished::Other))
+            })
+    } else {
+        Err(Unfinished::NotOwnLogin)
+    };
+    match result {
+        Ok(()) => {
+            out.line("Naming permission is ready.");
+            0
+        }
+        Err(why) => {
+            out.line(&format!(
+                "Naming permission did not finish: {}.",
+                why.reason()
+            ));
+            out.exit(why)
+        }
+    }
+}
+
 /// Where the tab's own words go (its terminal), and why its install did not finish, once the
 /// item knows: what [`CommandLineTools::in_tab`] speaks through.
 #[derive(Clone)]
@@ -346,6 +406,8 @@ pub enum RootPlan {
     WithTools,
     /// Preserve developer-tool selection and run only the independent root steps.
     StepsOnly,
+    /// An explicit name-menu repair: only the existing naming permission, with no OS targets.
+    NameRuleOnly,
 }
 
 /// The reader of what the elevation still owes ([`CommandLineTools::with_owed`]).
@@ -392,7 +454,7 @@ impl CommandLineTools {
     }
 
     /// This item naming the Mac by what `name` reads as its root half is about to run, where
-    /// that is a [`plain_name`]; anything else (or none) names nothing.
+    /// that is a typed canonical target; none names nothing.
     #[must_use]
     pub fn with_name(self, name: NameMac) -> Self {
         Self { name, ..self }
@@ -446,24 +508,37 @@ impl CommandLineTools {
     }
 
     /// [`Self::baseline`], with the Mac's Computer Name, Local hostname and host name set to
-    /// `name` where it is a [`plain_name`] (`--name`): the one password that installs the tools
+    /// `name` (typed `--name` and optional `--nickname`): the one password that installs the tools
     /// also gives the Mac the name its vault and fleet know it by. Every run of it turns on
     /// developer mode ([`crate::root_steps::DeveloperMode`]), puts the rule in place that names
     /// the Mac at an admission that comes later ([`crate::root_steps::NameRule`]), and installs
     /// the root LAN broker ([`crate::items::lan::LanBroker`]) before the tools' download, so the
     /// one password does every root step setup has. [`RootPlan::StepsOnly`] omits CLT
     /// installation and selection while retaining these independent steps.
+    /// [`RootPlan::NameRuleOnly`] contains only the naming permission and no OS targets.
     #[must_use]
-    pub fn baseline_named(plan: RootPlan, name: Option<&str>) -> String {
+    pub fn baseline_named(
+        plan: RootPlan,
+        name: Option<&aterm_types::machine_name::GeneratedNames>,
+    ) -> String {
+        if plan == RootPlan::NameRuleOnly {
+            return format!(
+                "schema = {}\n\n[names]\nadmitted_name_rule = true\n",
+                crate::SCHEMA
+            );
+        }
         let mut text = format!(
             "schema = {}\n\n[developer]\ncommand_line_tools = {}\ndebugger = true\n\n\
              [lan]\nbroker = true\n\n[names]\nadmitted_name_rule = true\n",
             crate::SCHEMA,
             plan == RootPlan::WithTools
         );
-        if let Some(name) = name.and_then(plain_name) {
+        if let Some(name) = name {
             text.push_str(&format!(
-                "computer_name = \"{name}\"\nlocal_host_name = \"{name}\"\nhost_name = \"{name}\"\n"
+                "computer_name = \"{}\"\nlocal_host_name = \"{}\"\nhost_name = \"{}\"\n",
+                name.computer_name(),
+                name.host_name(),
+                name.host_name(),
             ));
         }
         text
@@ -475,7 +550,7 @@ impl CommandLineTools {
     /// the credentials it cached for this terminal and cache none (sudo(8) 1.9.17 on macOS 27.0),
     /// so a password typed for an earlier `sudo` never authorizes the root half by itself, none is
     /// kept once it ends, and the person's own cached `sudo` stays as it was. Where the roster
-    /// gave this Mac its label by now ([`Self::with_name`]), `--name` carries it.
+    /// knows its canonical name by now ([`Self::with_name`]), `--name`/`--nickname` carry it.
     #[must_use]
     pub fn command(&self) -> Cmd {
         self.command_for(self.root_plan())
@@ -486,6 +561,38 @@ impl CommandLineTools {
             .root_plan
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn is_explicit(&self) -> bool {
+        self.unbidden.as_ref().is_some_and(|record| record.explicit)
+    }
+
+    /// Only the person's setup request may renew an old or unread naming permission.
+    /// Automatic runs retain the original metadata inventory and durable episode policy.
+    fn owed_now(&self, sys: &dyn System) -> Vec<crate::root_steps::Owed> {
+        let mut owed = (self.owed)(sys);
+        if self.is_explicit()
+            && sys.macos()
+            && sys
+                .identity()
+                .is_ok_and(|identity| identity.user.uid == sys.euid() && identity.user.uid != 0)
+        {
+            owed.retain(|step| *step != crate::root_steps::Owed::NameRule);
+            if !matches!(crate::root_steps::name_rule_current(sys), Ok(true)) {
+                owed.push(crate::root_steps::Owed::NameRule);
+            }
+        }
+        owed
+    }
+
+    fn independent_plan(&self, owed: &[crate::root_steps::Owed]) -> Option<RootPlan> {
+        if owed.is_empty() {
+            None
+        } else if self.is_explicit() && owed == [crate::root_steps::Owed::NameRule] {
+            Some(RootPlan::NameRuleOnly)
+        } else {
+            Some(RootPlan::StepsOnly)
+        }
     }
 
     /// Root work is re-read before launch. Independent work never acquires installation
@@ -502,22 +609,30 @@ impl CommandLineTools {
         sys: &dyn System,
         ceiling: RootPlan,
     ) -> Result<Option<RootPlan>, (String, Unfinished)> {
+        if ceiling == RootPlan::NameRuleOnly {
+            return Ok((!self.is_explicit()
+                || self
+                    .owed_now(sys)
+                    .contains(&crate::root_steps::Owed::NameRule))
+            .then_some(RootPlan::NameRuleOnly));
+        }
         if ceiling == RootPlan::StepsOnly {
-            return Ok((!(self.owed)(sys).is_empty()).then_some(RootPlan::StepsOnly));
+            return Ok(self.independent_plan(&self.owed_now(sys)));
         }
         let (why, unfinished) = match (self.found)(sys) {
             Found::Missing(_) => return Ok(Some(RootPlan::WithTools)),
             Found::Present(_) => {
-                return Ok((!(self.owed)(sys).is_empty()).then_some(RootPlan::StepsOnly));
+                return Ok(self.independent_plan(&self.owed_now(sys)));
             }
             Found::NotHere(_) => return Ok(None),
             Found::Refuses(why) => (why, Unfinished::Refuses),
             Found::Unknown(why) => (why, Unfinished::Unread),
         };
-        if (self.owed)(sys).is_empty() {
+        let owed = self.owed_now(sys);
+        if owed.is_empty() {
             Err((why, unfinished))
         } else {
-            Ok(Some(RootPlan::StepsOnly))
+            Ok(self.independent_plan(&owed))
         }
     }
 
@@ -526,13 +641,17 @@ impl CommandLineTools {
             .args(["-k", "-p", TAB_PROMPT])
             .arg(self.aterm.as_os_str())
             .args(["machines", "here", "apply", "--plain"]);
-        let root = if plan == RootPlan::StepsOnly {
-            root.arg("--root-steps-only")
-        } else {
-            root
+        let root = match plan {
+            RootPlan::WithTools => root,
+            RootPlan::StepsOnly => root.arg("--root-steps-only"),
+            RootPlan::NameRuleOnly => return root.arg("--name-rule-only"),
         };
-        match (self.name)().as_deref().and_then(plain_name) {
-            Some(name) => root.args(["--name", name.as_str()]),
+        let Some(name) = (self.name)() else {
+            return root;
+        };
+        let root = root.args(["--name", &name.number().to_string()]);
+        match name.nickname() {
+            Some(nickname) => root.args(["--nickname", nickname.as_str()]),
             None => root,
         }
     }
@@ -557,8 +676,9 @@ impl CommandLineTools {
         };
         match ended {
             Err(_)
-                if matches!((self.found)(sys), Found::Present(_))
-                    && (self.owed)(sys).is_empty()
+                if self.root_plan() != RootPlan::NameRuleOnly
+                    && matches!((self.found)(sys), Found::Present(_))
+                    && self.owed_now(sys).is_empty()
                     && crate::items::lan::ready(sys).unwrap_or(false) =>
             {
                 Ok(())
@@ -570,7 +690,10 @@ impl CommandLineTools {
     /// The line said right before `sudo` asks: [`TAB_INTRO`] or [`INTRO`] while the tools are
     /// missing, else the setup's own ([`TAB_INTRO_SETUP`], [`INTRO_SETUP`]).
     fn intro(in_tab: bool, plan: RootPlan) -> &'static str {
-        match (plan == RootPlan::StepsOnly, in_tab) {
+        if plan == RootPlan::NameRuleOnly {
+            return "aterm is updating only its machine-naming permission. macOS asks for your Mac password once.";
+        }
+        match (plan != RootPlan::WithTools, in_tab) {
             (true, true) => TAB_INTRO_SETUP,
             (true, false) => INTRO_SETUP,
             (_, true) => TAB_INTRO,
@@ -872,6 +995,7 @@ impl Item for CommandLineTools {
                 plan_failure = Some(why.clone());
                 return Err(crate::port::RunFailed::Refused(why));
             }
+            *self.root_plan.lock().unwrap_or_else(PoisonError::into_inner) = plan;
             if let Some(record) = &self.unbidden {
                 match record.claim(sys) {
                     Ok(added) => {
@@ -1032,10 +1156,15 @@ impl CommandLineTools {
         if self.asked.load(std::sync::atomic::Ordering::Relaxed) {
             return (Probe::Ok { now }, None);
         }
-        let owed = (self.owed)(sys);
+        let owed = self.owed_now(sys);
         if owed.is_empty() || self.asked.load(std::sync::atomic::Ordering::Relaxed) {
             return (Probe::Ok { now }, None);
         }
+        *self
+            .root_plan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            self.independent_plan(&owed).expect("nonempty root work");
         let steps = owed
             .iter()
             .map(|step| step.plain())
@@ -1126,7 +1255,7 @@ impl CommandLineTools {
         // With none definitely owed, do not ask merely to wait for Low Data Mode to end.
         if download
             && let Some(why) = crate::items::developer::low_data(sys)
-            && (self.owed)(sys).is_empty()
+            && self.owed_now(sys).is_empty()
         {
             return Some((
                 Probe::Blocked {
@@ -1220,6 +1349,10 @@ impl CommandLineTools {
                 plan_failure = Some(unfinished);
                 return Err(crate::port::RunFailed::Refused(why));
             }
+            *self
+                .root_plan
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = plan;
             tab.line(Self::intro(true, plan));
             self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
             tab.entered
@@ -1942,16 +2075,158 @@ mod tests {
             "{row:?}"
         );
         assert!(asked(&away).is_empty(), "{:?}", away.calls());
+
+        // A person's retry repairs the actual compiled permission, even when an old
+        // safe file made the automatic, metadata-only root inventory read current.
+        // The LAN image and plist are current, so no unrelated root work is owed.
+        let ready = |rule: &str| {
+            use aterm_uds::lan::{self, install};
+            let mut sys = console();
+            sys.logged_in(&crate::items::defaults::tests::user("alice", 501));
+            sys.on(
+                "/usr/sbin/DevToolsSecurity -status",
+                Ran::ok("Developer mode is currently enabled.\n"),
+            );
+            let source = Path::new("/Applications/aterm.app");
+            sys.running_app = Some(source.to_owned());
+            let image = install::test_image(0x0100_000c, &[b"same current code"]);
+            sys.file("/Applications/aterm.app/Contents/MacOS/aterm", &image)
+                .file(lan::IMAGE_EXECUTABLE, &image)
+                .file(lan::PLIST_PATH, install::plist_text(source).as_bytes());
+            assert!(crate::items::lan::reading(&sys).unwrap().unwrap().current());
+            let wanted = crate::root_steps::name_rule("alice").unwrap();
+            if rule != "missing" {
+                if rule != "opaque" {
+                    sys.file(
+                        crate::root_steps::ADMITTED_NAME_RULE,
+                        if rule == "current" {
+                            wanted.as_bytes()
+                        } else {
+                            b"old bare-mN rule"
+                        },
+                    );
+                }
+                sys.stat_of(
+                    crate::root_steps::ADMITTED_NAME_RULE,
+                    Stat {
+                        uid: 0,
+                        gid: 0,
+                        mode: 0o440,
+                        dir: false,
+                        symlink: false,
+                        len: wanted.len() as u64,
+                    },
+                );
+            }
+            sys
+        };
+        let composed = |decider: crate::init::Decider| {
+            decider
+                .compose(
+                    crate::init::Base {
+                        clt: Some(present().with_owed(Box::new(crate::root_steps::owed_here))),
+                        ..crate::init::Base::none()
+                    },
+                    || {
+                        Unbidden::new(Some(PathBuf::from(MARK)), BUILD.to_owned(), || {
+                            crate::init::Holds::NONE
+                        })
+                    },
+                )
+                .clt
+                .unwrap()
+        };
+        let permission = format!("{} --name-rule-only", argv());
+        for rule in ["old", "opaque", "missing"] {
+            let sys = ready(rule);
+            let ordinary = crate::root_steps::owed_here(&sys);
+            assert_eq!(
+                ordinary,
+                if rule == "missing" {
+                    vec![Owed::NameRule]
+                } else {
+                    Vec::new()
+                }
+            );
+            assert!(!matches!(
+                crate::root_steps::name_rule_current(&sys),
+                Ok(true)
+            ));
+            aterm_types::clt_mark::explicit(&sys, Path::new(MARK), BUILD).unwrap();
+            let item = composed(crate::init::Decider::Person);
+            assert_eq!(
+                run(&sys, &item, Mode::Plan).outcome,
+                Outcome::Planned,
+                "explicit permission repair: {rule}"
+            );
+            assert_eq!(item.root_plan(), RootPlan::NameRuleOnly);
+            sys.on(&permission, Ran::ok(""));
+            assert_eq!(run(&sys, &item, Mode::Apply).outcome, Outcome::Changed);
+            assert_eq!(asked(&sys), std::slice::from_ref(&permission));
+            assert!(
+                marked(&sys),
+                "an explicit repair consumes the same durable episode"
+            );
+            let row = run(&sys, &composed(crate::init::Decider::Aterm), Mode::Apply);
+            assert!(matches!(row.outcome, Outcome::Ok | Outcome::Deferred));
+            assert_eq!(
+                asked(&sys),
+                std::slice::from_ref(&permission),
+                "a later automatic pass never repeats the password"
+            );
+        }
+        let current = ready("current");
+        assert_eq!(crate::root_steps::name_rule_current(&current), Ok(true));
+        assert_eq!(
+            run(
+                &current,
+                &composed(crate::init::Decider::Person),
+                Mode::Apply
+            )
+            .outcome,
+            Outcome::Ok
+        );
+        assert!(asked(&current).is_empty());
+
+        let completed = ready("old");
+        let item = composed(crate::init::Decider::Person);
+        assert_eq!(run(&completed, &item, Mode::Plan).outcome, Outcome::Planned);
+        completed.file(
+            crate::root_steps::ADMITTED_NAME_RULE,
+            crate::root_steps::name_rule("alice").unwrap().as_bytes(),
+        );
+        assert!(item.apply(&completed, &ctx(&[])).is_ok());
+        assert!(
+            asked(&completed).is_empty(),
+            "fresh currency retires a queued repair"
+        );
+
+        for stopped in [false, true] {
+            let mut sys = ready("old");
+            if stopped {
+                sys.stop_now();
+            } else {
+                sys.admin = Some(false);
+            }
+            let _ = run(&sys, &composed(crate::init::Decider::Person), Mode::Apply);
+            assert!(
+                asked(&sys).is_empty(),
+                "permission debt bypassed live admission"
+            );
+        }
     }
 
     /// A swarm label known when the root half runs rides the same prompt: the one argv gains
-    /// `--name`, and the root half's baseline names the Mac by it. Free text is never passed
-    /// (NEGATIVE CONTROL: `Mac-mini-M4`, `M42`, `m42-studio`, `m042` and none leave the argv and
-    /// the baseline as they are without a name).
+    /// `--name` and optional typed `--nickname`; the root baseline derives all three slots
+    /// from those values. No target leaves the argv and baseline unnamed.
     #[test]
     fn a_known_swarm_label_rides_the_one_password_prompt() {
+        use aterm_types::machine_name::{GeneratedNames, Nickname, Number};
+        let target = GeneratedNames::number_only(Number::parse("m42").unwrap());
         let sys = console();
-        let item = missing().with_name(Box::new(|| Some("m42".to_owned())));
+        let item = missing().with_name(Box::new(|| {
+            Some(GeneratedNames::number_only(Number::parse("m42").unwrap()))
+        }));
         let named = format!("{} --name m42", argv());
         sys.on(&named, Ran::ok(""))
             .on_write(&named, std::path::Path::new(CC), b"");
@@ -1965,7 +2240,7 @@ mod tests {
         );
         let parsed = crate::baseline::parse(&CommandLineTools::baseline_named(
             RootPlan::WithTools,
-            Some("m42"),
+            Some(&target),
         ))
         .unwrap();
         let names = parsed.names.expect("a [names] table");
@@ -1974,20 +2249,67 @@ mod tests {
         assert_eq!(names.host_name.as_deref(), Some("m42"));
         assert_eq!(names.admitted_name_rule, Some(true));
 
-        for word in ["Mac-mini-M4", "M42", "m42-studio", "m042", ""] {
-            let sys = console();
-            let owned = word.to_owned();
-            let item = missing().with_name(Box::new(move || Some(owned.clone())));
-            sys.on(&argv(), Ran::ok(""))
-                .on_write(&argv(), std::path::Path::new(CC), b"");
-            run(&sys, &item, Mode::Apply);
-            assert_eq!(asked(&sys), [argv()], "{word:?}: {:?}", sys.calls());
-            assert_eq!(
-                CommandLineTools::baseline_named(RootPlan::WithTools, Some(word)),
-                CommandLineTools::baseline(),
-                "{word:?}"
-            );
-        }
+        let target = GeneratedNames::new(
+            Number::parse("m85").unwrap(),
+            &Nickname::parse("Dog").unwrap(),
+        );
+        let sys = console();
+        let owned = target.clone();
+        let item = missing().with_name(Box::new(move || Some(owned.clone())));
+        let named = format!("{} --name m85 --nickname Dog", argv());
+        sys.on(&named, Ran::ok(""))
+            .on_write(&named, std::path::Path::new(CC), b"");
+        let row = run(&sys, &item, Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
+        assert_eq!(asked(&sys), [named]);
+        let parsed = crate::baseline::parse(&CommandLineTools::baseline_named(
+            RootPlan::WithTools,
+            Some(&target),
+        ))
+        .unwrap();
+        let names = parsed.names.unwrap();
+        assert_eq!(names.computer_name.as_deref(), Some("m85 Dog"));
+        assert_eq!(names.local_host_name.as_deref(), Some("m85-dog"));
+        assert_eq!(names.host_name.as_deref(), Some("m85-dog"));
+        let sys = console();
+        let item = missing().with_name(Box::new(|| None));
+        sys.on(&argv(), Ran::ok(""))
+            .on_write(&argv(), std::path::Path::new(CC), b"");
+        run(&sys, &item, Mode::Apply);
+        assert_eq!(asked(&sys), [argv()]);
+
+        let permission = crate::baseline::parse(&CommandLineTools::baseline_named(
+            RootPlan::NameRuleOnly,
+            Some(&target),
+        ))
+        .unwrap();
+        assert!(permission.developer.is_none() && permission.lan.is_none());
+        let names = permission.names.unwrap();
+        assert_eq!(names.admitted_name_rule, Some(true));
+        assert!(
+            names.computer_name.is_none()
+                && names.local_host_name.is_none()
+                && names.host_name.is_none()
+        );
+        let item = CommandLineTools::new(
+            Box::new(|_| panic!("permission repair reads no developer-tool state")),
+            PathBuf::from(ATERM),
+        )
+        .with_name(Box::new(|| {
+            panic!("permission repair reads no saved target")
+        }));
+        *item.root_plan.lock().unwrap() = RootPlan::NameRuleOnly;
+        let fixed = format!("{} --name-rule-only", argv());
+        let sys = console();
+        sys.on(&fixed, Ran::ok(""));
+        let out = Tab::new(Arc::new(|_| {}));
+        assert!(item.apply_in_tab(&sys, &out).is_ok());
+        assert_eq!(asked(&sys), std::slice::from_ref(&fixed));
+        // CLT already present cannot forgive this endpoint's own failed result.
+        let failed = console();
+        failed.on(&fixed, Ran::exit(87, "permission failed"));
+        assert!(item.apply_in_tab(&failed, &out).is_err());
+        assert_eq!(asked(&failed), [fixed]);
     }
 
     /// A run outside the tab says its one line right before `sudo` asks, whatever ran on the

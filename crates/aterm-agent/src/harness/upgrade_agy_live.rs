@@ -172,7 +172,7 @@ impl OpenWorkFold {
         let created = row
             .get("created_at")
             .and_then(Value::as_str)
-            .and_then(super::upgrade_models::parse_utc)
+            .and_then(super::unix_time::parse_utc)
             .ok_or(Open::Unreadable)?;
         if created < from_s {
             return Ok(());
@@ -316,7 +316,7 @@ pub fn prompts_since(text: &str, from_s: u64) -> Vec<String> {
         .filter(|line| line.contains("USER_INPUT"))
         .filter_map(|line| aterm_json::from_str::<Value>(line.trim()).ok())
         .filter_map(|row| {
-            let at = super::upgrade_models::parse_utc(row.get("created_at")?.as_str()?)?;
+            let at = super::unix_time::parse_utc(row.get("created_at")?.as_str()?)?;
             if at < from_s
                 || row.get("type")?.as_str()? != "USER_INPUT"
                 || row.get("source")?.as_str()? != "USER_EXPLICIT"
@@ -392,7 +392,7 @@ pub fn quiet_transcript_reader<R: std::io::BufRead>(
             let first = aterm_json::from_str::<Value>(trimmed).ok().and_then(|row| {
                 row.get("created_at")
                     .and_then(Value::as_str)
-                    .and_then(super::upgrade_models::parse_utc)
+                    .and_then(super::unix_time::parse_utc)
             });
             if first.is_none_or(|at| at >= from_s) {
                 return Err(Open::Unproved);

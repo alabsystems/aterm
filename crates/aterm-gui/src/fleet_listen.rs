@@ -120,33 +120,37 @@ impl HeartbeatClock {
         Self { last, every, moved }
     }
 
-    /// [`Self::due`] for a caller whose last round may still be out (`busy`): while it is, this
-    /// answers nothing and takes nothing, so a move told meanwhile (the settled place's, seconds
-    /// after a route move began a round that finds the LAN still down) gets a round of its own
-    /// once that one ends, rather than being taken and dropped by a round that cannot start.
-    pub(crate) fn due_when_free(
+    /// Start a due round only while free. A refusal acknowledges no move and starts
+    /// no new interval. An accepted dispatch consumes only its selected generation;
+    /// a newer move arriving inside `start` remains pending for the next round.
+    pub(crate) fn dispatch_when_free(
         &mut self,
         now: std::time::Instant,
         busy: bool,
+        start: impl FnOnce() -> bool,
     ) -> Option<crate::network_moved::Woke> {
-        if busy { None } else { self.due(now) }
-    }
-
-    /// Whether a heartbeat is due at `now`, and why: a move not yet answered and due at `now`
-    /// (its source), else the interval run out ([`crate::network_moved::Woke::Timer`]). Each
-    /// answers once.
-    pub(crate) fn due(&mut self, now: std::time::Instant) -> Option<crate::network_moved::Woke> {
-        if let Some(woke) = self.moved.take_at(now) {
-            self.last = Some(now);
-            return Some(woke);
+        if busy {
+            return None;
         }
-        let lapsed = self
+        let pending = self.moved.pending_at(now);
+        let woke = if let Some((_, woke)) = pending {
+            woke
+        } else if self
             .last
-            .is_none_or(|last| now.saturating_duration_since(last) >= self.every);
-        lapsed.then(|| {
-            self.last = Some(now);
+            .is_none_or(|last| now.saturating_duration_since(last) >= self.every)
+        {
             crate::network_moved::Woke::Timer
-        })
+        } else {
+            return None;
+        };
+        if !start() {
+            return None;
+        }
+        if let Some((generation, _)) = pending {
+            self.moved.acknowledge(generation);
+        }
+        self.last = Some(now);
+        Some(woke)
     }
 }
 
@@ -1828,8 +1832,7 @@ fn admit_driver_at(
     denied: &[String],
     log: Option<&aterm_net::fleet_member::MemberKeys>,
 ) -> Result<(crate::fabric::Driver, aterm_net::fleet::DriveGrant), (String, bool)> {
-    let node = aterm_net::fleet_member::proven_driver(served, state, grants, log);
-    admit_proven_driver_at(served.peer_node(), node, state, grants, denied)
+    admit_proven_driver_at(served.peer_node(), state, grants, denied, log)
 }
 
 /// [`admit_driver_at`] for a node `proof` a mesh link proved, its stream's peer
@@ -1843,17 +1846,16 @@ fn admit_linked_driver_at(
     denied: &[String],
     log: Option<&aterm_net::fleet_member::MemberKeys>,
 ) -> Result<(crate::fabric::Driver, aterm_net::fleet::DriveGrant), (String, bool)> {
-    let node = aterm_net::fleet_member::recheck_driver(proof, state, grants, log);
-    admit_proven_driver_at(Some(proof), node, state, grants, denied)
+    admit_proven_driver_at(Some(proof), state, grants, denied, log)
 }
 
 #[cfg(unix)]
 fn admit_proven_driver_at(
     proof: Option<&aterm_net::fleet::NodeProof>,
-    node: Result<String, aterm_net::fleet_member::Undriven>,
     state: &std::path::Path,
     grants: &[aterm_net::fleet::DriveGrant],
     denied: &[String],
+    log: Option<&aterm_net::fleet_member::MemberKeys>,
 ) -> Result<(crate::fabric::Driver, aterm_net::fleet::DriveGrant), (String, bool)> {
     let refused = |why: &str, ungranted| (why.to_owned(), ungranted);
     if proof.is_some_and(|proof| {
@@ -1865,11 +1867,10 @@ fn admit_proven_driver_at(
             true,
         ));
     }
-    // Each node named by a head no other node this Mac knows shares.
-    let node = node.map_err(|why| {
-        let knows = aterm_net::fleet_member::known_nodes(state);
-        (why.said(&knows), why.ungranted())
-    })?;
+    // Each node named by a head no other node this Mac knows shares, from one read of its book.
+    let (verdict, knows) =
+        aterm_net::fleet_member::recheck_driver_and_peer(proof, state, grants, log);
+    let (node, peer) = verdict.map_err(|why| (why.said(&knows), why.ungranted()))?;
     let key = proof
         .filter(|proof| proof.node == node)
         .map(|proof| proof.key)
@@ -1881,7 +1882,6 @@ fn admit_proven_driver_at(
         key,
     };
     note_admitted_driver(&node, key);
-    let (knows, peer) = aterm_net::fleet_member::known_nodes_and_peer(state, &node);
     let host = driver_name(&node, peer.map(|peer| peer.host).as_deref(), &knows);
     Ok((crate::fabric::Driver { node, host }, grant))
 }
@@ -1902,10 +1902,15 @@ pub(crate) fn judge_vault_join_at(
     vault: Option<&aterm_secrets::client::Paths>,
 ) -> Result<aterm_agent::vault_join::Judged, String> {
     let proof = served.peer_node();
-    let driven = aterm_net::fleet_member::proven_driver(served, state, grants, log).is_ok();
-    let bound =
-        proof.and_then(|proof| aterm_net::fleet_member::Keyring::read(state).bound(&proof.node));
-    let peers = aterm_net::fleet_member::read_peers(state).ok();
+    let (driven, bound, peers) = match proof {
+        Some(proof)
+            if !aterm_net::fleet::is_denied_node(&proof.node, denied)
+                && !aterm_net::fleet::is_denied_key(&proof.key, denied) =>
+        {
+            aterm_net::fleet_member::vault_join_driver_and_book(proof, state, grants, log)
+        }
+        _ => (false, None, None),
+    };
     aterm_agent::vault_join::judge(
         proof,
         (
@@ -2700,9 +2705,10 @@ fn watch_fleet_generation(
                     last_census_refresh = std::time::Instant::now();
                     maybe_refresh_local_census();
                 }
-                if let Some(woke) = heartbeat.due_when_free(now, busy) {
+                if let Some(woke) = heartbeat.dispatch_when_free(now, busy, || {
+                    spawn_member_heartbeat(addr, secret.clone(), (stop, &hb_in_flight))
+                }) {
                     say_heartbeat_woke("fleet listener", woke);
-                    spawn_member_heartbeat(addr, secret.clone(), (stop, &hb_in_flight));
                 }
                 continue;
             }
@@ -2736,9 +2742,9 @@ fn spawn_member_heartbeat(
     addr: SocketAddr,
     secret: aterm_net::fleet::FleetSecret,
     (ended, in_flight): (&Arc<Stop>, &Arc<AtomicBool>),
-) {
+) -> bool {
     let Some(state) = aterm_types::dirs::state_dir() else {
-        return;
+        return false;
     };
     // A record of the vault the fleet state is of, adopted where an older build left none.
     let vault = vault_here().ok().flatten();
@@ -2760,7 +2766,7 @@ fn spawn_member_heartbeat(
     // No deny list read yet: no member is dialed until one is; the next round is due as usual.
     let Some(denied) = denied_nodes_now() else {
         aterm_log::debug!("fleet heartbeat skipped: {DENY_LIST_UNREAD}");
-        return;
+        return false;
     };
     spawn_member_heartbeat_at(
         &state,
@@ -2768,7 +2774,7 @@ fn spawn_member_heartbeat(
         secret,
         (ended, in_flight),
         (denied, log, crate::network_moved::alab_tcp()),
-    );
+    )
 }
 
 /// How long a heartbeat round resolves the `_alab._tcp` adverts its browse holds.
@@ -2821,22 +2827,22 @@ fn spawn_member_heartbeat_at(
     secret: aterm_net::fleet::FleetSecret,
     (ended, in_flight): (&Arc<Stop>, &Arc<AtomicBool>),
     (denied, log, browse): HeartbeatReach,
-) {
+) -> bool {
     use aterm_net::fleet_member::{Registration, heartbeat_members_while, read_node_identity};
     if ended.is_set() {
-        return;
+        return false;
     }
     let Some(me) = read_node_identity(state).ok().flatten() else {
-        return;
+        return false;
     };
     let Some(host) = own_host(addr) else {
-        return;
+        return false;
     };
     if in_flight
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return;
+        return false;
     }
     let flag = Arc::clone(in_flight);
     let ended = Arc::clone(ended);
@@ -2931,6 +2937,7 @@ fn spawn_member_heartbeat_at(
     if started.is_err() {
         in_flight.store(false, Ordering::Release);
     }
+    started.is_ok()
 }
 
 /// Follow `[fleet]` while `generation` listens at `addr`, as each connection is served
@@ -2941,6 +2948,17 @@ fn spawn_member_heartbeat_at(
 fn follow_serving(generation: u64, addr: SocketAddr) {
     let serving = served_now();
     let denied = denied_nodes_now();
+    let held = std::cell::OnceCell::new();
+    let keys_and_log = || {
+        held.get_or_init(|| {
+            (
+                aterm_types::dirs::state_dir()
+                    .map(|state| aterm_net::fleet_member::Keyring::read(&state))
+                    .unwrap_or_default(),
+                window_log(),
+            )
+        })
+    };
     // No deny list read yet: every open drive or content read is cut, as the handshake refuses
     // each new connection, until one is read.
     let unread = Serving {
@@ -2948,8 +2966,15 @@ fn follow_serving(generation: u64, addr: SocketAddr) {
         grants: Vec::new(),
     };
     let cut = match denied.as_deref() {
-        Some(denied) => cut_unserved_with_denied(&serving, &holds_now(), denied),
-        None => cut_unserved_with_denied(&unread, &holds_now(), &[]),
+        Some(denied) => cut_unserved_with_denied(
+            &serving,
+            &|node, key| {
+                let (keys, log) = keys_and_log();
+                holds_in(keys, log.as_deref(), node, key)
+            },
+            denied,
+        ),
+        None => cut_unserved_with_denied(&unread, &|_, _| false, &[]),
     };
     if cut > 0 {
         note_fleet(
@@ -2962,7 +2987,10 @@ fn follow_serving(generation: u64, addr: SocketAddr) {
     }
     lift_undriving_holds(
         &serving.grants,
-        &keyring_now(),
+        &|node| {
+            let (keys, log) = keys_and_log();
+            bound_or_admitted_in(keys, log.as_deref(), admitted_driver_key(node), node)
+        },
         denied.as_deref().unwrap_or_default(),
     );
     stand_fleet(generation, Standing::Listening, &serving.line(addr));
@@ -3524,7 +3552,11 @@ mod tests {
                 Some(heard.look(&peers))
             }
         ));
-        assert_eq!(heartbeat.due(now), None, "the interval has not run out");
+        assert_eq!(
+            heartbeat.dispatch_when_free(now, false, || true),
+            None,
+            "the interval has not run out"
+        );
         looks
             .send(vec![peer(7, LastSeen)])
             .expect("the beacon source runs");
@@ -3533,12 +3565,19 @@ mod tests {
             .expect("the beacon source runs");
         assert_eq!(seen.wait(HANG), Woke::Beacon);
         assert_eq!(
-            heartbeat.due(now),
+            heartbeat.dispatch_when_free(now, false, || true),
             Some(Woke::Beacon),
             "one heartbeat at once"
         );
-        assert_eq!(heartbeat.due(now), None, "and only one");
-        assert_eq!(heartbeat.due(now + every), Some(Woke::Timer));
+        assert_eq!(
+            heartbeat.dispatch_when_free(now, false, || true),
+            None,
+            "and only one"
+        );
+        assert_eq!(
+            heartbeat.dispatch_when_free(now + every, false, || true),
+            Some(Woke::Timer)
+        );
     }
 
     /// A HEARTBEAT A MOVE MAKES DUE WAITS OUT THIS MAC'S SPREAD (docs/DESIGN-fluid-swarm-2026-10-28.md,
@@ -3557,21 +3596,29 @@ mod tests {
         let every = Duration::from_secs(3 * 3600);
         let mut heartbeat = HeartbeatClock::new(Some(t0), every, moved.watch());
         moved.tell_at(Woke::Route, t0);
-        assert_eq!(heartbeat.due(t0), None, "not before this Mac's spread");
         assert_eq!(
-            heartbeat.due(t0 + spread),
+            heartbeat.dispatch_when_free(t0, false, || true),
+            None,
+            "not before this Mac's spread"
+        );
+        assert_eq!(
+            heartbeat.dispatch_when_free(t0 + spread, false, || true),
             Some(Woke::Route),
             "at this Mac's spread"
         );
-        assert_eq!(heartbeat.due(t0 + spread), None, "and only one");
+        assert_eq!(
+            heartbeat.dispatch_when_free(t0 + spread, false, || true),
+            None,
+            "and only one"
+        );
     }
 
     /// A MOVE TOLD WHILE A HEARTBEAT ROUND IS OUT STILL GETS A ROUND: back home alone (no herd
     /// spread), the route move starts a round at once, often while the LAN is still down, and
     /// the settled place's move comes seconds later while that round is out. It is not taken
     /// then (a round could not start), and once the round ends it is due, once.
-    /// NEGATIVE CONTROL: `due_when_free` taking the move whatever `busy` says (the old
-    /// `heartbeat.due(now)` at the call sites) answers it while the round is out, where the
+    /// NEGATIVE CONTROL: `dispatch_when_free` taking the move whatever `busy` says answers it
+    /// while the round is out, where the
     /// caller drops it, and "not while a round is out" fails.
     #[cfg(unix)]
     #[test]
@@ -3583,19 +3630,97 @@ mod tests {
         let mut heartbeat = HeartbeatClock::new(Some(t0), every, moved.watch());
         moved.tell_at(Woke::Place, t0);
         assert_eq!(
-            heartbeat.due_when_free(t0, true),
+            heartbeat.dispatch_when_free(t0, true, || true),
             None,
             "not while a round is out"
         );
         assert_eq!(
-            heartbeat.due_when_free(t0 + Duration::from_secs(3), false),
+            heartbeat.dispatch_when_free(t0 + Duration::from_secs(3), false, || true),
             Some(Woke::Place),
             "once it ended"
         );
         assert_eq!(
-            heartbeat.due_when_free(t0 + Duration::from_secs(3), false),
+            heartbeat.dispatch_when_free(t0 + Duration::from_secs(3), false, || true),
             None,
             "and only one"
+        );
+
+        // A free dispatcher can still refuse to start (for example, the OS could
+        // not create its worker). No thread exhaustion is needed to judge this
+        // production clock/dispatch boundary: refusal is its actual bool result.
+        let at = t0 + Duration::from_secs(10);
+        moved.tell_at(Woke::Route, at);
+        let starts = std::cell::Cell::new(0);
+        let refused = heartbeat.dispatch_when_free(at, false, || {
+            starts.set(starts.get() + 1);
+            false
+        });
+        assert_eq!(starts.get(), 1, "a real dispatch decision was reached");
+        assert_eq!(
+            heartbeat.dispatch_when_free(at + Duration::from_secs(1), false, || {
+                starts.set(starts.get() + 1);
+                true
+            }),
+            Some(Woke::Route),
+            "dispatch refusal must retain the network move for the next free tick"
+        );
+        assert_eq!(starts.get(), 2);
+        assert_eq!(refused, None, "a refused dispatch started no round");
+        assert_eq!(
+            heartbeat.dispatch_when_free(at + Duration::from_secs(1), false, || {
+                panic!("an accepted generation must not dispatch twice")
+            }),
+            None
+        );
+
+        // A newer move arriving inside an accepted dispatch belongs to the next
+        // round; acknowledgement may consume only the generation it selected.
+        let next = at + Duration::from_secs(2);
+        moved.tell_at(Woke::Place, next);
+        assert_eq!(
+            heartbeat.dispatch_when_free(next, false, || {
+                moved.tell_at(Woke::Route, next);
+                true
+            }),
+            Some(Woke::Place)
+        );
+        assert_eq!(
+            heartbeat.dispatch_when_free(next, false, || true),
+            Some(Woke::Route)
+        );
+        assert_eq!(heartbeat.dispatch_when_free(next, false, || true), None);
+
+        // A refused ordinary timer also remains due; failure cannot start a new
+        // three-minute interval without a round having started.
+        let timer = next + every;
+        assert_eq!(heartbeat.dispatch_when_free(timer, false, || false), None);
+        assert_eq!(
+            heartbeat.dispatch_when_free(timer + Duration::from_secs(1), false, || true),
+            Some(Woke::Timer)
+        );
+        assert_eq!(
+            heartbeat.dispatch_when_free(timer + Duration::from_secs(1), false, || true),
+            None
+        );
+
+        // The timer may start before a new move's herd spread expires. It does
+        // not acknowledge that not-yet-due generation.
+        let spread = Duration::from_millis(2_500);
+        let spread_moves = std::sync::Arc::new(Moved::spread_by(spread));
+        let mut delayed = HeartbeatClock::new(Some(t0), every, spread_moves.watch());
+        let timer = t0 + every;
+        spread_moves.tell_at(Woke::Route, timer);
+        assert_eq!(
+            delayed.dispatch_when_free(timer, false, || true),
+            Some(Woke::Timer)
+        );
+        assert_eq!(
+            delayed.dispatch_when_free(timer + spread, false, || true),
+            Some(Woke::Route)
+        );
+        assert_eq!(
+            delayed.dispatch_when_free(timer + spread, false, || true),
+            None
         );
     }
 

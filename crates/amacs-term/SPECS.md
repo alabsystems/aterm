@@ -8,8 +8,8 @@ tests check what (§3). Each §1 fn carries an `ensures` clause citing a Clean t
 `trust_import_amacs_term__<module>__<fn>`, the kernel definition Trust mints from the compiled
 body. Verdicts and refusals were measured on `targo 1.99.0-dev (41d799797)`, the prover
 `crates/aterm-release/trust/floors.tsv` records for this crate. "Gap N" is row N of §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`; how the contracts are written is
-`docs/PLAN-tests-to-specs-2026-10-15.md`, "The recipe that works".
+`docs/TRUST-LANE.md` (Blocking gaps); how the contracts are written is
+`docs/TRUST-LANE.md`, "The recipe that works".
 
 ## 0. Notation used in the statements
 

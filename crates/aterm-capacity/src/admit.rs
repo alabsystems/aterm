@@ -1112,15 +1112,41 @@ pub(crate) fn memory_turn(ahead: &[(&Other<'_>, u64)], available: u64) -> Memory
     for (i, (o, reserve)) in waiting {
         whole = whole.saturating_add(*reserve);
         let wanted = reserve.saturating_add(o.record.need.margin);
-        let starts =
-            !o.record.need.alone && room >= wanted && passes.is_none_or(|most| wanted <= most);
+        let holdback = o
+            .record
+            .need
+            .lead_reservation
+            .as_ref()
+            .filter(|_| o.record.need.critical)
+            .map_or(0, |proof| proof.holdback);
+        let protected_wanted = wanted.saturating_add(holdback);
+        let starts = !o.record.need.alone
+            && room >= protected_wanted
+            && passes.is_none_or(|most| protected_wanted <= most);
         if starts {
             // What it takes comes off the room and off what each waiter it goes first past
-            // spares: a later claim's turn is held to the room both leave.
-            room -= reserve;
-            passes = passes.map(|most| most.saturating_sub(*reserve));
+            // spares: a later claim's turn is held to the room both leave. A critical waiter
+            // also protects its admission margin until it has actually won the turn; otherwise
+            // a later small claim can consume that margin first and make the real admission stop
+            // fitting. Once held, its live ancestors occupy the spare and ordinary held-claim
+            // accounting applies.
+            let protected = reserve
+                .saturating_add(if o.record.need.critical {
+                    o.record.need.margin
+                } else {
+                    0
+                })
+                .saturating_add(holdback);
+            room -= protected;
+            passes = passes.map(|most| most.saturating_sub(protected));
         } else {
-            let short = blocked.saturating_add(wanted).saturating_sub(room);
+            // A retained lead's holdback represents claims that this later asker's ancestry may
+            // have hidden from `ahead`. It is part of the turn we promise, not merely the fit
+            // check above: omitting it here would let `spare` spend the very overshoot that
+            // protects those hidden claims.
+            let short = blocked
+                .saturating_add(protected_wanted)
+                .saturating_sub(room);
             // What first in, first out leaves beside it: the room past its reservation and every
             // earlier one's that cannot start.
             let beside = room.saturating_sub(blocked).saturating_sub(*reserve);
@@ -1130,14 +1156,25 @@ pub(crate) fn memory_turn(ahead: &[(&Other<'_>, u64)], available: u64) -> Memory
             } else if short == 0 {
                 // It fits beside them, its margin too, and waits only for one ahead that cannot
                 // start: a claim that leaves it that fit never delays it.
-                beside.saturating_sub(o.record.need.margin)
+                beside
+                    .saturating_sub(o.record.need.margin)
+                    .saturating_sub(holdback)
             } else {
                 // Where no claim's end brings what it lacks, it waits for memory no claim holds:
                 // it spares what first in, first out left beside its reservation, so a claim
                 // behind it still waits only for the claims ahead of it to end. That is none for
                 // a need of no margin, which lacks room beside the reservations then; one with a
                 // margin (a VM's boot) may fit beside them, its margin aside.
-                spare(&releases, short).unwrap_or(beside)
+                let funded = spare(&releases, short);
+                if o.record.need.critical && o.record.need.lead_reservation.is_some() {
+                    // A retained critical wait owns each byte its terminal sponsors deliver.
+                    // After one disappears, the kernel's available reading may lag its end; no
+                    // later unit may refill that gap. A known release may still leave a bounded
+                    // overshoot, which is safe backfill by the same subset-sum proof as CAP3.
+                    funded.unwrap_or(0)
+                } else {
+                    funded.unwrap_or(beside)
+                }
             };
             spared[i] = Some(own);
             passes = Some(passes.map_or(own, |most| most.min(own)));
@@ -1418,17 +1455,17 @@ fn kin_of(r: &Record, pid: u32, ancestors: &[u32]) -> bool {
 /// `available` now, less what each parent's holder has yet to use of its claims, plus what each
 /// other holder's tree uses now, at most its claims, which its end gives back; a claim no tree
 /// measures gives back only its reservation. A parent held ALONE leaves no lead room
-/// ([`Short::Alone`]). The first lead that does not fit ends them, since each lead waits for the
-/// leads ahead of it. With no process sweep or no reading of memory, none is sure.
+/// ([`Short::Alone`]). A retained lead is not sure for a waiter descended from one of its
+/// sponsors: that waiter may be work the sponsor must join before ending, so letting it pass is
+/// the ABBA escape. The first lead that is not sure ends them, since each later lead waits for it.
+/// With no process sweep none is sure; without a current memory reading only a retained lead can
+/// be sure.
 fn sure_leads(
     records: &[&Record],
     asker: (u32, &[u32]),
     procs: Option<&crate::Procs>,
     available: Option<u64>,
 ) -> Vec<(u64, u32, u64)> {
-    let (Some(procs), Some(available)) = (procs, available) else {
-        return Vec::new();
-    };
     let mut leads: Vec<&Record> = records
         .iter()
         .copied()
@@ -1438,6 +1475,56 @@ fn sure_leads(
         return Vec::new();
     }
     leads.sort_unstable_by_key(|r| (r.need.rank, r.order()));
+    let mut sure = Vec::with_capacity(leads.len());
+    for lead in leads {
+        if let Some(proof) = lead
+            .need
+            .critical
+            .then_some(lead.need.lead_reservation.as_ref())
+            .flatten()
+        {
+            // A still-held sponsor may have spawned capacity-aware work after the proof was
+            // written. That descendant must pass the lead so the sponsor can join it and deliver
+            // the pledge. Once the exact sponsor claim ends, it has delivered its memory: its
+            // old PID (or a reused one) grants no exemption.
+            let sponsor_parent = proof.sponsors.iter().any(|sponsor| {
+                (sponsor.order.1 == asker.0 || asker.1.contains(&sponsor.order.1))
+                    && records.iter().any(|record| {
+                        record.order() == sponsor.order
+                            && record.held.is_some()
+                            && record.accounting == crate::Accounting::Holder
+                            && record.need.critical
+                            && record.need.mem == sponsor.bytes
+                    })
+            });
+            if procs.is_none() || sponsor_parent {
+                break;
+            }
+            sure.push(lead.order());
+            continue;
+        }
+        let (Some(procs), Some(available)) = (procs, available) else {
+            break;
+        };
+        if !lead_fits_after_independent_holders(lead, records, asker, procs, available) {
+            break;
+        }
+        sure.push(lead.order());
+    }
+    sure
+}
+
+/// The snapshot proof used by an ordinary lead, and by a critical lead before it retains
+/// terminal funding: it fits once every independent held claim has ended, beside every parent
+/// that may need the asking waiter to run. A retained proof is stronger because it survives its
+/// sponsor record's disappearance and a lagging available-memory reading.
+fn lead_fits_after_independent_holders(
+    lead: &Record,
+    records: &[&Record],
+    asker: (u32, &[u32]),
+    procs: &Procs,
+    available: u64,
+) -> bool {
     let mut lines: HashMap<u32, Vec<u32>> = HashMap::from([(asker.0, asker.1.to_vec())]);
     for r in records.iter().filter(|r| r.held.is_none()) {
         lines.entry(r.pid).or_insert_with(|| procs.ancestors(r.pid));
@@ -1462,46 +1549,192 @@ fn sure_leads(
     roots.sort_unstable();
     roots.dedup();
     let trees = procs.trees(&roots);
-    let mut sure = Vec::with_capacity(leads.len());
-    for lead in leads {
-        let line = lines.get(&lead.pid).map_or(&[][..], Vec::as_slice);
-        let theirs: Vec<(&Record, bool)> = held
-            .iter()
-            .copied()
-            .filter(|(r, _)| !kin_of(r, lead.pid, line))
-            .collect();
-        if theirs
-            .iter()
-            .any(|(r, parent)| *parent && r.held.is_some_and(|h| h.alone))
-        {
-            break;
-        }
-        // Each holder's claims none of the lead's kin, and whether one of them is a parent.
-        let mut holders: HashMap<u32, (u64, bool)> = HashMap::new();
-        for (r, parent) in theirs
-            .iter()
-            .filter(|(r, _)| r.accounting == crate::Accounting::Holder)
-        {
-            let slot = holders.entry(r.pid).or_default();
-            slot.0 = slot.0.saturating_add(r.need.mem_now());
-            slot.1 |= *parent;
-        }
-        let (mut back, mut owed) = (0u64, 0u64);
-        for (pid, (claimed, parent)) in holders {
-            let used = trees.get(&pid).map_or(0, |t| t.charged);
-            if parent {
-                owed = owed.saturating_add(claimed.saturating_sub(used));
-            } else {
-                back = back.saturating_add(used.min(claimed));
-            }
-        }
-        let room = available.saturating_add(back).saturating_sub(owed);
-        if room < lead.need.mem.saturating_add(lead.need.margin) {
-            break;
-        }
-        sure.push(lead.order());
+    let line = lines.get(&lead.pid).map_or(&[][..], Vec::as_slice);
+    let theirs: Vec<(&Record, bool)> = held
+        .iter()
+        .copied()
+        .filter(|(r, _)| !kin_of(r, lead.pid, line))
+        .collect();
+    if theirs
+        .iter()
+        .any(|(r, parent)| *parent && r.held.is_some_and(|h| h.alone))
+    {
+        return false;
     }
-    sure
+    // Each holder's claims none of the lead's kin, and whether one of them is a parent.
+    let mut holders: HashMap<u32, (u64, bool)> = HashMap::new();
+    for (r, parent) in theirs
+        .iter()
+        .filter(|(r, _)| r.accounting == crate::Accounting::Holder)
+    {
+        let slot = holders.entry(r.pid).or_default();
+        slot.0 = slot.0.saturating_add(r.need.mem_now());
+        slot.1 |= *parent;
+    }
+    let (mut back, mut owed) = (0u64, 0u64);
+    for (pid, (claimed, parent)) in holders {
+        let used = trees.get(&pid).map_or(0, |tree| tree.charged).min(claimed);
+        if parent {
+            owed = owed.saturating_add(claimed.saturating_sub(used));
+        } else {
+            back = back.saturating_add(used);
+        }
+    }
+    let room = available.saturating_add(back).saturating_sub(owed);
+    room >= lead.need.mem.saturating_add(lead.need.margin)
+}
+
+/// Retained funding for a terminal critical Release waiter.
+///
+/// `available` excludes pages in use. Every other held claim is budgeted at its immutable peak:
+/// its unused peak is unavailable to the lead even if a phased claim later steps back up. Ending
+/// one terminal sponsor returns its used pages and removes its unused reservation, exactly its
+/// whole peak. An irredundant set whose peaks cover the resulting shortage therefore funds the
+/// lead. Only already-held, memory-only, non-phased terminal critical claims from the same
+/// release checkout may sponsor. A later waiter unrelated to those sponsors counts the retained
+/// lead immediately. [`sure_leads`] lets a sponsor's own descendant pass as an explicit ABBA
+/// escape, because the sponsor may have to join that work before it can deliver its pledge.
+pub(crate) fn funded_lead_reservation(
+    lead: &Record,
+    records: &[&Record],
+    procs: &Procs,
+    available: Option<u64>,
+) -> Option<crate::LeadReservation> {
+    let available = available?;
+    let terminal = |record: &Record| {
+        record.accounting == crate::Accounting::Holder
+            && record.need.rank == crate::Rank::Release
+            && record.need.leads
+            && record.need.critical
+            && record.need.mem > 0
+            && record.need.run_mem.is_none()
+            && record.need.stepped.is_none()
+            && !record.need.alone
+            && !record.need.covers
+            && record.need.cores == 0
+            && record.need.disk == 0
+            && record.need.quiet.is_none()
+            && record.credit.is_empty()
+            && !record.checkout.is_empty()
+    };
+    if !terminal(lead)
+        || lead.held.is_some()
+        || lead.need.lead_reservation.is_some()
+        || records.iter().any(|record| {
+            record.held.is_none()
+                && record.need.leads
+                && (record.need.rank, record.order()) < (lead.need.rank, lead.order())
+        })
+    {
+        return None;
+    }
+
+    let line = procs.ancestors(lead.pid);
+    let relevant: Vec<&Record> = records
+        .iter()
+        .copied()
+        .filter(|record| {
+            record.held.is_some() && record.need.mem > 0 && !kin_of(record, lead.pid, &line)
+        })
+        .collect();
+    if relevant
+        .iter()
+        .any(|record| record.held.is_some_and(|held| held.alone))
+    {
+        return None;
+    }
+
+    // A holder's process tree is credited once across all of that holder's claims. Whole and
+    // cohort accounting have no numeric tree credit, so their whole immutable peaks stay owed.
+    let mut claims: HashMap<u32, (u64, usize)> = HashMap::new();
+    let mut roots = Vec::new();
+    let mut fixed_owed = 0u128;
+    for record in &relevant {
+        if record.accounting == crate::Accounting::Holder {
+            let entry = claims.entry(record.pid).or_default();
+            entry.0 = entry.0.saturating_add(record.need.mem);
+            entry.1 = entry.1.saturating_add(1);
+            roots.push(record.pid);
+        } else {
+            fixed_owed = fixed_owed.saturating_add(u128::from(record.need.mem));
+        }
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    let trees = procs.trees(&roots);
+    let mut unused = fixed_owed;
+    for (pid, (peak, _)) in &claims {
+        let used = trees.get(pid).map_or(0, |tree| tree.charged).min(*peak);
+        unused = unused.saturating_add(u128::from(peak.saturating_sub(used)));
+    }
+    let wanted = u128::from(lead.need.mem.saturating_add(lead.need.margin));
+    let needed = wanted
+        .saturating_add(unused)
+        .saturating_sub(u128::from(available));
+    if needed == 0 || needed > u128::from(u64::MAX) {
+        return None;
+    }
+
+    let mut eligible: Vec<&Record> = relevant
+        .iter()
+        .copied()
+        .filter(|record| {
+            terminal(record)
+                && record.pid != lead.pid
+                && record.checkout == lead.checkout
+                && claims
+                    .get(&record.pid)
+                    .is_some_and(|(_, count)| *count == 1)
+        })
+        .collect();
+    eligible.sort_unstable_by_key(|record| (std::cmp::Reverse(record.need.mem), record.order()));
+    let mut selected = Vec::new();
+    let mut pledged = 0u128;
+    for record in eligible {
+        pledged = pledged.saturating_add(u128::from(record.need.mem));
+        selected.push(record);
+        if pledged >= needed {
+            break;
+        }
+    }
+    if pledged < needed || selected.len() > crate::LEAD_SPONSORS_MAX {
+        return None;
+    }
+    let mut at = selected.len();
+    while at > 0 {
+        at -= 1;
+        let without = pledged.saturating_sub(u128::from(selected[at].need.mem));
+        if without >= needed {
+            pledged = without;
+            selected.remove(at);
+        }
+    }
+    let sponsor_orders: HashSet<(u64, u32, u64)> =
+        selected.iter().map(|record| record.order()).collect();
+    let holdback = u64::try_from(
+        records
+            .iter()
+            .filter(|record| {
+                record.held.is_some()
+                    && record.need.mem > 0
+                    && !sponsor_orders.contains(&record.order())
+            })
+            .map(|record| u128::from(record.need.mem))
+            .sum::<u128>()
+            .min(u128::from(u64::MAX)),
+    )
+    .unwrap_or(u64::MAX);
+    Some(crate::LeadReservation {
+        needed: u64::try_from(needed).ok()?,
+        holdback,
+        sponsors: selected
+            .into_iter()
+            .map(|record| crate::LeadSponsor {
+                order: record.order(),
+                bytes: record.need.mem,
+            })
+            .collect(),
+    })
 }
 
 /// The quiet claim whose reservation holds `mine` back at `now` (unix ms), among `records` (the
@@ -1579,7 +1812,14 @@ impl fmt::Display for Alone {
     }
 }
 
-/// Whether `need` fits now beside every claim ahead of the waiter at `mine` (held, or waiting ahead: one that leads where `need` does not ([`Need::leads`]), else one of a higher rank or the same rank since earlier, less the disk of a waiter no claim's end can admit: [`reservations`]), and, for a need of memory, under memory pressure short of critical ([`Short::Pressure`]), with no claim held alone ([`Short::Alone`]), or alone where it is short only of memory no claim holds and either asked to be or is below what can ever be available (ALONE, [`mod@admit`]): `Ok(what it is granted)`, or what it is short of. A waiter of `mine`'s own process (`mine.1`) is not ahead of its memory.
+/// Whether `need` fits now beside every claim ahead of the waiter at `mine` (held, or waiting
+/// ahead: one that leads where `need` does not ([`Need::leads`]), else one of a higher rank or
+/// the same rank since earlier, less the disk of a waiter no claim's end can admit:
+/// [`reservations`]), and, for a need of memory, under memory pressure short of critical
+/// ([`Short::Pressure`]), with no claim held alone ([`Short::Alone`]), or alone where it is short
+/// only of memory no claim holds and either asked to be or is below what can ever be available
+/// (ALONE, [`mod@admit`]): `Ok(what it is granted)`, or what it is short of. A waiter of `mine`'s
+/// own process (`mine.1`) is not ahead of its memory.
 pub(crate) fn decide(
     need: &Need,
     mine: (u64, u32, u64),
@@ -1943,13 +2183,14 @@ impl Claim {
             || !self.entry_custody
             || self.record.accounting != crate::Accounting::Holder
             || self.record.held.is_none()
+            || self.record.need.critical
             || !crate::ledger::memory_only(&self.record.need)
         {
             return Err((
                 self,
                 io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "only an original admitted non-covering ordinary memory-only claim can detach",
+                    "only an original admitted non-critical non-covering ordinary memory-only claim can detach",
                 ),
             ));
         }
@@ -2321,8 +2562,15 @@ impl Claim {
     ///
     /// # Errors
     /// The record could not be written, or the cohort namespace refuses numeric pid credit;
-    /// the claim keeps the credit it had.
+    /// a critical-path claim also refuses mutable custody edges. The claim keeps the credit it
+    /// had.
     pub fn credit(&mut self, pids: &[u32]) -> io::Result<()> {
+        if self.record.need.critical {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "critical-path claims have immutable process-tree custody",
+            ));
+        }
         #[cfg(unix)]
         if self.laid.is_cohort() {
             return Err(io::Error::new(
@@ -2401,9 +2649,15 @@ impl Claim {
     /// keeps the claim for another process is handed ([`Self::hand_off`], [`Self::adopt`]).
     ///
     /// # Errors
-    /// The `dup`'s.
+    /// The `dup`'s, or a critical-path claim refuses transferable custody.
     #[cfg(unix)]
     pub fn descriptor(&self) -> io::Result<std::os::fd::OwnedFd> {
+        if self.record.need.critical {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "critical-path claims have non-transferable holder custody",
+            ));
+        }
         self.laid.descriptor()
     }
 
@@ -3087,6 +3341,9 @@ impl Waiter {
         } else {
             Vec::new()
         };
+        let funded = procs.as_ref().and_then(|procs| {
+            funded_lead_reservation(&self.record, &records, procs, reading.available)
+        });
         // Coverage reads the claims before `counted` leaves out the ancestors': an ancestor's held
         // quiet claim is what covers this one.
         let mut need = std::borrow::Cow::Borrowed(&self.record.need);
@@ -3125,12 +3382,7 @@ impl Waiter {
         let records = if self.record.accounting == crate::Accounting::CohortOwned {
             records
         } else {
-            counted(
-                records,
-                self.record.pid,
-                procs.as_ref(),
-                reading.available.or(reading.physical),
-            )
+            counted(records, self.record.pid, procs.as_ref(), reading.available)
         };
         let mut claimants = HashSet::with_capacity(records.len() + 1);
         claimants.extend(records.iter().map(|r| r.pid));
@@ -3283,6 +3535,22 @@ impl Waiter {
             Ok((granted, _)) => granted.cores,
             Err(_) => ranked_grant(&need, mine, &reading, &others, now),
         };
+        if self.record.need.lead_reservation.is_none()
+            && decided.as_ref().is_err_and(|short| {
+                !short.shorts.is_empty()
+                    && short
+                        .shorts
+                        .iter()
+                        .all(|item| matches!(item, Short::Memory { .. }))
+            })
+            && let Some(reservation) = funded
+            && self
+                .laid
+                .append(&Record::lead_reservation_line(&reservation))
+                .is_ok()
+        {
+            self.record.need.lead_reservation = Some(reservation);
+        }
         Ok(Found {
             cores,
             decided,

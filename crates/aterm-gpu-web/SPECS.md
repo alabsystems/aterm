@@ -15,7 +15,7 @@ Source: `crates/aterm-gpu-web` (`src/lib.rs` 31, `src/messages_api_tests.rs` 6,
 plus mounted `crates/aterm-wasm/src/` modules: `effects_api.rs` 2, `facade_api.rs` 2,
 `messages_api.rs` 3, `notifications_api.rs` 4, `predict_api.rs` 15, `scroll_input_api.rs` 13,
 `scrollback_tiers_api.rs` 2 and `theme_api.rs` 13, for 94 tests in all). Gap numbers refer to the gap table in
-`AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 Result: **47 specs**, covering **94 tests**. **0 tests are non-spec samples** (§4).
 
@@ -49,7 +49,7 @@ here once the callee's theorem can be cited across crates (gap 12).
   are `f64::trunc`/`f64::round`; `as i32` is Rust's saturating float-to-int cast.
 - `bp` = `term.modes().bracketed_paste()`.
 - `blocking_gaps` numbers are rows of the gap table in
-  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (the installed seal) blocks every
+  `docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (the installed seal) blocks every
   spec and is not repeated in the column.
 
 ## 1. Specs (TSV)
@@ -226,25 +226,6 @@ tests/cpu_gpu_parity.rs	web_cpu_gpu_rgba8_parity	cpu-gpu-parity
   `notification-queue-bounded-fifo`, `display-row-cache-transparent`, `encode-key-refines-mode`
   (given the bitflags round trip), and the facade halves of `frame-gate`, `reflow-*` and
   `predict-facade-gates`.
-
-## 4. Proof order (easiest high-value first)
-
-> Status: `predict_api::session_reset_forgets_rtt_while_coordinate_reset_preserves_it` was deleted with the shared `aterm-wasm` `predict_api.rs` mount (it depended on a real 20 ms sleep and `Instant::now`; RTT retention belongs to `aterm-predict`'s injected-clock spec, and the facade halves are in `predict-facade-gates`).
-
-1. **The `ScrollInputState` family** (`scroll-accumulator`, `scroll-clamp-and-reset`,
-   `scroll-frac-px-and-stamp`): scalar `f64` arithmetic on a one-field struct, with no loops and
-   no cross-crate calls. Factoring each method into a pure `fn(f64, …) -> (f64, i32)` that the
-   `&mut self` method calls removes gap 2; the rest is an IEEE binary64 model in Clean
-   (`t − trunc(t)` exact, saturating `as i32`). The facade half of `scroll-export-composition`
-   then needs only gap 4 and aterm-core's `scroll_display` clamp.
-2. **`tier-caps-json`** (gaps 1, 3): one `format!` of a bool, the smallest `String`-carrier case.
-3. **`visual-mutators-bump`** (gaps 2, 4): a `u64::wrapping_add` and a frame lemma over disjoint
-   fields, which `frame-gate` stands on. `frame-gate` follows with a `damage_epoch` citation from
-   aterm-core (gap 12) that also settles §5.1.
-4. **`notification-queue-bounded-fifo`**: a bounded FIFO with the invariant `|q| ≤ 64`. Factoring
-   a pure `enqueue(&mut VecDeque, n)` out of the `Arc<Mutex<…>>` leaves gaps 1 and 4.
-5. **`webgl-present-result`**, its `is_ok` clause (an enum carrier only). The message clause waits
-   for the `String` model.
 
 ## 5. Open findings
 

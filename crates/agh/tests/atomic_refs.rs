@@ -69,6 +69,23 @@ fn batch() -> AtomicRefBatch {
     .expect("a batch")
 }
 
+#[test]
+fn graphql_cannot_silently_drop_a_native_main_observation() {
+    let world = world("native-main-guard");
+    let guarded = batch().observing_main(common::MAIN_SHA).unwrap();
+    let error = world.run(&guarded).unwrap_err();
+    assert_eq!(error.kind, Kind::Usage);
+    assert_eq!(error.side_effect, SideEffect::None);
+    assert!(world.journal.open().unwrap().is_empty());
+    assert!(
+        world
+            .fake
+            .seen()
+            .iter()
+            .all(|request| request.method == "GET")
+    );
+}
+
 impl World {
     fn run(
         &self,

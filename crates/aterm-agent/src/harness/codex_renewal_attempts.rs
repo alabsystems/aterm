@@ -628,7 +628,7 @@ impl<'a> ReceiptWriter<'a> {
             let path = cancellation_path(self.env, &current.id)?;
             let text = encoded(&cancellation)?;
             private_parent(&path)?;
-            super::super::upgrade_models::write_atomic_mode(&path, &text, Some(0o600))
+            super::super::atomic_write::write_atomic_mode(&path, &text, Some(0o600))
                 .map_err(|_| "cancel-write")?;
             flush_parent(&path)?;
             cancellation

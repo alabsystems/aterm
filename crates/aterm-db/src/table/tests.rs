@@ -510,9 +510,10 @@ fn admitted_session_reuses_the_fresh_control_lock_and_refuses_foreign_custody() 
     .unwrap()
     .unwrap();
     let expected = bootstrap.request().unwrap().binding().actor();
-    let error = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust())
-        .err()
-        .expect("the admitted journal retains the actual exclusive writer lock");
+    let error =
+        Journal::open_existing_until(bootstrap.journal_dir(), bootstrap.trust(), Instant::now())
+            .err()
+            .expect("the admitted journal retains the actual exclusive writer lock");
     assert_eq!(error.kind(), aterm_secrets::ErrorKind::JournalBusy);
     let session = Session::from_admitted_journal(&bootstrap, journal)
         .expect("authorizing the held journal must not reopen its lock");
@@ -1760,5 +1761,32 @@ fn table_repair_refuses_a_peer_until_its_roster_is_read_then_keeps_the_last() {
     assert!(
         kept.is_ok(),
         "a failed read keeps the last answer: {kept:?}"
+    );
+}
+
+/// A writer session keeps no look ([`Session::keep_look`]): each check a write makes observes the
+/// vault on its own call, so a write is judged by the vault as it stands, never by the moment its
+/// admission looked. CONTROL: an observed session keeps the look it is given.
+/// NEGATIVE CONTROL (2026-11-10): a `keep_look` that keeps any session's look lets the writer
+/// keep it (`a writer session keeps no look`).
+#[test]
+fn a_writer_session_keeps_no_look() {
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let mut writer = Session::open(&bootstrap).unwrap();
+    assert!(writer.journal.is_writer(), "the fixture's writer session");
+    let refused = writer.keep_look(client::VaultLook::new(bootstrap.paths()));
+    assert!(
+        refused.is_err() && writer.look.is_none(),
+        "a writer session keeps no look: {refused:?}"
+    );
+    drop(writer);
+    let mut reader = Session::observe(&bootstrap).unwrap();
+    reader
+        .keep_look(client::VaultLook::new(bootstrap.paths()))
+        .unwrap();
+    assert!(
+        reader.look.is_some(),
+        "CONTROL: an observed session keeps its look"
     );
 }

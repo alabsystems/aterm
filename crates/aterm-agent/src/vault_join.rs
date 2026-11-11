@@ -24,9 +24,9 @@ use aterm_secrets::members::desk::{self, Desk, Local};
 use aterm_secrets::members::join::{self, Dial, Stream};
 use aterm_secrets::members::joiner::Joining;
 use aterm_types::MutexExt as _;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod automatic;
 pub use automatic::{AutomaticJoinHandle, AutomaticJoins};
@@ -288,6 +288,56 @@ pub const VAULT_JOIN_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
 pub(crate) type DialWithin<'a> =
     dyn Fn(&str, Duration) -> aterm_secrets::Result<Box<dyn Stream>> + Sync + 'a;
 
+struct NumericPreparation<'a> {
+    to: SocketAddr,
+    fleet: Option<(&'a FleetSecret, &'a NodeIdentity)>,
+    until: Instant,
+    within: Duration,
+    control: Arc<aterm_net::tls::PreparationControl>,
+}
+
+impl join::Preparation for NumericPreparation<'_> {
+    fn connect(&self) -> aterm_secrets::Result<Box<dyn Stream>> {
+        let by = Instant::now()
+            .checked_add(self.within)
+            .map_or(self.until, |by| by.min(self.until));
+        let stream = match self.fleet {
+            Some(identity) => aterm_net::fleet_member::prepare_vault_join(
+                self.to,
+                identity,
+                (by, self.within),
+                &self.control,
+            ),
+            None => aterm_net::fleet_member::prepare_ask(self.to, (by, self.within), &self.control),
+        }
+        .map_err(|error| aterm_secrets::Error::new(error.to_string()))?;
+        Ok(Box::new(stream))
+    }
+
+    fn cancel(&self) {
+        self.control.cancel();
+    }
+}
+
+pub(crate) fn prepare_ask(
+    at: &str,
+    until: Instant,
+    within: Duration,
+) -> aterm_secrets::Result<Box<dyn join::Preparation>> {
+    let (host, port) = aterm_net::fleet_member::parse_host_port(at, None)
+        .map_err(|_| aterm_secrets::Error::new("invalid numeric member endpoint"))?;
+    let ip = host
+        .parse()
+        .map_err(|_| aterm_secrets::Error::new("member endpoint needs name resolution"))?;
+    Ok(Box::new(NumericPreparation {
+        to: SocketAddr::new(ip, port),
+        fleet: None,
+        until,
+        within,
+        control: Arc::new(aterm_net::tls::PreparationControl::new()),
+    }))
+}
+
 /// What a proof that tries members one after another ([`join::prove_first`]) reaches the member
 /// at an address by: `dial` with that member's address and how long its dial (connect and
 /// handshake) may take, `within` at most and never past `until`. Once `until` has passed it
@@ -364,6 +414,90 @@ pub fn prove_over_fleet_admitted(
         .iter()
         .map(|(host, _, port)| aterm_net::fleet_member::host_port(host, *port))
         .collect();
+    // A pending possession retains its original ordered/pinned retry policy. Fresh numeric
+    // routes may prepare concurrently; no request or possession is sent by their workers.
+    if let Some(until) = until
+        && join::pending_proof(paths).is_ok_and(|pending| !pending)
+    {
+        let numeric: Vec<_> = peers
+            .iter()
+            .filter_map(|(host, addr, port)| {
+                let ip = addr.or_else(|| host.parse().ok())?;
+                Some((
+                    aterm_net::fleet_member::host_port(host, *port),
+                    SocketAddr::new(ip, *port),
+                ))
+            })
+            .collect();
+        if !numeric.is_empty() {
+            let prepared = |at: &str| -> aterm_secrets::Result<Box<dyn join::Preparation + '_>> {
+                let (_, to) = numeric.iter().find(|(key, _)| key == at).ok_or_else(|| {
+                    aterm_secrets::Error::new("member has no retained numeric route")
+                })?;
+                Ok(Box::new(NumericPreparation {
+                    to: *to,
+                    fleet: Some((secret, me)),
+                    until,
+                    within: VAULT_JOIN_WITHIN,
+                    control: Arc::new(aterm_net::tls::PreparationControl::new()),
+                }))
+            };
+            let numeric_ats: Vec<_> = numeric.iter().map(|(at, _)| at.clone()).collect();
+            let sign_node =
+                |message: &[u8]| -> [u8; 64] { me.sign_record(desk::PROVE_RECORD, message) };
+            let mut missed = match join::prove_first_prepared_admitted(
+                paths,
+                &prepared,
+                until,
+                joining,
+                &sign_node,
+                &numeric_ats,
+                admission,
+            ) {
+                Ok(joined) => return Ok(joined),
+                Err(missed) if missed.signed_maybe => return Err(missed),
+                Err(missed) => missed,
+            };
+            let named: Vec<_> = peers
+                .iter()
+                .filter(|(host, _, _)| host.parse::<IpAddr>().is_err())
+                .map(|(host, _, port)| aterm_net::fleet_member::host_port(host, *port))
+                .collect();
+            if named.is_empty() {
+                return Err(missed);
+            }
+            let avoid: Vec<_> = numeric.iter().map(|(_, to)| *to).collect();
+            let reach = |at: &str, within: Duration| -> aterm_secrets::Result<Box<dyn Stream>> {
+                let by = Instant::now() + within;
+                let (host, _, port) = peers
+                    .iter()
+                    .find(|(host, _, port)| aterm_net::fleet_member::host_port(host, *port) == at)
+                    .ok_or_else(|| aterm_secrets::Error::new("member is in no retained book"))?;
+                let reached = aterm_net::fleet_member::dial_named_avoiding(
+                    host,
+                    *port,
+                    (secret, Some(me)),
+                    FleetOp::VaultJoin,
+                    (by, within),
+                    &avoid,
+                )
+                .map_err(|error| aterm_secrets::Error::new(error.to_string()))?;
+                Ok(Box::new(reached.transport.into_bounded_stream(by)?))
+            };
+            let dial = dial_until(Some(until), VAULT_JOIN_WITHIN, &reach);
+            let result = match admission {
+                Some(admission) => {
+                    join::prove_first_admitted(paths, &dial, joining, &sign_node, &named, admission)
+                }
+                None => join::prove_first(paths, &dial, joining, &sign_node, &named),
+            };
+            return result.map_err(|mut later| {
+                missed.refused.append(&mut later.refused);
+                missed.signed_maybe = later.signed_maybe;
+                missed
+            });
+        }
+    }
     let reach = |at: &str, within: Duration| -> aterm_secrets::Result<Box<dyn Stream>> {
         let by = std::time::Instant::now() + within;
         let (host, addr, port) = peers

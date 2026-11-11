@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for [`aterm_agent::harness::upgrade_drive::Row::attention`] classification across all 41 upgrade states and their [`crate::message_reporters::upgrade_exceptions`] digest entries.
+//! Tests for [`aterm_agent::harness::upgrade_drive::Row::attention`] classification across all 39 upgrade states and their [`crate::message_reporters::upgrade_exceptions`] digest entries.
 //! Classes are `Q` (quiet record), `F:kind` (fault), `D:kind` (digest entry), and `I:kind` (standing interrupt).
 
 use aterm_agent::harness::upgrade::{Agent, GAVE_UP, Phase, Request};
@@ -89,7 +89,6 @@ fn fixture(id: &str, age: u64) -> Row {
         "G18" => claude("not-foreground"),
         "G19" => claude("conversation-owner-ambiguous"),
         "G20" => claude("changed-before-signal"),
-        "G21" => claude("model-cache-warm"),
         "H01" => claude("terminal:tmux"),
         "H02" => failed("not-a-shell-job"),
         "H03" => failed("argv:--foo"),
@@ -177,11 +176,11 @@ fn class(row: &Row) -> String {
     }
 }
 
-/// Verifies the attention classification of all 41 upgrade states across [`AGES`].
+/// Verifies the attention classification of all 39 upgrade states across [`AGES`].
 #[test]
 fn every_upgrade_state_has_its_attention() {
     #[rustfmt::skip]
-    let table: [(&str, [&str; 3]); 40] = [
+    let table: [(&str, [&str; 3]); 39] = [
         ("G01", ["Q", "F:harness-stuck", "F:harness-stuck"]),
         ("G02", ["Q", "Q", "Q"]),
         ("G03", ["Q", "Q", "D:own-work"]),
@@ -202,7 +201,6 @@ fn every_upgrade_state_has_its_attention() {
         ("G18", ["Q", "D:suspended", "D:suspended"]),
         ("G19", ["Q", "F:harness-stuck", "F:harness-stuck"]),
         ("G20", ["Q", "F:harness-stuck", "F:harness-stuck"]),
-        ("G21", ["Q", "F:harness-stuck", "F:harness-stuck"]),
         ("H01", ["D:no-terminal", "D:no-terminal", "D:no-terminal"]),
         ("H02", ["D:refused-launch", "D:refused-launch", "D:refused-launch"]),
         ("H03", ["D:refused-launch", "D:refused-launch", "D:refused-launch"]),
@@ -277,9 +275,8 @@ fn the_relaunch_and_the_returned_prompt_reach_their_interrupts_on_time() {
 fn no_state_but_an_ended_agent_ever_interrupts() {
     let ids = [
         "G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08", "G09", "G10", "G11", "G12", "G13",
-        "G14", "G15", "G16", "G17", "G18", "G19", "G20", "G21", "H01", "H02", "H03", "H04", "S01",
-        "S02", "S03", "S04", "S05", "S06", "F01", "F02", "F03", "F04", "F05", "F06", "O01", "O02",
-        "X11",
+        "G14", "G15", "G16", "G17", "G18", "G19", "G20", "H01", "H02", "H03", "H04", "S01", "S02",
+        "S03", "S04", "S05", "S06", "F01", "F02", "F03", "F04", "F05", "F06", "O01", "O02", "X11",
     ];
     let mut interrupts = std::collections::BTreeSet::new();
     for id in ids {

@@ -272,6 +272,7 @@ fn drive<B: Backend>(
     let mut backend = Some(initial);
     let mut previous = None;
     let mut permanent = None;
+    let mut retry: Option<Failure> = None;
     loop {
         let left = end.saturating_duration_since(Instant::now());
         let line = if left.is_zero() {
@@ -321,6 +322,13 @@ fn drive<B: Backend>(
             continue;
         }
         if backend.is_none() {
+            if let Some(failure) = &retry
+                && failure.retry_at.is_some_and(|at| Instant::now() < at)
+            {
+                error(output, request.id, failure)?;
+                continue;
+            }
+            retry = None;
             let connect_end = end.min(Instant::now() + request.within);
             match reopen(&options, connect_end) {
                 Ok(connected) => backend = Some(connected),
@@ -328,6 +336,8 @@ fn drive<B: Backend>(
                     error(output, request.id, &failure)?;
                     if !failure.retry {
                         permanent = Some(failure);
+                    } else {
+                        retry = Some(failure);
                     }
                     continue;
                 }
@@ -346,6 +356,7 @@ fn drive<B: Backend>(
                 if failure.retry {
                     backend = None;
                     previous = None;
+                    retry = Some(failure.clone());
                 }
                 error(output, request.id, &failure)?;
             }
@@ -572,6 +583,43 @@ mod tests {
         let rows = rows(&output);
         assert_eq!(rows[2]["retryable"].as_bool(), Some(false));
         assert_eq!(rows[3]["retryable"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn a_session_preserves_the_retry_deadline_across_connection_replacement() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fake = Fake {
+            calls: Arc::clone(&calls),
+            messages: Vec::new(),
+            fail: true,
+        };
+        let mut opens = 0;
+        let mut output = Vec::new();
+        drive(
+            fake,
+            |_, _| {
+                opens += 1;
+                Err(Failure {
+                    message: "owned provider wait".into(),
+                    retry: true,
+                    retry_at: Some(Instant::now() + Duration::from_secs(3600)),
+                })
+            },
+            options(),
+            Instant::now() + Duration::from_secs(60),
+            Cursor::new(b"{\"id\":1,\"command\":\"list\"}\n{\"id\":2,\"command\":\"list\"}\n{\"id\":3,\"command\":\"list\"}\n{\"id\":4,\"command\":\"ping\"}\n".to_vec()),
+            &mut output,
+        ).unwrap();
+        assert_eq!(
+            opens, 1,
+            "the next request cannot reconnect before the provider deadline"
+        );
+        assert_eq!(*calls.lock().unwrap(), ["list"]);
+        let rows = rows(&output);
+        assert_eq!(rows[2]["message"].as_str(), Some("owned provider wait"));
+        assert_eq!(rows[3]["message"].as_str(), Some("owned provider wait"));
+        assert_eq!(rows[3]["retryable"].as_bool(), Some(true));
+        assert_eq!(rows[4]["type"].as_str(), Some("pong"));
     }
 
     #[test]

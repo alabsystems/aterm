@@ -27,6 +27,7 @@ pub(super) fn closed_request(request: &Submission) -> bool {
 pub(super) struct Preparation {
     prelude: crate::metadata_prelude::Owner,
     sdk: Arc<sdk::Keeper>,
+    deadline: Instant,
     prepared: bool,
     environment: Vec<(Vec<u8>, Vec<u8>)>,
 }
@@ -63,6 +64,7 @@ impl Preparation {
             Self {
                 prelude,
                 sdk,
+                deadline,
                 prepared: false,
                 environment,
             },
@@ -88,14 +90,22 @@ impl Preparation {
             sdk.validate_loaded(pid)
         })?;
         if prepared {
-            self.sdk.validate()?;
-            self.sdk.validate_loaded(child.id())?;
-            if !crate::metadata_prelude::no_fork(child.id())? {
-                return Err(refused("resolver root no-fork policy is unavailable"));
-            }
+            self.validate(child.id())?;
             self.prepared = true;
         }
         Ok(prepared)
+    }
+
+    fn validate(&self, pid: u32) -> io::Result<()> {
+        self.sdk.validate()?;
+        self.sdk.validate_loaded(pid)?;
+        if !crate::metadata_prelude::no_fork(pid)? {
+            return Err(refused("resolver root no-fork policy is unavailable"));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
     }
 
     pub(super) fn prepared(&self) -> bool {
@@ -135,19 +145,34 @@ impl Owner {
                 }
                 // Retain original admission through the durable write and
                 // recheck its actual claim immediately before final GO.
-                self.journal
-                    .update(&job.binding, "running", aterm_json::json!({}))?;
+                let (monotonic_ns, unix_ns) = start::clocks()?;
+                let started = Instant::now();
+                self.journal.update(
+                    &job.binding,
+                    "running",
+                    aterm_json::json!({"monotonic_ns":monotonic_ns,"unix_ns":unix_ns}),
+                )?;
                 job::inspection(&self.fence, &self.debt, job)?;
+                let pid = job.child.child_mut().id();
+                job.resolver
+                    .as_ref()
+                    .ok_or_else(|| refused("resolver root preparation unavailable"))?
+                    .validate(pid)?;
+                if job.timeout.is_some_and(|timeout| {
+                    started
+                        .checked_add(timeout)
+                        .is_none_or(|end| Instant::now() >= end)
+                }) {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
                 if job.events.cancelled() {
                     return Err(io::ErrorKind::Interrupted.into());
                 }
-                let (monotonic_ns, unix_ns) = start::clocks()?;
-                let started = Instant::now();
                 job.child.child_mut().resume()?;
                 job.started = started;
                 job.launched = true;
                 let _ = job.events.emit(Event::Started {
-                    pid: job.child.child_mut().id(),
+                    pid,
                     birth: job.root_birth,
                     monotonic_ns,
                     unix_ns,

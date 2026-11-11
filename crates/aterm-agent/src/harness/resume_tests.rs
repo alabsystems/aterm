@@ -52,7 +52,6 @@ fn line_of(dir: &ClaudeDir, pid: u32, started: Option<u64>, argv: &[String]) -> 
             offset_at: &offset,
         },
         None,
-        None,
     )
     .and_then(|facts| facts.resume)
 }
@@ -120,7 +119,6 @@ fn two_records_in_one_directory_each_pid_resumes_its_own_conversation() {
             now: 0,
             offset_at: &offset,
         },
-        None,
         None,
     )
     .expect("the footer reads the record");
@@ -341,7 +339,6 @@ fn the_footers_resume_line_carries_the_home_its_process_runs_under() {
                 now: 0,
                 offset_at: &offset,
             },
-            None,
             user_home,
         )
         .and_then(|facts| facts.resume)

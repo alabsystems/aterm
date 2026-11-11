@@ -1154,10 +1154,29 @@ fn enrollment_uses_only_typed_no_action_for_provider_route_refusal() {
             }
         }
     }
-    use crate::harness::{codex_enrollment::Phase, login_drive::Outcome};
+    use crate::harness::{
+        codex_enrollment::Phase,
+        login_drive::{NativePreparationStage, Outcome},
+    };
     for (outcome, expected) in [
         (
             Outcome::NotRun("original budget expired before native effects".into()),
+            Phase::Refused,
+        ),
+        (
+            Outcome::PreparationFailed(NativePreparationStage::RowPolicy),
+            Phase::Refused,
+        ),
+        (
+            Outcome::PreparationFailed(NativePreparationStage::GrantCustody),
+            Phase::Refused,
+        ),
+        (
+            Outcome::PreparationFailed(NativePreparationStage::NativeScope),
+            Phase::Refused,
+        ),
+        (
+            Outcome::PreparationFailed(NativePreparationStage::RowAdmission),
             Phase::Refused,
         ),
         (
@@ -1165,6 +1184,10 @@ fn enrollment_uses_only_typed_no_action_for_provider_route_refusal() {
             Phase::Running,
         ),
     ] {
+        let expected_stage = match &outcome {
+            Outcome::PreparationFailed(stage) => Some(*stage),
+            _ => None,
+        };
         let bed = Bed::new(Cli::Codex);
         let records = bed
             .store
@@ -1185,6 +1208,15 @@ fn enrollment_uses_only_typed_no_action_for_provider_route_refusal() {
         assert_eq!(status.phase, expected);
         assert_eq!(status.generation, None);
         assert_eq!(host.calls.get(), 1);
+        let (stored, warning) = bed.store.load_logins(bed.env.now).unwrap();
+        assert!(warning.is_none());
+        let (intent, diagnosed, stage) = stored
+            .enrollment
+            .diagnostics(&request.id, &request.caller)
+            .unwrap();
+        assert_eq!(intent, request.intent());
+        assert_eq!(diagnosed, status);
+        assert_eq!(stage, expected_stage);
         assert_eq!(
             enroll_codex_operation(&bed.env, &host, &request).unwrap(),
             status

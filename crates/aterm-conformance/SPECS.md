@@ -83,7 +83,7 @@ Measurement side (`src/measure`; constants are the `pub const`s of `scan.rs`, `p
   quantities are read from `ctx.statuses[i]`; "paired take" means `statuses = Some`.
 
 Gaps: `blocking gaps` numbers are rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7: 0 a seal that publishes Clean-discharged
+`docs/TRUST-LANE.md` (Blocking gaps): 0 a seal that publishes Clean-discharged
 rows (every row), 1 non-scalar carriers, 2 certified `&self`/`&mut self` views, 3 E6 body widening, 4
 callee-ensures composition, 5 quantified clauses, 6 plain-Rust clause publication, 7 loops, 8 effects,
 10 model→code refinement, 11 generics, 12 cross-crate citation, 13 threads and closures, 16 soundness.
@@ -487,12 +487,6 @@ tests/xterm_differential_regressions.rs	scroll_region_persists_into_alt_screen	a
 tests/xterm_differential_regressions.rs	scroll_region_set_in_alt_screen_persists_after_exit	alt-switch-keeps-margins	
 ```
 
-## 3. Coverage
-
-`rect-coords-resolution` is the lemma under all six rectangle rows, and `alt-screen-trio-model`,
-`decsc-decrc` and `pending-wrap-transitions` share the DECSC snapshot and the PW frame condition, so
-proving those first shortens the proofs that depend on them.
-
 ## 4. Measurements outside the ordinary test suite
 
 The 23 paint rows and 3 spin rows are explicit `harness = false` benchmarks in
@@ -514,14 +508,6 @@ remain deleted.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **(Fixed 2026-10-28.) Defects the specs previously carried as preconditions**
-   - `src/measure/starvation.rs::classify` now widens `sampling_hole_us > 2 * nominal_dt_us` and
-     `wall_us * BUDGET_PRESSURE_DEN >= budget_us * BUDGET_PRESSURE_NUM` to `u128`, and
-     `SchedReading::book` saturates `ticks`, `late_total_us`, `win_ticks`, and `win_late_total_us`.
-   - `src/measure/scan.rs::frame_background` now returns `[0, 0, 0]` when `width == 0 || height == 0`
-     (and `band_top` returns `None` when `w == 0`), so empty `Frame`s scan without panicking.
-   - `src/measure/scan.rs::scan_frames` now delegates through `driven_last_frame_indexed` and reports
-     the true offending `frame` index in `ScanError::MalformedStatus { frame, error }`.
 2. **Resolved rulings**
    - *(Resolved)* `tests/vt_categories3.rs::decncsm_preserves_cells_but_not_other_deccolm_resets`
      now holds DECNCSM to its documented scope: a DECCOLM transition retains cell contents and tab stops
@@ -534,11 +520,6 @@ remain deleted.
      (dropped trailing raw bytes keep a within-budget clamped prefix image on row 0 with `"OK"` on row 1; a
      raster allocation exceeding `MAX_DCS_GLOBAL_BUDGET` aborts the decoder, places no image, and prints
      `"OK"` on row 0), matching `process-total-and-recovers`.
-3. **(Fixed 2026-10-28.) Tests that previously sampled less than their name or comment claimed**
-   - `tests/conformance.rs::backspace_moves_cursor_left` now asserts cursor movement directly and BS saturation at column 0.
-   - `tests/vt_categories.rs::scroll_region_index_scrolls_only_the_region` now asserts row 3 (`d` moved up), row 4 (cleared), and row 5 (`e` below region untouched) in addition to rows 1 and 2.
-   - `tests/vt_categories.rs::ed1_erases_above_the_cursor` now asserts inclusive partial erase of cols `0..=1` on the cursor row (`"  t"`) and cursor preservation.
-   - `tests/vt_categories3.rs::deccolm_ignored_when_mode_40_is_reset` now queries DECRQM (`CSI ? 3 $ p` → `\x1b[?3;2$y`) instead of the vacuous 80-column clamp check.
 4. **Duplicates and redundant assertions**
    - `tests/xterm_differential_regressions.rs::scrolling_lf_clears_pending_wrap` says it mirrors aterm-grid's
      `each_operation_keeps_or_consumes_the_parked_wrap`
@@ -547,42 +528,3 @@ remain deleted.
    - *(Resolved)* `tests/kitty_mouse.rs::mouse_x10_coordinate_beyond_223_clamps_and_keeps_the_x10_frame`: removed the redundant `assert_ne!` implied by the preceding `assert_eq!`.
 5. **Stale prose**
    - *(Resolved)* Removed the stale `#[ignore = "ENGINE BUG: ..."]` header note from `tests/rect_ops.rs` and the stale DECSC summary comment from `tests/xterm_differential_regressions.rs`.
-
-## 6. Proof order
-
-Every row needs a non-scalar carrier (gap 1) or a body shape E6 refuses (gap 3), so the order starts
-with the rows nearest scalar code (`match` on literals, no loops, no `&mut self`) and moves outwards.
-The first five are in this crate and need no gap 12.
-
-1. **`qos-table`** (gaps 0, 3): a `match` on `u32` literals into a fieldless enum, decidable by
-   evaluation.
-2. **`paint-verdict-monotone`** and **`starvation-classify`** (gaps 0, 1, 3): `Copy` scalar inputs to
-   fieldless or scalar-payload enums. `classify` forces the overflow fix in §5.1: state the spec
-   without the `requires`, watch it fail, then saturate.
-3. **`cell-new-positive`** (0, 1), **`spin-judge`** (0, 1, 2) and **`ribbon-lit-predicates`** (0, 1,
-   2): straight-line `bool` logic over `Copy` structs read through `&self`, the first struct carriers
-   (gap 1) and certified `&self` views (gap 2).
-4. **`saturated-hue-floor`**, its Some/None half (0, 3): pure `u8` max/min arithmetic, once the float
-   value half is a separate clause. **`hue-set-buckets`** (0, 1, 3) follows: `u16` bit operations.
-5. **`paint-row-validate`** then **`paint-judge-denotation`** (0, 1, 2, 3, 5): enum matches and scalar
-   comparisons over the scan summary, with no loop but the `all()` over status rows; this makes the
-   paint verdict a theorem rather than a sample.
-6. **`rect-coords-resolution`** (0, 1, 2, 3), in aterm-core: saturating `u16` arithmetic over a params
-   slice and two mode bits, the lemma under DECFRA, DECERA, DECSERA, DECCARA, DECRARA and DECCRA.
-   **`decstbm-validity`** (0, 1, 2, 3, 6) has the same shape once its validity predicate is a pure
-   function.
-7. **`mouse-encode-format`** (0, 1, 3, 7, 12), in aterm-types: a pure encoder over `u8`/`u16` into a
-   `Vec<u8>` with one digit loop; the home crate already lists `mouse-x10`, `mouse-utf8` and
-   `mouse-decimal-forms`.
-8. The loop-and-collection scanner rows in dependency order (gaps 5 and 7): `bool-run-lengths` →
-   `rainbow-summary-over-distinct-samples` → `circular-hue-max` → `ink-objects-4-connected` →
-   `row-hue-separation`, `band-ink-partition`, `tall-component-records` →
-   `companion-component-selection`, `located-pet-component` → `dynamic-metrics-denotation` →
-   `driven-window-darkness` → the three `scan_frames` rows.
-9. The VT state rows in their home crates, on a `ty_model!` terminal model (gap 10 for the two
-   refinements): `pending-wrap-transitions` and `decsc-decrc` first, then `alt-screen-trio-model`, the
-   rectangle family and the reply tables (`vt-device-attributes`, `xtsmgraphics-replies`,
-   `vt-cpr-reports-cursor`).
-10. Last, the effectful rows (gaps 8 and 13): `scan-ink-and-recorded-continuity`'s `scan_dir` half,
-    `ctl-call-spent-budget`'s spawn half, `budget-await-event` and `sampler-lifecycle`. Factor the pure
-    core out first; `ctl-call-spent-budget`'s spent-budget branch is already pure.

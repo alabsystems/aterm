@@ -2116,7 +2116,7 @@ fn seat_of(store: &crate::session_store::Store, session: u64) -> Option<Seat> {
     };
     let pty_child = root_of(shell);
     let agent = crate::harness_host::published_snapshot(&sid).and_then(|snap| {
-        let start = aterm_agent::harness::upgrade_models::parse_lstart(&snap.start)?;
+        let start = aterm_agent::harness::unix_time::parse_lstart(&snap.start)?;
         Some((snap.pid, i64::try_from(start).ok()?))
     });
     Some(Seat {

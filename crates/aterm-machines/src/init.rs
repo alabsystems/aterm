@@ -1128,6 +1128,31 @@ fn entry(
     tab_var: Option<&std::ffi::OsStr>,
     tab_run: &dyn Fn(&Options, &Host<'_>) -> u8,
 ) -> ExitCode {
+    entry_with_system(
+        args,
+        host,
+        tab_var,
+        tab_run,
+        &crate::sessions::is_live_account,
+        &|| Box::new(Live::new().with_presence(host.present)),
+        &|current| host.converge.init_name(current),
+    )
+}
+
+type NameCompletion<'a> =
+    dyn Fn(&dyn Fn() -> Result<(), String>) -> Result<Option<String>, String> + 'a;
+
+/// The actual entry with its local process ports supplied; production constructs the
+/// live system only after the parser and tab/query routing have admitted ordinary setup.
+fn entry_with_system(
+    args: Vec<OsString>,
+    host: &Host<'_>,
+    tab_var: Option<&std::ffi::OsStr>,
+    tab_run: &dyn Fn(&Options, &Host<'_>) -> u8,
+    own_account: &dyn Fn() -> bool,
+    system: &dyn Fn() -> Box<dyn System>,
+    publish: &NameCompletion<'_>,
+) -> ExitCode {
     let mut options = match options(&args) {
         Ok(options) => options,
         Err(why) => {
@@ -1162,7 +1187,7 @@ fn entry(
         eprintln!("aterm init: {why}\n{}", usage());
         return ExitCode::from(2);
     }
-    if !crate::sessions::is_live_account() && !options.toolset_alone() {
+    if !own_account() && !options.toolset_alone() {
         eprintln!("aterm init: {AWAY_FROM_HOME}");
         return ExitCode::FAILURE;
     }
@@ -1196,7 +1221,7 @@ fn entry(
             host.grants,
         )
     };
-    let sys = Live::new().with_presence(host.present);
+    let sys = system();
     let cwd = std::env::current_dir().ok();
     let printer = Printer::new(options.verbose, options.json);
     let result = sys
@@ -1204,7 +1229,7 @@ fn entry(
         .map_err(Refused::Failed)
         .and_then(|mut journal| {
             converge(
-                &sys,
+                sys.as_ref(),
                 &options,
                 &Front {
                     base: &|applies| {
@@ -1231,7 +1256,7 @@ fn entry(
             )
         });
     printer.flush();
-    let rows = match result {
+    let mut rows = match result {
         Ok(rows) => rows,
         Err(Refused::Usage(why)) => {
             say_after_run(format_args!("aterm init: {why}\n{}", usage()));
@@ -1243,6 +1268,18 @@ fn entry(
             return ExitCode::FAILURE;
         }
     };
+    if let Some(row) = finish_init_name(
+        &options,
+        host.decided,
+        sys.as_ref(),
+        host.records,
+        &rows,
+        publish,
+    ) {
+        printer.row(&row);
+        printer.flush();
+        rows.push(row);
+    }
     let start = start.into_inner().unwrap_or_else(PoisonError::into_inner);
     let recorded = note_owed(
         &rows,
@@ -1296,6 +1333,72 @@ fn entry(
     answered.map_or_else(|failed| failed, |()| ExitCode::from(code))
 }
 
+/// Only a person's ordinary apply that selected and completed base.clt may align names.
+/// The completion port captures its target now, after root returned, and rechecks this
+/// Stop/record fence alongside its saved-name/policy fence before each OS effect.
+fn finish_init_name(
+    options: &Options,
+    decided: Decider,
+    sys: &dyn System,
+    records: &dyn Records,
+    rows: &[ItemReport],
+    publish: &NameCompletion<'_>,
+) -> Option<ItemReport> {
+    let mut root = rows.iter().filter(|row| row.id == crate::init_clt::ID);
+    if decided != Decider::Person
+        || options.action != Action::Apply
+        || options.help
+        || options.converge
+        || (!options.only.is_empty()
+            && !options
+                .only
+                .iter()
+                .any(|word| crate::init_clt::selected(word)))
+        || !root
+            .next()
+            .is_some_and(|row| matches!(row.outcome, Outcome::Ok | Outcome::Changed))
+        || root.next().is_some()
+    {
+        return None;
+    }
+    let current = || {
+        if sys.stopped().is_some() {
+            return Err("setup was stopped before its machine names finished".into());
+        }
+        let holds = records.holds();
+        if holds.newer {
+            return Err("a newer setup record holds machine naming unchanged".into());
+        }
+        if let Some(why) = holds.stopped {
+            return Err(why);
+        }
+        Ok(())
+    };
+    let began = std::time::Instant::now();
+    let result = current().and_then(|()| publish(&current));
+    let mut row = match result {
+        Ok(None) => return None,
+        Ok(Some(now)) => {
+            let mut row = held_row("sync.identity", "Mac names", String::new());
+            row.outcome = Outcome::Ok;
+            row.to = Some(now);
+            row.why = None;
+            row
+        }
+        Err(why) => {
+            let mut row = held_row("sync.identity", "Mac names", why);
+            row.outcome = Outcome::Blocked;
+            row.essential = true;
+            row
+        }
+    };
+    row.family = "identity".into();
+    row.layer = Some(Layer::Base);
+    row.class = Some(Class::Preference);
+    row.elapsed_ms = Some(u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX));
+    Some(row)
+}
+
 /// The id of the row `--json` carries for the line of what the person's choices in System
 /// State held ([`held_row`]).
 const HELD: &str = "init.system-state";
@@ -1345,10 +1448,6 @@ fn in_tab(var: Option<&std::ffi::OsStr>, options: &Options) -> bool {
 /// 1, which say the run printed its last line, so the window ends the tab itself if it still
 /// shows ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_STARTED`]).
 const TAB_NOT_STARTED: u8 = aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_STARTED;
-
-/// Clears the tab's screen and scrollback once its run starts, so nothing typed or echoed while
-/// it waited for the go line stays in view.
-const TAB_CLEAR: &str = "\x1b[H\x1b[2J\x1b[3J";
 
 /// [`tab`] on this Mac: its words on this run's terminal, its install in this account.
 fn tab_entry(options: &Options, host: &Host<'_>) -> u8 {
@@ -1412,14 +1511,9 @@ fn tab(
     // as soon as the tab lands, often before this run reaches here, and a read that discarded
     // typed-ahead input would wait for a line that never comes again. The screen clear after
     // it removes the line's echo.
-    let go = sys.ask_kept("");
-    if !matches!(&go, Ok(Some(line))
-        if line.bytes() == aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO.as_bytes())
-    {
+    if !crate::init_clt::await_tab_go(sys, out) {
         return TAB_NOT_STARTED;
     }
-    drop(go);
-    out.write(TAB_CLEAR);
     let installed = if live() {
         converge(out).is_ok_and(|rows| {
             rows.iter().any(|row| {
@@ -1819,6 +1913,14 @@ pub enum OwedClone {
     Nothing(String),
     /// The private vault inventory was read and every repository verified locally.
     Verified { present: usize, total: usize },
+    /// Every repository of the private vault inventory has a matching checkout here, but
+    /// `unborn` of them have no commit and no current proof that their remote is empty: only a
+    /// read of each remote, which acquires any commits it finds, can verify them.
+    Unobserved {
+        present: usize,
+        unborn: usize,
+        total: usize,
+    },
     /// One is owed, but init.toml turned the GitHub step off since: why.
     Off(String),
     /// One is owed, and the token it waits for, or the git every clone runs, is not on this Mac
@@ -1877,6 +1979,12 @@ fn stamped_holds(record: &str) -> Holds {
     holds
 }
 
+fn later_clone_hold(record: &str, now: &Holds) -> Option<String> {
+    now.later(&stamped_holds(record), Setting::Repositories)
+        .then(|| now.line(&[Setting::Repositories], false))
+        .flatten()
+}
+
 /// The account's converge state under `state`, where [`CLONE_OWED`] lives.
 fn converge_state(state: &Path) -> PathBuf {
     state.join(aterm_converge::FileJournal::DIR)
@@ -1928,6 +2036,209 @@ pub(crate) fn owe_clone(state: &Path, start: &Holds) -> Result<(), String> {
 /// The line [`CLONE_OWED`] carries when the step's last run stopped at a step only a person
 /// can take: the step's mark then ([`crate::init_github::TokenRead::mark`]) follows it.
 const PERSON_MARK: &str = "mark ";
+
+/// The fresh control check before a subscriber starts repository work. This checks
+/// current policy and the bounded debt record, never Git or checkout readiness.
+/// A pending typed credential withdrawal retains its ordinary source admission;
+/// this reading alone authorizes no repository effect or completion.
+///
+/// # Errors
+/// The local account, profile, debt record or applicable withdrawal cannot be read safely.
+pub fn owed_clone_control(
+    sys: &dyn System,
+    state: &Path,
+    now: &Holds,
+) -> Result<Option<String>, String> {
+    let ctx = repository_context(sys)?;
+    // Explicit opt-out may still retire its existing credential request. Preserve
+    // this canonical local-only path before Off, while the person's holds still win.
+    if !now.holds(Setting::Repositories)
+        && crate::init_github::RepositoryCredentialWithdrawal::capture(sys, &ctx)?.is_some()
+    {
+        return Ok(None);
+    }
+    let dir = converge_state(state);
+    let record = match aterm_uds::private_file::read_private(&dir, CLONE_OWED, 4096) {
+        Ok(record) => Some(record),
+        Err(aterm_uds::private_file::PrivateFileError::Missing) => None,
+        Err(why) => return Err(format!("{}: {why}", dir.join(CLONE_OWED).display())),
+    };
+    clone_control_hold(sys, &ctx, now, record.as_deref())
+}
+
+fn clone_control_hold(
+    sys: &dyn System,
+    ctx: &Ctx,
+    now: &Holds,
+    record: Option<&[u8]>,
+) -> Result<Option<String>, String> {
+    if !crate::init_github::settings_managed(sys, &ctx.users[0])? {
+        return Ok(Some("off: init.toml's [github] enabled = false".into()));
+    }
+    if now.stopped.is_some() || now.newer {
+        return Ok(Some(now.why(Setting::Repositories)));
+    }
+    Ok(match record {
+        Some(record) => later_clone_hold(&String::from_utf8_lossy(record), now),
+        None => now
+            .holds(Setting::Repositories)
+            .then(|| now.why(Setting::Repositories)),
+    })
+}
+
+/// The bounded control intent of one repository apply, retaining the original
+/// debt file so a later request cannot grant an older captured operation.
+/// Credential, source, inventory and checkout admission remain independent.
+pub struct OwedCloneIntent {
+    state: PathBuf,
+    user: crate::model::User,
+    holds: Holds,
+    debt: Option<CloneDebt>,
+    withdrawal: bool,
+}
+
+struct CloneDebt {
+    file: std::fs::File,
+    bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for OwedCloneIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwedCloneIntent(..)")
+    }
+}
+
+impl CloneDebt {
+    fn read(state: &Path) -> Result<Option<Self>, String> {
+        use std::io::Read as _;
+        let dir = converge_state(state);
+        let (file, metadata) = match aterm_uds::private_file::open_private(&dir, CLONE_OWED) {
+            Ok(opened) => opened,
+            Err(aterm_uds::private_file::PrivateFileError::Missing) => return Ok(None),
+            Err(why) => return Err(format!("{}: {why}", dir.join(CLONE_OWED).display())),
+        };
+        if metadata.len() > 4096 {
+            return Err("the repository debt record exceeds its 4096-byte bound".into());
+        }
+        let mut bytes = Vec::new();
+        (&file)
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|why| format!("{}: {why}", dir.join(CLONE_OWED).display()))?;
+        if bytes.len() > 4096 {
+            return Err("the repository debt record exceeds its 4096-byte bound".into());
+        }
+        Ok(Some(Self { file, bytes }))
+    }
+
+    fn same(&self, other: &Self) -> Result<bool, String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let before = self.file.metadata().map_err(|why| why.to_string())?;
+        let now = other.file.metadata().map_err(|why| why.to_string())?;
+        Ok((before.dev(), before.ino()) == (now.dev(), now.ino()) && self.bytes == other.bytes)
+    }
+}
+
+impl OwedCloneIntent {
+    /// Capture the current control policy and exact optional private debt record.
+    /// An older repository switch may be overridden only by that named request.
+    /// # Errors
+    /// Current policy holds the work, or account, profile or debt cannot be read safely.
+    pub fn capture(sys: &dyn System, state: &Path, now: &Holds) -> Result<Self, String> {
+        let ctx = repository_context(sys)?;
+        let debt = CloneDebt::read(state)?;
+        let held = now.holds(Setting::Repositories);
+        if held
+            && let Some(why) = clone_control_hold(
+                sys,
+                &ctx,
+                now,
+                debt.as_ref().map(|debt| debt.bytes.as_slice()),
+            )?
+        {
+            return Err(why);
+        }
+        // Capture this purpose before effects. A callback inside retirement must
+        // not discover new ledger work or invalidate its own completed cleanup.
+        let withdrawal =
+            crate::init_github::RepositoryCredentialWithdrawal::capture(sys, &ctx)?.is_some();
+        if withdrawal {
+            if held {
+                return Err(now.why(Setting::Repositories));
+            }
+        } else if !held
+            && let Some(why) = clone_control_hold(
+                sys,
+                &ctx,
+                now,
+                debt.as_ref().map(|debt| debt.bytes.as_slice()),
+            )?
+        {
+            return Err(why);
+        }
+        Ok(Self {
+            state: state.to_path_buf(),
+            user: ctx.users[0].clone(),
+            holds: now.clone(),
+            debt,
+            withdrawal,
+        })
+    }
+
+    /// Whether this same account, state root, debt and policy permit the next effect.
+    /// A new debt cannot supply an override to an operation captured without it.
+    /// # Errors
+    /// A current account, profile or private debt reading is unsafe or unavailable.
+    pub fn current(&self, sys: &dyn System, state: &Path, now: &Holds) -> Result<bool, String> {
+        if state != self.state.as_path() || now.later(&self.holds, Setting::Repositories) {
+            return Ok(false);
+        }
+        let ctx = repository_context(sys)?;
+        if ctx.users[0] != self.user {
+            return Ok(false);
+        }
+        let debt = CloneDebt::read(state)?;
+        let same = match (&self.debt, &debt) {
+            (None, None) => true,
+            (Some(before), Some(now)) => before.same(now)?,
+            _ => false,
+        };
+        if !same {
+            return Ok(false);
+        }
+        if self.withdrawal {
+            // The separately captured withdrawal still validates its own source,
+            // request and account. This is only the original unheld caller guard.
+            return Ok(!now.holds(Setting::Repositories));
+        }
+        Ok(clone_control_hold(
+            sys,
+            &ctx,
+            now,
+            debt.as_ref().map(|debt| debt.bytes.as_slice()),
+        )?
+        .is_none())
+    }
+
+    /// Recheck one ordinary apply's captured source as well as its control intent.
+    /// An empty selection cannot turn a named clone into cleanup over a held group.
+    /// # Errors
+    /// The current local account, policy, debt or captured source cannot be read safely.
+    pub fn current_inputs(
+        &self,
+        sys: &dyn System,
+        state: &Path,
+        now: &Holds,
+        inputs: &crate::init_github::InitialRepositoryInputs,
+    ) -> Result<bool, String> {
+        if !self.current(sys, state, now)?
+            || (inputs.selects_no_repositories() && now.holds(Setting::Repositories))
+        {
+            return Ok(false);
+        }
+        inputs.is_current_now(sys)
+    }
+}
 
 /// `sync.clone`'s reading under the account's state directory `state`: whether an `aterm init`
 /// owes its GitHub step ([`note_owed`]), whether the person's choices in System State (`now`)
@@ -2034,7 +2345,10 @@ pub fn owed_clone_captured(
         // The full vault fence is current, but the capture never admitted local
         // repository work. Preserve holds and unfinished dispositions; never promote
         // a later local observation through this blocked capture.
-        if matches!(&value, OwedClone::Due(_) | OwedClone::Verified { .. }) {
+        if matches!(
+            &value,
+            OwedClone::Due(_) | OwedClone::Verified { .. } | OwedClone::Unobserved { .. }
+        ) {
             return Ok(OwedClone::Waiting(why.into()));
         }
     } else if !inputs.is_current_now(sys)? {
@@ -2071,9 +2385,7 @@ fn owed_clone_with(
     if now.stopped.is_some() || now.newer {
         return Ok(OwedClone::Waiting(now.why(Setting::Repositories)));
     }
-    if now.later(&stamped_holds(&record), Setting::Repositories)
-        && let Some(line) = now.line(&[Setting::Repositories], false)
-    {
+    if let Some(line) = later_clone_hold(&record, now) {
         return Ok(OwedClone::Held(line));
     }
     // Live callers already captured the default source. A standalone legacy
@@ -2310,20 +2622,31 @@ fn automatic_clone(
         None => crate::init_github::automatic_inventory_counts(sys, &ctx),
     };
     match counted {
-        Ok(Some((0, 0))) => Ok(OwedClone::Nothing(
+        Ok(Some(counts)) if counts.total == 0 => Ok(OwedClone::Nothing(
             "the private inventory selects no repositories".into(),
         )),
-        Ok(Some((present, total))) if present == total => {
+        Ok(Some(counts)) if counts.all_here() => {
             if crate::init_github::RepositorySelection::acknowledgment_due(sys, &ctx.users[0])? {
                 Ok(OwedClone::Due(
                     "confirm the delivered repository credential locally".into(),
                 ))
+            } else if counts.unborn == 0 {
+                Ok(OwedClone::Verified {
+                    present: counts.present,
+                    total: counts.total,
+                })
             } else {
-                Ok(OwedClone::Verified { present, total })
+                Ok(OwedClone::Unobserved {
+                    present: counts.present,
+                    unborn: counts.unborn,
+                    total: counts.total,
+                })
             }
         }
-        Ok(Some((present, total))) => Ok(OwedClone::Due(format!(
-            "{present}/{total} repositories from the private vault are present; fleet setup clones the rest"
+        Ok(Some(counts)) => Ok(OwedClone::Due(format!(
+            "{}/{} repositories from the private vault are present; fleet setup clones the rest",
+            counts.present + counts.unborn,
+            counts.total
         ))),
         Ok(None) => Ok(nothing()),
         Err(why) => Ok(OwedClone::Waiting(why)),
@@ -6504,6 +6827,7 @@ const fn word(outcome: Outcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::init_clt::TAB_CLEAR;
     use crate::items::defaults::tests::{ctx, export, user};
     use crate::model::{Effect, Probe};
     use crate::port::{Fake, Ran, Stat};
@@ -8324,6 +8648,118 @@ mod tests {
             "no machine command runs: {:?}",
             sys.calls()
         );
+
+        // Ordinary explicit init aligns names only after the selected root row really
+        // succeeded. The existing released-store premise remains in force at this boundary.
+        let mut ready = row.clone();
+        ready.outcome = Outcome::Ok;
+        ready.why = None;
+        let explicit = Options {
+            only: vec![crate::init_clt::ID.into()],
+            ..Options::default()
+        };
+        let publishes = std::cell::Cell::new(0);
+        let publish = |current: &dyn Fn() -> Result<(), String>| {
+            assert!(released.load(Ordering::SeqCst));
+            current()?;
+            publishes.set(publishes.get() + 1);
+            Ok(Some("macOS names match m85 Dog / m85-dog".into()))
+        };
+        let aligned = finish_init_name(
+            &explicit,
+            Decider::Person,
+            &sys,
+            &NoRecords,
+            &[ready.clone()],
+            &publish,
+        );
+        assert!(
+            aligned.is_some(),
+            "successful explicit base.clt must finish its fresh naming projection"
+        );
+        assert_eq!(publishes.get(), 1);
+        for (decided, action, only, root) in [
+            (Decider::Aterm, Action::Apply, vec![], ready.clone()),
+            (Decider::Person, Action::Check, vec![], ready.clone()),
+            (Decider::Person, Action::Plan, vec![], ready.clone()),
+            (
+                Decider::Person,
+                Action::Apply,
+                vec!["keyboard".into()],
+                ready.clone(),
+            ),
+            (
+                Decider::Person,
+                Action::Apply,
+                vec!["github".into()],
+                ready.clone(),
+            ),
+            (Decider::Person, Action::Apply, vec![], row.clone()),
+        ] {
+            let selected = Options {
+                action,
+                only,
+                ..Options::default()
+            };
+            assert!(
+                finish_init_name(&selected, decided, &sys, &NoRecords, &[root], &publish).is_none()
+            );
+        }
+        assert_eq!(
+            publishes.get(),
+            1,
+            "unasked, query, unrelated and deferred root lanes do not publish names"
+        );
+        let mut independent = ready.clone();
+        independent.id = "github.repositories@alice".into();
+        independent.class = Some(Class::Preference);
+        independent.outcome = Outcome::Failed;
+        assert!(
+            finish_init_name(
+                &explicit,
+                Decider::Person,
+                &sys,
+                &NoRecords,
+                &[ready.clone(), independent],
+                &publish
+            )
+            .is_some(),
+            "an independent repository failure does not suppress completed naming work"
+        );
+        let mut root_failed = ready.clone();
+        root_failed.outcome = Outcome::Failed;
+        assert!(
+            finish_init_name(
+                &explicit,
+                Decider::Person,
+                &sys,
+                &NoRecords,
+                &[ready.clone(), root_failed],
+                &publish
+            )
+            .is_none()
+        );
+        assert_eq!(
+            publishes.get(),
+            2,
+            "failed root work is never treated as a successful root return"
+        );
+        let mut deferred = ready.clone();
+        deferred.id = crate::init_fseventsd::ID.into();
+        deferred.outcome = Outcome::Deferred;
+        assert!(
+            finish_init_name(
+                &explicit,
+                Decider::Person,
+                &sys,
+                &NoRecords,
+                &[ready, deferred],
+                &publish
+            )
+            .is_some(),
+            "an unrelated elevation-class row that never attempted root does not suppress names"
+        );
+        assert_eq!(publishes.get(), 3);
     }
 
     #[test]
@@ -13048,6 +13484,81 @@ mod tests {
         );
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(7)));
         assert_eq!(ran.get(), 1);
+
+        // Exercise the ordinary parser/entry as well as the earlier direct completion
+        // boundary. All host effects are Fake; only its selected base.clt row runs.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Released(std::sync::Arc<AtomicBool>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let published = AtomicUsize::new(0);
+        let ordinary = Host {
+            decided: Decider::Person,
+            base: &|_| Base {
+                items: Vec::new(),
+                held: Some(Box::new(Released(std::sync::Arc::clone(&released)))),
+                clt: Some(crate::init_clt::CommandLineTools::new(
+                    Box::new(|_| crate::init_clt::Found::Present("already installed".into())),
+                    PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
+                )),
+                toolset: None,
+                targo: None,
+            },
+            full_disk_access: &|| None,
+            records: &crate::init::NoRecords,
+            grants: |_| Vec::new(),
+            workstation_check: &|_| panic!("base.clt reads no workstation"),
+            walk: &|_| None,
+            converge: &ports,
+            alab: &|| false,
+            present: || true,
+        };
+        let answer = entry_with_system(
+            vec!["--only".into(), "base.clt".into(), "--json".into()],
+            &ordinary,
+            None,
+            &|_, _| panic!("ordinary entry is not the tab worker"),
+            &|| true,
+            &|| {
+                let sys = alice_with_checkout(501, None);
+                sys.file(
+                    crate::root_steps::ADMITTED_NAME_RULE,
+                    crate::root_steps::name_rule("alice").unwrap().as_bytes(),
+                );
+                sys.stat_of(
+                    crate::root_steps::ADMITTED_NAME_RULE,
+                    crate::port::Stat {
+                        uid: 0,
+                        gid: 0,
+                        mode: 0o440,
+                        dir: false,
+                        symlink: false,
+                        len: crate::root_steps::name_rule("alice").unwrap().len() as u64,
+                    },
+                );
+                assert_eq!(crate::root_steps::name_rule_current(&sys), Ok(true));
+                Box::new(sys)
+            },
+            &|current| {
+                assert!(
+                    released.load(Ordering::SeqCst),
+                    "publication follows the base release"
+                );
+                current()?;
+                published.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("macOS names match the freshly saved choice".into()))
+            },
+        );
+        assert_eq!(format!("{answer:?}"), exit(0));
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            1,
+            "actual ordinary entry must call its completion port"
+        );
     }
 
     /// The tab's program starts nothing and says nothing until the window types its go line
@@ -14844,6 +15355,7 @@ mod tests {
             held: &|| None,
             owed: &owed,
             clone: &clone,
+            control: None,
             forget: &|| forget_owed_clone(&state),
         };
         assert!(

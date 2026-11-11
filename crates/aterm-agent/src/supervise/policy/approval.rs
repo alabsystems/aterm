@@ -64,8 +64,6 @@ pub const RULE_CREDITS_CONSENT: &str = "credits-consent@v1";
 pub const RULE_CREDITS_DECLINE: &str = "credits-decline@v1";
 /// Full power.
 pub const RULE_DECLINE: &str = "decline@v1";
-/// Full power.
-pub const RULE_MODEL_SWITCH: &str = "model-switch@v1";
 /// A box taller than the screen in a bypass session, declined with what its foot note flags
 /// ([`tall_box`]).
 pub const RULE_TALL_BOX: &str = "tall-box@v1";
@@ -527,7 +525,6 @@ pub struct ApprovalCtx {
     pub bypass_mode: bool,
     pub approve: Approve,
     pub answer_questions: bool,
-    pub model_fallback: bool,
     pub limit_wait: bool,
     pub limit_reset: bool,
     pub reset_kinds: Vec<aterm_phase::ResetKind>,
@@ -610,7 +607,6 @@ impl ApprovalCtx {
             bypass_mode: false,
             approve: defaults.approve,
             answer_questions: defaults.answer_questions,
-            model_fallback: defaults.model_fallback.is_some(),
             limit_wait: defaults.limit_wait,
             limit_reset: defaults.limit_reset,
             reset_kinds: defaults.limit_reset_kinds,
@@ -5552,7 +5548,10 @@ fn other_dialog<'p>(
         return Err(credits_held(o));
     }
     if let Some(o) = refusal_pause_switch(program, p) {
-        return fallback_switch(o, ctx);
+        return Err(format!(
+            "a model switch (`{}`): aterm changes no session's model",
+            o.label
+        ));
     }
     if p.options.iter().any(buys)
         && let Some(o) = p
@@ -5606,17 +5605,6 @@ fn refusal_pause_switch(program: Program, p: &PromptV2) -> Option<&Opt> {
             Some(switch)
         }
         _ => None,
-    }
-}
-
-fn fallback_switch<'p>(o: &'p Opt, ctx: &ApprovalCtx) -> Result<(&'static str, &'p Opt), String> {
-    if ctx.model_fallback {
-        Ok((RULE_MODEL_SWITCH, o))
-    } else {
-        Err(format!(
-            "a model switch (`{}`): model_fallback is off",
-            o.label
-        ))
     }
 }
 

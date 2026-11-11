@@ -96,16 +96,7 @@ fn a_relaunch_carries_the_provider_and_its_launch_policy_and_drops_what_the_sess
     assert_eq!(resumed_ref(&last), None, "--last names no session");
     assert_eq!(
         rewrite_argv(&prompt, None),
-        Ok(argv(&[
-            "--base-url",
-            "u",
-            "--contributor-mode",
-            "off",
-            "--model",
-            "muse-wonder-full-1.0",
-            "--reasoning-effort",
-            "xhigh",
-        ]))
+        Ok(argv(&["--base-url", "u", "--contributor-mode", "off"]))
     );
     let dashed = argv(&[STORE, "--", "--yolo", "resume"]);
     assert_eq!(
@@ -535,7 +526,7 @@ fn the_told_line_is_muses_own_resume_line() {
 }
 
 #[test]
-fn a_relaunch_runs_contributor_mode_off_and_a_fresh_start_the_default_model() {
+fn a_relaunch_runs_contributor_mode_off() {
     // A launch that turned contributor mode on (either spelling), and one that
     // never named it: the relaunch carries it off, exactly once.
     for words in [
@@ -549,18 +540,6 @@ fn a_relaunch_runs_contributor_mode_off_and_a_fresh_start_the_default_model() {
             "{words:?}"
         );
     }
-    // A fresh start (no session to resume) runs the default model at xhigh.
-    assert_eq!(
-        rewrite_argv(&argv(&[STORE]), None),
-        Ok(argv(&[
-            "--contributor-mode",
-            "off",
-            "--model",
-            "muse-wonder-full-1.0",
-            "--reasoning-effort",
-            "xhigh",
-        ]))
-    );
 }
 
 #[test]

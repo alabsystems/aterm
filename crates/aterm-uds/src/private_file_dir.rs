@@ -33,6 +33,14 @@ impl PrivateDirectory {
                 )
                 .open(path)
         })?;
+        Self::from_file(file)
+    }
+
+    /// Judge and retain this exact already opened directory. No path is reopened.
+    /// This is private filesystem admission, not ownership or execution authority.
+    /// # Errors
+    /// The descriptor is not an owner-private directory with no ACL grants.
+    pub fn from_file(file: File) -> io::Result<Self> {
         let directory = Self { file };
         directory.view()?;
         Ok(directory)

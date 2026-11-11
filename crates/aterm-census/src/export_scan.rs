@@ -493,14 +493,15 @@ fn link(target: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The exported copy of `from` at `to`: the bytes the export `changed` it to, else a copy (a
-/// clone where the volume makes one).
+/// The exported copy of `from` at `to`: the bytes the export `changed` it to, else a streamed
+/// copy. APFS clones also modify the source inode, delivering an event for the checkout even
+/// when the destination is quiet. Reading and writing bytes leaves that source alone.
 fn write(from: &Path, to: &Path, changed: Option<&[u8]>) -> std::io::Result<()> {
     if let Some(dir) = to.parent() {
         std::fs::create_dir_all(dir)?;
     }
     match changed {
-        None => std::fs::copy(from, to).map(drop),
+        None => aterm_tempfile::copy_to_new_file(from, to),
         Some(bytes) => std::fs::write(to, bytes),
     }
 }

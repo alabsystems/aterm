@@ -187,21 +187,5 @@ impl From<Error> for std::io::Error {
 impl std::error::Error for Error {}
 
 #[cfg(all(test, any(unix, windows)))]
-mod tests {
-    use super::Error;
-    use std::io;
-
-    #[test]
-    fn an_aterm_uds_error_maps_to_upstreams_codes() {
-        let os = |n| Error::from_io(&io::Error::from_raw_os_error(n));
-        assert_eq!(os(1).raw_os_error(), Some(1));
-        assert_eq!(os(38).raw_os_error(), Some(38));
-        assert_eq!(os(i32::MAX).raw_os_error(), Some(i32::MAX));
-        assert_eq!(os(0), Error::ERRNO_NOT_POSITIVE);
-        assert_eq!(os(-4), Error::ERRNO_NOT_POSITIVE);
-        let eof = io::Error::from(io::ErrorKind::UnexpectedEof);
-        assert_eq!(Error::from_io(&eof), Error::UNEXPECTED);
-        let text = io::Error::other("BCryptGenRandom failed (NTSTATUS 0xc0000001)");
-        assert_eq!(Error::from_io(&text), Error::UNEXPECTED);
-    }
-}
+#[path = "error_tests.rs"]
+mod tests;

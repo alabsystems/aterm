@@ -57,7 +57,11 @@ fn pooled_lint_claim_reads_its_recorded_width_and_retains_the_peak_margin() {
         )
         .with_checks(&[crate::Check::Lint]);
         ctx.memory = Some(Book::at(Some(path), Some(128 * GIB), Some(120 * GIB)));
-        ctx.pool = Some(aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 18).unwrap());
+        ctx.pool = Some(
+            aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 18)
+                .unwrap()
+                .into(),
+        );
         let planned = |ctx: &crate::Ctx| {
             crate::plan::plan(ctx)
                 .into_iter()
@@ -1448,10 +1452,11 @@ fn counted_reader(pid: u32) -> Named {
 }
 
 /// A METER THAT ATTRIBUTES READS EVERY MEMBER AT EVERY READ, TAKES IT FOR WHAT ITS LAST READABLE
-/// READ NAMED, AND KEEPS ONLY HEAVY COMPILERS' PEAKS: a unit's peak is the most its compiler
-/// held, its lifetime peak included, where that reaches the floor (1 GiB); two compilers of one
-/// unit keep the most of them; a read that cannot read a member leaves its name. NEGATIVE
-/// CONTROLS: the light compiler (pid 5) is named, yet its unit keeps no peak; the wrapper (pid 7)
+/// READ NAMED, KEEPS ONLY HEAVY COMPILERS IN THE SHAPING PEAKS, AND RETAINS LIGHT IDENTITIES FOR
+/// CLAIMS: a unit's peak is the most its compiler held, its lifetime peak included; a light unit
+/// is absent from `unit_peaks` but present at the 1 GiB floor in `unit_claim_peaks`; two compilers
+/// of one unit keep the most of them; a read that cannot read a member leaves its name. NEGATIVE
+/// CONTROLS: dropping the light identity makes the claim map assertion fail; the wrapper (pid 7)
 /// holds more than its unit's compilers, yet its unit's peak is theirs; the linker misnamed at
 /// its first read (pid 8) holds 5 GiB, yet `aterm_gui lib` keeps its compilers' 3 GiB, where a
 /// first name kept for good would give it 5; the compiler misnamed as its wrapper at its first
@@ -1515,6 +1520,22 @@ fn a_meter_names_each_member_by_its_last_readable_read_and_keeps_heavy_peaks() {
             ("aterm_term lib".to_owned(), 2 * GIB),
         ]
     );
+    let claim_peaks: Vec<(String, u64)> = meter
+        .unit_claim_peaks()
+        .into_iter()
+        .map(|(n, p)| (n.kind, p))
+        .collect();
+    assert_eq!(
+        claim_peaks,
+        [
+            ("aterm_cell lib".to_owned(), UNIT_FLOOR),
+            ("aterm_grid lib".to_owned(), 2 * GIB),
+            ("aterm_gui lib".to_owned(), 3 * GIB),
+            ("aterm_gui test".to_owned(), 6 * GIB),
+            ("aterm_term lib".to_owned(), 2 * GIB),
+        ],
+        "NEGATIVE CONTROL: the claim book needs the meter-proved light identity"
+    );
     let mut reads = READS.lock().unwrap_or_else(PoisonError::into_inner).clone();
     reads.sort_unstable();
     assert_eq!(
@@ -1525,6 +1546,7 @@ fn a_meter_names_each_member_by_its_last_readable_read_and_keeps_heavy_peaks() {
         "every member at every read that found it"
     );
     assert!(Meter::new().unit_peaks().is_empty());
+    assert!(Meter::new().unit_claim_peaks().is_empty());
 }
 
 /// A COMPILER'S SPAN IS ITS FIRST AND LAST READ, ITS UNIT'S WRAPPER THE ONE FIRST READ BEFORE

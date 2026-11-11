@@ -62,7 +62,7 @@ pub(super) fn behind(exe: &Path, twin: Option<PathBuf>) -> Result<Option<Move>, 
     let Some(build) = super::super::super::accounts::read_bounded(&twin, 64 * 1024)
         .ok()
         .flatten()
-        .and_then(|text| super::super::catalog::twin_binary(&text))
+        .and_then(|text| super::super::super::twin::twin_binary(&text))
     else {
         return Ok(None);
     };

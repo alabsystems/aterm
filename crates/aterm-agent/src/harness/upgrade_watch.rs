@@ -359,16 +359,8 @@ fn sanctioned(
             st.point_at,
             st.guard.clone(),
         );
-        let promised = st.promised_model().map(str::to_owned);
         let how;
-        (*st, how) = St::retarget(
-            Some(st.clone()),
-            &from,
-            &to,
-            promised.as_deref(),
-            Proc::default(),
-            now,
-        );
+        (*st, how) = St::retarget(Some(st.clone()), &from, &to, Proc::default(), now);
         if st.phase == Phase::Pending {
             st.tab = tab;
         }

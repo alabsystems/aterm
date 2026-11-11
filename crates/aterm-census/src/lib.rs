@@ -28,7 +28,7 @@ mod wasm_cfg;
 pub use guards::{Finding, GUARDS, GuardReport, Rule, run_guards};
 pub use lazy_init::{LAZY_INIT_PRECISION_NOTE, run_lazy_init_census};
 pub use lock_order::run_lock_order_census;
-pub use memo::{Memo, MemoReport, Rejudged, pin_code};
+pub use memo::{Memo, MemoReport, Rejudged, on_one_worker, pin_code, without_parallel_workers};
 pub use scope_census::{SCOPE_PRECISION_NOTE, run_scope_census};
 /// Browser `cdylib` root crates re-exported for `aterm-forge`'s `[OB-17]` check.
 pub use wasm_census::WASM_ROOT_CRATES;
@@ -1352,7 +1352,7 @@ impl Reach {
 /// call-graph checks, which share none of its work. The thread carries the census's memo scope
 /// ([`memo::threads`]), so what the walk reads is the census unit's question.
 struct HeldGuardWalk<'scope>(
-    Option<std::thread::ScopedJoinHandle<'scope, Result<held_guard::HeldGuardScan, String>>>,
+    Option<memo::Joined<'scope, Result<held_guard::HeldGuardScan, String>>>,
 );
 
 impl<'scope> HeldGuardWalk<'scope> {

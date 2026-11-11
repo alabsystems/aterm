@@ -308,8 +308,6 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),

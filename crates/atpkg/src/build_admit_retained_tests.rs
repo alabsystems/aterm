@@ -601,6 +601,149 @@ fn sdk_cache_bundle_until_reaper_finish(world: &Path, seat: &Seat<'_>) {
     drop(reclaimed);
 }
 
+fn private_input_bundle_before_birth_and_until_native_finish(world: &Path, seat: &Seat<'_>) {
+    use crate::{build_admit::service::PreparationInputs, private_input::Producer};
+    use std::io::Write as _;
+
+    let lost = Producer::create(world, "lost-before-dispatch")
+        .unwrap()
+        .finish()
+        .unwrap();
+    let unused_home = world.join("refused-input-cargo-home");
+    std::fs::create_dir(&unused_home).unwrap();
+    let unused = PreparationInputs::new(
+        vec![lost.lend().unwrap()],
+        crate::cargo_cache::SourceCacheGuard::try_acquire(&unused_home).unwrap(),
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap();
+    drop(lost);
+    let mut before_birth = Owner::new(1, 16).unwrap();
+    let marker = world.join("refused-child-must-not-run");
+    let mut refused_target = command("/usr/bin/touch");
+    refused_target.arg(&marker);
+    let refusal = before_birth
+        .submit_retained_inputs(
+            held(world, seat),
+            &mut refused_target,
+            Duration::ZERO,
+            unused,
+        )
+        .expect_err("lost original guard refuses before child birth");
+    assert!(before_birth.is_empty());
+    assert!(!marker.exists());
+    drop(refusal.into_parts());
+
+    let input_owner = Producer::create(world, "new-materialization")
+        .unwrap()
+        .finish()
+        .unwrap();
+    let home = world.join("private-input-cargo-home");
+    std::fs::create_dir(&home).unwrap();
+    let cache = crate::cargo_cache::SourceCacheGuard::try_acquire(&home).unwrap();
+    let expired = PreparationInputs::new(vec![input_owner.lend().unwrap()], cache, Instant::now())
+        .err()
+        .expect("expired endpoint refuses before any dispatch");
+    assert_eq!(expired.error().kind(), io::ErrorKind::TimedOut);
+    let (_, (inputs, cache)) = expired.into_parts();
+    let bundle = PreparationInputs::new(
+        inputs,
+        cache,
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap();
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let output = world.join("actual-private-input-child.stdout");
+    let mut target = command("/bin/cat");
+    target
+        .stdin(reader)
+        .stdout(std::fs::File::create(&output).unwrap());
+    let held = held(world, seat);
+    let reference = held.claim.cohort_closure_ref().unwrap();
+    let mut owner = Owner::new(1, 16).unwrap();
+    owner
+        .submit_retained_inputs(held, &mut target, Duration::ZERO, bundle)
+        .unwrap()
+        .publication
+        .unwrap();
+    drop(target);
+    writer.write_all(b"actual-child-ran").unwrap();
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "actual input user startup",
+        || {
+            assert!(
+                owner
+                    .tick(&mut |_, _| Ok(JobControl::Wait), &mut |_| {})
+                    .unwrap()
+                    .is_empty()
+            );
+            (std::fs::read(&output).unwrap() == b"actual-child-ran").then_some(())
+        },
+    );
+    assert!(
+        input_owner.retire().is_err(),
+        "retained native use prevents local retirement"
+    );
+    // The failed consuming retirement above drops its returned original Owner:
+    // the input is now quarantined, while the accepted Use keeps its actual lock.
+    let container = world.join("new-materialization");
+    assert!(
+        std::fs::read_to_string(container.join(".input-owner"))
+            .unwrap()
+            .contains("quarantined")
+    );
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(container.join(".input-owner.lock"))
+        .unwrap();
+    let mutate = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.join(".package-cache-mutate"))
+        .unwrap();
+    assert!(matches!(
+        aterm_toolchain::record_lock::RecordLock::try_lock(lock.try_clone().unwrap(), 0),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    assert!(matches!(
+        aterm_toolchain::record_lock::RecordLock::try_lock(mutate.try_clone().unwrap(), 0),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(owner); // Existing in-process reaper receives the same actual job+bundle.
+    // Owner drop may already cancel and settle this actual cat. An available
+    // input lock is valid only with positive original cohort settlement; never
+    // assume a fixed cleanup latency or demand an artificially pending child.
+    match aterm_toolchain::record_lock::RecordLock::try_lock(lock.try_clone().unwrap(), 0) {
+        Ok(_released) => assert_eq!(
+            seat.ledger
+                .as_ref()
+                .unwrap()
+                .cohort_claim_state(&reference)
+                .unwrap(),
+            CohortClaimState::Closed,
+        ),
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Err(error) => panic!("original input lock observation: {error}"),
+    }
+    drop(writer);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "actual input cohort settlement",
+        || {
+            retired(seat, &reference)?;
+            let _input =
+                aterm_toolchain::record_lock::RecordLock::try_lock(lock.try_clone().unwrap(), 0)
+                    .ok()?;
+            let _cache =
+                aterm_toolchain::record_lock::RecordLock::try_lock(mutate.try_clone().unwrap(), 0)
+                    .ok()?;
+            Some(())
+        },
+    );
+}
+
 #[test]
 fn retained_actor() {
     let Ok(case) = std::env::var(ACTOR) else {
@@ -616,6 +759,9 @@ fn retained_actor() {
             "arm" => uncertain_arm(world, seat),
             "cache" => cache_guard_until_native_finish(world, seat),
             "sdk-cache-member" => sdk_cache_bundle_until_reaper_finish(world, seat),
+            "private-input-bundle" => {
+                private_input_bundle_before_birth_and_until_native_finish(world, seat)
+            }
             "foreign" => {
                 foreign_owner_keeps_resources(world, seat);
                 return 1;
@@ -682,4 +828,9 @@ fn actual_cargo_cache_guard_stays_owned_until_native_finish() {
 #[test]
 fn actual_managed_sdk_and_cache_bundle_survives_root_reap_and_reaper_handoff() {
     actor("sdk-cache-member");
+}
+
+#[test]
+fn actual_private_input_bundle_refuses_expired_preflight_and_survives_owner_loss() {
+    actor("private-input-bundle");
 }

@@ -1061,7 +1061,7 @@ mod carried {
 
     /// The process's launch, unix seconds, at `at` on 2026-10-07.
     pub(super) fn launch(at: &str) -> i64 {
-        crate::harness::upgrade_models::parse_utc(&format!("2026-10-07T{at}Z"))
+        crate::harness::unix_time::parse_utc(&format!("2026-10-07T{at}Z"))
             .and_then(|s| i64::try_from(s).ok())
             .expect("a time")
     }

@@ -126,10 +126,6 @@ struct Knobs {
     /// The command line the shell's integration recorded for the command the
     /// tab runs (default `sh agy.sh`, a launcher naming no agy).
     cmdline: Option<&'static str>,
-    /// agy's quota rotates the launch onto this model (default: it keeps its own).
-    quota_to: Option<&'static str>,
-    /// agy's quota rotates the launch onto this model only when stopped at a quota wall on screen.
-    quota_at_wall_to: Option<&'static str>,
     /// Actual vendor-record versions, with build ids derived by the same typed parser.
     versions: Option<(&'static str, &'static str)>,
 }
@@ -321,52 +317,6 @@ impl AgyKernel for LiveKernel {
 
     fn started_ms(&self, pid: u32) -> Option<u64> {
         (pid == TUI).then_some(START_MS)
-    }
-
-    fn quota_pick(
-        &self,
-        model: Option<&str>,
-        _exe: &Path,
-        _env: &[(String, String)],
-        _flags: &[String],
-    ) -> Option<crate::harness::agy_quota::Pick> {
-        use crate::harness::agy_quota::{Pick, Standing};
-        let from = model.unwrap_or("gemini-4-argon-high").to_owned();
-        Some(match self.knobs.quota_to {
-            Some(to) if to != from => Pick::Rotate {
-                from,
-                from_standing: Standing::Spent,
-                to: to.to_owned(),
-                to_standing: Standing::Open,
-            },
-            _ => Pick::Keep {
-                model: from,
-                standing: Standing::Open,
-            },
-        })
-    }
-
-    fn quota_pick_at(
-        &self,
-        model: Option<&str>,
-        exe: &Path,
-        env: &[(String, String)],
-        flags: &[String],
-        at_wall: bool,
-    ) -> Option<crate::harness::agy_quota::Pick> {
-        use crate::harness::agy_quota::{Pick, Standing};
-        if at_wall && let Some(to) = self.knobs.quota_at_wall_to {
-            let from = model.unwrap_or("gemini-4-argon-high").to_owned();
-            if to != from {
-                return Some(Pick::Rotate {
-                    from,
-                    from_standing: Standing::Low,
-                    to: to.to_owned(),
-                    to_standing: Standing::Open,
-                });
-            }
-        }
-        self.quota_pick(model, exe, env, flags)
     }
 
     fn summaries(&self, _: &Path, _: &str) -> Result<String, ()> {
@@ -732,8 +682,6 @@ impl LiveRig {
             background: knobs.background,
             aterm_state: None,
             ask: true,
-            several_logins: false,
-            usage_credits: false,
             usage_tap: None,
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
             agents_off: Vec::new(),
@@ -936,35 +884,6 @@ fn stale_foreign_or_invalid_agy_words_cannot_hold_another_move() {
 }
 
 #[test]
-fn a_build_word_does_not_block_an_agy_quota_model_rotation() {
-    for request in [Request::Skip(VERSION.into()), Request::DeferUntil(u64::MAX)] {
-        let rig = LiveRig::new(Knobs {
-            twin: Some(Twin::Same),
-            quota_to: Some("claude-opus-5-5-medium"),
-            ..Knobs::default()
-        });
-        let mv = Move {
-            running: VERSION.into(),
-            target: VERSION.into(),
-            twin: rig.twin.clone(),
-        };
-        let mut st = claim_record(&rig.snapshot(), &mv, rig.opts.human_grace_s, now_s())
-            .expect("claim shape");
-        st.fail("signal-refused", now_s());
-        st.request = request;
-        st.request_tab = TAB.into();
-        rig.store(&st);
-        let report = rig.visit();
-        assert_eq!(report.step, "done:resumed", "{report:?}");
-        assert_eq!(rig.asked("signal").len(), 1);
-        assert_eq!(
-            rig.record().expect("rotation").cause,
-            "model:claude-opus-5-5-medium"
-        );
-    }
-}
-
-#[test]
 fn a_saved_word_does_not_strand_an_agy_restart_already_in_flight() {
     let ready = Arc::new(AtomicBool::new(false));
     let rig = LiveRig::new(Knobs {
@@ -1052,6 +971,42 @@ fn an_idle_agy_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
             "agy upgraded to {NEW_VERSION} (from {VERSION}) · the same conversation resumed, nothing typed"
         )
     );
+}
+
+/// An agy relaunch line carries exactly the launch's own `--model` words and adds none: a launch
+/// that names no model relaunches on a line with no `--model`, and one launched with `--model
+/// gemini-4-argon-high` relaunches on a line with exactly that one pair, before the conversation.
+#[test]
+fn an_agy_relaunch_line_carries_exactly_the_launchs_model_flag() {
+    for (launch, model) in [
+        (&["--effort", "high"][..], None),
+        (
+            &["--model", "gemini-4-argon-high", "--effort", "high"][..],
+            Some("gemini-4-argon-high"),
+        ),
+    ] {
+        let rig = LiveRig::new(Knobs {
+            argv: Some(launch.iter().map(|w| (*w).to_owned()).collect()),
+            ..Knobs::default()
+        });
+        let r = rig.visit();
+        assert_eq!(r.step, "done:resumed", "{launch:?}: {r:?}");
+        let typed = rig.asked("turn");
+        assert_eq!(typed.len(), 1, "the relaunch line alone: {typed:#?}");
+        let line = &typed[0];
+        assert_eq!(
+            line.matches("'--model").count(),
+            usize::from(model.is_some()),
+            "{launch:?}: {line}"
+        );
+        let tail = match model {
+            Some(model) => format!("'--model' '{model}' '--effort' 'high' '--conversation={C1}'"),
+            None => format!("'--effort' 'high' '--conversation={C1}'"),
+        };
+        assert!(line.contains(&tail), "{launch:?}: {line}");
+        let st = rig.record().expect("the record");
+        assert_eq!(ag::argv_model(&st.argv).as_deref(), model, "{launch:?}");
+    }
 }
 
 #[test]
@@ -1914,7 +1869,7 @@ fn real_claim_relaunches() -> bool {
 
 /// 2026-10-26 review: the agy quiet upgrade's SIGTERM waits out the whole grace, so its claim names
 /// that grace, and a key typed at the prompt after it holds the relaunch line it owes exactly as
-/// long as it would have held the SIGTERM, for the upgrade's claim and a quota rotation's (`model:`).
+/// long as it would have held the SIGTERM.
 /// The control: a claim naming the land rung's keys gap (what the line read an agy claim that named
 /// none as) lets go a key the SIGTERM waited on.
 #[test]
@@ -1952,21 +1907,14 @@ fn an_agy_claim_holds_its_line_on_the_grace_its_sigterm_waited_out() {
         Some(grace_s),
         "the claim names the grace its SIGTERM waited out"
     );
-    let rotation = St {
-        cause: format!("{}gemini-3-flash", crate::harness::relaunch::CAUSE_MODEL),
-        ..upgrade.clone()
-    };
     let sigterm_held =
         |age_s: u64| crate::harness::upgrade_drive::held_by_status(&key_status(age_s), grace_s);
-    for claim in [&upgrade, &rotation] {
-        for age_s in [0, 1, 19, 20, 21, 30, 60, 119, 120, 121, 300] {
-            assert_eq!(
-                owed_line_held(claim, grace_s, age_s),
-                sigterm_held(age_s),
-                "{:?}: a key {age_s} s old",
-                claim.cause
-            );
-        }
+    for age_s in [0, 1, 19, 20, 21, 30, 60, 119, 120, 121, 300] {
+        assert_eq!(
+            owed_line_held(&upgrade, grace_s, age_s),
+            sigterm_held(age_s),
+            "a key {age_s} s old"
+        );
     }
     let gap = St {
         line_grace_s: Some(crate::harness::upgrade::KEYS_GAP_S),
@@ -2109,210 +2057,40 @@ fn tier1_the_real_agy_quiet_upgrade_conforms_to_the_model() {
     assert_eq!(caught, BTreeSet::from(MUTANTS), "every mutant caught alone");
 }
 
+/// An agy stopped at a quota wall on a build that is not behind its twin is never relaunched for
+/// its quota: the upgrade step is not due, the visit says `current`, and nothing is signalled,
+/// typed or recorded. The same holds for a twin older than the running build.
 #[test]
-fn an_idle_agy_on_a_spent_pool_is_relaunched_on_the_quota_pick() {
-    let knobs = Knobs {
-        twin: Some(Twin::Same),
-        quota_to: Some("claude-opus-5-5-medium"),
-        ..Knobs::default()
-    };
-    let rig = LiveRig::new(knobs.clone());
+fn an_agy_at_a_quota_wall_on_a_current_build_is_not_relaunched() {
     let tabs = LiveRig::tabs();
-    assert_eq!(
-        live::upgrade_due_with(&rig.opts, &tabs, Some(rig.twin.clone()), &rig.kernel),
-        Some(Due::Yes),
-        "a rotation owed is due though the build is current"
-    );
-    let rotation = live::rotation_due(
-        &rig.kernel.exe,
-        &rig.kernel.args(TUI).expect("running launch"),
-        Some(rig.twin.clone()),
-        &rig.opts.home,
-        &rig.kernel,
-    )
-    .expect("the exact current twin can rotate");
-    assert_eq!(rotation.mv.target, VERSION);
-    assert_eq!(rotation.mv.twin, rig.twin);
-    let r = rig.visit();
-    assert_eq!(r.step, "done:resumed", "{r:?}");
-    assert_eq!(
-        (r.from.as_str(), r.to.as_str()),
-        ("gemini-4-argon-high", "claude-opus-5-5-medium(quota)")
-    );
-    let typed = rig.asked("turn");
-    assert_eq!(typed.len(), 1, "the relaunch line alone: {typed:#?}");
-    assert!(
-        typed[0].contains(&format!(
-            "'--model=claude-opus-5-5-medium' '--effort' 'high' '--conversation={C1}'"
-        )),
-        "{}",
-        typed[0]
-    );
-    let st = rig.record().expect("the record");
-    assert_eq!(st.cause, "model:claude-opus-5-5-medium");
-    assert_eq!(
-        ag::argv_model(&st.argv).as_deref(),
-        Some("claude-opus-5-5-medium")
-    );
-    assert!(
-        st.outcome
-            .starts_with("agy moved onto claude-opus-5-5-medium by its quota"),
-        "{}",
-        st.outcome
-    );
-    let kept = LiveRig::new(Knobs {
-        twin: Some(Twin::Same),
-        ..Knobs::default()
-    });
-    assert_eq!(
-        kept.visit().step,
-        "current",
-        "a pool that keeps its model moves nothing"
-    );
-    assert_eq!(
-        live::upgrade_due_with(&kept.opts, &tabs, Some(kept.twin.clone()), &kept.kernel),
-        Some(Due::No)
-    );
-    let older = LiveRig::new(Knobs {
-        twin: Some(Twin::Older),
-        quota_to: Some("claude-opus-5-5-medium"),
-        ..Knobs::default()
-    });
-    assert_eq!(
-        live::rotation_due(
-            &older.kernel.exe,
-            &older.kernel.args(TUI).expect("running launch"),
-            Some(older.twin.clone()),
-            &older.opts.home,
-            &older.kernel,
-        ),
-        None,
-        "a quota move must not disguise an older executable as the current build"
-    );
-    assert_eq!(
-        live::upgrade_due_with(&older.opts, &tabs, Some(older.twin.clone()), &older.kernel),
-        Some(Due::No)
-    );
-    assert_eq!(older.visit().step, "current");
-    assert!(older.asked("signal").is_empty());
-    assert!(older.asked("turn").is_empty());
-    assert!(older.record().is_none());
+    for twin in [Twin::Same, Twin::Older] {
+        let rig = LiveRig::new(Knobs {
+            twin: Some(twin),
+            screen: Some(aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL),
+            summary: Some(Ok(format!("{C1}|CASCADE_RUN_STATUS_RUNNING|0|\n"))),
+            ..Knobs::default()
+        });
+        assert_eq!(
+            live::upgrade_due_with(&rig.opts, &tabs, Some(rig.twin.clone()), &rig.kernel),
+            Some(Due::No),
+            "{twin:?}"
+        );
+        assert_eq!(rig.visit().step, "current", "{twin:?}");
+        assert!(rig.asked("signal").is_empty(), "{twin:?}");
+        assert!(rig.asked("turn").is_empty(), "{twin:?}");
+        assert!(rig.record().is_none(), "{twin:?}");
+    }
 }
 
+/// A transcript grown past 32 MiB with rows written after the agy started is still read whole
+/// ([`live::transcript_look`]): a tail seek bounded at 32 MiB would answer `wait:log-unproved`.
 #[test]
-fn an_agy_stopped_at_a_quota_wall_rotates_onto_the_other_pool_and_resumes_the_turn() {
-    let rig = LiveRig::new(Knobs {
-        twin: Some(Twin::Same),
-        screen: Some(aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL),
-        summary: Some(Ok(format!("{C1}|CASCADE_RUN_STATUS_RUNNING|0|\n"))),
-        quota_at_wall_to: Some("claude-opus-5-5-medium"),
-        ..Knobs::default()
-    });
-    let tabs = LiveRig::tabs();
-    assert_eq!(
-        live::rotation_due(
-            &rig.kernel.exe,
-            &rig.kernel.args(TUI).expect("running launch"),
-            Some(rig.twin.clone()),
-            &rig.opts.home,
-            &rig.kernel,
-        ),
-        None,
-        "without a quota wall on screen, a low named pool stays put"
-    );
-    assert_eq!(
-        live::upgrade_due_with(&rig.opts, &tabs, Some(rig.twin.clone()), &rig.kernel),
-        Some(Due::Yes),
-        "a quota wall on screen with another pool open makes rotation due"
-    );
-    let r = rig.visit();
-    assert_eq!(r.step, "continued", "{r:?}");
-    assert_eq!(
-        (r.from.as_str(), r.to.as_str()),
-        ("gemini-4-argon-high", "claude-opus-5-5-medium(quota)")
-    );
-    let typed = rig.asked("turn");
-    assert_eq!(
-        typed.len(),
-        2,
-        "the relaunch line and the continuation prompt: {typed:#?}"
-    );
-    assert!(
-        typed[0].contains(&format!(
-            "'--model=claude-opus-5-5-medium' '--effort' 'high' '--conversation={C1}'"
-        )),
-        "{}",
-        typed[0]
-    );
-    assert!(
-        typed[1].contains(
-            "Relaunched on claude-opus-5-5-medium: the model this session ran reached its usage limit, so it was restarted with that model"
-        ),
-        "{}",
-        typed[1]
-    );
-    let st = rig.record().expect("the record");
-    assert!(!st.quiet, "a quota wall rotation must type carry-on");
-    assert!(
-        st.outcome.ends_with("the same conversation resumed"),
-        "{}",
-        st.outcome
-    );
-}
-#[test]
-fn an_agy_behind_twin_and_stopped_at_a_quota_wall_upgrades_and_rotates_together() {
-    let rig = LiveRig::new(Knobs {
-        twin: Some(Twin::Newer),
-        screen: Some(aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL),
-        summary: Some(Ok(format!("{C1}|CASCADE_RUN_STATUS_RUNNING|0|\n"))),
-        quota_at_wall_to: Some("claude-opus-5-5-medium"),
-        ..Knobs::default()
-    });
-    let r = rig.visit();
-    assert_eq!(r.step, "continued", "{r:?}");
-    assert_eq!(
-        (r.from.as_str(), r.to.as_str()),
-        ("gemini-4-argon-high", "claude-opus-5-5-medium(quota)")
-    );
-    let st = rig.record().expect("the record");
-    assert_eq!((st.from.as_str(), st.to.as_str()), (VERSION, NEW_VERSION));
-    assert!(!st.quiet, "a quota wall rotation must type carry-on");
-    let typed = rig.asked("turn");
-    assert_eq!(typed.len(), 2, "{typed:#?}");
-    assert!(
-        typed[0].contains(&format!(
-            "'--model=claude-opus-5-5-medium' '--effort' 'high' '--conversation={C1}'"
-        )),
-        "{}",
-        typed[0]
-    );
-    assert!(
-        typed[1].contains("Relaunched on claude-opus-5-5-medium:"),
-        "{}",
-        typed[1]
-    );
-}
-
-#[test]
-fn an_agy_switched_via_slash_model_with_a_large_transcript_rotates_at_an_individual_quota_wall() {
+fn a_large_agy_transcript_is_still_read() {
     use std::io::Write as _;
-    let screen = aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL
-        .replace(
-            "⚠ agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached.",
-            "⚠ Individual quota reached.",
-        )
-        .replace("Gemini 4 Argon · high", "Claude Opus 5.5 · high");
-    let screen: &'static str = Box::leak(screen.into_boxed_str());
     let rig = LiveRig::new(Knobs {
         twin: Some(Twin::Same),
-        screen: Some(screen),
-        argv: Some(vec!["--dangerously-skip-permissions".to_owned()]),
-        summary: Some(Ok(format!("{C1}|CASCADE_RUN_STATUS_IDLE|0|\n"))),
-        quota_at_wall_to: Some("gemini-4-argon-high"),
         ..Knobs::default()
     });
-    // Grow `transcript.jsonl` past 32 MiB with post-start rows so the old 32 MiB tail seek would
-    // have failed with `wait:log-unproved`.
     let config = rig.opts.home.join(".gemini/antigravity-cli");
     let path = config
         .join("brain")
@@ -2334,101 +2112,4 @@ fn an_agy_switched_via_slash_model_with_a_large_transcript_rotates_at_an_individ
         "transcript exceeds 33 MiB"
     );
     assert_eq!(live::transcript_look(&config, C1, START_MS), Ok(()));
-
-    let tabs = LiveRig::tabs();
-    assert_eq!(
-        live::upgrade_due_with(&rig.opts, &tabs, Some(rig.twin.clone()), &rig.kernel),
-        Some(Due::Yes),
-        "footer's Claude Opus 5.5 model triggers rotation onto gemini-4-argon-high even without --model on argv"
-    );
-    let r = rig.visit();
-    assert_eq!(r.step, "continued", "{r:?}");
-    assert_eq!(
-        (r.from.as_str(), r.to.as_str()),
-        ("Claude Opus 5.5", "gemini-4-argon-high(quota)")
-    );
-    let typed = rig.asked("turn");
-    assert_eq!(typed.len(), 2, "{typed:#?}");
-    assert!(
-        typed[0].contains(&format!(
-            "'--model=gemini-4-argon-high' '--dangerously-skip-permissions' '--conversation={C1}'"
-        )),
-        "{}",
-        typed[0]
-    );
-}
-
-/// NEGATIVE CONTROL: when the owner skips or defers a newer `agy` build, hitting a quota wall
-/// rotates models on the running executable instead of upgrading onto the held twin, and the kept
-/// word continues to hold idle upgrade sweeps for that target while letting a still-newer build
-/// through.
-#[test]
-fn an_agy_behind_a_held_twin_at_a_quota_wall_rotates_on_its_running_build_and_keeps_the_word() {
-    for (ask, step) in [
-        (Ask::Skip, "wait:skipped"),
-        (Ask::Defer(3600), "wait:deferred"),
-    ] {
-        let rig = LiveRig::new(Knobs {
-            versions: Some(("1.4.0-R6427.1", "1.4.0-R6500.1")),
-            twin: Some(Twin::Newer),
-            screen: Some(aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL),
-            summary: Some(Ok(format!("{C1}|CASCADE_RUN_STATUS_RUNNING|0|\n"))),
-            quota_at_wall_to: Some("claude-opus-5-5-medium"),
-            ..Knobs::default()
-        });
-        let claim = rig.failed_claim();
-        rig.store(&claim);
-        let row =
-            ask_for(&rig.opts, TAB, ask, "1.4.0-R6500.1", &key(TAB)).expect("owner build hold");
-
-        let r = rig.visit();
-        assert_eq!(r.step, "continued", "{ask:?}: {r:?}");
-        assert_eq!(
-            (r.from.as_str(), r.to.as_str()),
-            ("gemini-4-argon-high", "claude-opus-5-5-medium(quota)")
-        );
-        let st = rig.record().expect("rotation record");
-        assert_eq!(
-            (st.from.as_str(), st.to.as_str(), st.source.as_str()),
-            (
-                "1.4.0-R6427.1",
-                "1.4.0-R6427.1",
-                crate::harness::upgrade_drive::SAME_PROGRAM
-            )
-        );
-        assert_eq!(st.request, row.request, "{ask:?}");
-        let typed = rig.asked("turn");
-        assert!(
-            typed[0].contains(&rig.kernel.exe.display().to_string()),
-            "must launch running build, not held twin: {}",
-            typed[0]
-        );
-        assert!(
-            !typed[0].contains(&rig.twin.display().to_string()),
-            "must not launch held twin: {}",
-            typed[0]
-        );
-
-        let idle_rig = LiveRig::new(Knobs {
-            versions: Some(("1.4.0-R6427.1", "1.4.0-R6500.1")),
-            twin: Some(Twin::Newer),
-            ..Knobs::default()
-        });
-        idle_rig.store(&st);
-        let after = idle_rig.visit();
-        assert_eq!(after.step, step, "{ask:?}: {after:?}");
-        assert!(idle_rig.asked("signal").is_empty());
-
-        if ask == Ask::Skip {
-            let newer_rig = LiveRig::new(Knobs {
-                versions: Some(("1.4.0-R6427.1", "1.4.0-R6600.1")),
-                twin: Some(Twin::Newer),
-                ..Knobs::default()
-            });
-            newer_rig.store(&st);
-            let moved = newer_rig.visit();
-            assert_eq!(moved.step, "done:resumed", "{moved:?}");
-            assert_eq!(newer_rig.asked("signal").len(), 1);
-        }
-    }
 }

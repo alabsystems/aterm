@@ -250,8 +250,6 @@ pub struct Row {
     /// The entry's shape and age as read, carried as [`Self::stalled`].
     pub on_its_own: bool,
     pub behind_said: Option<String>,
-    /// The model the announcement asked for by the model rule.
-    pub model: String,
     /// Which agent the upgrade moves.
     pub agent: upgrade::Agent,
     /// When the agent the move ended was seen gone.
@@ -407,7 +405,6 @@ impl Row {
             ready: reads_ready_clock(st.agent)
                 && matches!(st.phase, Phase::Announced { .. })
                 && st.ready_since != 0,
-            model: st.model_list.clone(),
             agent: st.agent,
             exited_at: exited_seen(st, now, ended_unstamped),
             ended_unstamped,
@@ -1481,7 +1478,6 @@ impl Row {
             ("request", self.request.word()),
             ("outcome", self.outcome.clone()),
             ("stalled", self.stall(now).unwrap_or_default()),
-            ("model", self.model.clone()),
             ("agent", self.agent.product().to_string()),
             ("release", self.release.clone()),
             ("rung", self.rung_word(now)),
@@ -1567,18 +1563,11 @@ impl Row {
     /// What the upgrade moves the session onto, in the owner's words.
     #[must_use]
     pub fn move_words(&self) -> String {
-        let model = (!self.model.is_empty()).then(|| word(&self.model));
         if !self.from.is_empty() && self.from == self.to {
-            return format!(
-                "{} {} → {}",
-                self.agent.product(),
-                word(&self.to),
-                model.unwrap_or_else(|| "another model".to_string())
-            );
+            return format!("{} {} restart", self.agent.product(), word(&self.to));
         }
-        let with = model.map_or_else(String::new, |m| format!(" with {m}"));
         format!(
-            "{} {} → {}{with}",
+            "{} {} → {}",
             self.agent.product(),
             word(&self.from),
             word(&self.to)
@@ -2058,7 +2047,7 @@ enum Special {
 
 fn resume_command(line: &str, session: &str) -> Option<String> {
     let launch = launch_of(line)?;
-    let told = crate::harness::upgrade_drive::resume_command_kept(None, &launch, session)?;
+    let told = crate::harness::upgrade_drive::resume_command_kept(&launch, session)?;
     let exports = home_exports(line);
     let env: Vec<(&str, &str)> = exports.iter().map(|(n, v)| (*n, v.as_str())).collect();
     crate::harness::resume::with_env(&env, &told)
@@ -3644,8 +3633,8 @@ fn record_row(opts: &Opts, session: &str, text: &str, now: u64) -> Result<Option
         Some(st) => st,
         None => {
             // An object with no `phase` under a name no record takes is another document
-            // sharing the folder (the model priority, a restart stamp, a retired writer's
-            // state file); one under a record's own name is that record, damaged.
+            // sharing the folder (a restart stamp, a retired writer's state file); one under a
+            // record's own name is that record, damaged.
             let value: Value = aterm_json::from_str(text).map_err(|_| ())?;
             let record_named =
                 upgrade::is_session_id(session) || upgrade::Agent::keyed(session).is_some();
@@ -4555,7 +4544,7 @@ fn write_back(opts: &Opts, back: &BTreeMap<String, u64>) {
         .iter()
         .map(|(session, exited)| format!("{session} {exited}\n"))
         .collect();
-    let _ = crate::harness::upgrade_models::write_atomic(&path, &body);
+    let _ = crate::harness::atomic_write::write_atomic(&path, &body);
 }
 
 const SLEPT_S: u64 = 60;
@@ -4928,8 +4917,6 @@ impl View {
                 background: false,
                 aterm_state: None,
                 ask: false,
-                several_logins: false,
-                usage_credits: false,
                 usage_tap: None,
                 instances: crate::harness::upgrade_drive::Instances::Machine,
                 agents_off: Vec::new(),
@@ -5103,7 +5090,7 @@ fn announce_word(opts: &Opts, now: u64) {
     let Ok(dir) = ensure_upgrade_tree(&opts.state, Some("owner")) else {
         return;
     };
-    let _ = crate::harness::upgrade_models::write_atomic(&dir.join("word"), &format!("{now}\n"));
+    let _ = crate::harness::atomic_write::write_atomic(&dir.join("word"), &format!("{now}\n"));
 }
 
 #[cfg(all(test, unix))]

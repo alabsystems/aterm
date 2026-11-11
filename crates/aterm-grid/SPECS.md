@@ -105,7 +105,7 @@ function such a wrapper delegates to; a test whose code has no production twin i
 
 Columns: `id`; `kind`; `functions`; `statement`; `primary tests` (how many tests the spec subsumed at
 recovery; §2 maps those in the tree); `difficulty` (the Rust features the proof must handle); `blocking gaps`
-(numbers in the gap table of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7; gap 0, the seal that
+(numbers in the gap table of `docs/TRUST-LANE.md` (Blocking gaps); gap 0, the seal that
 publishes Clean rows, is on every row).
 
 ```tsv
@@ -315,106 +315,6 @@ reader-live-bottom-gesture	contract	GridStorage::reader_live_bottom_gen; Grid::{
 zero-share-tiered-is-ring-only	equivalence	Grid::{with_tiered_scrollback,set_scrollback_line_limit,resize,resize_no_reflow,resize_offloading_scrollback,reattach_reflowed_scrollback,reattach_reflowed_scrollback_or_redetach,write_char,line_feed,carriage_return}	∀ rows, cols, ring cap C, limit L ≤ C, every script of steps {resize, resize_no_reflow, offloaded resize (detach then reattach[_or_redetach], including a second resize_offloading_scrollback inside the window that returns None and resizes in place), write a line}: t = with_tiered_scrollback(rows,cols,C,store)+set_scrollback_line_limit(Some(L)) and its ring-only twin w = with_scrollback(rows,cols,L) (plain resize for every resize form) satisfy Tr(t)=Tr(w) after every step; the redetach loop ends within 2 passes once the width has settled; t.assert_invariants() holds throughout.	3	whole Grid state machine (ring, lazy buffer, tiered store, reflow job); a bisimulation over two storage representations	0,1,2,3,4,5,7
 history-contiguous-suffix	invariant	Grid::{resize,resize_offloading_scrollback,reattach_reflowed_scrollback,erase_scrollback,attach_scrollback,set_scrollback_line_limit,scrollback_lines}	∀ reachable tiered grid whose store share is zero (L ≤ ring cap, including a replacement store attached during an offload window), after any sequence of numbered-line writes and resizes: Tr(g) = [k..=newest] for some k (no hole, no newer line ahead of an older one), scrollback_lines() ≤ L, and once ≥ L lines have scrolled past the screen scrollback_lines() = L; re-attaching a stale worker job after a reset never breaks this.	2	as zero-share-tiered-is-ring-only; an invariant over the composed resize/offload/reattach paths	0,1,2,3,4,5,7
 ```
-
-### Distribution by kind (204)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 145 | packed-color-encoding, packed-colors-side-algebra, convert-colors, cell-constructors, cell-read-accessors, cell-mutators, cell-color-accessors, current-style-new-fields, current-style-reset, display-offset-damage, damage-row-iterators, damage-bounds-iteration, selection-damage-union-lattice, selection-damage-overflow-absorb, cell-extra-fields, extras-map-basic, extras-clear-ops, extras-shifts, extras-uniform-run, hyperlink-limit, extras-capacity-policy, alloc-slice-contract, page-pool-reuse-and-memory, recycled-row-cells, row-new, orphan-fixup-primitives, row-set, row-narrow-write, row-wide-write, fill-cell-run, cells-mut-with-fixup, ich-insert-chars-fill, dch-delete-chars-fill, ech-erase-chars-with, bounded-ich-dch, clear-range-with-orphan, selective-erase-decsca, bit10-locality, fixup-wide-boundary, row-resize, row-clear-erase-reset, row-line-size, row-copy-from, row-wrapped-flag, row-display, tab-stop-set-clear, ht-next-stop, cbt-prev-stop, tab-stops-resize-grow-only, grid-construct, row-access-bounds, column-geometry, row-u16-saturating, ring-row-shift-permutation, region-and-margin-setters, cursor-set-clamp, cursor-vertical-margins, cursor-horizontal-margins, carriage-return, line-feed, reverse-line-feed, autowrap-deferred, writes-replace-extras, wide-autowrap-tail-bce, grid-cell-text-reads, row-metadata-accessors, viewport-memo-sharing, scroll-region-shift, top-anchored-region-archive, el-span, erase-bce-orphan, ed-span, ed-line-attributes, right-erase-breaks-wrap-link, selective-erase-span, selective-erase-pending-wrap, ed3-erase-scrollback, decaln, rect-fill-erase, decsera, deccara-decrara, reverse-cell-attrs, deccra-copy, ich-dch-shift, ech-erase-chars, il-dl, il-dl-margined, decic-decdc, unscroll-denotation, row-band-move-compose, row-band-moves-denote-ops, viewport-scroll-damage, display-offset-navigation, content-damage-and-generation, mark-cursor-damage, continue-absolute-numbering, history-line-order, history-read-errors, history-fence-export, history-fence-breaks, reserve-older-history-keys, attach-older-history, older-history-build, retention-limit, grid-memory-accounting, staged-arena-and-sums, lazy-spine-slack-bound, compress-offload-staging, flood-backlog-cap, trickle-skip-rule, flood-marker-line, extract-row-extras-gate, extract-row-extras-spans, row-to-line-colour-resolution, scrolled-row-extras-is-empty, materialize-from-line-denotation, fill-row-from-line, checkpoint-lines-layout, reflow-mode-from-bool, resize-clamp-and-reset, reflow-cursor-tracking, resize-keeps-the-next-write, reflow-viewport-placement, width-change-seam-policy, conpty-width-demote, double-size-rows-resize-in-place, reflow-extras-follow-cells, remap-copied-extra, adjust-chunk-boundary, cursor-in-chunk, source-coords-for-row, copy-cells-to-row, chunk-cells-to-rows, reflow-history-rewrap, scrollback-rewrap-denotation, history-renumber-epoch-on-width-reflow, no-reflow-resize-truncates, resize-keeps-reader-position, rows-grow-policy, rows-shrink-shape, resize-undo-validity, truecolor-survives-resize, offload-window-cap-logging, reader-live-bottom-gesture, line-feeds-coalesce |
-| refinement | 15 | damage-tracker-model, ring-model, restore-tab-stops-admission, write-char-denotation, scroll-up-appends-transcript, top-anchored-scroll-refinement, unified-retention-limit-refinement, grapheme-unit-segmentation, reflow-rewrap-layout, rows-only-resize-transcript, resize-row-reuse-refines-model, offload-window-refinement, offload-window-conserves-history, offload-refines-plain-resize, offload-reader-position |
-| equivalence | 13 | cell-flags-bit-algebra, extras-render-data, row-get-unchecked, run-writers-refine-write-char-wrap, viewport-memo-transparent, history-walk-refines-get, staged-row-equals-eager, line-consumers-agree, stored-cells-run-expansion, grapheme-ascii-fast-path, resize-undo-flap-identity, offload-step-schedule-independence, zero-share-tiered-is-ring-only |
-| invariant | 14 | current-style-cache-invariant, image-layer-stack, hyperlink-bound-invariant, page-store-row-separation, early-wrap-hole-lifecycle, row-touched-span, grid-type-invariant, cursor-in-bounds, has-extras-iff-entry, content-gen-tracks-content, absolute-row-numbering, history-link-budget, flood-history-no-silent-hole, history-contiguous-suffix |
-| cost | 7 | hyperlink-walk-cost, extras-op-cost, rgb-harvest-cost, rows-only-resize-cost, reflow-cost, scroll-off-is-lazy, width-resize-sync-cost |
-| table-property | 5 | cell-flags-layout, wide-continuation-of, tab-default-stops, pending-wrap-motion-table, erase-pending-wrap-table |
-| round-trip | 3 | row-line-roundtrip, checkpoint-visible-roundtrip, width-roundtrip-restores-topology |
-| other | 1 | page-send-sync-sound |
-| no-panic | 1 | row-unsafe-ub-free |
-
-### Blocking-gap histogram
-
-`gap → specs blocked by it`. No spec is blocked by gap 0 alone: every one also needs at least one
-widening (most often 1, non-scalar carriers; 2, certified `&self`/`&mut self`; 3, E6 body widening).
-
-| gap | specs blocked |
-|---|---|
-| 0 | 203 |
-| 1 | 181 |
-| 2 | 172 |
-| 3 | 175 |
-| 4 | 101 |
-| 5 | 109 |
-| 6 | 59 |
-| 7 | 120 |
-| 8 | 60 |
-| 10 | 11 |
-| 11 | 6 |
-| 12 | 47 |
-| 13 | 18 |
-| 14 | 1 |
-| 16 | 2 |
-
-### Proof dependency order
-
-1. Scalar and const facts: `cell-flags-layout`, `row-u16-saturating`, `wide-continuation-of`,
-   `cell-flags-bit-algebra`, `packed-color-encoding`, `packed-colors-side-algebra`,
-   `reverse-cell-attrs`, `cursor-in-chunk`, `adjust-chunk-boundary`, `display-offset-damage`, `reflow-mode-from-bool`,
-   `flood-marker-line`, `row-band-move-compose`.
-2. Cell values: `convert-colors`, `cell-constructors`, `cell-read-accessors`, `cell-mutators`, `cell-color-accessors`,
-   then `current-style-new-fields`, `current-style-reset`, `current-style-cache-invariant`.
-3. Small `&mut self` state on the grid: `column-geometry`, `region-and-margin-setters`, `cursor-set-clamp`,
-   `cursor-vertical-margins`, `cursor-horizontal-margins`, `carriage-return`, `cursor-in-bounds`,
-   `pending-wrap-motion-table`, `tab-default-stops`, `tab-stop-set-clear`, `ht-next-stop`, `cbt-prev-stop`,
-   `tab-stops-resize-grow-only`, `continue-absolute-numbering`, `reader-live-bottom-gesture`, `trickle-skip-rule`.
-4. Damage: `damage-row-iterators` → `damage-tracker-model` → `damage-bounds-iteration`, `mark-cursor-damage`;
-   `selection-damage-union-lattice`, `selection-damage-overflow-absorb`.
-5. Extras: `cell-extra-fields`, `image-layer-stack` → `ring-model` → `extras-map-basic` → `extras-clear-ops`,
-   `extras-shifts`, `extras-render-data`, `extras-uniform-run` → `hyperlink-bound-invariant` → `hyperlink-limit`;
-   `extras-capacity-policy`.
-6. Pages and rows (the unsafe lane, gap 8): `alloc-slice-contract`, `page-pool-reuse-and-memory`,
-   `recycled-row-cells`, `page-store-row-separation`, `page-send-sync-sound` → `row-new`, `row-get-unchecked`,
-   `orphan-fixup-primitives` → `row-set`, `row-narrow-write`, `row-wide-write`, `fill-cell-run`,
-   `cells-mut-with-fixup`, `clear-range-with-orphan`, `ech-erase-chars-with`, `ich-insert-chars-fill`,
-   `dch-delete-chars-fill`, `bounded-ich-dch`, `selective-erase-decsca`, `fixup-wide-boundary`, `row-resize`,
-   `row-line-size`, `row-copy-from`, `row-clear-erase-reset`, `row-wrapped-flag`, `row-display` →
-   `bit10-locality`, `early-wrap-hole-lifecycle` → `row-unsafe-ub-free`.
-7. Grid screen ops over the row lemmas: `grid-construct`, `row-access-bounds`, `ring-row-shift-permutation`,
-   `write-char-denotation`, `autowrap-deferred`, `run-writers-refine-write-char-wrap`, `writes-replace-extras`,
-   `wide-autowrap-tail-bce`, `has-extras-iff-entry`, then `line-feed`, `reverse-line-feed`, `scroll-region-shift`,
-   the erase family (`el-span`, `erase-bce-orphan`, `ed-span`, `ed-line-attributes`, `selective-erase-span`,
-   `selective-erase-pending-wrap`, `erase-pending-wrap-table`, `right-erase-breaks-wrap-link`, `decaln`,
-   `rect-fill-erase`, `decsera`, `deccara-decrara`, `deccra-copy`), line ops (`ich-dch-shift`, `ech-erase-chars`,
-   `il-dl`, `il-dl-margined`, `decic-decdc`), `row-band-moves-denote-ops`, `content-damage-and-generation`,
-   `viewport-scroll-damage`, `display-offset-navigation`, `grid-cell-text-reads`, `row-metadata-accessors`,
-   and last `grid-type-invariant`, which frames every mutator.
-8. History and lines: `history-line-order`, `history-read-errors`, `history-walk-refines-get`,
-   `staged-row-equals-eager`, `staged-arena-and-sums`, `extract-row-extras-*`, `row-to-line-colour-resolution`,
-   `materialize-from-line-denotation`, `grapheme-unit-segmentation`, `grapheme-ascii-fast-path`,
-   `stored-cells-run-expansion` → `row-line-roundtrip`, `line-consumers-agree`, `fill-row-from-line` →
-   `scroll-up-appends-transcript`, `top-anchored-region-archive`, `unscroll-denotation`,
-   `viewport-memo-*`, `checkpoint-*`, `retention-limit`, `ed3-erase-scrollback`, `absolute-row-numbering`,
-   `history-fence-*`, `reserve-older-history-keys`, `older-history-build`, `attach-older-history`,
-   the flood and lazy-buffer specs, `history-link-budget`, `grid-memory-accounting`.
-9. Resize and reflow: `copy-cells-to-row`, `remap-copied-extra`, `source-coords-for-row` → `chunk-cells-to-rows`
-   → `reflow-rewrap-layout`, `reflow-cursor-tracking`, `reflow-extras-follow-cells`, `double-size-rows-resize-in-place`,
-   `scrollback-rewrap-denotation` → `reflow-history-rewrap`, `reflow-viewport-placement`, `width-change-seam-policy`,
-   `conpty-width-demote`, `no-reflow-resize-truncates`, `rows-only-resize-transcript`, `rows-grow-policy`,
-   `rows-shrink-shape`, `resize-undo-*`, `truecolor-survives-resize`, `resize-clamp-and-reset`,
-   `resize-keeps-reader-position`, `history-renumber-epoch-on-width-reflow` → `width-roundtrip-restores-topology`.
-10. Offload window and model refinements (gaps 10 and 13): `offload-step-schedule-independence`,
-    `offload-window-conserves-history`, `offload-window-cap-logging`, `offload-reader-position`,
-    `offload-refines-plain-resize`, `offload-window-refinement`, `unified-retention-limit-refinement`,
-    `top-anchored-scroll-refinement`, `resize-row-reuse-refines-model`, `restore-tab-stops-admission`,
-    `zero-share-tiered-is-ring-only`, `history-contiguous-suffix`.
-11. Cost specs, which need ghost state: `hyperlink-walk-cost`, `extras-op-cost`, `rgb-harvest-cost`,
-    `rows-only-resize-cost`, `reflow-cost`, `scroll-off-is-lazy`, `width-resize-sync-cost`.
-
-The cheapest starts are in step 1. The `CellFlags` trio (`cell-flags-layout`, `wide-continuation-of`,
-`cell-flags-bit-algebra`) is `u16` bit algebra with no loops, heap or panics, decidable by evaluation, and every
-row, write, erase and reflow spec rests on it. `cursor-in-chunk` and `adjust-chunk-boundary` are pure scalar
-kernels; `adjust-chunk-boundary`'s progress clause is the decreases measure `chunk-cells-to-rows` needs.
-`display-offset-damage` is the arithmetic core of `viewport-scroll-damage` and a first case for gap 4 through
-`apply_display_offset_damage`. `row-u16-saturating` is blocked on gap 3: E6 imports no body with a narrowing
-integer `as` cast (not even `fn(u32) -> u16 { idx as u16 }`), and contract predicates admit neither `if` nor `as`.
 
 ## 2. Test → spec map (TSV)
 
@@ -1116,13 +1016,6 @@ crates/aterm-grid/tests/history_renumber_epoch.rs	a_width_reflow_with_no_scrollb
 crates/aterm-grid/tests/security_regression_5573.rs	resize_one_row_doesnt_corrupt_others	page-store-row-separation	
 crates/aterm-grid/tests/security_regression_5573.rs	row_resize_shrink_valid_unsafe_usage	row-resize	
 ```
-
-## 3. Coverage
-
-- 1820 tests read. 1576 map to one of the 208 specs (22 of them also sample a second spec). 244 are not spec samples (§4).
-- The biggest collapses (primary tests): `extras-shifts` (64), `damage-tracker-model` (37), `il-dl` (35), `scroll-region-shift` (35), `row-narrow-write` (34), `ich-dch-shift` (30), `reflow-rewrap-layout` (29), `run-writers-refine-write-char-wrap` (28), `grid-cell-text-reads` (28), `row-line-roundtrip` (27).
-- Proving `chunk-cells-to-rows`, `adjust-chunk-boundary` and `cursor-in-chunk` gives the chunking lemma that `reflow-rewrap-layout`, `reflow-cursor-tracking`, `reflow-history-rewrap` and `width-roundtrip-restores-topology` (51 primary tests between them) reuse; `row-narrow-write`/`row-wide-write` and the `orphan-fixup-primitives` are the lemmas of every grid write, erase and line-op spec.
-- 207 specs remain after merging the same property seen from different files across the six passes, and after dropping two specs whose code is `#[cfg(test)]` (`generation-tracker-evict`, `style-intern-resolve`).
 
 ## 4. Tests that are not spec samples
 

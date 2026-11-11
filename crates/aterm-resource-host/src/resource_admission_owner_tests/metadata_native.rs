@@ -381,7 +381,12 @@ fn host() {
         let error = recipe::Recipe::qualify_in(&pending.submission.request, 2, Some(&layout))
             .err()
             .expect("unmanaged environment must refuse before capability code");
-        assert!(error.to_string().contains("closed native profile"));
+        let expected = if name.starts_with(b"DYLD_") {
+            "dynamic loader overrides"
+        } else {
+            "closed native profile"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
         assert!(
             !world
                 .scratch

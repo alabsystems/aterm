@@ -67,12 +67,7 @@ fn fleet_file(cli: Cli) -> String {
 /// Whether `account` is the account a file's row of `cli` names: its address or provider
 /// identity, in the same realm.
 fn names_account(account: &LabAccount, cli: Cli, email: &str, vendor: Vendor) -> bool {
-    account.cli == cli
-        && accounts::same_provider_realm(cli, vendor.region, account.vendor.region)
-        && [Some(account.email.as_str()), account.identity.as_deref()]
-            .into_iter()
-            .flatten()
-            .any(|own| accounts::email_matches(own, email))
+    account.cli == cli && account.says(vendor.region, email)
 }
 
 /// Whether the lab knows the account a file's row of `cli` names.

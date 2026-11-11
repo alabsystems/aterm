@@ -325,25 +325,33 @@ impl Watch {
         }
     }
 
-    /// The source of the latest move this watch was not told of and is due at `now`, without
-    /// waiting.
-    #[cfg_attr(
-        all(windows, not(test)),
-        expect(dead_code, reason = "its one caller, the heartbeat clock, is Unix's")
-    )]
-    pub(crate) fn take_at(&mut self, now: Instant) -> Option<Woke> {
+    /// The exact generation and source due now, without acknowledging either. A
+    /// caller may dispatch first, then acknowledge only this selected generation.
+    #[cfg(any(unix, test))]
+    pub(crate) fn pending_at(&self, now: Instant) -> Option<(u64, Woke)> {
         let told = self
             .moved
             .told
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        (told.count != self.seen && told.due.is_none_or(|due| !self.spread || now >= due)).then(
-            || {
-                let woke = told.heard_since(self.seen);
-                self.seen = told.count;
-                woke
-            },
-        )
+        (told.count != self.seen && told.due.is_none_or(|due| !self.spread || now >= due))
+            .then_some((told.count, told.heard_since(self.seen)))
+    }
+
+    /// Complete one selected generation after its dispatch was accepted. A move
+    /// told during dispatch remains newer than `seen` and belongs to the next round.
+    #[cfg(any(unix, test))]
+    pub(crate) fn acknowledge(&mut self, generation: u64) {
+        self.seen = generation;
+    }
+
+    /// The source of the latest move this watch was not told of and is due at `now`, without
+    /// waiting. Consumers that need no dispatch acknowledgement take it immediately.
+    #[cfg(any(unix, test))]
+    pub(crate) fn take_at(&mut self, now: Instant) -> Option<Woke> {
+        let (generation, woke) = self.pending_at(now)?;
+        self.acknowledge(generation);
+        Some(woke)
     }
 
     /// [`Watch::take_at`] now.

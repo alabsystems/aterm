@@ -4348,8 +4348,9 @@ const fn reads_limit_until(agent: Program) -> bool {
     }
 }
 
-/// Whether the host re-evaluates `agent`'s model quota rotation on turn and wall events.
-const fn rotates_model_quota(agent: Program) -> bool {
+/// Whether the host reads `agent`'s usage-limit reset from its quota reading, which needs no
+/// conversation id ([`WorkerIdle::limit_until`]).
+const fn limit_read_without_session(agent: Program) -> bool {
     match agent {
         Program::Agy => true,
         Program::Claude
@@ -5462,6 +5463,9 @@ pub(crate) struct TapKept {
     noted: Option<TapNoted>,
     /// When a busy read last took the tap's reading ([`TapAt::Busy`]).
     busy_at: Option<i64>,
+    /// When the session's login was last looked at for its sighting
+    /// ([`WorkerIdle::sighting_step`]).
+    sight_at: Option<i64>,
     /// The account no row lists, the windows and the time of the reading this worker last sent
     /// to the journal ([`WorkerIdle::tap_unlisted`]).
     unlisted: Option<TapUnlisted>,
@@ -5525,6 +5529,12 @@ enum TapAt {
 /// `aterm harness accounts` line, an untapped tab's footer and another machine's read of this
 /// one stay within a minute of it.
 const BUSY_TAP_S: i64 = 60;
+
+/// How often a session's login is looked at for its sighting ([`WorkerIdle::sighting_step`]): a
+/// `/login` in the tab is heard within a minute, and a tab that is read every tick costs one
+/// environment read and one profile read a minute. What is noted of a look is bounded apart
+/// ([`observe::Sightings::due`]).
+const SIGHT_S: i64 = 60;
 
 impl std::fmt::Debug for WorkerIdle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -6253,10 +6263,6 @@ impl IdleHost for WorkerIdle {
                 .unwrap_or_else(PoisonError::into_inner)
                 .served = Some(pid);
         }
-        if rotates_model_quota(self.agent) && self.switches.upgrade() {
-            due_moved(&self.kept);
-            self.park.store(true, Ordering::SeqCst);
-        }
         let unnamed = self.unnamed();
         let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
         let climbed = run.same > 0;
@@ -6433,7 +6439,7 @@ impl IdleHost for WorkerIdle {
         if !reads_limit_until(self.agent) {
             return None;
         }
-        let quota_lane = rotates_model_quota(self.agent);
+        let quota_lane = limit_read_without_session(self.agent);
         let snap = self
             .followed_kept()
             .or_else(|| {
@@ -6449,14 +6455,7 @@ impl IdleHost for WorkerIdle {
                 self.followed_kept()
             })
             .filter(|s| quota_lane || s.session.is_some())?;
-        let reset = (self.hooks.acts.limit_reset)(&snap);
-        if quota_lane && self.switches.upgrade() {
-            due_moved(&self.kept);
-            if (self.hooks.acts.due)(&self.sid) == Due::Yes {
-                self.park.store(true, Ordering::SeqCst);
-            }
-        }
-        reset
+        (self.hooks.acts.limit_reset)(&snap)
     }
 
     /// The transcript that confirms a wall ([`IdleHost::transcript_tail`]).
@@ -6501,10 +6500,6 @@ impl IdleHost for WorkerIdle {
         if upgrades(self.agent) {
             if open {
                 self.owns.store(false, Ordering::SeqCst);
-            }
-            if rotates_model_quota(self.agent) && self.switches.upgrade() {
-                due_moved(&self.kept);
-                self.park.store(true, Ordering::SeqCst);
             }
             let now = aterm_time::unix_secs().unwrap_or(0);
             *self
@@ -6742,15 +6737,16 @@ impl IdleHost for WorkerIdle {
     /// What the session's own login file says it runs on, sighted at a turn-end point
     /// ([`IdleHost::account_seen`]): a Codex, agy, Grok Build or Kimi Code session's against its
     /// pool's roster ([`Self::note_pool_sighting`]), a Muse Code session's alone
-    /// ([`Self::note_muse_sighting`]). Claude Code's is made where its account is noted
-    /// ([`Self::account_note`]).
+    /// ([`Self::note_muse_sighting`]), and a Claude Code session's by its own step, roster or no
+    /// roster ([`Self::sighting_step`]).
     fn account_seen(&self) {
         match self.agent {
             Program::Codex | Program::Agy | Program::Grok | Program::Kimi => {
                 self.note_pool_sighting();
             }
             Program::Muse => self.note_muse_sighting(),
-            Program::Claude | Program::Generic => {}
+            Program::Claude => self.sighting_step(),
+            Program::Generic => {}
         }
     }
 
@@ -9359,7 +9355,6 @@ impl WorkerIdle {
         look: &AccountLook,
         state: &accounts::State,
     ) {
-        self.note_sighting(seat, roster, look, &state.machine);
         let Some(label) = look.judged(roster) else {
             return;
         };
@@ -9402,6 +9397,93 @@ impl WorkerIdle {
         }
     }
 
+    /// The session's sighting, where one is due: what its login file says it runs on, as the
+    /// journal and the registry hear it (`docs/DESIGN-account-discovery-2026-11-09.md`;
+    /// [`observe::sighting`]). It asks nothing of the account policy and needs no roster: with
+    /// rotation off, and on a Mac that lists no account, the tab still runs a login the fleet
+    /// should know is in use here. Only an agent whose observer is built is read
+    /// ([`accounts_for`]), and only where it runs on a stored login or a vault token by its
+    /// environment and its settings both.
+    ///
+    /// The tab is named by the id the store keeps ([`accounts::Store::machine_id`]), which this
+    /// makes on a Mac whose store never held one: a state read alone mints a fresh id on every
+    /// load until one is kept, and each would name another tab.
+    fn sight(&self) -> Option<observe::Sighted> {
+        if !accounts_for(self.agent) {
+            return None;
+        }
+        let seat = (self.hooks.acts.account_seat)()?;
+        let roster = sighting_roster(&seat);
+        let none = accounts::Roster::default();
+        let look = self.account_look(&seat, roster.as_ref().unwrap_or(&none))?;
+        let observed = look.seen.seen()?;
+        let snap = &look.snap;
+        if !self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd) {
+            return None;
+        }
+        let store = seat.claude_store();
+        let held = store
+            .load(seat.now)
+            .map_or_else(|_| String::new(), |(state, _)| state.machine);
+        let machine = store.machine_id(&held).ok()?;
+        let tab = journal::Tab::of(&machine, &self.sid);
+        let harness = accounts::Cli::of(self.agent).map_or("claude", accounts::Cli::id);
+        let sighted = with_kept_of(&self.kept, |k| {
+            observe::sighting(
+                roster.as_ref(),
+                &look.who,
+                &look.seen,
+                &mut k.account.sighted,
+                tab,
+                harness,
+                seat.now,
+            )
+        });
+        if sighted
+            .notes
+            .iter()
+            .any(|note| note.kind == "wrong-account")
+        {
+            aterm_log::info!(
+                "harness @{}: account observed {} from {}, not the roster's {}",
+                self.sid,
+                observed.email,
+                observed.path.display(),
+                roster
+                    .as_ref()
+                    .and_then(|roster| accounts::judged_label(roster, &look.who))
+                    .unwrap_or("default row")
+            );
+        }
+        Some(sighted)
+    }
+
+    /// [`IdleHost::account_seen`]: the session's sighting ([`Self::sight`]) published, read at
+    /// most once per [`SIGHT_S`].
+    fn sighting_step(&self) {
+        let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
+            return;
+        };
+        {
+            let mut kept = self.tap.lock().unwrap_or_else(PoisonError::into_inner);
+            // A clock set back makes the next look due rather than holding it off.
+            if kept
+                .sight_at
+                .is_some_and(|then| (0..SIGHT_S).contains(&now.saturating_sub(then)))
+            {
+                return;
+            }
+            kept.sight_at = Some(now);
+        }
+        let Some(sighted) = self.sight() else {
+            return;
+        };
+        journal::publish(&sighted.notes);
+        if let Some(login) = &sighted.login {
+            journal::observed(login);
+        }
+    }
+
     /// What the session's login file says it runs on, told to the journal and the registry
     /// (`docs/DESIGN-account-discovery-2026-11-09.md`): its sighting when one is due, a
     /// disagreement with the believed row once, and for an account no row lists its session's
@@ -9420,7 +9502,7 @@ impl WorkerIdle {
         let harness = accounts::Cli::of(self.agent).map_or("claude", accounts::Cli::id);
         let sighted = with_kept_of(&self.kept, |k| {
             observe::sighting(
-                roster,
+                Some(roster),
                 &look.who,
                 &look.seen,
                 &mut k.account.sighted,
@@ -11823,7 +11905,7 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     };
     let began_wall_ms = snap
         .as_ref()
-        .and_then(|snap| aterm_agent::harness::upgrade_models::parse_lstart(&snap.start))
+        .and_then(|snap| aterm_agent::harness::unix_time::parse_lstart(&snap.start))
         .map(|secs| secs.saturating_mul(1000));
     let watched = job.watch_until.is_some();
     let decide_at = |exit: bool| {
@@ -13205,9 +13287,7 @@ fn resume_line(job: &WorkerJob) -> Option<(String, String)> {
 /// The line a person is told to run to resume the agent `snap` describes on its own conversation.
 fn resume_told(snap: &Snapshot) -> Option<String> {
     match &snap.run {
-        relaunch::AgentRun::Claude => {
-            relaunch::told_command(&aterm_primer::home_dir()?, harness_state().as_deref(), snap)
-        }
+        relaunch::AgentRun::Claude => relaunch::told_command(&aterm_primer::home_dir()?, snap),
         relaunch::AgentRun::Codex(_) => None,
         relaunch::AgentRun::Muse(run) => {
             aterm_agent::harness::upgrade_muse::told_line(snap.session.as_deref()?, &run.env)
@@ -17305,7 +17385,7 @@ pub(crate) fn held_judges(word: &str) -> bool {
 /// or raises the owner's ask) that the loop tells only once its own means at that point are
 /// spent, so what the worker waits on is a person, not the loop's next act: a request the API
 /// refused at each of `FUTILE_AFTER_TRIES` tries (`Refused`), a context compaction cannot shrink
-/// (`Context`), a model with no reset and no fallback the tab can make (`Bucket`), a limit that
+/// (`Context`), a model limit with no reset (`Bucket`), a limit that
 /// answers each try the same, stands an hour past its reset or passed over a conversation the
 /// loop cannot read (`Futile`), and the same reply or no work held after aterm's acts (a
 /// `Stalled` one with its `held` arm, Land's same-reply hold among them).
@@ -17446,14 +17526,22 @@ struct InstallClock {
     since: Instant,
 }
 
+/// A sampled exemption's clock. Autopilot Off has no running deadline: its first resumed
+/// observation starts a whole one, rather than spending the gap since the last Off sample.
+#[derive(Clone, Copy)]
+enum StartupPause {
+    AutopilotOff,
+    Observed(Instant),
+}
+
 /// The deadlines' books ([`look_at_startups`]).
 struct Startups {
     from: Option<Instant>,
     started: std::collections::HashSet<String>,
-    /// The last look that found each worker outside the startup deadline's judgement, which falls
-    /// a whole one after that: Autopilot off, a codex-alab that may not claim
+    /// Pending observed Autopilot Off, or the clock floor from its first resumed observation.
+    /// Other exemptions retain their last-look floor: a codex-alab that may not claim
     /// ([`StartupSeen::CannotClaim`]), a relaunch in hand, or an install.
-    off: HashMap<String, Instant>,
+    off: HashMap<String, StartupPause>,
     hands: HashMap<String, Instant>,
     held: HashMap<String, HeldClock>,
     /// Each launcher's install, from the look that first found it.
@@ -17518,13 +17606,22 @@ fn look_at_startups(
     let mut soonest = |at: Instant| next = Some(next.map_or(at, |n| n.min(at)));
     for w in &reads {
         if off.contains(&w.sid) {
-            books.off.insert(w.sid.clone(), now);
+            books.off.insert(w.sid.clone(), StartupPause::AutopilotOff);
             books.hands.remove(&w.sid);
             books.held.remove(&w.sid);
             books.installs.remove(&w.sid);
             continue;
         }
-        let back = books.off.get(&w.sid).copied().unwrap_or(from);
+        let back = match books.off.get_mut(&w.sid) {
+            Some(pause) => match *pause {
+                StartupPause::AutopilotOff => {
+                    *pause = StartupPause::Observed(now);
+                    now
+                }
+                StartupPause::Observed(at) => at,
+            },
+            None => from,
+        };
         match (w.state, &w.seen) {
             (StartupState::Other, _) => {}
             (StartupState::StallOver, _) => {
@@ -17561,7 +17658,7 @@ fn look_at_startups(
             }
             (_, StartupSeen::Unread) => soonest(now + STARTUP_UNREAD_LOOK),
             (_, StartupSeen::CannotClaim) => {
-                books.off.insert(w.sid.clone(), now);
+                books.off.insert(w.sid.clone(), StartupPause::Observed(now));
                 books.installs.remove(&w.sid);
                 soonest(now + STARTUP_UNREAD_LOOK);
             }
@@ -17589,7 +17686,7 @@ fn look_at_startups(
                     .own_panel_until(&w.sid, STARTUP_DEADLINE)
                     .filter(|until| now < *until);
                 if books.waits.relaunching.contains(&w.sid) || panel.is_some() {
-                    books.off.insert(w.sid.clone(), now);
+                    books.off.insert(w.sid.clone(), StartupPause::Observed(now));
                     soonest(panel.map_or(now + HELD_RELOOK, |until| until.min(now + HELD_RELOOK)));
                     continue;
                 }
@@ -17646,7 +17743,7 @@ fn judge_install_startup(
         .own_panel_until(&w.sid, STARTUP_DEADLINE)
         .filter(|until| now < *until);
     if books.waits.relaunching.contains(&w.sid) || panel.is_some() {
-        books.off.insert(w.sid.clone(), now);
+        books.off.insert(w.sid.clone(), StartupPause::Observed(now));
         // A harness-owned wait is no install quiet. Resume with a whole quiet clock.
         books.installs.remove(&w.sid);
         return Some(panel.map_or(now + HELD_RELOOK, |until| until.min(now + HELD_RELOOK)));
@@ -17666,7 +17763,7 @@ fn judge_install_startup(
     }
     let limit = clock.since.max(from).max(w.since) + INSTALL_QUIET_LIMIT;
     if now < limit {
-        books.off.insert(w.sid.clone(), now);
+        books.off.insert(w.sid.clone(), StartupPause::Observed(now));
         Some(limit.min(now + HELD_RELOOK))
     } else {
         (hooks.acts.startup_mark)(
@@ -20024,7 +20121,7 @@ pub(crate) fn window_drive_opts(
     window_drive_opts_with_tap(home, state, sock, false)
 }
 
-/// Capture the model-evidence policy and optional tap from one recovered roster.
+/// Capture the optional usage tap from one recovered roster.
 /// Only the acting lane enables the tap; views and recorded requests leave it off.
 pub(crate) fn window_drive_opts_with_tap(
     home: std::path::PathBuf,
@@ -20052,8 +20149,6 @@ pub(crate) fn window_drive_opts_with_tap(
         background: false,
         aterm_state: aterm_types::dirs::state_dir(),
         ask: upgrade_ask(),
-        several_logins: accounts.several_logins,
-        usage_credits: usage_credits(),
         usage_tap: accounts.usage_tap,
         instances: upgrade_drive::Instances::Machine,
         agents_off: Vec::new(),
@@ -20535,12 +20630,10 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
         }),
         transcript_tail: Arc::new(upgrade_drive::snapshot_transcript_tail),
         repo_work: Arc::new(move |snap| {
-            use aterm_agent::harness::{repo_work, upgrade_models};
+            use aterm_agent::harness::{repo_work, unix_time};
             let tail = upgrade_drive::snapshot_transcript_tail(snap);
-            let used = repo_work::Used::of_session(
-                upgrade_models::parse_lstart(&snap.start),
-                tail.as_deref(),
-            );
+            let used =
+                repo_work::Used::of_session(unix_time::parse_lstart(&snap.start), tail.as_deref());
             repo_work::session_dir(&snap.cwd, tail.as_deref())
                 .map_or_else(Default::default, |dir| {
                     session_repo_work(&dir, repo_home.as_deref(), &used)
@@ -20757,7 +20850,7 @@ fn account_wall_at(
 
 /// The unix second a process started, from its kernel start as the snapshot keeps it ([`Snapshot::start`]: `ps -o lstart=` in UTC).
 fn process_started(start: &str) -> Option<i64> {
-    aterm_agent::harness::upgrade_models::parse_lstart(start).and_then(|s| i64::try_from(s).ok())
+    aterm_agent::harness::unix_time::parse_lstart(start).and_then(|s| i64::try_from(s).ok())
 }
 
 /// Whether `row` runs under a login directory of its own, not the default login.
@@ -22835,7 +22928,7 @@ fn account_cold_at(
     admitted.route = accounts::AuthRoute::Stored;
     admitted.auth_observed = true;
     note_cold_stretch(seat, &admitted, snap)?;
-    // Preserve the original profile so a model move cannot erase its billing context.
+    // The admitted snapshot carries the original profile unchanged.
     Ok(Some(admitted))
 }
 
@@ -23617,6 +23710,19 @@ fn account_roster_or_own(seat: &AccountSeat) -> Option<accounts::Roster> {
     match roster_read(seat) {
         Ok(roster) => Some(roster),
         Err(RosterUnread::Nothing) => Some(accounts::Roster::own()),
+        Err(RosterUnread::Refused | RosterUnread::LoginsUnread) => None,
+    }
+}
+
+/// The roster a session's sighting is reconciled against ([`WorkerIdle::sight`]): an empty one
+/// for a Mac that lists no account, so its login reads as an account no row lists and its
+/// session is journaled under the observed account, never under the synthetic own row
+/// ([`accounts::Roster::own`], whose label is no account's); `None` for a roster that could not
+/// be read, which says nothing of what a row lists.
+fn sighting_roster(seat: &AccountSeat) -> Option<accounts::Roster> {
+    match roster_read(seat) {
+        Ok(roster) => Some(roster),
+        Err(RosterUnread::Nothing) => Some(accounts::Roster::default()),
         Err(RosterUnread::Refused | RosterUnread::LoginsUnread) => None,
     }
 }

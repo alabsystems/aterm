@@ -878,6 +878,17 @@ fn native_click(source_pid: i64) -> crate::hwkey::NativeInput {
     }
 }
 
+/// A native modifier change from the process `source_pid` names.
+#[cfg(target_os = "macos")]
+fn native_modifier(source_pid: i64) -> crate::hwkey::NativeInput {
+    crate::hwkey::NativeInput {
+        kind: 12, // NSEventTypeFlagsChanged
+        keycode: 56,
+        timestamp: stamp(),
+        source_pid,
+    }
+}
+
 /// Where a native menu or toolbar item chosen by `chooser` (the event AppKit is dispatching as
 /// the item's callback runs, the test build's stand-in) is posted from
 /// ([`crate::tab_spawn::native_post_origin`]).
@@ -1129,9 +1140,24 @@ fn a_click_another_process_posted_arrives_relayed() {
     }
 }
 
-/// The classifier the window installs before a native key or click can generate a callback
-/// reads the event's source: another process's key or click is relayed, a keyboard's or a
-/// mouse's is the person's.
+/// A MODIFIER CHANGE ANOTHER PROCESS POSTED ARRIVES AS IT WAS CLASSIFIED: `flagsChanged:`
+/// retains the native event's verdict through the window callback, so the application's callback
+/// must read it just as a key's does.
+/// NEGATIVE CONTROL: without `ModifiersChanged` in `arriving_input_origin`, a retained relayed
+/// modifier change arrived as the person's.
+#[test]
+fn a_modifier_change_another_process_posted_arrives_relayed() {
+    let changed = aterm_window::event::WindowEvent::ModifiersChanged(Default::default());
+    for origin in [InputOrigin::Relayed, InputOrigin::Person] {
+        crate::hwkey::with_window_event_origin_for_test(origin, || {
+            assert_eq!(crate::arriving_input_origin(&changed), origin);
+        });
+    }
+}
+
+/// The classifier the window installs before a native key, modifier change or click can generate
+/// a callback reads the event's source: another process's input is relayed, a keyboard's or a
+/// mouse's input is the person's.
 /// NEGATIVE CONTROL: with `platform::window_input_origin` passing [`crate::hwkey::HID_SYSTEM`]
 /// for every event's source, another process's key was the person's.
 #[cfg(target_os = "macos")]
@@ -1146,8 +1172,13 @@ fn the_window_classifier_reads_an_events_source() {
         };
     for (event, want) in [
         (native_key(1, elsewhere()), InputOrigin::Relayed),
+        (native_modifier(elsewhere()), InputOrigin::Relayed),
         (native_click(elsewhere()), InputOrigin::Relayed),
         (native_key(1, crate::hwkey::HID_SYSTEM), InputOrigin::Person),
+        (
+            native_modifier(crate::hwkey::HID_SYSTEM),
+            InputOrigin::Person,
+        ),
         (native_click(crate::hwkey::HID_SYSTEM), InputOrigin::Person),
     ] {
         assert_eq!(

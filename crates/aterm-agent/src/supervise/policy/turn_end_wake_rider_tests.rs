@@ -165,9 +165,9 @@ fn a_wakes_fact_rides_each_of_the_four_acts_whole_and_each_still_reads_as_its_ac
 
 /// A WAKE'S FACT NEVER RIDES AN ANSWER, A WALL'S RETRY, A DRAFT, OR AN ACT OF THE UPGRADE'S OR A
 /// RELAUNCH'S: each such point decides as it would handed no wake, and no act it decides carries
-/// the fact; a relaunch (the memory restart, a model's fallback or its return, an account move)
-/// is left as it is, the continuation it would type in its place carrying nothing. (A grey
-/// suggestion is no longer accepted bare: the continuation typed over it is a continuation.)
+/// the fact; a relaunch (the memory restart, an account move) is left as it is, the continuation
+/// it would type in its place carrying nothing. (A grey suggestion is no longer accepted bare:
+/// the continuation typed over it is a continuation.)
 /// NEGATIVE CONTROL: the continuation at a plain point carries it.
 #[test]
 fn a_wakes_fact_never_rides_an_answer_a_retry_a_draft_or_an_upgrade() {
@@ -264,13 +264,6 @@ fn a_wakes_fact_never_rides_an_answer_a_retry_a_draft_or_an_upgrade() {
     };
     for (why, rule_id) in [
         (Restart::Memory, RULE_MEMORY_RESTART),
-        (
-            Restart::Model {
-                to: "sonnet".to_string(),
-            },
-            RULE_MODEL_FALLBACK,
-        ),
-        (Restart::ModelBack { to: None }, RULE_MODEL_RESTORE),
         (
             Restart::Account {
                 to: "work".to_string(),

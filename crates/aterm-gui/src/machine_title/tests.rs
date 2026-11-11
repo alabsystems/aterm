@@ -41,8 +41,8 @@ fn the_title_is_the_name_and_the_nickname_clipped_to_sixteen_scalars() {
         "m8 Heron"
     );
     assert_eq!(
-        machine_menu_bar_title(&view("m0", "Otter", false)),
-        "m0 Otter"
+        machine_menu_bar_title(&view("unnumbered", "Otter", false)),
+        "unnumbered Otter"
     );
     let sixteen = "Abcdefghijklmnop";
     assert_eq!(
@@ -69,27 +69,27 @@ fn the_title_is_the_name_and_the_nickname_clipped_to_sixteen_scalars() {
 fn the_first_row_says_whether_this_machine_is_in_a_fleet() {
     assert_eq!(
         machine_menu_info_row(&view("m8", "Heron", true)),
-        "m8 \u{00B7} Heron \u{00B7} in a fleet"
+        "m8 \u{00B7} Heron \u{00B7} in ALab"
     );
     assert_eq!(
-        machine_menu_info_row(&view("m0", "Otter", false)),
-        "m0 \u{00B7} Otter \u{00B7} not in a fleet"
+        machine_menu_info_row(&view("unnumbered", "Otter", false)),
+        "unnumbered \u{00B7} Otter \u{00B7} not in a fleet"
     );
     let joining = MachineView {
         fleet: InFleet::Joining,
-        ..view("m0", "Otter", false)
+        ..view("unnumbered", "Otter", false)
     };
     assert_eq!(
         machine_menu_info_row(&joining),
-        "m0 \u{00B7} Otter \u{00B7} joining a fleet"
+        "unnumbered \u{00B7} Otter \u{00B7} joining ALab"
     );
     let unread = MachineView {
         fleet: InFleet::Unread("source.toml: bad".to_owned()),
-        ..view("m0", "Otter", false)
+        ..view("unnumbered", "Otter", false)
     };
     assert_eq!(
         machine_menu_info_row(&unread),
-        "m0 \u{00B7} Otter \u{00B7} fleet not read"
+        "unnumbered \u{00B7} Otter \u{00B7} fleet not read"
     );
 }
 
@@ -140,10 +140,17 @@ fn the_reader_posts_the_name_and_each_change_it_hears() {
     read_loop(dir, Some(&vault(dir)), || Ok(None), post, wait);
     let posted = posted.into_inner();
     let first = posted.first().expect("a first view").clone();
-    assert_eq!((first.name.as_str(), &first.fleet), ("m0", &InFleet::Out));
+    assert_eq!(
+        (first.name.as_str(), &first.fleet),
+        ("unnumbered", &InFleet::Out)
+    );
     assert_eq!(
         posted,
-        [first, view("m0", RENAMED, false), view("m0", RENAMED, true)],
+        [
+            first,
+            view("unnumbered", RENAMED, false),
+            view("unnumbered", RENAMED, true)
+        ],
         "one post per change, none for a read that found none"
     );
     assert_eq!(
@@ -261,7 +268,7 @@ fn a_title_read_before_an_update_commits_is_kept() {
 }
 
 #[test]
-fn the_view_starts_the_field_at_the_stored_word_not_the_title_s_form() {
+fn the_view_starts_the_field_at_the_display_spelling() {
     let root = state();
     let dir = root.path();
     read(dir, Some(&vault(dir)), || Ok(None)).expect("a first read makes the name");
@@ -273,7 +280,7 @@ fn the_view_starts_the_field_at_the_stored_word_not_the_title_s_form() {
     let shown = read(dir, Some(&vault(dir)), || Ok(None)).expect("a read");
     assert_eq!(
         (shown.nick.as_str(), shown.word.as_str()),
-        ("Kestrel", "kestrel")
+        ("Kestrel", "Kestrel")
     );
 }
 
@@ -374,7 +381,7 @@ fn the_writer_applies_number_and_nickname_requests_in_submission_order() {
                     .expect("sets a nickname")
                     .name
             }
-            NameChange::Synchronize(_) => {
+            NameChange::Synchronize(_) | NameChange::SynchronizeCurrent => {
                 unreachable!("this writer-order fixture queues edits only")
             }
         };
@@ -470,11 +477,11 @@ fn an_authoritative_name_file_reset_replaces_the_windows_higher_revision() {
     )
     .expect("the authoritative read after a reset");
     let restored = app.machine_view.as_ref().expect("the replacement view");
-    assert_eq!((restored.name.as_str(), restored.rev), ("m0", 0));
+    assert_eq!((restored.name.as_str(), restored.rev), ("unnumbered", 0));
     let stored = file::read(root.path())
         .expect("reads")
         .expect("the replacement file");
-    assert_eq!(restored.word, stored.nick.as_str());
+    assert_eq!(restored.word, stored.display_nick());
 }
 
 /// A read name reaches the status item: the glance the item is built from carries the title, and

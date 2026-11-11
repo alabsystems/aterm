@@ -792,11 +792,7 @@ impl AgentRestore {
                 .into_iter()
                 .filter_map(|(name, value)| value.map(|value| (name, value)))
                 .collect::<Vec<_>>(),
-                aterm_agent::harness::upgrade_drive::resume_command_kept(
-                    None,
-                    &self.argv,
-                    conversation,
-                )?,
+                aterm_agent::harness::upgrade_drive::resume_command_kept(&self.argv, conversation)?,
             ),
             Some(RunRestore::Codex(CodexRestore {
                 alab: Some(alab), ..
@@ -2002,31 +1998,63 @@ impl WindowLayout {
 
     /// Whether [`Self::tab_order`] is a valid canonical permutation of `tabs` and `native_tabs`.
     fn canonical_order_is_valid(&self) -> bool {
+        const INLINE_BITS: usize = MAX_TABS_PER_WINDOW;
+        const INLINE_WORDS: usize = INLINE_BITS / 64;
+
+        fn mark_seen(
+            bits: &mut [u64; INLINE_WORDS],
+            overflow: &mut Vec<bool>,
+            index: usize,
+            len: usize,
+        ) -> bool {
+            if index >= len {
+                return false;
+            }
+            if let Some(word) = bits.get_mut(index / 64) {
+                let mask = 1u64 << (index % 64);
+                if (*word & mask) != 0 {
+                    return false;
+                }
+                *word |= mask;
+                true
+            } else {
+                if overflow.is_empty() {
+                    overflow.resize(len - INLINE_BITS, false);
+                }
+                !std::mem::replace(&mut overflow[index - INLINE_BITS], true)
+            }
+        }
+
         if self.tab_order.is_empty() {
             return self.native_tabs.is_empty();
         }
-        if self.tab_order.len() != self.tabs.len().saturating_add(self.native_tabs.len()) {
+        if self.tabs.len().checked_add(self.native_tabs.len()) != Some(self.tab_order.len()) {
             return false;
         }
-        let mut next_terminal = 0usize;
-        let mut next_native = 0usize;
+        let mut terminal_bits = [0u64; INLINE_WORDS];
+        let mut terminal_overflow = Vec::new();
+        let mut native_bits = [0u64; INLINE_WORDS];
+        let mut native_overflow = Vec::new();
         for entry in &self.tab_order {
-            match *entry {
-                TabOrderEntry::Terminal { index } => {
-                    if index != next_terminal {
-                        return false;
-                    }
-                    next_terminal = next_terminal.saturating_add(1);
-                }
-                TabOrderEntry::Native { index } => {
-                    if index != next_native {
-                        return false;
-                    }
-                    next_native = next_native.saturating_add(1);
-                }
+            let ok = match *entry {
+                TabOrderEntry::Terminal { index } => mark_seen(
+                    &mut terminal_bits,
+                    &mut terminal_overflow,
+                    index,
+                    self.tabs.len(),
+                ),
+                TabOrderEntry::Native { index } => mark_seen(
+                    &mut native_bits,
+                    &mut native_overflow,
+                    index,
+                    self.native_tabs.len(),
+                ),
+            };
+            if !ok {
+                return false;
             }
         }
-        next_terminal == self.tabs.len() && next_native == self.native_tabs.len()
+        true
     }
 
     /// Validated canonical order.
@@ -5955,6 +5983,15 @@ focused = true
             RestoreManifest::from_toml(&toml).is_none(),
             "duplicate descriptor indices may not alias one live tab"
         );
+
+        malformed_uri.windows[0].tab_order = vec![
+            TabOrderEntry::Native { index: 1 },
+            TabOrderEntry::Terminal { index: 0 },
+            TabOrderEntry::Native { index: 0 },
+        ];
+        let permuted = RestoreManifest::from_toml(&aterm_toml::to_string(&malformed_uri).unwrap())
+            .expect("non-monotonic bijection of legacy tab indices is valid");
+        assert_eq!(permuted.windows[0].restored_tabs.len(), 3);
 
         let mut duplicate_settings = mixed_sample("file:///tmp/readme.md");
         duplicate_settings.windows[0].native_tabs[1] = NativeTabRestore::Settings {

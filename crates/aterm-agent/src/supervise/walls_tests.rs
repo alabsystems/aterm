@@ -593,68 +593,14 @@ fn a_wall_met_again_after_a_seat_move_is_the_new_seats_own() {
 }
 
 #[test]
-fn an_agy_quota_wall_rotates_onto_the_other_pool_or_waits_for_the_earliest_refill_and_resumes() {
+fn an_agy_quota_wall_waits_for_its_pools_refill_and_resumes() {
     use aterm_phase::agy::fixtures::lab as agy;
     let wall = screen(agy::ERROR_429);
     let ended = screen(agy::END_OF_TURN);
-    let ended_flash = drawn(&ended, "Gemini 3.1 Pro · low", "Gemini 3.5 Flash · low");
-    let agy_shell = rows(&["$ agy", ""]);
 
-    // 1. When another pool is available (`upgrade_due = true`), the host steps right at the quota
-    //    wall to rotate `agy` onto the other model pool, and once relaunched on the new model seat,
-    //    steps at idle to type the continuation prompt (`continued`).
-    let host = AccountHost::scripted(&[None], &[]);
-    *host.step.lock().unwrap() = Some("continued");
-    host.upgrade_due.store(true, Ordering::SeqCst);
-    let opts = account_opts(&host);
-    let mut m = agy_mock(vec![ended_flash.clone()]);
-    let mut s = session(&mut m, Some("@s-1".to_string()));
-    s.set_zone_lookup(test_zones);
-    let mut clock = Clock::start(&mut s);
-    s.program = Some("agy".to_owned());
-    let wall_point = point_at(&s, wall.clone(), 1);
-    let _ = s
-        .turn_end_at_point(&wall_point, Some(Duration::from_secs(60)), &opts)
-        .expect("a decision");
-    assert!(s.policy_limit_holds());
-    host.carry.store(true, Ordering::SeqCst);
-    let stepped = s
-        .host_steps_here(&wall_point, &opts, &mut false, &mut Alone)
-        .expect("the host's rotation step at the wall");
-    assert!(stepped, "host rotates at the wall when another pool is due");
-    assert_eq!(host.said("carry-on").len(), 1);
-
-    // After relaunch onto the new model (`ended_flash`), the seat move releases the limit and
-    // lets the host's carry-on step type the continuation prompt immediately.
-    host.upgrade_due.store(false, Ordering::SeqCst);
-    host.relaunch_owed.store(true, Ordering::SeqCst);
-    clock.to(&mut s, 30);
-    s.program = Some("zsh".to_owned());
-    let shell_point = point_at(&s, agy_shell, 2);
-    let _ = s.turn_end_at_point(&shell_point, None, &opts);
-    clock.to(&mut s, 60);
-    s.program = Some("agy".to_owned());
-    let mut after_point = point_at(&s, ended_flash.clone(), 3);
-    if let Some(row) = aterm_phase::agy::composer(&ended_flash) {
-        after_point.screen.cursor_row = row;
-    }
-    let _ = s
-        .turn_end_at_point(&after_point, Some(Duration::from_secs(4)), &opts)
-        .expect("a decision");
-    assert!(
-        !s.policy_limit_holds(),
-        "seat move to the new model releases the limit"
-    );
-    host.carry.store(true, Ordering::SeqCst);
-    let stepped = s
-        .host_steps_here(&after_point, &opts, &mut false, &mut Alone)
-        .expect("the host's carry-on step on the new model");
-    assert!(stepped, "the continuation prompt is typed on the new model");
-    assert_eq!(host.said("carry-on").len(), 2);
-
-    // 2. When both pools are spent (`upgrade_due = false`), `limit_until` supplies the earliest
-    //    pool refill timestamp (900s, earlier than the screen's 1h notice), waits until then,
-    //    and seamlessly resumes via `usage-resume@v1` once the quota is restored.
+    // `limit_until` supplies the pool's refill (900s, earlier than the screen's 1h notice): the
+    // session waits until then and resumes in place via `usage-resume@v1` once the quota is
+    // restored.
     let host = AccountHost::scripted(&[None], &[]);
     let refill_unix = u64::try_from(TEST_NOW + 900).unwrap();
     *host.limit_until.lock().unwrap() = Some(refill_unix);
@@ -681,7 +627,7 @@ fn an_agy_quota_wall_rotates_onto_the_other_pool_or_waits_for_the_earliest_refil
         .expect("the host's step");
     assert!(
         !stepped,
-        "withheld while both pools are spent before refill"
+        "withheld while the pool is spent before its refill"
     );
 
     clock.to(&mut s, 600);

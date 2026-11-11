@@ -85,7 +85,6 @@ fn in_tab<T>(name: &str, tab: Tab, act: impl FnOnce(&Opts, Snapshot, &dyn Kernel
         },
         &click(PermissionTo::Settings),
     );
-    seed_builds(&opts);
     let shell = stand_in_shell_with(None, &[&[OUTSIDE_ROUTE][..], tab.shell_env].concat());
     let mut agent = parked_bare().spawn().expect("agent");
     wait_exec(agent.id());

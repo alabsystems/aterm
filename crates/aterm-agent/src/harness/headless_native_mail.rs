@@ -465,8 +465,10 @@ fn run(
             }
             mailbox
         }
-        Err(error) if error == "The mail browser profile is already in use" => return Err(BUSY),
-        Err(error) if error == "Headless mailbox requires an unavailable second factor" => {
+        Err(error) if error.message == "The mail browser profile is already in use" => {
+            return Err(BUSY);
+        }
+        Err(error) if error.message == "Headless mailbox requires an unavailable second factor" => {
             super::super::mailbox_needs::record_observed_missing(
                 source_cfg,
                 target,
@@ -474,7 +476,9 @@ fn run(
             );
             return Err("Headless mailbox requires an unavailable second factor");
         }
-        Err(error) if error == "Headless mailbox requires an unavailable second password" => {
+        Err(error)
+            if error.message == "Headless mailbox requires an unavailable second password" =>
+        {
             super::super::mailbox_needs::record_observed_missing(
                 source_cfg,
                 target,
@@ -482,7 +486,7 @@ fn run(
             );
             return Err("Headless mailbox requires an unavailable second password");
         }
-        Err(error) if error == "Proton rejected the headless browser credentials" => {
+        Err(error) if error.message == "Proton rejected the headless browser credentials" => {
             note_login(cfg, &source, &login, LoginOutcome::Refused, &mut seen);
             return Err(super::super::mailbox_routes::refused_words(&login));
         }

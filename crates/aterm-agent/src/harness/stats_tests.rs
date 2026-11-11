@@ -15,7 +15,7 @@ use crate::supervise::policy::turn_end::{
     LAND_ANSWER, LAND_NUDGE_COMMITTED_BEFORE, RULE_ACCOUNT, RULE_ANSWER, RULE_API_BACK,
     RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONSENT, RULE_CONTINUE, RULE_DONE_CHECK,
     RULE_HOST_TURN, RULE_LAND_ANSWER, RULE_LAND_NUDGE, RULE_LIMIT_RESUME, RULE_LOGIN,
-    RULE_MODEL_FALLBACK, RULE_OUTAGE_RESUME, RULE_SUGGESTION, RULE_USAGE_PROBE, WAKE_KEPT,
+    RULE_OUTAGE_RESUME, RULE_SUGGESTION, RULE_USAGE_PROBE, WAKE_KEPT,
 };
 
 fn row(ts: i64, sid: &str, rule_id: &str, outcome: Outcome, command: &str, reason: &str) -> String {
@@ -138,7 +138,7 @@ fn a_ledger_row_counts_where_the_table_says() {
         typed(t, RULE_LOGIN, "/login"),
         typed(t, RULE_HOST_TURN, "[aterm harness] …"),
         typed(t, RULE_USAGE_PROBE, "/usage"),
-        typed(t, RULE_MODEL_FALLBACK, "relaunch --model x"),
+        typed(t, "model-fallback@v1", "relaunch --model x"),
         typed(t, "future-rule@v9", "something new"),
         said(t, "-", Outcome::Escalated, "no rule answers this box"),
         row(t, "s-1", RULE_READ_ONLY, Outcome::Skipped, forged, "moved"),
@@ -590,7 +590,7 @@ fn an_upgrade_row_tells_an_upgrade_from_a_relaunch() {
         up(104, "-", "2.1.299", "2.1.300(managed)", "exited"),
         up(105, "s-1", "2.1.299", "2.1.300(managed)", "adopted"),
         up(106, "s-1", "2.1.299", "2.1.300(managed)", "wait:busy"),
-        up(107, "s-1", "2.1.300", "model:opus", "model-ride-dropped"),
+        up(107, "s-1", "2.1.300", "2.1.301(managed)", "announced:1"),
     ];
     let fold = |since_ms| {
         let mut acc = HarnessStats::new(since_ms);
@@ -916,8 +916,6 @@ fn sweep_opts(home: &Path, harness_state: &Path) -> Opts {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),

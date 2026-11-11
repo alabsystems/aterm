@@ -9668,10 +9668,6 @@ pub(crate) fn is_wall_retry(rule: &str) -> bool {
 }
 /// A continuation past a usage window's reset.
 pub const RULE_LIMIT_RESUME: &str = "usage-resume@v1";
-/// The agent relaunched on the fallback model on a model bucket.
-pub const RULE_MODEL_FALLBACK: &str = "model-fallback@v1";
-/// The agent relaunched on the bucket's model again at the bucket's reset.
-pub const RULE_MODEL_RESTORE: &str = "model-restore@v1";
 /// The agent relaunched under another of the owner's Claude Code accounts.
 pub const RULE_ACCOUNT: &str = "account-rotate@v1";
 /// The accounts probe.
@@ -9797,8 +9793,8 @@ pub const CREDITS_HOLD_TOLD: &str = "usage credits carry the session and name no
 /// The same where the credits carry a MODEL's requests, none named ([`CreditsEpisode::model`]).
 pub const CREDITS_HOLD_MODEL_TOLD: &str = "usage credits carry the requests of the model \
      this session runs, with no reset named: nothing is typed on them (credits-hold@v1) until \
-     it runs another (`[harness] model_fallback`, or a relaunch); `[harness] usage_credits = \
-     true` continues on credits";
+     its person moves it to another model (`/model`); `[harness] usage_credits = true` \
+     continues on credits";
 /// The agent restarted in its tab for Claude Code's critical-memory banner.
 pub const RULE_MEMORY_RESTART: &str = "memory-restart@v1";
 /// The agent restarted in its tab because it read the line the loop wrote to it and drew none of
@@ -9839,12 +9835,6 @@ pub enum Restart {
     InputLost {
         of: crate::supervise::custody::Process,
         line: crate::supervise::custody::LineAsk,
-    },
-    Model {
-        to: String,
-    },
-    ModelBack {
-        to: Option<String>,
     },
     Account {
         to: String,
@@ -9951,13 +9941,8 @@ impl Unmade {
 impl Restart {
     /// A lost line's restart's [`Self::word`] ([`Restart::InputLost`]).
     pub const INPUT_LOST: &'static str = "input-lost";
-    /// A model's way back's [`Self::word`] ([`Restart::ModelBack`]).
-    pub const MODEL_BACK: &'static str = "model-back";
     /// An account move ahead's [`Self::word`] ([`Restart::Account`] at [`AccountAt::Ahead`]).
     pub const ACCOUNT_AHEAD: &'static str = "account-ahead";
-
-    /// A model's move onto its fallback's [`Self::word`] ([`Restart::Model`]).
-    pub const MODEL: &'static str = "model";
     /// An account move at a wall's [`Self::word`] ([`Restart::Account`] at [`AccountAt::Wall`]).
     pub const ACCOUNT: &'static str = "account";
     /// A move onto the account's vault token's [`Self::word`] ([`Restart::Route`] to
@@ -9969,18 +9954,14 @@ impl Restart {
     /// A person's click on the chip's [`Self::word`] ([`Restart::Permission`]), either way.
     pub const PERMISSION: &'static str = "permission";
 
-    /// THE KINDS ([`Self::word`]) OF THE MOVES PUT OFF TO A QUIET MOMENT: a model's way back, an
-    /// account move ahead and a route move, which the turn-end state owes until the move is made
-    /// or refused, never a screen. Where its host answers a wait (`wait:…`,
+    /// THE KINDS ([`Self::word`]) OF THE MOVES PUT OFF TO A QUIET MOMENT: an account move ahead
+    /// and a route move, which the turn-end state owes until the move is made or refused, never a
+    /// screen. Where its host answers a wait (`wait:…`,
     /// `busy:another-sweep`), the point goes on with the act it would have taken (`DEFERRED`) and
     /// the move is asked again at a later turn end, under the same ask ([`RestartAsk`]) while its
     /// run holds a live claim of the conversation's record ([`RestartClaim`], [`Self::moves`]).
-    pub const PUT_OFF: [&'static str; 4] = [
-        Self::MODEL_BACK,
-        Self::ACCOUNT_AHEAD,
-        Self::ROUTE_TOKEN,
-        Self::ROUTE_STORED,
-    ];
+    pub const PUT_OFF: [&'static str; 3] =
+        [Self::ACCOUNT_AHEAD, Self::ROUTE_TOKEN, Self::ROUTE_STORED];
 
     /// Whether a restart of the kind `word` ([`Self::word`]) is a move put off to a quiet moment
     /// ([`Self::PUT_OFF`]).
@@ -9989,17 +9970,15 @@ impl Restart {
         Self::PUT_OFF.contains(&word)
     }
 
-    /// THE KINDS ([`Self::word`]) OF THE MOVES: a model's move onto its fallback and its way back,
-    /// an account move at a wall or ahead of one, and a move onto another credential of the same
-    /// account (a route move). A move is the session's, not its process's:
+    /// THE KINDS ([`Self::word`]) OF THE MOVES: an account move at a wall or ahead of one, and a
+    /// move onto another credential of the same account (a route move). A move is the session's,
+    /// not its process's:
     /// asked again after the loop's other acts it is the same move, so while its run holds a live
     /// claim of the conversation's record ([`RestartClaim`]) the loop keeps that ask until the move
     /// is made, refused or another restart's run takes its place, and the re-ask meets the record
     /// it claimed (carried while its relaunch is in flight, made once that is carried on). A memory
     /// restart's need and a lost line's are the process's: neither is a move.
-    pub const MOVES: [&'static str; 6] = [
-        Self::MODEL,
-        Self::MODEL_BACK,
+    pub const MOVES: [&'static str; 4] = [
         Self::ACCOUNT,
         Self::ACCOUNT_AHEAD,
         Self::ROUTE_TOKEN,
@@ -10018,8 +9997,6 @@ impl Restart {
         match self {
             Restart::Memory => "memory",
             Restart::InputLost { .. } => Self::INPUT_LOST,
-            Restart::Model { .. } => Self::MODEL,
-            Restart::ModelBack { .. } => Self::MODEL_BACK,
             Restart::Account {
                 at: AccountAt::Wall,
                 ..
@@ -10058,9 +10035,7 @@ impl Restart {
 /// record finds none), until the move is made or refused or another restart's run takes its place:
 /// its next ask, at a later turn end or on its back-off, meets the record its ask claimed. A move
 /// whose run holds no claim ends its run at the act, so a later ask that claims the record is
-/// another run's; either way the move is dated by the second its claim was taken
-/// (`approvals::model_switch_reason`), never by an ask that claimed nothing or a claim that
-/// lapsed. A later loop restores the run of a move its journal's last restart note shows deferred
+/// another run's. A later loop restores the run of a move its journal's last restart note shows deferred
 /// with its claim held, which outlives the acts there too. The
 /// relaunch's record keeps the ask that claimed it (`St::ask`), and a restart asked again meets
 /// its own record by that ask, never by its cause alone, so a restart asked of the process an
@@ -10079,8 +10054,6 @@ impl RestartAsk {
         match why {
             Restart::InputLost { line, .. } => Self(format!("line:{}", line.word())),
             Restart::Memory
-            | Restart::Model { .. }
-            | Restart::ModelBack { .. }
             | Restart::Account { .. }
             | Restart::Route { .. }
             | Restart::Permission { .. } => Self(format!("{}@{run_at}", why.word())),
@@ -10105,8 +10078,7 @@ impl RestartAsk {
 /// tell the two apart (`wait:held` is said at either), so the loop reads the claim from this field
 /// alone (`Session::restart_agent`): a run holds a claim from the answer that took it until an
 /// answer that read the record finds it no live claim of the run's or the run ends, which keeps a
-/// move's ask past its other acts (`Session::run_outlives_act`); the move is dated by the second
-/// the claim was taken; and the run's claim is journaled (`HOST … restart:<kind> ask=<ask>
+/// move's ask past its other acts (`Session::run_outlives_act`); and the run's claim is journaled (`HOST … restart:<kind> ask=<ask>
 /// claimed=<second|no> step=<step>`), which a later loop reads back
 /// (`turn_end_loop::journaled_open_moves`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10881,7 +10853,7 @@ pub fn is_answer_rule(rule: &str) -> bool {
         .any(|p| p.prose_rule_id() == rule)
 }
 
-/// Claude Code's own `/model` aliases: the only names a switch back is typed with.
+/// Claude Code's own `/model` aliases, the short names a notice may give a model by.
 pub const MODEL_ALIASES: &[&str] = &["sonnet", "opus", "haiku", "fable"];
 
 /// Pieces a suggestion may be made of to be a continuation, joined by `,`, `;`, `.`, ` and ` or ` then `: what builds before v6's 5a accepted bare under [`RULE_SUGGESTION`] ([`suggestion_allowed`]). Cruise now types its own continuation over any suggestion.
@@ -12756,42 +12728,6 @@ impl ContextFill {
     }
 }
 
-/// A model switch this policy made.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelSwitch {
-    pub from: Option<String>,
-    pub to: String,
-    pub back_at: Option<Instant>,
-    /// The agent process the switch is in ([`TurnEndState::agent_process`]); `None` until the
-    /// host names one.
-    pub proc: Option<SwitchProc>,
-    /// The host names another process than [`Self::proc`] and no conversation of it yet: the
-    /// switch's return waits until it does, as that process may be another program.
-    pub unproven: bool,
-}
-
-/// The agent process a model switch is in, as its host names it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SwitchProc {
-    pub pid: u32,
-    /// When it started, unix seconds.
-    pub start: i64,
-    /// The conversation it holds, once the host names one.
-    pub conversation: Option<String>,
-}
-
-/// What [`TurnEndState::agent_process`] did to the model switch in force.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SwitchScope {
-    /// The switch is in this process now: the first the host named, a relaunch that resumed its
-    /// conversation, one the harness started or owes a continuation for, or a conversation its
-    /// process opened (a `/clear`).
-    Moved(SwitchProc),
-    /// Another process on another conversation, which the harness did not start, runs in the tab
-    /// (a program the person started): the switch is over.
-    Closed,
-}
-
 /// How far past a turn's busy work a person's keystroke still counts as their hand in it.
 pub const PERSON_TURN_SLACK: Duration = Duration::from_secs(30);
 
@@ -13354,15 +13290,6 @@ pub struct TurnEndState {
     agent_start: Option<Instant>,
     agent_start_unix: Option<i64>,
     after: Option<&'static str>,
-    model: Option<ModelSwitch>,
-    /// The harness started a new agent process while a model switch stood, and the host has not
-    /// named it yet: a step of the host's whose word says so, or this loop's own restart
-    /// ([`Self::harness_started`]). It carries the switch, as every relaunch keeps `--model`.
-    started_by_harness: bool,
-    fallback_unmade: bool,
-    fallback_unasked: bool,
-    fallback_unix: Option<i64>,
-    fallback_started: Option<i64>,
     notice_unix: Option<i64>,
     account: Option<AccountMove>,
     account_asked: bool,
@@ -13650,12 +13577,6 @@ impl TurnEndState {
             agent_start: None,
             agent_start_unix: None,
             after: None,
-            model: None,
-            started_by_harness: false,
-            fallback_unmade: false,
-            fallback_unasked: false,
-            fallback_unix: None,
-            fallback_started: None,
             notice_unix: None,
             account: None,
             account_asked: false,
@@ -13784,13 +13705,6 @@ impl TurnEndState {
             go_ahead_person: None,
             person_key: None,
             go_ahead_booked: None,
-        }
-    }
-
-    /// A model switch a previous loop on the session made and did not undo (the approval ledger's open `/model` row).
-    pub fn seed_model(&mut self, switch: ModelSwitch) {
-        if self.model.is_none() {
-            self.model = Some(switch);
         }
     }
 
@@ -17169,9 +17083,6 @@ impl TurnEndState {
                 back(t);
             }
         }
-        if let Some(t) = self.model.as_mut().and_then(|m| m.back_at.as_mut()) {
-            back(t);
-        }
         if let Some(c) = &mut self.credits {
             for t in [&mut c.reset, &mut c.passed, &mut c.since]
                 .into_iter()
@@ -17215,12 +17126,6 @@ impl TurnEndState {
     #[must_use]
     pub fn reset_resume_owed(&self) -> Option<Instant> {
         self.reset_resume.map(|owed| owed.due)
-    }
-
-    /// The model switch in force, if any.
-    #[must_use]
-    pub const fn model_switch(&self) -> Option<&ModelSwitch> {
-        self.model.as_ref()
     }
 
     /// Whether the act [`Self::acted`] last recorded (a typed act; a restart is [`Self::restarted`]'s) was typed IN A LIMIT'S PLACE.
@@ -17317,12 +17222,6 @@ impl TurnEndState {
         {
             t.exhausted = true;
         }
-    }
-
-    /// Whether the fallback relaunch for the bucket being worked was refused for good ([`Self::restarted`] with `made` false).
-    #[must_use]
-    pub const fn fallback_refused(&self) -> bool {
-        self.fallback_unmade
     }
 
     /// The account move made and not answered yet, if any.
@@ -17551,50 +17450,6 @@ impl TurnEndState {
             && (reading.login_screen.is_some() || reading.login_interrupted || reading.login_back)
     }
 
-    /// A BUCKET THE SESSION LEFT.
-    #[must_use]
-    pub fn bucket_left(&self, reading: &TurnEndReading) -> bool {
-        reading
-            .wall
-            .is_some_and(|kind| self.left_bucket(kind, &reading.wall_message))
-    }
-
-    /// [`Self::bucket_left`] for a wall of `kind` in `message`'s words.
-    #[must_use]
-    pub fn left_bucket(&self, kind: WallKind, message: &str) -> bool {
-        self.fallback_unasked
-            && matches!(kind, WallKind::ModelBucket { .. })
-            && self
-                .model
-                .as_ref()
-                .and_then(|m| m.from.as_deref())
-                .is_some_and(|from| bucket_model(message).as_deref() == Some(from))
-            && !self
-                .notice_unix
-                .zip(self.fallback_made())
-                .is_some_and(|(written, made)| written > made)
-    }
-
-    fn relaunched_off(&self, t: &WallTrack) -> bool {
-        t.class == WallClass::Model
-            && t.named.is_none()
-            && self
-                .model
-                .as_ref()
-                .and_then(|m| m.from.as_deref())
-                .is_some_and(|from| bucket_model(&t.said).as_deref() == Some(from))
-    }
-
-    fn fallback_made(&self) -> Option<i64> {
-        self.fallback_started.or(self.fallback_unix)
-    }
-
-    /// THE FALLBACK'S RELAUNCH WAS MADE at `unix` (seconds), told by the loop after [`Self::restarted`] made it.
-    pub const fn fallback_made_at(&mut self, unix: i64) {
-        self.fallback_unix = Some(unix);
-        self.fallback_started = None;
-    }
-
     /// WHEN THE TRANSCRIPT'S NOTICE WAS WRITTEN, at this decision's read, told by the loop (`supervise/wall_confirm.rs`).
     pub const fn notice_written_at(&mut self, unix: Option<i64>) {
         self.notice_unix = unix;
@@ -17604,19 +17459,6 @@ impl TurnEndState {
     #[must_use]
     pub const fn notice_written(&self) -> Option<i64> {
         self.notice_unix
-    }
-
-    /// THE FALLBACK'S RELAUNCH WAS MADE AND NO TURN ASKED since ([`Self::bucket_left`]'s latch).
-    #[must_use]
-    pub const fn fallback_unasked(&self) -> bool {
-        self.fallback_unasked
-    }
-
-    /// Seed a fallback relaunch from a previous loop where no turn has been asked yet.
-    pub const fn seed_fallback_unasked(&mut self, made_at: i64) {
-        self.fallback_unasked = self.model.is_some();
-        self.fallback_unix = Some(made_at);
-        self.fallback_started = None;
     }
 
     const fn ran_under_move(&self, reading: &TurnEndReading) -> bool {
@@ -17688,8 +17530,7 @@ impl TurnEndState {
         {
             return None;
         }
-        let shown = reading.wall.filter(|_| !self.bucket_left(reading));
-        let wall = shown.or_else(|| {
+        let wall = reading.wall.or_else(|| {
             let t = self.wall.as_ref()?;
             left_named(t, reading)
                 .map(|n| n.kind)
@@ -18024,7 +17865,6 @@ impl TurnEndState {
             })
         {
             self.wall = None;
-            self.fallback_unmade = false;
             self.limit_ended = true;
             self.limit_ended_elsewhere = true;
         }
@@ -18076,14 +17916,11 @@ impl TurnEndState {
             })
         {
             self.wall = None;
-            self.fallback_unmade = false;
             self.limit_ended = true;
         }
         let left_login = self.login_left(reading) && !self.ran_under_move(reading);
-        let left_bucket = self.bucket_left(reading);
-        self.fallback_unasked = left_bucket;
         let unwalled;
-        let reading = if left_login || left_bucket {
+        let reading = if left_login {
             unwalled = TurnEndReading {
                 wall: None,
                 wall_message: String::new(),
@@ -19286,7 +19123,6 @@ impl TurnEndState {
                     });
                     self.wall = None;
                     self.login_resume = false;
-                    self.fallback_unmade = false;
                 } else if interrupted && let Some(t) = self.wall.as_mut() {
                     t.login.cancelled = true;
                 } else if reading.login_back
@@ -19860,7 +19696,6 @@ impl TurnEndState {
                         LoginBooks::default()
                     },
                 });
-                self.fallback_unmade = false;
                 self.account_unmade = unmade_seeded;
             }
         }
@@ -19932,7 +19767,6 @@ impl TurnEndState {
         let kept = self.kept_words(action, reading);
         self.point_last = false;
         self.settle_left();
-        self.fallback_unasked = false;
         self.account_asked |= self.account.is_some();
         self.account_startup = false;
         self.account_resume = false;
@@ -20226,9 +20060,6 @@ impl TurnEndState {
     /// THE SAME START IN UNIX SECONDS, told by the loop beside [`Self::agent_started`].
     pub fn agent_started_unix(&mut self, unix: i64) {
         self.agent_start_unix = Some(unix);
-        if self.fallback_started.is_none() && self.fallback_unix.is_some_and(|made| unix >= made) {
-            self.fallback_started = Some(unix);
-        }
         self.drop_gone_countdown();
         self.drop_gone_launch_latch();
     }
@@ -20237,74 +20068,6 @@ impl TurnEndState {
     #[must_use]
     pub const fn agent_start_unix(&self) -> Option<i64> {
         self.agent_start_unix
-    }
-
-    /// THE HOST NAMES THE AGENT'S PROCESS (`pid`, started at `start` unix seconds) and the
-    /// conversation it holds. A model switch rides every process the harness starts from the one
-    /// its relaunch started, as each relaunch keeps the fallback's `--model`: one that resumes
-    /// its conversation (a crash's, a stall's, an upgrade's, this loop's memory or lost-input
-    /// restart), one the host still owes a continuation for (`owed`, asked only here), and one
-    /// the harness started since the last process the host named ([`Self::harness_started`]: an
-    /// upgrade's or a restart's that starts afresh on a new conversation). Any other process on
-    /// another conversation is a program started apart from it, the person's own in the same tab
-    /// on its launch's model: the switch is over, its bucket falls back as any does, and nothing
-    /// restores it at `back_at`. Another process whose conversation the host does not name yet
-    /// holds the switch's return ([`ModelSwitch::unproven`]) until it does; one that names a
-    /// conversation where the switch's process never named its own (or a host that names
-    /// conversations for neither) takes the switch on, as nothing tells the two apart. A
-    /// crash's or a stall's relaunch of a conversation nobody asked anything starts afresh and
-    /// reaches the loop by no step: it ends the switch as another program would.
-    pub fn agent_process(
-        &mut self,
-        pid: u32,
-        start: i64,
-        conversation: Option<&str>,
-        owed: impl FnOnce() -> bool,
-    ) -> Option<SwitchScope> {
-        let m = self.model.as_mut()?;
-        let now = SwitchProc {
-            pid,
-            start,
-            conversation: conversation.map(str::to_string),
-        };
-        let started = std::mem::take(&mut self.started_by_harness);
-        let moved = match &m.proc {
-            None => true,
-            Some(was) if (was.pid, was.start) == (pid, start) => {
-                now.conversation.is_some() && was.conversation != now.conversation
-            }
-            Some(was) => match (&was.conversation, &now.conversation) {
-                (Some(_), None) => {
-                    m.unproven = true;
-                    self.started_by_harness = started;
-                    return None;
-                }
-                (None, None) => true,
-                (Some(held), Some(named)) if held == named => true,
-                (None, Some(_)) => true,
-                (Some(_), Some(_)) => {
-                    if !started && !owed() {
-                        self.model = None;
-                        self.fallback_unasked = false;
-                        return Some(SwitchScope::Closed);
-                    }
-                    true
-                }
-            },
-        };
-        m.unproven = false;
-        moved.then(|| {
-            m.proc = Some(now.clone());
-            SwitchScope::Moved(now)
-        })
-    }
-
-    /// THE HARNESS STARTED A NEW AGENT PROCESS: a step of the host's whose word says so
-    /// ([`crate::harness::upgrade_drive::started`]), or this loop's own restart made (a memory
-    /// restart's, a lost line's). While a model switch stands, the next other process the host
-    /// names is that one ([`Self::agent_process`]).
-    pub const fn harness_started(&mut self) {
-        self.started_by_harness = self.model.is_some();
     }
 
     /// THE RELAUNCH'S START-UP UNDER A LIMIT: a usage limit, spend limit or
@@ -20393,7 +20156,6 @@ impl TurnEndState {
         self.keyed_by_harness();
         self.land.check_pending = false;
         self.land.check_owed = false;
-        self.fallback_unasked = false;
         self.checking = false;
         self.seeded_check = None;
         self.seeded_land = None;
@@ -20524,42 +20286,7 @@ impl TurnEndState {
             self.account_startup = self.account.is_some();
         }
         match why {
-            Restart::Memory | Restart::InputLost { .. } if made => self.harness_started(),
             Restart::Memory | Restart::InputLost { .. } => {}
-            Restart::Model { to } if made => {
-                let track = self.wall.as_ref().filter(|t| t.class == WallClass::Model);
-                let credits = self
-                    .credits
-                    .take_if(|c| c.model.is_some())
-                    .filter(|_| track.is_none());
-                let back_at = reading
-                    .reset_at
-                    .or_else(|| track.and_then(|t| t.named).map(|n| n.at))
-                    .or_else(|| credits.as_ref().and_then(|c| c.reset))
-                    .filter(|&r| r > now);
-                let from = bucket_model(&reading.wall_message)
-                    .or_else(|| track.and_then(|t| bucket_model(&t.said)))
-                    .or_else(|| credits.and_then(|c| c.model));
-                self.model = Some(ModelSwitch {
-                    from,
-                    to: to.clone(),
-                    back_at,
-                    proc: None,
-                    unproven: false,
-                });
-                self.fallback_unasked = true;
-                if let Some(t) = &mut self.wall {
-                    t.attempts += 1;
-                    if t.class == WallClass::Model {
-                        t.named = None;
-                    }
-                }
-            }
-            Restart::Model { .. } => self.fallback_unmade = true,
-            Restart::ModelBack { .. } => {
-                self.model = None;
-                self.fallback_unasked = false;
-            }
             Restart::Account { to, at } if made => {
                 let owed = match self.account {
                     Some(_) if !self.account_asked => self.account_resume,
@@ -20585,9 +20312,6 @@ impl TurnEndState {
                     self.account_moves.pop_front();
                 }
                 self.wall = None;
-                self.model = None;
-                self.fallback_unmade = false;
-                self.fallback_unasked = false;
                 self.credits = None;
             }
             Restart::Account {
@@ -22005,8 +21729,8 @@ fn decide_unridden(
 ) -> TurnEndAction {
     // AUTOPILOT OFF: the harness keeps its hands off the session — plain
     // Claude Code. Nothing typed, waited for, restarted or escalated,
-    // whatever the screen shows: a wall, a memory banner, an owed act or
-    // an open switch included.
+    // whatever the screen shows: a wall, a memory banner and an owed act
+    // included.
     if reading.autopilot == Autopilot::Off {
         return ended_at(trace, "autopilot-off", TurnEndAction::Nothing);
     }
@@ -22017,15 +21741,6 @@ fn decide_unridden(
             ..reading.clone()
         };
         note(trace, "login-left", None, || Outcome::Passed);
-        return decide_unridden(state, &plain, cfg, now, trace);
-    }
-    if state.bucket_left(reading) {
-        let plain = TurnEndReading {
-            wall: None,
-            wall_message: String::new(),
-            ..reading.clone()
-        };
-        note(trace, "bucket-left", None, || Outcome::Passed);
         return decide_unridden(state, &plain, cfg, now, trace);
     }
     if reading.upgrading {
@@ -22714,23 +22429,6 @@ fn act_past_walls(
     {
         return ended_at(trace, "account-ahead", ahead_to(to, cont));
     }
-    if let Some(m) = &state.model
-        && let Some(at) = m.back_at
-        && now >= at
-        && !m.unproven
-        && reading.restartable
-        && !matches!(cont, TurnEndAction::Escalate { .. })
-    {
-        return ended_at(
-            trace,
-            "model-back",
-            TurnEndAction::Restart {
-                why: Restart::ModelBack { to: m.from.clone() },
-                rule_id: RULE_MODEL_RESTORE,
-                otherwise: Box::new(cont),
-            },
-        );
-    }
     if let Some(to) = route_ahead(state, reading, now)
         && !matches!(cont, TurnEndAction::Escalate { .. })
     {
@@ -22807,71 +22505,44 @@ fn credits_hold(
         return None;
     }
     let held = state.credits_held(reading.credits.as_ref(), reading.program, now)?;
-    let hold = match super::outlook::credits_outlook(held.reset.is_some(), cfg, true) {
-        super::outlook::CreditsOutlook::WaitsForReset => TurnEndAction::WaitUntil {
-            until: held.lifts.unwrap_or(now),
-            why: match &held.model {
-                Some(model) => format!(
-                    "usage credits carry {model}'s requests ({RULE_CREDITS_HOLD}): its limit resets"
-                ),
-                None => format!(
-                    "usage credits carry the session ({RULE_CREDITS_HOLD}): the subscription's \
+    Some(
+        match super::outlook::credits_outlook(held.reset.is_some(), cfg, true) {
+            super::outlook::CreditsOutlook::WaitsForReset => TurnEndAction::WaitUntil {
+                until: held.lifts.unwrap_or(now),
+                why: match &held.model {
+                    Some(model) => format!(
+                        "usage credits carry {model}'s requests ({RULE_CREDITS_HOLD}): its limit resets"
+                    ),
+                    None => format!(
+                        "usage credits carry the session ({RULE_CREDITS_HOLD}): the subscription's \
                      window resets"
-                ),
-            },
-            wait: WaitKind::Other,
-        },
-        super::outlook::CreditsOutlook::Person if !held.told => TurnEndAction::Escalate {
-            reason: if held.model.is_some() {
-                CREDITS_HOLD_MODEL_TOLD
-            } else {
-                CREDITS_HOLD_TOLD
-            }
-            .to_string(),
-        },
-        super::outlook::CreditsOutlook::Person => match held.lifts {
-            Some(until) => TurnEndAction::WaitUntil {
-                until,
-                why: format!(
-                    "usage credits carry the session ({RULE_CREDITS_HOLD}), no reset named: \
-                     the five-hour window has reset by then"
-                ),
+                    ),
+                },
                 wait: WaitKind::Other,
             },
-            None => TurnEndAction::Nothing,
+            super::outlook::CreditsOutlook::Person if !held.told => TurnEndAction::Escalate {
+                reason: if held.model.is_some() {
+                    CREDITS_HOLD_MODEL_TOLD
+                } else {
+                    CREDITS_HOLD_TOLD
+                }
+                .to_string(),
+            },
+            super::outlook::CreditsOutlook::Person => match held.lifts {
+                Some(until) => TurnEndAction::WaitUntil {
+                    until,
+                    why: format!(
+                        "usage credits carry the session ({RULE_CREDITS_HOLD}), no reset named: \
+                     the five-hour window has reset by then"
+                    ),
+                    wait: WaitKind::Other,
+                },
+                None => TurnEndAction::Nothing,
+            },
+            super::outlook::CreditsOutlook::Carried
+            | super::outlook::CreditsOutlook::Unattended => TurnEndAction::Nothing,
         },
-        super::outlook::CreditsOutlook::Carried | super::outlook::CreditsOutlook::Unattended => {
-            TurnEndAction::Nothing
-        }
-    };
-    if let Some(model) = &held.model
-        && let Some(to) = credits_fallback(state, reading, cfg, model)
-    {
-        return Some(TurnEndAction::Restart {
-            why: Restart::Model { to },
-            rule_id: RULE_MODEL_FALLBACK,
-            otherwise: Box::new(hold),
-        });
-    }
-    Some(hold)
-}
-
-fn credits_fallback(
-    state: &TurnEndState,
-    reading: &TurnEndReading,
-    cfg: &SupervisorConfig,
-    model: &str,
-) -> Option<String> {
-    let to = cfg.model_fallback.as_ref()?;
-    let same = to
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|w| w.eq_ignore_ascii_case(model));
-    (!same
-        && reading.restartable
-        && state.model.is_none()
-        && !state.fallback_unmade
-        && !state.fallback_refused())
-    .then(|| to.clone())
+    )
 }
 
 fn held_by_credits(
@@ -23494,7 +23165,6 @@ fn unread_track<'a>(state: &'a TurnEndState, reading: &TurnEndReading) -> Option
         named_class(t.class)
             && (reading.wall.is_none() || reading.wall_remembered)
             && !limit_conversation_known(t, reading)
-            && !state.relaunched_off(t)
     })
 }
 
@@ -24098,22 +23768,6 @@ fn names_usage_credits(message: &str) -> bool {
     lower.contains("usage credits") || lower.contains("extra usage")
 }
 
-fn credits_wall(
-    state: &TurnEndState,
-    reading: &TurnEndReading,
-    cfg: &SupervisorConfig,
-    message: &str,
-    otherwise: &dyn Fn() -> TurnEndAction,
-) -> Option<TurnEndAction> {
-    let from = bucket_model(message)?;
-    let to = credits_fallback(state, reading, cfg, &from)?;
-    Some(TurnEndAction::Restart {
-        why: Restart::Model { to },
-        rule_id: RULE_MODEL_FALLBACK,
-        otherwise: Box::new(otherwise()),
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn wall_own_act(
     state: &TurnEndState,
@@ -24246,42 +23900,13 @@ fn wall_own_act(
                 // `limit_after`).
                 return TurnEndAction::Nothing;
             }
-            if credits_only && let Some(act) = credits_wall(state, reading, cfg, msg, &wait_out) {
-                return act;
-            }
             wait_out()
         }
         WallKind::ModelBucket { consent } => {
             if consent && attempts == 0 && cfg.continue_policy && cfg.usage_credits {
                 return continue_as(RULE_CONSENT, Clearing::Measured);
             }
-            let Some(fallback) = &cfg.model_fallback else {
-                return wait_out();
-            };
-            if attempts == 0
-                && reading.reset_at.is_some_and(|r| {
-                    now >= later(r, state.timing.grace_for(reading.program) + reading.jitter)
-                })
-            {
-                return wait_out();
-            }
-            if state.model.is_some()
-                || state.fallback_unmade
-                || !reading.restartable
-                || bucket_model(msg).as_deref() == Some(fallback.as_str())
-            {
-                // Switched already, a relaunch that could not be made or no
-                // host to make one, or the fallback is the model at its
-                // limit: the reset is waited out.
-                return wait_out();
-            }
-            TurnEndAction::Restart {
-                why: Restart::Model {
-                    to: fallback.clone(),
-                },
-                rule_id: RULE_MODEL_FALLBACK,
-                otherwise: Box::new(wait_out()),
-            }
+            wait_out()
         }
         WallKind::Context => {
             if !cfg.compact_on_context_wall {

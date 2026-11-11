@@ -37,7 +37,7 @@ they name another crate.
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (every test that samples the spec:
 `file::fn` is in `tests/file.rs`, `src/file.rs::fn` is a unit test, `-` is none), `difficulty`
 (Rust features the proof must handle), and `gaps`: the rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7 that block the spec. Gap 0 (a seal that
+`docs/TRUST-LANE.md` (Blocking gaps) that block the spec. Gap 0 (a seal that
 publishes Clean rows) is a prerequisite of every row and is left out.
 
 ```tsv
@@ -80,47 +80,9 @@ path-monitor-and-status	contract	path_monitor::PathStatus::from_raw, path_monito
 serial-queue-dispatch	contract	queue::SerialQueue::{new,as_id,is_current,sync,spawn,drop}, queue::ContainedOnQueue	SerialQueue::new(label) creates a +1 serial dispatch_queue_t stamped with its own address under CURRENT. Work submitted via spawn or sync executes one item at a time in FIFO submission order inside an autoreleasepool; sync waits for all prior items and returns f()'s value. is_current() holds iff called from work executing on this queue. sync called when is_current() panics immediately ("would deadlock") without calling dispatch_sync_f, leaving the queue usable. A Rust panic in sync is caught and resume_unwind'd on the caller; an NSException in sync is contained via exception::contain and panicked as ContainedOnQueue{ordinal}; in spawn, either is contained/caught, reported on stderr, and later work still runs. Drop calls dispatch_release once while pending spawned work keeps the queue alive until drained; as_id() exposes the non-null Objective-C dispatch_queue_t.	src/queue.rs::work_runs_one_at_a_time_in_submission_order_and_sync_waits_for_it, src/queue.rs::the_queue_knows_its_own_work_and_no_other, src/queue.rs::a_sync_from_the_queues_own_work_is_refused_not_deadlocked, src/queue.rs::a_panic_in_sync_reaches_the_caller_and_the_queue_goes_on, src/queue.rs::a_panic_in_spawned_work_is_reported_and_later_work_still_runs, src/queue.rs::pending_work_outlives_the_dropped_holder, src/queue.rs::the_queue_is_an_object_the_runtime_can_message	libdispatch FFI (dispatch_queue_create, dispatch_sync_f, dispatch_async_f, dispatch_get_specific, dispatch_release), catch_unwind + resume_unwind, Box::into_raw/from_raw closure trampolines	2, 8, 11, 13
 ```
 
-### Distribution by kind (36)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 16 | returns-indirectly-and-entry, inert-zero, objc-try-protocol, containment-trampoline, containment-report-format, main-thread-bound, main-thread-witness, class-lookup, autoreleasepool-scope, block-abi, ivar-slot-contract, owning-class, protocol-or-register, send-rect-nil, path-monitor-and-status, serial-queue-dispatch |
-| refinement | 9 | encode-matches-platform, wake-plan-refines-model, wake-timer-cf-refinement, declared-class-registration, declared-dispatch, weak-obj-model, ffi-decls-match-sdk, send-site-abi, declared-row-matches-authority |
-| table-property | 3 | encode-table, swizzle-install-decision, sdk-constants-equal |
-| equivalence | 2 | strip-offsets-filter, method-encoding-concat |
-| round-trip | 2 | bool-semantics, string-bridge-round-trip |
-| invariant | 2 | sel-cache-coherent, ownership-balance |
-| no-panic | 1 | abort-on-unwind-never-unwinds |
-| other | 1 | platform-runtime-axioms (FFI assumptions with conformance witnesses) |
-
-### Blocking-gap histogram (specs blocked by each audit §7 gap)
-
-| gap | specs | note |
-|---|---|---|
-| 0 | 36 | prerequisite of every row; no spec is blocked by it alone |
-| 1 | 15 | non-scalar carriers (`&str`, `String`, `Vec`, enums, structs) |
-| 2 | 8 | `&self`/`&mut self` views, two-state |
-| 3 | 4 | E6 body widening (calls, casts, loops, `+` with overflow check) |
-| 5 | 1 | quantified clauses |
-| 6 | 1 | plain-Rust clause publication |
-| 7 | 4 | loops |
-| 8 | 31 | effects: platform spec, FFI assumption channel, unsafe |
-| 10 | 4 | model-to-code refinement beyond scalars |
-| 11 | 11 | generics |
-| 12 | 3 | cross-crate theorem citation |
-| 13 | 10 | threads, closures, higher-order |
-
-Gap 8 dominates: 31 of 36 specs, because this crate is an FFI binding. Only five specs avoid it
-(those at the start of §6).
-
 ## 2. Test → spec map
 
 None: §1's `subsumes` column names every test that samples each spec.
-
-## 3. Coverage
-
-- §1 maps the 36 specs directly via `subsumes` (plus 1 non-spec parser guard in §4); the crate
-  currently holds 109 `#[test]` functions alongside its custom-harness drives.
 
 ## 4. Tests that are not spec samples
 
@@ -129,50 +91,6 @@ vacuity. It goes once `ffi-decls-match-sdk` is a declaration-level contract.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **(Fixed 2026-10-28.) Tautological assertion in `encode_offsets`.**
-   - `encode_offsets::stripping_deletes_offsets_and_nothing_else_over_every_row_in_the_process` now
-     walks extended protocol method encodings alongside class method tables, enforces both
-     `with_count >= 1` and `with_quoted >= 1`, and pins digit-bearing quoted class names directly.
-2. **(Fixed 2026-10-28.) `MainThreadBound<T>` now carries `#[repr(transparent)]`**
-   (`src/main_thread_bound.rs`), with compile-time `size_of`/`align_of` assertions.
-3. **(Fixed 2026-10-28.) Substituting-initializer and foreign-receiver guard.** `ClassMeta` now
-   provides `is_instance`, `assert_instance`, and `guard_init` walking `object_getClass` /
-   `class_getSuperclass`: `alloc_init` releases a substituted foreign `+1` return and panics before
-   forming `Retained<Self>`, and `ivars()` verifies the receiver's runtime class chain before
-   computing `_atermIvars`.
 4. **The test count in the wave-2 chunk list is off by one.** It lists 202 tests for aterm-objc, but
    `tests/main_thread_bound_drive.rs` and `tests/objc_static_suite.rs` match `#[test]` only in doc
    comments. There are 200 real `#[test]` fns, plus the harness=false drive counted as one test (201).
-
-## 6. Proof order (easiest high-value first)
-
-First the specs that need no platform lane (gap 8), cheapest first, then the pure halves of
-effectful specs.
-
-1. **`bool-semantics`**: a one-byte `repr(transparent)` newtype with `const fn` accessors; the
-   round trip is a case split on `bool` (and on `i8 ≠ 0` on x86_64). Drop or factor the Debug
-   clause. Trust refuses it on seal `150efe4a`: `Bool::new` gets no E6 import
-   (`AutoBoundHeadOverApplied`), no clause can name its struct result, and a clause cannot project
-   the tuple field `self.0` that `as_bool` reads.
-2. **`encode-table`**: decidable by const evaluation of each impl's associated const once
-   `&'static str` consts are carriers. Every encoding spec builds on it.
-3. **`strip-offsets-filter`**: one loop over chars with a two-variable state, whose loop invariant
-   is the filter over the prefix. `swizzle-install-decision`, `send-site-abi` and
-   `declared-row-matches-authority` build on it.
-4. **`method-encoding-concat`**: straight-line concatenation per arity; with `encode-table` it
-   gives the expected side of every encoding comparison.
-5. **`wake-plan-refines-model`**: a deterministic state machine over an `Option` and a `bool`,
-   bound to `Model`, with its negative control already written.
-6. **`returns-indirectly-and-entry`**, the `returns_indirectly` predicate (gaps 3, 11); the
-   symbol-address half needs gap 8.
-7. **`send-rect-nil`**, the nil branch (gaps 1, 3).
-8. **`swizzle-install-decision`**, after factoring the decision table into a pure fn over
-   `(claim, owner, registered, expected, current, new)` (gap 1); the CAS and FFI half needs gaps 2,
-   8 and 13.
-9. **`ivar-slot-contract`**, the `IvarSlot::{init,get,dispose}` half (gaps 1, 2, 11): the flag
-   protocol and exactly-once drop, independent of the runtime's offset placement.
-
-The rest wait on gap 8, starting with the FFI assumption channel: `platform-runtime-axioms` and
-`encode-matches-platform` become assumptions with their tests as conformance witnesses.
-`sdk-constants-equal`, `send-site-abi` and `declared-row-matches-authority` state facts about
-`aterm-gui` and `aterm-window` code, so they also need gap 12 and belong on those crates.

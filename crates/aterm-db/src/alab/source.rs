@@ -241,6 +241,101 @@ impl Registry {
             },
         )
     }
+
+    /// Admit a primary native projection and ordinary vault candidates under
+    /// one retained local context. Current Readers and Writers may project;
+    /// this grants no shared-table, provider or budget mutation capability.
+    ///
+    /// The caller already holds its local account writer. Compare every
+    /// relevant candidate through `reader` before saving bounded prepared
+    /// intent. Do not reenter Commons, acquire another writer, use the network
+    /// or replay images inside `persist`. Source guards remain held through
+    /// the callback and release before this function returns; replay follows.
+    ///
+    /// `entry_vault` must be the current generation or a retained ancestor.
+    /// Missing or recovery-only native custody is unavailable, not absent.
+    ///
+    /// # Errors
+    /// Stale or denied membership, changed/partial/excluded source, missing or
+    /// busy custody, wrong vault/configuration, expired admission, or `persist`.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbNativeProjection",
+            action = "Case",
+            reason = "The environment selects membership, source, policy and callback outcome."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbNativeProjection",
+            action = "Read",
+            project = "aterm_db::alab::store::source::projection_tests::transition"
+        )
+    )]
+    pub fn with_admitted_projection<T>(
+        &self,
+        config: &Path,
+        entry_vault: &Paths,
+        vault_config: &aterm_secrets::client::Config,
+        expected: Option<&SourceRevision>,
+        persist: impl FnOnce(&SourceRead, &aterm_secrets::client::EntryReader<'_>) -> Result<T>,
+    ) -> Result<T> {
+        #[cfg(test)]
+        if PROJECTION_MUTANT.get() == 3 {
+            return Err(Error::new("injected projection unavailability"));
+        }
+        let deadline = crate::admission::deadline();
+        application::with_retained_store(
+            &self.paths,
+            entry_vault,
+            deadline,
+            |session, catalog| {
+                let compiled =
+                    crate::att::current_in(catalog, session.trust(), &crate::att::REGISTRY.chain());
+                let descriptor = compiled.descriptor(session.trust())?;
+                include_source(config, session.paths(), session.trust(), descriptor.scope)?;
+                Ok((descriptor, compiled))
+            },
+            |session, store, scope, compiled, look, validate| {
+                let log = Log::read_with(session, store, scope, decode)?;
+                let view = View::read(compiled.table, session, &log);
+                let source = SourceRead::read(session, scope, &view)?;
+                #[cfg(test)]
+                let compare = PROJECTION_MUTANT.get() != 1;
+                #[cfg(not(test))]
+                let compare = true;
+                if compare && expected.is_some_and(|expected| expected != source.revision()) {
+                    return Err(Error::snapshot_changed());
+                }
+                include_source(config, session.paths(), session.trust(), scope)?;
+                (validate.current)()?;
+                match look
+                    .with_entry_reader(entry_vault, vault_config, |reader| {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(Error::new("native projection admission expired"));
+                        }
+                        include_source(config, session.paths(), session.trust(), scope)?;
+                        (validate.custody)()?;
+                        persist(&source, reader)
+                    })
+                    .map_err(crate::table::failure)?
+                {
+                    aterm_secrets::client::EntryAdmission::Accepted(result) => result,
+                    aterm_secrets::client::EntryAdmission::Busy => {
+                        Err(Error::busy().context("ordinary vault projection source"))
+                    }
+                    aterm_secrets::client::EntryAdmission::Changed => {
+                        Err(Error::snapshot_changed())
+                    }
+                    aterm_secrets::client::EntryAdmission::Unavailable => Err(Error::new(
+                        "ordinary vault source is unavailable for projection",
+                    )),
+                }
+            },
+        )
+    }
 }
 
 /// Check before opening the table (which may recover an interrupted append),
@@ -268,8 +363,13 @@ fn include_source(
 #[cfg(test)]
 thread_local! {
     static MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static PROJECTION_MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 #[path = "source_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "projection_tests.rs"]
+mod projection_tests;

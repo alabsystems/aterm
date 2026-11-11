@@ -67,29 +67,5 @@ impl<const LIMBS: usize> RandomMod for Uint<LIMBS> {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::{NonZero, RandomMod, U256};
-    use rand_core::SeedableRng;
-
-    #[test]
-    fn random_mod() {
-        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1);
-
-        // Ensure `random_mod` runs in a reasonable amount of time
-        let modulus = NonZero::new(U256::from(42u8)).unwrap();
-        let res = U256::random_mod(&mut rng, &modulus);
-
-        // Check that the value is in range
-        assert!(res >= U256::ZERO);
-        assert!(res < U256::from(42u8));
-
-        // Ensure `random_mod` runs in a reasonable amount of time
-        // when the modulus is larger than 1 limb
-        let modulus = NonZero::new(U256::from(0x10000000000000001u128)).unwrap();
-        let res = U256::random_mod(&mut rng, &modulus);
-
-        // Check that the value is in range
-        assert!(res >= U256::ZERO);
-        assert!(res < U256::from(0x10000000000000001u128));
-    }
-}
+#[path = "rand_tests.rs"]
+mod tests;

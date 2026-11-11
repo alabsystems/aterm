@@ -304,6 +304,39 @@ pub(crate) const REPORT_RUN: &str = " in run ";
 /// What ends a panic report's first line when the panic was on the main thread: it unwinds out of `main` and ends the process, whose `atexit` removes the run's crash marker, so once another launch has consumed the report (`.seen`) this mark is the only record that the run crashed (read by [`panic_report_head`]).
 pub(crate) const MAIN_THREAD_PANIC: &str = " on the main thread";
 
+/// The Unix event time in a panic report's opening line, including its fractional second.
+/// Malformed or unrepresentable timestamps leave the artifact's time unknown.
+pub(crate) fn panic_report_timestamp(first: &str) -> Option<Duration> {
+    let first = first.strip_prefix("aterm-gui ")?;
+    let at = first.split_once(" crashed at unix ")?.1;
+    let token = at.split_whitespace().next()?;
+    let (seconds, fraction) = token
+        .split_once('.')
+        .map_or((token, None), |(seconds, fraction)| {
+            (seconds, Some(fraction))
+        });
+    if seconds.is_empty() || !seconds.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let nanos = match fraction {
+        None => 0,
+        Some(fraction) => {
+            if fraction.is_empty()
+                || fraction.len() > 9
+                || !fraction.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let digits = u32::try_from(fraction.len()).ok()?;
+            fraction
+                .parse::<u32>()
+                .ok()?
+                .checked_mul(10_u32.pow(9 - digits))?
+        }
+    };
+    Some(Duration::new(seconds.parse().ok()?, nanos))
+}
+
 /// What a panic report's first line says of the run that filed it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReportHead {
@@ -1451,6 +1484,31 @@ mod tests {
             "the main thread's is marked, and the report names its run"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panic_report_timestamp_preserves_fractions_and_refuses_malformed_fields() {
+        for (field, expected) in [
+            ("42", Some(Duration::from_secs(42))),
+            ("42.250", Some(Duration::new(42, 250_000_000))),
+            ("42.25", Some(Duration::new(42, 250_000_000))),
+            ("42.000000001", Some(Duration::new(42, 1))),
+            ("42.", None),
+            ("+42.250", None),
+            ("-42.250", None),
+            ("42.250x", None),
+            ("42.1234567890", None),
+            ("18446744073709551616.000", None),
+        ] {
+            let first =
+                format!("aterm-gui 0.1.0 crashed at unix {field} in run 7 on the main thread");
+            assert_eq!(panic_report_timestamp(&first), expected, "{field}");
+        }
+        assert_eq!(panic_report_timestamp("aterm: fatal signal 6"), None);
+        assert_eq!(
+            panic_report_timestamp("panicked at crashed at unix 42.250"),
+            None
+        );
     }
 
     #[test]

@@ -635,8 +635,27 @@ fn connect_by(
     dialer: Option<UnitsDialer>,
     dial: impl Fn(&SocketAddr) -> io::Result<TcpStream>,
 ) -> io::Result<Box<dyn UnitConn>> {
-    use std::net::ToSocketAddrs as _;
-    let addrs: Vec<SocketAddr> = peer.to_socket_addrs()?.collect();
+    #[cfg(unix)]
+    let addrs = if let Ok(addr) = peer.parse::<SocketAddr>() {
+        vec![addr]
+    } else {
+        let (host, port) = peer.rsplit_once(':').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "LAN peer needs host:port")
+        })?;
+        let port = port
+            .parse::<u16>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        aterm_uds::lan::resolve(host, PEER_CONNECT)
+            .map_err(io::Error::from)?
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect()
+    };
+    #[cfg(windows)]
+    let addrs: Vec<SocketAddr> = {
+        use std::net::ToSocketAddrs as _;
+        peer.to_socket_addrs()?.collect()
+    };
     if let Some(stream) = addrs
         .iter()
         .find_map(|addr| dialer.and_then(|units| units(addr.ip())))

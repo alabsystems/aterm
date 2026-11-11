@@ -722,59 +722,108 @@ pub(super) fn partition_with_empty(
     } else {
         admit_home(sys, user)?;
     }
-    let home = Path::new(&user.home);
     let mut standing = Partition::default();
-    for repo in all {
-        if HOME_FOLDERS
-            .iter()
-            .any(|folder| folder.eq_ignore_ascii_case(&repo.name))
-        {
-            standing.notes.push(format!(
-                "~/{} is a standard home folder; left untouched",
-                repo.name
-            ));
-            continue;
-        }
-        let path = home.join(&repo.name);
-        match sys.stat(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                standing.missing.push(repo.clone());
-            }
-            Ok(stat) if stat.dir && !stat.symlink => {
-                match verify_existing(sys, user, &repo.owner, repo, &path) {
-                    Ok(()) => match crate::checkout::unborn(sys, user, &path) {
-                        Ok(Some(_))
-                            if !empty
-                                .iter()
-                                .any(|proof| proof.current(sys, user, repo, &path)) =>
-                        {
-                            standing.unborn.push((repo.clone(), path));
-                        }
-                        Err(why) => standing.notes.push(format!("~/{}: {why}", repo.name)),
-                        Ok(_) => match super::dependencies::ready(sys, user, &path, repo) {
-                            Ok(true) => standing.present.push((repo.clone(), path)),
-                            Ok(false) => standing.dependencies.push((repo.clone(), path)),
-                            Err(super::dependencies::Unready::Git(why)) => {
-                                standing.git_waits.push(format!("~/{}: {why}", repo.name));
-                            }
-                            Err(super::dependencies::Unready::Preserved(why)) => {
-                                standing.notes.push(format!("~/{}: {why}", repo.name));
-                            }
-                        },
-                    },
-                    Err(why) => standing.notes.push(why),
-                }
-            }
-            Ok(_) => standing.notes.push(format!(
-                "~/{} is occupied or linked; left untouched",
-                repo.name
-            )),
-            Err(_) => standing
-                .notes
-                .push(format!("cannot inspect ~/{}; left untouched", repo.name)),
+    for (repo, read) in all.iter().zip(read_all(sys, user, all, empty)) {
+        match read {
+            Standing::Missing => standing.missing.push(repo.clone()),
+            Standing::Present(path) => standing.present.push((repo.clone(), path)),
+            Standing::Dependencies(path) => standing.dependencies.push((repo.clone(), path)),
+            Standing::Unborn(path) => standing.unborn.push((repo.clone(), path)),
+            Standing::GitWait(why) => standing.git_waits.push(why),
+            Standing::Note(why) => standing.notes.push(why),
         }
     }
     Ok(standing)
+}
+
+/// How many repositories [`partition_with_empty`] reads at once. Each read is a few local Git
+/// commands; one after another, fifty repositories took most of `aterm status`'s three seconds.
+const READ_LANES: usize = 8;
+
+/// Where one repository stands in [`Partition`].
+enum Standing {
+    Missing,
+    Present(PathBuf),
+    Dependencies(PathBuf),
+    Unborn(PathBuf),
+    GitWait(String),
+    Note(String),
+}
+
+/// Each of `all`'s standing, in list order, read up to [`READ_LANES`] at once. The reads only
+/// look: none changes a checkout, so their order does not matter.
+fn read_all(sys: &dyn System, user: &User, all: &[Repo], empty: &[EmptyCheckout]) -> Vec<Standing> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let read: Vec<std::sync::OnceLock<Standing>> =
+        all.iter().map(|_| std::sync::OnceLock::new()).collect();
+    let lane = || {
+        loop {
+            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (Some(repo), Some(slot)) = (all.get(index), read.get(index)) else {
+                return;
+            };
+            let _ = slot.set(standing(sys, user, repo, empty));
+        }
+    };
+    // This thread is a lane too: a lane the system cannot start leaves its share to the others.
+    std::thread::scope(|scope| {
+        for _ in 1..all.len().min(READ_LANES) {
+            let _ = std::thread::Builder::new().spawn_scoped(scope, lane);
+        }
+        lane();
+    });
+    read.into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("every repository is read once the lanes have joined")
+        })
+        .collect()
+}
+
+fn standing(sys: &dyn System, user: &User, repo: &Repo, empty: &[EmptyCheckout]) -> Standing {
+    if HOME_FOLDERS
+        .iter()
+        .any(|folder| folder.eq_ignore_ascii_case(&repo.name))
+    {
+        return Standing::Note(format!(
+            "~/{} is a standard home folder; left untouched",
+            repo.name
+        ));
+    }
+    let path = Path::new(&user.home).join(&repo.name);
+    match sys.stat(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Standing::Missing,
+        Ok(stat) if stat.dir && !stat.symlink => {
+            match verify_existing(sys, user, &repo.owner, repo, &path) {
+                Ok(()) => match crate::checkout::unborn(sys, user, &path) {
+                    Ok(Some(_))
+                        if !empty
+                            .iter()
+                            .any(|proof| proof.current(sys, user, repo, &path)) =>
+                    {
+                        Standing::Unborn(path)
+                    }
+                    Err(why) => Standing::Note(format!("~/{}: {why}", repo.name)),
+                    Ok(_) => match super::dependencies::ready(sys, user, &path, repo) {
+                        Ok(true) => Standing::Present(path),
+                        Ok(false) => Standing::Dependencies(path),
+                        Err(super::dependencies::Unready::Git(why)) => {
+                            Standing::GitWait(format!("~/{}: {why}", repo.name))
+                        }
+                        Err(super::dependencies::Unready::Preserved(why)) => {
+                            Standing::Note(format!("~/{}: {why}", repo.name))
+                        }
+                    },
+                },
+                Err(why) => Standing::Note(why),
+            }
+        }
+        Ok(_) => Standing::Note(format!(
+            "~/{} is occupied or linked; left untouched",
+            repo.name
+        )),
+        Err(_) => Standing::Note(format!("cannot inspect ~/{}; left untouched", repo.name)),
+    }
 }
 
 fn unborn_current(
@@ -3344,6 +3393,44 @@ pub(super) mod tests {
             && !call.contains("fetch")
             && !call.contains("pull")
             && !call.contains("reset")));
+    }
+
+    /// Repositories read on several lanes still stand in the order GitHub listed them.
+    #[test]
+    fn a_partition_read_on_lanes_keeps_the_list_order() {
+        let (sys, who, _) = fixture();
+        let mut names: Vec<String> = (0..3 * READ_LANES)
+            .map(|index| format!("r{index:02}"))
+            .collect();
+        names.insert(READ_LANES, "Music".to_owned());
+        let mut missing = Vec::new();
+        let mut notes = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let path = Path::new(&who.home).join(name);
+            if name == "Music" {
+                notes.push("~/Music is a standard home folder; left untouched".to_owned());
+                continue;
+            }
+            match index % 3 {
+                0 => {
+                    missing.push(name.clone());
+                    continue;
+                }
+                1 => sys.file(path.to_str().unwrap(), b"owner file"),
+                _ => sys.link(path.to_str().unwrap(), "/elsewhere"),
+            };
+            notes.push(format!("~/{name} is occupied or linked; left untouched"));
+        }
+        let all: Vec<Repo> = names
+            .iter()
+            .zip(1..)
+            .map(|(name, id)| repo(&value(name, id, true), Some("alice")).unwrap())
+            .collect();
+        let standing = partition(&sys, &who, &all).unwrap();
+        let read: Vec<_> = standing.missing.iter().map(|repo| &repo.name).collect();
+        assert_eq!(read, missing.iter().collect::<Vec<_>>());
+        assert_eq!(standing.notes, notes);
+        assert!(standing.present.is_empty() && standing.unborn.is_empty());
     }
 
     /// A file, a link or another origin's worktree where a selected repository goes is left as

@@ -25,7 +25,7 @@ and `tests/recorded.rs` (modules of `tests/getrandom_suite.rs`). A test is delet
 - The CSPRNG assumption: OS output is unpredictable, so two fills differ. It is the statistical
   part of `tests/fill.rs`, an assumption about the OS that the specs cite and no proof carries
   over; deleting the `fill.rs` tests drops only that check.
-- `blocking_gaps`: rows of §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`, beyond gap 0
+- `blocking_gaps`: rows of `docs/TRUST-LANE.md` (Blocking gaps), beyond gap 0
   (the installed seal publishes no Lean-discharged row), which every row needs.
 
 ## 1. Specs (TSV)
@@ -59,11 +59,6 @@ tests/fill.rs	getrandom_writes_every_byte_of_every_length	os-fill-writes-every-b
 tests/fill.rs	getrandom_uninit_writes_every_byte_and_returns_the_same_memory	getrandom-uninit-refines-getrandom	os-fill-writes-every-byte
 ```
 
-## 3. Coverage
-
-- All 6 live `#[test]` functions across `src/error.rs` (1), `tests/recorded.rs` (3), and
-  `tests/fill.rs` (2) map to the 8 specs in §1.
-
 ## 4. Tests that are not spec samples
 
 None.
@@ -84,26 +79,3 @@ None.
 4. *(Resolved)* **The `tests/fill.rs` module doc no longer claims a `2^-64` per-round bound**; it
    states the `0..=4096` byte-fill test scope directly, while `os-fill-writes-every-byte` carries the
    CSPRNG assumption.
-
-## 6. Proof order
-
-Every spec needs at least gap 1, so the order follows the smallest remaining gap set.
-
-1. **`error-code-table`** (gaps 1, 3). A `const fn` over a `NonZeroU32` newtype with u16→u32
-   arithmetic, decidable by evaluating 13 constants plus a bound on `n: u16`. It retires
-   `the_named_codes_are_upstreams` (the layout check already lives as a const assert in
-   `src/error.rs`).
-2. **`error-raw-os-error-partition`** (gaps 1, 3, 5). One u32 binder and a comparison with `IS`. It
-   is the lemma both formatting specs stand on.
-3. **`from-io-errno-mapping`** (gaps 1, 3, 4). Needs a `raw_os_error` model of `std::io::Error`, then
-   it is a three-way Option/sign case split. It retires the only in-crate unit test.
-4. **`getrandom-forwards`** (gaps 1, 2, 4, 12). Small body. The empty case is local; the non-empty
-   case cites `aterm_uds::rand::fill`'s ensures across crates.
-5. **`error-internal-format`** (gaps 1, 3, 4, 5, 6). String and Formatter carriers over a finite
-   table plus a fallback arm.
-6. **`getrandom-uninit-refines-getrandom`** (gaps 1, 2, 3, 4, 8): MaybeUninit initialisation and
-   pointer identity on top of `getrandom-forwards`.
-7. **`error-os-format`** (gaps 1, 3, 4, 5, 6, 8): rests on std's strerror text, an FFI effect.
-8. **`os-fill-writes-every-byte`** (gaps 1, 2, 7, 8, 12, 13): the crate's reason to exist and the
-   hardest: a chunk-partition loop invariant through a closure, FFI `PlatformSpec` rows and fs
-   effects. It lives in `aterm-uds`, so it is proved there and cited here.

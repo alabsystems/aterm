@@ -344,41 +344,6 @@ pub fn argv_model(argv: &[String]) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `argv` on `model`: every `--model` before `--` dropped with its value, and `--model=<model>`
-/// put right after the program, where Go's flag parser reads it whatever follows.
-#[must_use]
-pub fn with_model(argv: &[String], model: &str) -> Vec<String> {
-    let Some((program, rest)) = argv.split_first() else {
-        return Vec::new();
-    };
-    let mut out = vec![program.clone(), format!("--{FLAG_MODEL}={model}")];
-    let mut i = 0;
-    while i < rest.len() {
-        let tok = rest[i].as_str();
-        i += 1;
-        if matches!(tok, "-" | "--") || !tok.starts_with('-') {
-            out.extend(rest[i - 1..].iter().cloned());
-            break;
-        }
-        match flag_token(tok) {
-            Some((FLAG_MODEL, attached)) => {
-                if attached.is_none() {
-                    i += 1;
-                }
-            }
-            Some((name, None)) if matches!(flag(name), Some((Arity::One, _))) => {
-                out.push(tok.to_owned());
-                if let Some(value) = rest.get(i) {
-                    out.push(value.clone());
-                    i += 1;
-                }
-            }
-            _ => out.push(tok.to_owned()),
-        }
-    }
-    out
-}
-
 /// THE CONVERSATION AN ARGV RESUMES (`--conversation`, any spelling), as given.
 #[must_use]
 pub fn resumed_conversation(argv: &[String]) -> Option<String> {

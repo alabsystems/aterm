@@ -704,10 +704,10 @@ fn rows_older_builds_replicated_keep_validating() {
             "machine_column": 2, "providers": [], "unclassified_columns": [],
         }]})
     };
-    for hint in ["m40-1234", "m1234567.2", "m3", "M27-2", "m3.2"] {
+    for hint in ["m40-1234", "m1234567.2", "m3", "M27-2", "m3.2", "m0"] {
         validate(&key, &row(hint)).unwrap();
     }
-    for hint in ["m0", "m3.0", "m27-02", "m40-3fa2", "mac-3", "m3.2.1"] {
+    for hint in ["m3.0", "m27-02", "m40-3fa2", "mac-3", "m3.2.1"] {
         assert!(validate(&key, &row(hint)).is_err(), "{hint}");
     }
 }

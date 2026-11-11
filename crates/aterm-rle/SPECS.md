@@ -39,7 +39,7 @@ the specs whose proofs retire it, and §5 lists where a test disagrees with the 
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary in §2),
 `difficulty` (the Rust features the proof must handle), `blocking_gaps` (rows of §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`). Gap 0 (a seal that publishes Clean rows)
+`docs/TRUST-LANE.md` (Blocking gaps)). Gap 0 (a seal that publishes Clean rows)
 blocks every row. A first proof can sidestep gap 11 by stating the spec at `T = u8`.
 
 ```tsv
@@ -85,19 +85,7 @@ src/tests_performance.rs	rle_set_range_linear_in_runs	rle-find-run-cost
 tests/fuzz_rle.rs	fuzz_rle_mutators_never_panic	rle-no-panic	rle-inv
 ```
 
-## 3. Coverage
-
-- All 17 live `#[test]` functions across `src/tests.rs` (6), `src/tests_exhaustive.rs` (5),
-  `src/tests_saturation.rs` (3), `src/tests_performance.rs` (2), and `tests/fuzz_rle.rs` (1) are
-  mapped in §2 across the 14 specs.
-- `rle-inv` is the precondition of every other functional spec. The tests' structure checks
-  (`assert_rle_matches_model` in `src/tests.rs`, `assert_invariant` in the fuzz) retire with it.
-
 ## 4. Tests that are not spec samples
-
-> Status 2026-10-15: `rle_set_individual_cost_scales_with_run_count` deleted.
->
-> Status 2026-10-28: `tests_performance::rle_set_range_linear_in_runs` was rewritten (§5.2) to assert exact `count_run_iteration()` counts rather than a growth-rate ratio band, so 0 non-spec tests remain.
 
 Once `rle-find-run-cost` is proved over a ghost counter and its tests are deleted, the
 `#[cfg(test)]` `iteration_counter` module in `src/lib.rs` and the `count_run_iteration()` calls in
@@ -115,20 +103,3 @@ Once `rle-find-run-cost` is proved over a ghost counter and its tests are delete
    directly** without citing a test file.
 4. *(Resolved)* **`tests_exhaustive::rle_index_trait_oob_panics` uses bare `#[should_panic]`** without
    pinning `core::slice`'s panic message text.
-
-## 6. Proof order (easiest high-value first)
-
-`rle-observers` → `rle-ctor` (new/default/with_value half) → `rle-extend-clamped` → `rle-try-extend`
-→ `rle-find-run` → `rle-get-index` → `rle-set` → `rle-find-run-cost` → `rle-resize` → `rle-iter`
-→ `rle-ctor` (from_iter half) → `rle-set-range` → `rle-inv` (assembled from the per-operation
-preservation lemmas proved alongside each contract) → `rle-no-panic`. `rle-capacity-error-display`
-is independent.
-
-1. **`rle-observers`**: field reads and one `u32` subtraction that cannot underflow, with no loop and
-   no call. `len`, `run_count` and `remaining_capacity` are the vocabulary every other spec uses.
-2. **`rle-try-extend`** with **`rle-extend-clamped`**: no loops (`last_mut`, one compare, one push or
-   one length bump). They give the tail-only frame condition that `rle-ctor`'s `from_iter` and
-   `rle-resize`'s growth path reuse.
-3. **`rle-find-run`**, then **`rle-get-index`**: one accumulator loop with an obvious invariant
-   (`accumulated = start(r,i) ≤ index`), the lemma `rle-set`, `rle-set-range` and
-   `rle-find-run-cost` stand on.

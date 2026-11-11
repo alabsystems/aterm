@@ -34,9 +34,12 @@ pub(crate) struct FetchedOrigin {
 
 #[path = "github_remote/write.rs"]
 mod write;
+pub(crate) use write::ClaimWrite;
 pub use write::RefWrite;
 #[cfg(test)]
 pub(crate) use write::claim_fixture;
+#[cfg(test)]
+pub(crate) use write::claim_fixture_with_fx;
 #[cfg(test)]
 pub(crate) use write::engine_fixture;
 
@@ -189,11 +192,23 @@ impl Remote {
     }
 
     fn run(&self, run: GitRun) -> Result<agh::git::GitOut, String> {
+        let name = match &run.op {
+            agh::git::GitOp::CheckLocal { .. } => "native Git source admission",
+            agh::git::GitOp::LsRemote { .. } => "native Git ref advertisement",
+            _ => "native Git object operation",
+        };
+        let _timing = crate::cut_timing::Timer::new(name);
+        let run = run.with_named(self.named.clone());
+        // CommitRead owns both its finite-work and native no-progress bounds.
+        // Overriding them refuses the ancestry query needed when a retry's
+        // observed main has advanced again before the caller refreshes it.
+        let run = if matches!(run.op, agh::git::GitOp::CommitRead { .. }) {
+            run
+        } else {
+            run.with_progress_window(STALL_WINDOW)
+        };
         self.client
-            .run_git(
-                &run.with_named(self.named.clone())
-                    .with_progress_window(STALL_WINDOW),
-            )
+            .run_git(&run)
             .map_err(|error| self.client.redactor().apply(&error.why))
     }
 
@@ -274,12 +289,37 @@ impl Remote {
     /// and the final captured-origin/tracking CAS use the same admission as a
     /// complete origin refresh; a caller does not need the tag catalog here.
     pub(crate) fn refresh_main(&self) -> Result<String, String> {
+        self.refresh_main_after(None)
+    }
+
+    /// A retried claim must retain every observed forward main, including the
+    /// last unsent inventory, before checking supersession on the new snapshot.
+    pub(crate) fn refresh_main_after(&self, floor: Option<&str>) -> Result<String, String> {
         let before = self.tracking_main()?;
         let main = self
             .get("refs/heads/main")?
             .ok_or("the authenticated origin has no main branch")?;
         self.fetch_exact(&main)?;
         self.require_commit(&main)?;
+        if let Some(floor) = floor.filter(|floor| *floor != main) {
+            // Admission observed this endpoint in its private object view. A
+            // rewind need not leave it in the freshly fetched main's ancestry.
+            self.fetch_exact(floor)?;
+            let request = agh::git::CommitRead::new(agh::git::CommitReadInput {
+                commits: Vec::new(),
+                queries: vec![agh::git::AncestryQuery {
+                    ancestor: floor.into(),
+                    descendant: main.clone(),
+                }],
+            })
+            .map_err(|error| self.client.redactor().apply(&error.why))?;
+            let out = self.run(GitRun::commit_read(&self.slug, &self.repo, request, false))?;
+            let value: aterm_json::Value = aterm_json::from_str(&out.stdout)
+                .map_err(|error| format!("claim main ancestry: {error}"))?;
+            if value["queries"][0]["contained"].as_bool() != Some(true) {
+                return Err("could_not_run: remote main did not advance fast-forward between claim attempts".into());
+            }
+        }
         self.record_main(before.as_deref(), &main)?;
         Ok(main)
     }
@@ -635,6 +675,22 @@ impl Remote {
         let refs = parse_refs(&out.stdout, namespace)?;
         self.ensure_origin()?;
         Ok(refs)
+    }
+
+    /// Read the lease and fence from one complete native advertisement.
+    pub(crate) fn publisher_controls(&self) -> Result<(Option<String>, Option<String>), String> {
+        const PREFIX: &str = "refs/tags/aterm-release-";
+        self.ensure_origin()?;
+        let out = self.run(GitRun::ls_remote(
+            &self.slug,
+            Some("refs/tags/aterm-release-*"),
+        ))?;
+        let mut refs = parse_refs(&out.stdout, PREFIX)?;
+        self.ensure_origin()?;
+        Ok((
+            refs.remove(agh::git::RELEASE_LEASE_REF),
+            refs.remove(agh::git::PUBLISHER_FENCE_REF),
+        ))
     }
 
     /// Resolve one exact full ref without interpreting it as a pattern.

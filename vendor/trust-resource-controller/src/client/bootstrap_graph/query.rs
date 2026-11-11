@@ -9,7 +9,7 @@ use trust_resource_provenance::{Host, PinnedHelper};
 
 use super::{
     BootstrapGraphSupport, Connection, EnrolledBootstrapGraph, OutputBoundBootstrapGraph,
-    QueryState, bounded, finish, live, time,
+    QueryState, SourceBoundBootstrapGraph, bounded, finish, live, time,
 };
 use crate::bootstrap_graph::{query, transport};
 use crate::client::{Client, Delivery};
@@ -383,6 +383,19 @@ impl OutputBoundBootstrapGraph {
         deadline: Instant,
     ) -> Result<CompletedSdkQuery, QueryFailure> {
         let original = self.original.as_mut().expect("same original output graph");
+        original.check(deadline).map_err(QueryFailure::before)?;
+        client.query_with_original(QueryRoot::connection(original), request, gnu, deadline)
+    }
+}
+impl SourceBoundBootstrapGraph {
+    pub fn sdk_query(
+        &mut self,
+        client: &Client,
+        request: query::Request,
+        gnu: &[BorrowedFd<'_>; 2],
+        deadline: Instant,
+    ) -> Result<CompletedSdkQuery, QueryFailure> {
+        let original = self.original.as_mut().expect("same original source graph");
         original.check(deadline).map_err(QueryFailure::before)?;
         client.query_with_original(QueryRoot::connection(original), request, gnu, deadline)
     }

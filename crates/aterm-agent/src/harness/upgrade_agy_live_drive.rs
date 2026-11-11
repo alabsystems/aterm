@@ -8,11 +8,10 @@ use std::time::Duration;
 
 use super::super::super::upgrade_agy_live::{self as live, Look, Message, Open};
 use super::super::build_start;
-use super::super::upgrade::{Agent, Phase, same_build};
+use super::super::upgrade::{Agent, Phase};
 use super::super::{
-    Client, Due, Hand, LiveTab, Opts, Report, SAME_PROGRAM, St, Terminated, connect, held,
-    load_record, managed_agent_twin, now_s, restore, said, save, save_checked, screen,
-    store_version, terminate,
+    Client, Due, Hand, LiveTab, Opts, Report, St, Terminated, connect, held, load_record,
+    managed_agent_twin, now_s, restore, said, save, save_checked, screen, store_version, terminate,
 };
 use super::{AgyKernel, ag, carry_in_flight_with, key, ledger, plan, relaunch_held};
 
@@ -56,7 +55,7 @@ fn twin_target(twin: &Path) -> Option<PathBuf> {
     let text = super::super::super::accounts::read_bounded(twin, 64 * 1024)
         .ok()
         .flatten()?;
-    super::super::catalog::twin_binary(&text)
+    super::super::super::twin::twin_binary(&text)
 }
 
 /// Returns the [`Move`] owed by `exe` onto `twin`, or `Err` when unprovable ([`Open::Unproved`]).
@@ -79,109 +78,6 @@ pub(super) fn behind(exe: &Path, twin: Option<PathBuf>) -> Result<Option<Move>, 
     }))
 }
 
-/// A model move agy's quota owes the agy a tab runs: its model's pool is low or spent and
-/// [`crate::harness::agy_quota::pick`] puts it on a model in another pool. The relaunch is the
-/// live upgrade's, onto the build it runs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Rotation {
-    /// The build move, here onto the build that runs.
-    pub(super) mv: Move,
-    /// The model it runs (its `--model`, else agy's default).
-    pub(super) from: String,
-    /// The model it is relaunched on.
-    pub(super) to: String,
-    /// The pick's own words ([`crate::harness::agy_quota::Pick::describe`]).
-    pub(super) why: String,
-}
-
-/// The [`Rotation`] the agy `args` runs as `exe` owes, `None` when its pool keeps it.
-pub(super) fn rotation_due(
-    exe: &Path,
-    args: &atpkg::caller_shell::ProcArgs,
-    twin: Option<PathBuf>,
-    user_home: &Path,
-    k: &dyn AgyKernel,
-) -> Option<Rotation> {
-    rotation_due_at(exe, args, twin, user_home, false, None, k)
-}
-
-/// [`rotation_due`] with `at_wall` (`true` when `agy` is stopped at a quota wall on screen) and
-/// `screen_model` (the live model read from the TUI footer/launch card when `/model` switched it).
-pub(super) fn rotation_due_at(
-    exe: &Path,
-    args: &atpkg::caller_shell::ProcArgs,
-    twin: Option<PathBuf>,
-    user_home: &Path,
-    at_wall: bool,
-    screen_model: Option<&str>,
-    k: &dyn AgyKernel,
-) -> Option<Rotation> {
-    let mv = if ag::store_build(exe) {
-        let twin = twin?;
-        let target = std::fs::canonicalize(twin_target(&twin)?).ok()?;
-        if target != std::fs::canonicalize(exe).ok()? {
-            if !at_wall {
-                return None;
-            }
-            behind(exe, Some(twin)).ok().flatten()?
-        } else {
-            let running = build_record(exe)?;
-            Move {
-                running: running.clone(),
-                target: running,
-                twin,
-            }
-        }
-    } else {
-        let running = build_record(exe).unwrap_or_else(|| "-".to_string());
-        Move {
-            running: running.clone(),
-            target: running,
-            twin: exe.to_path_buf(),
-        }
-    };
-    let argv_model = ag::argv_model(&args.argv);
-    let env = ag::relaunch_env(|n| args.env_var(n), user_home);
-    let flags = ag::config_flags(&args.argv);
-    let mut pick = k.quota_pick_at(argv_model.as_deref(), exe, &env, &flags, at_wall);
-    if at_wall
-        && let Some(sm) = screen_model
-        && !crate::harness::agy_quota::family(sm).is_empty()
-        && pick
-            .as_ref()
-            .and_then(|p| match p {
-                crate::harness::agy_quota::Pick::Keep { model, .. }
-                | crate::harness::agy_quota::Pick::Wait { model, .. }
-                | crate::harness::agy_quota::Pick::Unknown { model } => {
-                    (!model.is_empty()).then_some(model.as_str())
-                }
-                crate::harness::agy_quota::Pick::Rotate { from, .. } => {
-                    (!from.is_empty()).then_some(from.as_str())
-                }
-            })
-            .is_none_or(|cm| {
-                crate::harness::agy_quota::family(sm) != crate::harness::agy_quota::family(cm)
-            })
-        && let Some(override_pick) = k.quota_pick_at(Some(sm), exe, &env, &flags, true)
-        && !matches!(
-            override_pick,
-            crate::harness::agy_quota::Pick::Unknown { .. }
-        )
-    {
-        pick = Some(override_pick);
-    }
-    let pick = pick?;
-    let crate::harness::agy_quota::Pick::Rotate { from, to, .. } = &pick else {
-        return None;
-    };
-    Some(Rotation {
-        mv,
-        from: from.clone(),
-        to: to.clone(),
-        why: pick.describe(),
-    })
-}
-
 /// The active model on `tab`'s screen (`c`) when `agy` is stopped at a quota wall
 /// (`Some(Some(model))` when the footer or launch card names one, `Some(None)` when at a quota wall
 /// without one, `None` when not at a quota wall).
@@ -189,12 +85,6 @@ pub(in super::super) fn wall_screen_model_on(c: &mut Client, tab: &str) -> Optio
     let s = screen(c, tab)?;
     screen_quota_wall(&s.rows)
         .then(|| aterm_phase::agy::launch_card(&s.rows).map(|card| card.model))
-}
-
-/// [`wall_screen_model_on`] on a fresh connection for `opts` and `tab`.
-pub(in super::super) fn wall_screen_model(opts: &Opts, tab: &str) -> Option<Option<String>> {
-    let mut c = connect(opts, tab).ok()?;
-    wall_screen_model_on(&mut c, tab)
 }
 
 /// Answers [`super::super::due`] for a tab led by `agy`.
@@ -225,25 +115,8 @@ pub(super) fn upgrade_due_with(
     let Some(exe) = k.exe(pid) else {
         return Some(Due::Unread(super::super::UNREAD_PROCESS));
     };
-    Some(match behind(&exe, twin.clone()) {
+    Some(match behind(&exe, twin) {
         Ok(Some(_)) => Due::Yes,
-        Ok(None) if rotation_due(&exe, &args, twin.clone(), &opts.home, k).is_some() => Due::Yes,
-        Ok(None)
-            if wall_screen_model(opts, tab).is_some_and(|screen_model| {
-                rotation_due_at(
-                    &exe,
-                    &args,
-                    twin,
-                    &opts.home,
-                    true,
-                    screen_model.as_deref(),
-                    k,
-                )
-                .is_some()
-            }) =>
-        {
-            Due::Yes
-        }
         Ok(None) => Due::No,
         Err(word) => Due::Unread(word),
     })
@@ -652,55 +525,15 @@ pub(super) fn upgrade_visit(
     let Some(exe) = k.exe(pid) else {
         return Some(said(r, format!("wait:{}", super::super::UNREAD_PROCESS)));
     };
-    let (mut mv, rotation) = match behind(&exe, twin.clone()) {
-        Ok(Some(mv)) => {
-            let rot = wall_screen_model(opts, &tab).and_then(|screen_model| {
-                rotation_due_at(
-                    &exe,
-                    &args,
-                    twin,
-                    &opts.home,
-                    true,
-                    screen_model.as_deref(),
-                    k,
-                )
-            });
-            match rot {
-                Some(rot) => (rot.mv.clone(), Some(rot)),
-                None => (mv, None),
-            }
-        }
-        Ok(None) => {
-            let rot = rotation_due(&exe, &args, twin.clone(), &opts.home, k).or_else(|| {
-                let screen_model = wall_screen_model(opts, &tab)?;
-                rotation_due_at(
-                    &exe,
-                    &args,
-                    twin,
-                    &opts.home,
-                    true,
-                    screen_model.as_deref(),
-                    k,
-                )
-            });
-            match rot {
-                Some(rot) => (rot.mv.clone(), Some(rot)),
-                None => return Some(said(r, "current")),
-            }
-        }
+    let mv = match behind(&exe, twin) {
+        Ok(Some(mv)) => mv,
+        Ok(None) => return Some(said(r, "current")),
         Err(word) => return Some(said(r, format!("wait:{word}"))),
     };
-    let r = match &rotation {
-        Some(rot) => Report {
-            from: rot.from.clone(),
-            to: format!("{}(quota)", rot.to),
-            ..r
-        },
-        None => Report {
-            from: mv.running.clone(),
-            to: format!("{}(managed)", mv.target),
-            ..r
-        },
+    let r = Report {
+        from: mv.running.clone(),
+        to: format!("{}(managed)", mv.target),
+        ..r
     };
     if opts.background {
         return Some(said(r, AT_BREAK));
@@ -732,41 +565,14 @@ pub(super) fn upgrade_visit(
             now_s(),
         )
     });
-    if rotation.is_none()
-        && let Some(word) = held_word
-    {
+    if let Some(word) = held_word {
         return Some(said(r, format!("wait:{word}")));
-    }
-    let move_held = rotation.is_some()
-        && !same_build(Agent::Agy, &mv.running, &mv.target)
-        && held_word.is_some();
-    if move_held {
-        mv = Move {
-            running: mv.running.clone(),
-            target: mv.running,
-            twin: exe.clone(),
-        };
     }
     let (config, started_ms) = (run.config.clone(), run.started_ms);
     let Ok(mut c) = connect(opts, &tab) else {
         return Some(said(r, "wait:no-socket"));
     };
-    let at_wall =
-        rotation.is_some() && screen(&mut c, &tab).is_some_and(|s| screen_quota_wall(&s.rows));
-    let look = |c: &mut Client| {
-        let mut l = look_at(opts, c, &tab, pid, &config, &conversation, started_ms, k);
-        if rotation.is_some() && screen(c, &tab).is_some_and(|s| screen_quota_wall(&s.rows)) {
-            l.idle = true;
-            if let Ok(Some(s)) = &mut l.summary
-                && s.status != live::STATUS_IDLE
-                && !s.not_fully_idle
-                && s.children_busy == 0
-            {
-                s.status = live::STATUS_IDLE.to_owned();
-            }
-        }
-        l
-    };
+    let look = |c: &mut Client| look_at(opts, c, &tab, pid, &config, &conversation, started_ms, k);
     if let Err(why) = live::gate(&look(&mut c)) {
         return Some(said(r, format!("wait:{why}")));
     }
@@ -774,20 +580,8 @@ pub(super) fn upgrade_visit(
     let Some(mut st) = claim_record(&snap, &mv, opts.human_grace_s, now) else {
         return Some(said(r, "wait:no-session"));
     };
-    if let Some(rot) = &rotation {
-        st.argv = ag::with_model(&st.argv, &rot.to);
-        st.cause = format!("{}{}", super::super::super::relaunch::CAUSE_MODEL, rot.to);
-        st.quiet = !at_wall;
-        if move_held {
-            st.source = SAME_PROGRAM.to_string();
-        }
-    }
     if let Some(prior) = prior.as_ref() {
-        if !st.is_upgrade() && same_build(Agent::Agy, &st.from, &st.to) {
-            prior.kept_by_restart(&tab, &mut st);
-        } else {
-            prior.retried_by(&mut st);
-        }
+        prior.retried_by(&mut st);
     }
     match plan(opts, &st, k) {
         Ok(_) => {}
@@ -801,9 +595,7 @@ pub(super) fn upgrade_visit(
     {
         return Some(said(r, "skip:env-not-carried"));
     }
-    if (rotation.is_none() || mv.running != mv.target)
-        && let Err(why) = build_start::proved_named(opts, &r, &mv.twin, &mv.target, SOURCE, now)
-    {
+    if let Err(why) = build_start::proved_named(opts, &r, &mv.twin, &mv.target, SOURCE, now) {
         return Some(said(r, format!("wait:{why}")));
     }
     if opts.dry_run {
@@ -855,20 +647,10 @@ pub(super) fn upgrade_visit(
             return Some(r);
         }
     }
-    let note = match &rotation {
-        Some(rot) if at_wall => format!(
-            "SIGTERM (quota wall: its conversation {} resumed on --model {}: {})",
-            st.thread, rot.to, rot.why
-        ),
-        Some(rot) => format!(
-            "SIGTERM (idle: nothing asked or typed; its conversation {} resumed on --model {}: {})",
-            st.thread, rot.to, rot.why
-        ),
-        None => format!(
-            "SIGTERM (idle: nothing asked or typed; its conversation {} resumed on {} as it was)",
-            st.thread, mv.target
-        ),
-    };
+    let note = format!(
+        "SIGTERM (idle: nothing asked or typed; its conversation {} resumed on {} as it was)",
+        st.thread, mv.target
+    );
     ledger(opts, &said(r.clone(), "terminated"), &note);
     let r = relaunch_held(opts, r, &mut st, &mut c, &mut hand, k);
     if !matches!(st.phase, Phase::Exiting { .. }) {

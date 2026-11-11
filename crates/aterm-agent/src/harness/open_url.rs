@@ -4248,7 +4248,7 @@ pub(super) fn poll_mailbox_for_magic_link(
                     if let Some(name) = path.file_name() {
                         let marker =
                             mailbox_dir.join(format!("{}.clicked", name.to_string_lossy()));
-                        let _ = super::upgrade_models::write_atomic(&marker, "1\n");
+                        let _ = super::atomic_write::write_atomic(&marker, "1\n");
                     }
                     return Ok(magic_url);
                 }

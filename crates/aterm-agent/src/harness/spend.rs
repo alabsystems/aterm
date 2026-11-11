@@ -477,7 +477,7 @@ fn approx(usage: &Map) -> bool {
 }
 
 fn family_of(model: &str) -> Option<String> {
-    super::upgrade_models::family_version(model).map(|(family, _)| family)
+    super::claude_model::family_version(model).map(|(family, _)| family)
 }
 
 /// How far one transcript has been folded.

@@ -1171,16 +1171,16 @@ pub fn place_published(
 /// The cut tree for the checkout at `repo`.
 ///
 /// # Errors
-/// A checkout at the filesystem root has no parent to put a sibling in.
+/// A checkout at the filesystem root has no parent to hold the quiet folder.
 pub fn cut_tree_path(repo: &Path) -> Result<PathBuf> {
     match (repo.parent(), repo.file_name()) {
         (Some(parent), Some(name)) => {
             let mut leaf = name.to_os_string();
             leaf.push("-cut.noindex");
-            Ok(parent.join(leaf))
+            Ok(parent.join(aterm_tempfile::QUIET).join(leaf))
         }
         _ => Err(Error::new(format!(
-            "{} has no parent directory to hold the cut tree beside it",
+            "{} has no parent directory to hold the cut tree's quiet folder",
             repo.display()
         ))),
     }
@@ -1203,6 +1203,18 @@ pub fn place_cut_tree(git: &dyn GitRunner, repo: &Path, commit: &str) -> Result<
     refuse_rewriting_info_attributes(git)?;
     let path = cut_tree_path(repo)?;
     if !path.exists() {
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::new("cut tree has no parent"))?;
+        // The shared /tmp/.ubd is allowed by quiet_in's owner/sticky checks; every other
+        // newly named parent must satisfy the release's private-directory rule.
+        if aterm_tempfile::quiet_in(
+            repo.parent()
+                .ok_or_else(|| Error::new("checkout has no parent"))?,
+        ) != parent
+        {
+            crate::snapshot::private_dir(parent, "cut tree parent").map_err(Error::new)?;
+        }
         git_ok(git, &["worktree", "prune"])?;
         let spelled = path.to_string_lossy().into_owned();
         let add = ["worktree", "add", "-q", "--detach", &spelled, commit];
@@ -4949,6 +4961,117 @@ mod published_commit_tests {
         }
     }
 
+    /// Real main, 2026-11-10: a branch dropped its own entry to take main's changelog, the
+    /// entry landed again afterwards, and a peer that forked before the entry merged main.
+    /// Against the peer's parent that merge adds the entry, but its copy comes from main,
+    /// which already saw the removal, so it is the author's current text and not stale.
+    #[test]
+    fn an_entry_reauthored_after_its_removal_is_not_resurrected_by_a_later_merge() {
+        let repo = Repo::new("note-reauthored");
+        let bare = "## [Unreleased]\n\n## [0.1.0] - date\n\n- older change\n";
+        repo.commit("no notes yet", &[("CHANGELOG.md", bare)]);
+        repo.run(&["branch", "peer"]);
+        let noted = bare.replace(
+            "## [Unreleased]\n\n",
+            "## [Unreleased]\n\n### Fixed\n\n- **Idle node.** Polls less often.\n\n",
+        );
+        repo.commit("note", &[("CHANGELOG.md", &noted)]);
+        repo.commit("take main's notes", &[("CHANGELOG.md", bare)]);
+        repo.commit("the note lands after", &[("CHANGELOG.md", &noted)]);
+        repo.run(&["checkout", "-q", "peer"]);
+        repo.commit("peer change", &[("peer", "peer work")]);
+        repo.run(&["merge", "--no-ff", "-qm", "peer merges main", "main"]);
+        changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
+    }
+
+    /// Real main, 2026-11-10 (447aa1deaa5, then 466277007c5): a branch's merge of main put
+    /// main's new release heading above the branch's unreleased entry, so for a minute the
+    /// entry sat under a release that never shipped it; the next merge moved it back. The
+    /// entry never left the changelog, so that move is no removal. A shipped copy merged
+    /// back stays refused: the release section still holds it.
+    #[test]
+    fn an_entry_a_merge_misplaces_under_a_release_and_the_next_moves_back_is_not_resurrected() {
+        let repo = Repo::new("note-misplaced");
+        let bare = "## [Unreleased]\n\n## [0.1.0] - date\n\n- older change\n";
+        repo.commit("no notes yet", &[("CHANGELOG.md", bare)]);
+        repo.run(&["branch", "branch"]);
+        let released = bare.replace(
+            "## [Unreleased]\n\n",
+            "## [Unreleased]\n\n## [0.2.0] - date\n\n- Main's shipped change.\n\n",
+        );
+        repo.commit("release 0.2.0", &[("CHANGELOG.md", &released)]);
+        repo.run(&["checkout", "-q", "branch"]);
+        let entry = "- **Sessions keep their model.** A restart keeps the launch's `--model`.\n";
+        let noted = bare.replace(
+            "## [Unreleased]\n\n",
+            &format!("## [Unreleased]\n\n{entry}\n"),
+        );
+        repo.commit("branch note", &[("CHANGELOG.md", &noted)]);
+        repo.run(&["merge", "--no-ff", "--no-commit", "-s", "ours", "main"]);
+        let misplaced = released.replace(
+            "## [0.2.0] - date\n\n",
+            &format!("## [0.2.0] - date\n\n{entry}\n"),
+        );
+        repo.commit("merge misplaces the note", &[("CHANGELOG.md", &misplaced)]);
+        repo.run(&["checkout", "-q", "main"]);
+        repo.commit("main moves", &[("main", "work")]);
+        repo.run(&["checkout", "-q", "branch"]);
+        repo.run(&["merge", "--no-ff", "--no-commit", "-s", "ours", "main"]);
+        let repaired = released.replace(
+            "## [Unreleased]\n\n",
+            &format!("## [Unreleased]\n\n{entry}\n"),
+        );
+        repo.commit(
+            "the next merge moves the note back",
+            &[("CHANGELOG.md", &repaired)],
+        );
+        changelog_gate_at(&repo.git(), "HEAD", "0.3.0").unwrap();
+
+        let shipped = released.replace(
+            "## [0.2.0] - date\n\n",
+            &format!("## [0.2.0] - date\n\n{entry}\n"),
+        );
+        repo.commit("the note ships in 0.2.0", &[("CHANGELOG.md", &shipped)]);
+        let restored = shipped.replace(
+            "## [Unreleased]\n\n",
+            &format!("## [Unreleased]\n\n{entry}\n"),
+        );
+        repo.commit(
+            "a merge brings the shipped note back",
+            &[("CHANGELOG.md", &restored)],
+        );
+        let err = changelog_gate_at(&repo.git(), "HEAD", "0.3.0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already released in [0.2.0]"), "{err}");
+    }
+
+    #[test]
+    fn recut_notes_cannot_resurrect_a_rewritten_rolled_entry() {
+        let repo = Repo::new("recut-note-resurrection");
+        let original = "## [Unreleased]\n\n### Fixed\n\n- Original claim.\n\n## [0.1.0] - date\n\n- older change\n";
+        repo.commit("original", &[("CHANGELOG.md", original)]);
+        let rolled = original.replace("### Fixed", "## [0.2.0] - date\n\n### Fixed");
+        repo.commit("roll candidate", &[("CHANGELOG.md", &rolled)]);
+        assert!(changelog_gate_at(&repo.git(), "HEAD", "0.2.0").is_ok());
+        repo.run(&["branch", "peer"]);
+        let corrected = rolled.replace("Original claim.", "Corrected claim.");
+        let removed = repo.commit("correct candidate", &[("CHANGELOG.md", &corrected)]);
+        assert!(changelog_gate_at(&repo.git(), "HEAD", "0.2.0").is_ok());
+        repo.run(&["checkout", "-q", "peer"]);
+        repo.commit("peer work", &[("peer", "work")]);
+        repo.run(&["checkout", "-q", "main"]);
+        repo.run(&["merge", "--no-ff", "--no-commit", "peer"]);
+        let restored = repo.commit("restore stale rolled note", &[("CHANGELOG.md", &rolled)]);
+        let error = changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&removed) && error.contains(&restored),
+            "{error}"
+        );
+    }
+
     #[test]
     fn release_notes_resurrection_refuses_and_names_both_commits() {
         let repo = Repo::new("note-resurrection");
@@ -5051,7 +5174,7 @@ mod published_commit_tests {
             &source(&published),
         )
         .expect("pushes after the publish are not a refusal");
-        let tree = repo.root.path().join("work-cut.noindex");
+        let tree = repo.root.path().join(".ubd/work-cut.noindex");
         assert_eq!(checkout.tree, tree, "the cut tree sits beside the checkout");
         assert!(checkout.moved);
         assert_eq!(checkout.main_ahead, 2);
@@ -5240,7 +5363,7 @@ mod published_commit_tests {
         )
         .expect_err("a commit main does not carry is no release source");
         assert!(
-            !repo.root.path().join("work-cut.noindex").exists(),
+            !repo.root.path().join(".ubd/work-cut.noindex").exists(),
             "no cut tree was made"
         );
 
@@ -5333,7 +5456,7 @@ mod published_commit_tests {
         let repo = Repo::new("foreign");
         let published = repo.commit("publish me", &[("a", "1")]);
         repo.publish_origin();
-        let foreign = repo.root.path().join("work-cut.noindex");
+        let foreign = repo.root.path().join(".ubd/work-cut.noindex");
         fs::create_dir_all(&foreign).unwrap();
         fs::write(foreign.join("keep"), "mine").unwrap();
         place_published(
@@ -5353,7 +5476,7 @@ mod published_commit_tests {
         repo.publish_origin();
         let info = repo.work().join(".git/info");
         fs::create_dir_all(&info).unwrap();
-        let cut = repo.root.path().join("work-cut.noindex");
+        let cut = repo.root.path().join(".ubd/work-cut.noindex");
         for line in ["* text eol=crlf", "a -text", "[attr]crlfy text eol=crlf"] {
             fs::write(info.join("attributes"), format!("# mine\n{line}\n")).unwrap();
             let error = place_published(
@@ -5398,7 +5521,7 @@ mod published_commit_tests {
     fn the_cut_tree_sits_beside_the_checkout_never_inside_it() {
         assert_eq!(
             cut_tree_path(Path::new("/Users//me/aterm")).unwrap(),
-            PathBuf::from("/Users//me/aterm-cut.noindex")
+            PathBuf::from("/Users//me/.ubd/aterm-cut.noindex")
         );
         assert!(cut_tree_path(Path::new("/")).is_err());
     }

@@ -366,6 +366,7 @@ impl Owner {
                 job.metadata_sdk.take();
                 job.metadata_gnu.take();
                 job.compiler.take();
+                job.ay.take();
                 job.workload.take();
                 let _ = job.events.emit_terminal(event, observation);
                 job.terminal_sent = true;

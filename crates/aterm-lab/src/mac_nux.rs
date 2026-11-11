@@ -6634,6 +6634,23 @@ fn retain_raw(g: &Guest, ask: &Ask, scenario: Scenario) -> Result<Option<PathBuf
     let Some(record) = &ask.record else {
         return Ok(None);
     };
+    if scenario == Scenario::DebugSuccessor {
+        // A normal row has already quit its GUI and retained its pre-quit metrics. On a
+        // failure, read the remaining responder, whose own kernel identity labels the result.
+        if let Err(error) = g.run(
+            &format!(
+                "if [ -S {socket} ]; then {GUEST_NUX}/{GUEST_HELPER} socket-metrics {socket} > {GUEST_NUX}/collector-metrics.txt 2> {GUEST_NUX}/collector-metrics-error.txt; fi",
+                socket = debug_successor::SOCKET,
+            ),
+            STEP,
+        ) {
+            // An unavailable optional read must not discard the existing failure archive.
+            eprintln!(
+                "mac nux: successor metrics read unavailable: {}",
+                error.msg.as_deref().unwrap_or("read interrupted")
+            );
+        }
+    }
     let collector_uid = g
         .uid
         .parse::<u32>()

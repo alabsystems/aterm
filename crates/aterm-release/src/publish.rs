@@ -610,8 +610,11 @@ fn ref_write_description(written: RefWrite) -> String {
 
 /// Read the exact lightweight lock through the authenticated native origin.
 pub fn release_lease_owner(origin: &dyn Origin) -> Result<Option<String>> {
-    origin
-        .get(RELEASE_LEASE_REF)?
+    checked_lease_owner(origin.get(RELEASE_LEASE_REF)?)
+}
+
+fn checked_lease_owner(owner: Option<String>) -> Result<Option<String>> {
+    owner
         .map(|owner| {
             if !valid_lease_owner(&owner) {
                 return Err(Error::new("release lease is not one raw object ID"));
@@ -637,7 +640,15 @@ fn publisher_fence_for_guard(
     origin: &dyn Origin,
     guard: &PublisherFenceGuard,
 ) -> Result<Option<PublisherFence>> {
-    let Some(token) = origin.get(PUBLISHER_FENCE_REF)? else {
+    fence_from_observed_token(origin, guard, origin.get(PUBLISHER_FENCE_REF)?)
+}
+
+fn fence_from_observed_token(
+    origin: &dyn Origin,
+    guard: &PublisherFenceGuard,
+    token: Option<String>,
+) -> Result<Option<PublisherFence>> {
+    let Some(token) = token else {
         return Ok(None);
     };
     if token.eq_ignore_ascii_case(guard.token()) {
@@ -1677,7 +1688,8 @@ pub fn assert_publisher_session(
     lease: &ReleaseLeaseGuard,
     fence: &PublisherFenceGuard,
 ) -> Result<()> {
-    let owner = release_lease_owner(origin)?;
+    let (owner, token) = origin.publisher_controls()?;
+    let owner = checked_lease_owner(owner)?;
     if !lease.is_owner(owner.as_deref()) || fence.owner() != lease.owner {
         return Err(Error::new(format!(
             "publisher session lost claim ownership: expected {}, observed {}",
@@ -1685,7 +1697,7 @@ pub fn assert_publisher_session(
             owner.as_deref().unwrap_or("absent")
         )));
     }
-    let observed = publisher_fence_for_guard(origin, fence)?;
+    let observed = fence_from_observed_token(origin, fence, token)?;
     if observed
         .as_ref()
         .is_none_or(|current| current.token != fence.token() || current.owner != fence.owner())
@@ -1760,9 +1772,11 @@ pub fn release_completed_publisher_session(
     guard: &PublisherFenceGuard,
 ) -> Result<LeaseRelease> {
     let expected_owner = expected_owner.to_ascii_lowercase();
-    let owner = crate::cut_timing::measure("unlock read lease", || release_lease_owner(origin))?;
+    let (owner, token) =
+        crate::cut_timing::measure("unlock read controls", || origin.publisher_controls())?;
+    let owner = checked_lease_owner(owner)?;
     let fence = crate::cut_timing::measure("unlock read fence", || {
-        publisher_fence_for_guard(origin, guard)
+        fence_from_observed_token(origin, guard, token)
     })?;
     match (owner.as_deref(), fence.as_ref()) {
         (None, None) => return Ok(LeaseRelease::AlreadyAbsent),
@@ -1803,10 +1817,11 @@ pub fn release_completed_publisher_session(
             ],
         )
     })?;
-    let owner_now =
-        crate::cut_timing::measure("unlock verify lease", || release_lease_owner(origin))?;
+    let (owner_now, token_now) =
+        crate::cut_timing::measure("unlock verify controls", || origin.publisher_controls())?;
+    let owner_now = checked_lease_owner(owner_now)?;
     let fence_now = crate::cut_timing::measure("unlock verify fence", || {
-        publisher_fence_for_guard(origin, guard)
+        fence_from_observed_token(origin, guard, token_now)
     })?;
     match (owner_now.as_deref(), fence_now.as_ref()) {
         (None, None) => Ok(LeaseRelease::Released),
@@ -3595,6 +3610,7 @@ impl Drop for PrivateTempDir {
 }
 
 fn private_release_asset_temp(parent: &Path) -> Result<PrivateTempDir> {
+    let parent = aterm_tempfile::quiet_in(parent);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())

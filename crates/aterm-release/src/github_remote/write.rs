@@ -17,6 +17,12 @@ pub enum RefWrite {
     Transient(String),
 }
 
+pub(crate) enum ClaimWrite {
+    Written,
+    Conflict,
+    InventoryChanged { main: String, why: String },
+}
+
 impl Remote {
     /// The canonical control protocol has its own validated operation; ordinary
     /// immutable tags and commit-ancestry updates never acquire this authority.
@@ -77,6 +83,46 @@ impl Remote {
 
     /// Preserve a caller's one atomic expected-OID transaction.
     pub(crate) fn write_batch(&self, batch: AtomicRefBatch) -> Result<RefWrite, String> {
+        self.ref_result(self.write_batch_result(batch)?)
+    }
+
+    pub(crate) fn write_claim_ref(
+        &self,
+        reference: &str,
+        before: Option<&str>,
+        after: &str,
+        main: Option<&str>,
+    ) -> Result<ClaimWrite, String> {
+        let mut batch = AtomicRefBatch::new(vec![RefUpdate {
+            reference: reference.into(),
+            before: before.unwrap_or(super::NULL_OID).into(),
+            after: after.into(),
+        }])
+        .map_err(|error| self.native_write_error(&error))?;
+        if let Some(main) = main {
+            batch = batch
+                .observing_main(main)
+                .map_err(|error| self.native_write_error(&error))?;
+        }
+        let result = self.write_batch_result(batch)?;
+        if let Err(error) = &result
+            && error.kind == agh::Kind::CouldNotRun
+            && error.side_effect == agh::SideEffect::None
+            && let agh::Sub::GitInventoryChanged { main } = &error.sub
+        {
+            return Ok(ClaimWrite::InventoryChanged {
+                main: main.clone(),
+                why: self.native_write_error(error),
+            });
+        }
+        match self.ref_result(result)? {
+            RefWrite::Written => Ok(ClaimWrite::Written),
+            RefWrite::Conflict => Ok(ClaimWrite::Conflict),
+            RefWrite::Transient(why) => Err(why),
+        }
+    }
+
+    fn write_batch_result(&self, batch: AtomicRefBatch) -> Result<agh::Result<()>, String> {
         if origin_slug(&self.repo)? != self.slug {
             return Err("origin changed before the native ref write".into());
         }
@@ -97,7 +143,7 @@ impl Remote {
             .refs(&self.slug)
             .push_atomic_with_progress_window(&permit, &self.repo, &batch, &intents, STALL_WINDOW)
             .and_then(agh::write::Outcome::into_result);
-        self.ref_result(result)
+        Ok(result.map(|_| ()))
     }
 
     /// Delete one exact owned ref. A grouped delete needs its own atomic native
@@ -178,6 +224,19 @@ pub(crate) fn engine_fixture(
 
 #[cfg(test)]
 pub(crate) fn claim_fixture(repo: &std::path::Path, bare: &std::path::Path) -> Remote {
+    claim_fixture_with_fx(
+        repo,
+        bare,
+        std::sync::Arc::new(agh::Fx::simulated(1_760_000_000)),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn claim_fixture_with_fx(
+    repo: &std::path::Path,
+    bare: &std::path::Path,
+    fx: std::sync::Arc<agh::Fx>,
+) -> Remote {
     let mut command = crate::ledger::object_git(repo).unwrap();
     command.args(["rev-parse", "--absolute-git-dir"]);
     let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
@@ -249,7 +308,7 @@ pub(crate) fn claim_fixture(repo: &std::path::Path, bare: &std::path::Path) -> R
     let client = agh::GithubBuilder::new(router)
         .env(std::sync::Arc::new(env))
         .transport(transport)
-        .fx(std::sync::Arc::new(agh::Fx::simulated(1_760_000_000)))
+        .fx(fx)
         .journal(dirs)
         // Local-bare transport exchanges no credentials. Any accidental helper
         // invocation must fail rather than run this integration test as a CLI.

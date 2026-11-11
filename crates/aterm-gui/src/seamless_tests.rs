@@ -2669,8 +2669,8 @@ fn commit_parent_death_helper() {
             .env(PARENT_DEATH_READY, &ready)
             .env(PARENT_DEATH_EXPECTED_PID, std::process::id().to_string())
             .stderr(said);
-        crate::test_alone::hand(watcher.command(), PARENT_DEATH_READ_FD, raw[0]);
-        crate::test_alone::hand(watcher.command(), PARENT_DEATH_WRITE_FD, raw[1]);
+        watcher.hand(PARENT_DEATH_READ_FD, raw[0]);
+        watcher.hand(PARENT_DEATH_WRITE_FD, raw[1]);
         let mut watcher = [watcher.spawn()];
         std::fs::write(&marker, watcher[0].id().to_string()).expect("publish watcher pid");
 
@@ -2759,7 +2759,7 @@ fn stand_in_proof(nonce: &str) -> AdoptionProof {
 fn watching_stand_in(
     mode: &str,
     scratch: &std::path::Path,
-    stderr: Option<std::process::Stdio>,
+    stderr: Option<crate::test_alone::Stdio>,
 ) -> (crate::test_alone::Running, std::io::PipeWriter) {
     use std::os::fd::AsRawFd as _;
     let ready = scratch.join("reader.ready");
@@ -2777,7 +2777,7 @@ fn watching_stand_in(
     if let Some(stderr) = stderr {
         reader.command().stderr(stderr);
     }
-    crate::test_alone::hand(reader.command(), PARENT_DEATH_READ_FD, read.as_raw_fd());
+    reader.hand(PARENT_DEATH_READ_FD, read.as_raw_fd());
     let mut reader = [reader.spawn()];
     drop(read);
     crate::test_alone::until_or_ended("the stand-in arms its watch", &mut reader, || {

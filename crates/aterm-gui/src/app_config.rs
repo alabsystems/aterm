@@ -10683,7 +10683,7 @@ mod output_streak_cfg_tests {
                    dismiss_surveys = false\ncontinue = false\ncontinue_text = \"go\"\n\
                    continue_per_hour = 2\nrules_file = \"/r\"\nretry_api_errors = false\n\
                    probe_api = false\nresume_limits = false\nlimit_wait = false\n\
-                   accounts = \"off\"\nmodel_fallback = \"\"\n\
+                   accounts = \"off\"\n\
                    compact_on_context_wall = false\nrelaunch = false\nupgrade = false\n\
                    human_grace_s = 600\n";
         for named in [

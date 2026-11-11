@@ -29,22 +29,39 @@ use crate::keyboard::ModifiersState;
 use crate::monitor::MonitorHandle;
 use crate::window::Window;
 
+/// Complete AppKit launch before entering the application's event loop.
+///
+/// No application callbacks or windows are created. A subsequent run delivers
+/// the normal initialization events. Headless loops do nothing.
+pub trait EventLoopExtMacOS {
+    /// Finish native launch while the caller can still serve its old windows.
+    fn prepare_launch(&mut self);
+}
+
+impl<T: 'static> EventLoopExtMacOS for crate::event_loop::EventLoop<T> {
+    fn prepare_launch(&mut self) {
+        self.event_loop.prepare_launch();
+    }
+}
+
 /// Register a handler consulted on the main thread before AppKit terminates the application.
 #[inline]
 pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
     crate::platform_impl::set_quit_confirm_hook(handler);
 }
 
-/// The original native key or mouse event before Option handling or input-method
+/// The original native key, modifier or mouse event before Option handling or input-method
 /// interpretation.
 ///
 /// LOCAL PATCH (aterm): identity only; the window layer assigns it no input authority.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NativeInputEvent {
-    /// The `NSEventType`: `NSEventTypeKeyDown` (10) or `NSEventTypeKeyUp` (11) for a key, or a
-    /// mouse button's down or up or `NSEventTypeScrollWheel` (22).
+    /// The `NSEventType`: `NSEventTypeKeyDown` (10), `NSEventTypeKeyUp` (11) or
+    /// `NSEventTypeFlagsChanged` (12) for a keyboard event, or a mouse button's down or up or
+    /// `NSEventTypeScrollWheel` (22).
     pub kind: usize,
-    /// The native virtual keycode of a key; 0 for a mouse event, which has none.
+    /// The native virtual keycode of a key or changed modifier; 0 for a mouse event, which has
+    /// none.
     pub keycode: u16,
     /// The native timestamp in seconds since boot.
     pub timestamp: f64,
@@ -53,12 +70,13 @@ pub struct NativeInputEvent {
     pub source_pid: i64,
 }
 
-/// Install the application's classifier before its first window receives a key or a click.
+/// Install the application's classifier before its first window receives a key, modifier change
+/// or click.
 ///
-/// The first registration takes effect. Each native key, mouse button and scroll event is
-/// classified once before it can generate window callbacks; that application's decision is
-/// retained through deferred delivery. The window layer does not interpret the decision or grant
-/// any authority.
+/// The first registration takes effect. Each native key, modifier-change, mouse-button and scroll
+/// event is classified once before it can generate window callbacks; that application's decision
+/// is retained through deferred delivery. The window layer does not interpret the decision or
+/// grant any authority.
 #[inline]
 pub fn set_window_input_classifier(classifier: fn(NativeInputEvent) -> InputOrigin) {
     crate::platform_impl::set_window_input_classifier(classifier);

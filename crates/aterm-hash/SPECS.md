@@ -38,7 +38,7 @@ aterm cites").
 
 `subsumes` names the primary tests (the rest are in §2), `difficulty` the Rust features the
 proof must handle, and `blocking gaps` rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -66,16 +66,6 @@ src/lib.rs	test_fxhasher_bytes_match_rustc_hash	HASH-FX-3	HASH-FX-2, HASH-FX-1 (
 src/lib.rs	test_fxhasher_str_includes_terminator_byte	HASH-FX-3	HASH-FX-1 (write_u8(0xff), finish)
 ```
 
-## 3. Coverage
-
-- Each of the 7 tests maps to one of the 6 specs (§2).
-- Retiring `test_fxhasher_bytes_match_rustc_hash` and `test_fxhasher_str_includes_terminator_byte`
-  needs HASH-FX-1, -2 and -3 all Certified. Retiring `a_stream_of_writes_is_the_hash_of_their_concatenation`
-  needs all three FNV specs.
-- Every test here is a short list of sampled vectors. The specs replace them with the reference
-  algorithm over all inputs, and the published vectors survive as `decide` corollaries that act as
-  negative controls.
-
 ## 4. Tests that are not spec samples
 
 None.
@@ -98,22 +88,3 @@ None.
    by 16 and overshoots: with len = 21, off goes from 0 to 16 > 5. HASH-FX-3 states the bound that
    holds (`off ≡ 0 mod 16 ∧ off < len`), which is also what the in-bounds argument for
    `bytes[off..off+16]` uses (off < len − 16 at the read).
-
-## 6. Proof order (easiest, high value first)
-
-1. **The scalar core: `multiply_mix` (HASH-FX-2).** It is straight-line, panic-free `u64`/`u128`
-   arithmetic and the closest to "gap 0 only". After the seal, it needs only XOR, casts and a shift
-   admitted for E6 import (gap 3). It is `bv_decide`/`omega`-class.
-2. **HASH-FNV-1 in full.** Its loop and its word step are astream-wire's `fnv1a_64_update` and
-   `fnv1a_64_mix_u64`, so it comes in two halves: astream lands their refinement `ensures` first
-   (one const-fn loop with an obvious invariant and one straight-line step over its Clean-origin
-   multiply, on that side), and then the row here is a cross-crate citation of them
-   (gap 12) plus the constant facts. Its published vectors are a
-   built-in negative control. It is the base for HASH-FNV-2 and -3.
-3. **HASH-FNV-2.** Free once HASH-FNV-1 holds (`List.foldl_append`).
-4. **HASH-FNV-3.** A newtype with a ghost history. Together with 2 and 3 it retires the three FNV
-   tests, and it is a small first case for gap 2 (two-state `&mut self`).
-5. **HASH-FX-2 read helpers** (`read_u32_le`, `read_u64_le`). Slice indexing with a length guard.
-6. **HASH-FX-3.** The stride-16 loop plus slice patterns, built on step 5. This is the hardest spec here.
-7. **HASH-FX-1.** Needs std's generic `Hash` impls for primitives modelled (gap 11) before the
-   `hash_one` corollaries are about the real call path. Prove the per-method two-state clauses first.

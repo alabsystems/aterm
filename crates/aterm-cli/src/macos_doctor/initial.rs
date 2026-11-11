@@ -38,7 +38,7 @@ pub use authorization::InitialSetupAuthorization;
 pub use authorization::{InitialSetupAdmissionFault, InitialSetupAdmissionStopTest};
 mod access;
 mod observe;
-pub use observe::{ObservationBatch, ObservationRead, observe_initial_setup};
+pub use observe::{ObservationRead, observe_initial_setup};
 pub(super) use observe::{changed_at_login, note_at_login};
 mod scope;
 #[cfg(any(test, debug_assertions))]

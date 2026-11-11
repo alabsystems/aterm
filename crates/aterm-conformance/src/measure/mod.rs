@@ -230,18 +230,5 @@ pub(crate) fn create_stdio_file(path: &std::path::Path) -> std::io::Result<std::
 }
 
 #[cfg(test)]
-mod take_tests {
-    #[test]
-    fn count_takes_share_custody_and_a_timing_take_excludes_them() {
-        let gate = super::RwLock::new(());
-        let count = super::take_on(&gate, false);
-        assert!(gate.try_read().is_ok());
-        assert!(gate.try_write().is_err());
-        drop(count);
-        let timing = super::take_on(&gate, true);
-        assert!(gate.try_read().is_err());
-        assert!(gate.try_write().is_err());
-        drop(timing);
-        assert!(gate.try_write().is_ok());
-    }
-}
+#[path = "mod_take_tests.rs"]
+mod take_tests;

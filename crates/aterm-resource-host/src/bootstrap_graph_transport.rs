@@ -142,6 +142,33 @@ pub(crate) fn serve(
     // Costly real Steps/lock acquisition may happen before output exists. The
     // original Job deadline includes queue/preparation and is never an RPC reset.
     let deadline = receiving.preparing.deadline();
+    let source = wire::SourceAttachment::decode(&receiving.channel.receive(deadline)?)?;
+    let token = crate::actor::bootstrap_graph_source_begin(
+        receiving.preparing.source_transfer(source.clone())?,
+    )?;
+    let digest = aterm_digest::Sha256::digest(&source.binding_preimage()?);
+    receiving.channel.send(
+        &wire::SourceReply::Prepared {
+            key: source.key.clone(),
+            attachment_sha256: digest,
+            context: token.context().clone(),
+        }
+        .encode()?,
+        deadline,
+    )?;
+    let descriptions =
+        wire::transport::receive_source(&mut receiving.channel, &source, deadline, revalidate)?;
+    let current = crate::actor::bootstrap_graph_source_retain(token, descriptions)?;
+    revalidate()?;
+    receiving.channel.send(
+        &wire::SourceReply::Attached {
+            key: source.key,
+            attachment_sha256: digest,
+            context: current,
+        }
+        .encode()?,
+        deadline,
+    )?;
     let output = wire::OutputAttachment::decode(&receiving.channel.receive(deadline)?)?;
     let token = crate::actor::bootstrap_graph_output_begin(
         receiving.preparing.output_transfer(output.clone())?,

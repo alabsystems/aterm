@@ -190,6 +190,18 @@ pub(super) fn bold_out(text: &str) -> String {
     paint(stdout_color(), BOLD, text)
 }
 
+/// Brew `Tty.blue` around a name (stdout) — livecheck's
+/// package names.
+pub(super) fn blue_out(text: &str) -> String {
+    paint(stdout_color(), BLUE, text)
+}
+
+/// Brew `Tty.blue` around a name inside an `onoe` line
+/// (stderr) — livecheck's per-package errors.
+pub(super) fn blue_err(text: &str) -> String {
+    paint(stderr_color(), BLUE, text)
+}
+
 /// Print a `Warning:`-labelled message to stderr with brew's
 /// yellow label (brew's `opoo` body; the label stays in the text).
 macro_rules! opoo {

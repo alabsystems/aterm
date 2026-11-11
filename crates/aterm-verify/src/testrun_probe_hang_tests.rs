@@ -105,7 +105,10 @@ fn standin_hung_probe_run() {
         EnvSnapshot::default(),
         scratch,
     )
-    .with_halt(crate::halt_of(false, armed));
+    .with_halt(crate::halt_of(&crate::cli::Args {
+        fail_fast: armed,
+        ..crate::cli::Args::default()
+    }));
     ctx.hang_samples = Some(dir.join("samples"));
     let mut report = crate::ladder::Report::new("test");
     run_planned_with_probe_window(

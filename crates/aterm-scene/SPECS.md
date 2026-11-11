@@ -3,15 +3,6 @@
 
 # aterm-scene: spec recovery from its 12 unit tests
 
-> Status 2026-11-03: reconciled with current `main` (adding `mix-rgb-contract` and the four
-> integer `motion` specs for MOT-1's `src/motion.rs`, and removing the deleted
-> `scene_rgb_and_tile_rect_const_helpers` note from §4).
-
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 16 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it
-> subsumes are deleted. Every test in this crate samples a spec (§4), so no test is
-> deleted ahead of its proof.
-
 Source: `crates/aterm-scene` (read only). Every `#[test]` is mapped: `src/lib.rs` has 1,
 `src/atlas.rs` has 1, `src/motion.rs` has 5, and `src/vector.rs` has 5, for 12 in all. Code
 reached: `clampf`, `smoothstep`, `mix_rgb`, `fill_path`, `fill_scanline`, `fill_path_fixed`,
@@ -62,7 +53,7 @@ contracts with no float dependency.
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests), `difficulty` (the Rust
 features the proof must handle), `blocking gaps` (rows of §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`). Gap 0 (an installed seal that publishes
+`docs/TRUST-LANE.md` (Blocking gaps)). Gap 0 (an installed seal that publishes
 Lean-discharged rows) blocks every row.
 
 ```tsv
@@ -106,17 +97,6 @@ src/vector.rs	out_of_range_coords_clamp	fill-path-total-and-bounded	fill-path-co
 src/vector.rs	parse_path_roundtrips_the_asset_grammar	parse-path-language	parse-path-roundtrip
 ```
 
-## 3. Coverage
-
-- 12 live tests mapped. All 12 map to a spec, and none is a non-spec check.
-- The four `motion-*` specs in `src/motion.rs` are pure integer/fixed-point contracts (5 tests) that
-  do not depend on a float model; `parse_path_roundtrips_the_asset_grammar` also retires on
-  `parse-path-language`.
-- The three `fill_path` behaviour tests (`even_odd_holes_work`, `out_of_range_coords_clamp` and the
-  coverage half of `fill_path_fixed_matches_float_frame`) all sit behind
-  `fill-scanline-refines-subsample-model`, so that proof is the rasterizer's bottleneck.
-  `fill-path-coverage-geometry` adds real geometry on top of it.
-
 ## 4. Tests that are not spec samples
 
 None.
@@ -143,26 +123,3 @@ None.
 5. **`Tile::over` is `trust::skip`.** Every fill spec composes through it, so the skip must be
    removed (and `over` given its own contract) before `over-run-is-over-fold` or any fill refinement
    can be proved.
-
-## 6. Proof order (easiest high-value first)
-
-Every spec needs the `f32` model, so the order starts with the narrowest remaining gaps.
-
-1. **`clampf-contract`**: two comparisons, straight-line; the first proof over an `f32` carrier
-   with a NaN case, which every other spec needs.
-2. **`smoothstep-contract`**: composes `clampf`'s ensures. Drop the monotonicity clause if rounding
-   breaks it.
-3. **`parse-path-language`**: self-contained (no `Tile`, no thread local); retires
-   `parse_path_roundtrips_the_asset_grammar`. Skip it if `parse_path` leaves the `pub` API (§5.3).
-4. **`fill-path-noop-guards`**: the first proof over `&mut Tile` and the scratch `RefCell`.
-5. **`over-run-is-over-fold`** and **`flatten-cubic-contract`**: bounded-loop lemmas the main
-   refinement cites; the first needs §5.5.
-6. **`fill-path-total-and-bounded`**: panic-freedom and termination of the whole rasterizer; with
-   step 4 it retires `degenerate_paths_are_safe`.
-7. **`fill-scanline-refines-subsample-model`**: the bottleneck (§3).
-8. **`fill-path-fixed-refines-fill-path`**: thin once step 7 holds (§5.6); retires
-   `fill_path_fixed_matches_float_frame`.
-9. **`fill-path-coverage-geometry`**: adds gap 14 and a real-geometry model; retires
-   `even_odd_holes_work` and, with step 6, `out_of_range_coords_clamp`.
-10. **`parse-path-roundtrip`**: last; it needs an `f32` `Display`/`FromStr` model and retires no
-    test.

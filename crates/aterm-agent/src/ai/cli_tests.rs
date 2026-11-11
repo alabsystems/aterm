@@ -486,7 +486,7 @@ fn signed(b: &Box3, env: &Env, secret: &Path, text: &str) -> (Vec<u8>, Vec<u8>) 
 }
 
 /// The name of a document the person chose can fit where its signature's temporary does not
-/// ([`crate::harness::upgrade_models::write_atomic`]), and the refusal names what to change.
+/// ([`crate::harness::atomic_write::write_atomic`]), and the refusal names what to change.
 ///
 /// NEGATIVE CONTROL (2026-11-05): with the write's own error passed on, the refusal reads
 /// `aterm ai fleet: File name too long (os error 63)` and the words' assertion fails.

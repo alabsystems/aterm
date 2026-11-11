@@ -90,6 +90,42 @@ fn linux_reads_its_forks_from_proc_stat() {
     assert_eq!(reader.blocked(), None, "nor a stale blocked count");
 }
 
+/// macOS: the set's one load-info read gives its threads and its run queue, each from its own
+/// field: the run queue is the load average, which the mach factor only checks, never the
+/// factor or the thread count in its place. A busy set (26.8 runnable on 10 cores, A4 §3's
+/// 10:42:59 reading) and an idle one (2 runnable) each read their own load average; unread
+/// cores make the queue a failed read, and a zero thread count reads none. The self-check
+/// cannot stand in for this: with no more threads runnable than cores, the idle pair swapped
+/// passes it too (the last assertion), so the live read below passes a swap on an idle Mac.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_sets_one_read_gives_its_threads_and_its_run_queue_by_field() {
+    let info = |load_average, mach_factor| PsetLoadInfo {
+        _task_count: 812,
+        thread_count: 4103,
+        load_average,
+        mach_factor,
+    };
+    let busy = info(26_800, 370);
+    assert_eq!(
+        of_load_info(busy, Some(10)),
+        (Some(4103), RunQueue::Milli(26_800))
+    );
+    let idle = info(2_000, 8_000);
+    assert_eq!(
+        of_load_info(idle, Some(10)),
+        (Some(4103), RunQueue::Milli(2_000))
+    );
+    assert_eq!(of_load_info(idle, None), (Some(4103), RunQueue::Failed));
+    let empty = PsetLoadInfo {
+        thread_count: 0,
+        ..idle
+    };
+    assert_eq!(of_load_info(empty, Some(10)).0, None);
+    // The control's premise: swapped, the idle pair still passes the self-check.
+    assert!(crate::runq::pset_holds(8_000, 2_000, 10));
+}
+
 /// Live, macOS: every pair reads, each count under its limit, this user's processes among the
 /// machine's, and the threads are the processor set's threads, not its tasks (macOS runs
 /// several threads a process; the set's task count is about the process count).

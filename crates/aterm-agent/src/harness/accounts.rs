@@ -2253,6 +2253,43 @@ pub fn footer_account(
     (account.label.is_some() || account.email.is_some()).then_some(account)
 }
 
+impl FooterAccount {
+    /// The name a person reads the account by: its observed email, else its row's label.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.email.as_deref().or(self.label.as_deref())
+    }
+}
+
+/// The name a person reads a login's account by, wherever one is shown (the owner, 2026-11-09:
+/// "show the email"): the email its login file names; else, for an unread login, the address
+/// its reconciled row names ([`Row::shown_name`]), which is that row's label where it names
+/// none. `None` where nothing names it: no row and no observation, or only the synthetic own
+/// row ([`Roster::own`]), whose label is no account's name.
+#[must_use]
+pub fn account_name(
+    roster: &Roster,
+    who: &ProcessLogin,
+    seen: &super::observe::Observation,
+) -> Option<String> {
+    if let Some(email) = seen.email() {
+        return Some(email.to_owned());
+    }
+    let row = reconcile(roster, who, seen).row()?;
+    (!row.is_own()).then(|| row.shown_name().to_owned())
+}
+
+impl Row {
+    /// Whether this is the synthetic row of a machine that lists no account ([`Roster::own`]):
+    /// the own label with no directory and no address.
+    #[must_use]
+    pub fn is_own(&self) -> bool {
+        self.label == super::cli::ACCOUNTS_OWN_LABEL
+            && self.dir.is_none()
+            && self.expected_identity_email().is_none()
+    }
+}
+
 /// The logins' file name, in the store beside `state.json` ([`State::to_json`]).
 pub const LOGINS_FILE: &str = "logins.json";
 
@@ -2765,7 +2802,7 @@ fn write_checkpoint_with_parent(
         .prefix(RENEWAL_CHECKPOINT_STAGE_PREFIX)
         .tempdir_in(staging)?;
     let candidate = stage.path().join("result");
-    super::upgrade_models::write_atomic_mode(&candidate, &text, Some(0o600))?;
+    super::atomic_write::write_atomic_mode(&candidate, &text, Some(0o600))?;
     std::fs::hard_link(&candidate, staging.join(RENEWAL_CHECKPOINT_FILE))?;
     aterm_durable::durable_dir(staging)
 }
@@ -3130,6 +3167,39 @@ impl AttemptOutcome {
     pub const fn failing(self) -> bool {
         matches!(self, Self::NoRoute | Self::Failed | Self::Blocked)
     }
+
+    /// How the attempt a [`Kind::SignIn`] event records ended, read back from its `why`: an
+    /// automatic sign-in's `auto <outcome>: <routes>` ([`note_sign_in_attempt`]), a driven
+    /// renewal's `<host> <flow> <outcome>` ([`super::login_drive::Drove::attempt_of`]; its host
+    /// may be `auto`), or Grok's sign-in's `<host> device <outcome>; <rungs>`
+    /// ([`super::grok_signin::attempt_of`]); `None` for any other reason, a step
+    /// ([`sign_in_step`]) among them.
+    #[must_use]
+    pub fn of_sign_in(why: &str) -> Option<Self> {
+        why.strip_prefix(AUTO_SIGN_IN)
+            .and_then(|r| r.strip_prefix(' '))
+            .and_then(|rest| Self::parse(rest.split_once(':')?.0))
+            .or_else(|| super::login_drive::Drove::attempt_of(why))
+            .or_else(|| super::grok_signin::attempt_of(why))
+    }
+}
+
+/// The `why` of the [`Kind::SignIn`] event that begins a shared adoption.
+pub const SHARED_ADOPTION_BEGUN: &str = "shared adoption begun";
+
+/// The `why` of the [`Kind::SignIn`] event that begins a shared preparation.
+pub const SHARED_PREPARATION_BEGUN: &str = "shared preparation begun";
+
+/// Whether a [`Kind::SignIn`] event's `why` records a step of a sign-in and not how one ended: a
+/// shared adoption or preparation begun ([`SHARED_ADOPTION_BEGUN`],
+/// [`SHARED_PREPARATION_BEGUN`]), or a person's browser window ending
+/// ([`super::browser_window::ledger_why`]), which says how the window ended and not whether a
+/// login was bound.
+#[must_use]
+pub fn sign_in_step(why: &str) -> bool {
+    why == SHARED_ADOPTION_BEGUN
+        || why == SHARED_PREPARATION_BEGUN
+        || super::browser_window::is_ledger_why(why)
 }
 
 /// A row's last automatic sign-in: how it ended, the routes its ladder tried (one bounded line
@@ -8937,24 +9007,30 @@ pub fn claude_worker_may_move(mode: Mode, who: &ProcessLogin) -> bool {
     mode != Mode::Off && who.default_home && own
 }
 
-/// The starter's row and the row a Claude Code worker whose starter runs as `who` starts on, where
-/// it moves at all: [`claude_worker_may_move`], the roster lists several, and [`worker_row`] moves
-/// it. This is the one rule the task launcher follows and a survey reports, so what a survey says
-/// a launch would start on cannot drift from what the launch does.
+/// The row a Claude Code worker's starter runs on and the row the worker starts on, where it
+/// moves at all: [`claude_worker_may_move`], the roster lists several, and [`worker_row`] moves
+/// it. The starter's row is the one its `login` reconciles to ([`reconcile`]): the account its
+/// login file names, never the row its environment alone suggests, so a plain start in a home
+/// that holds another account's login is judged as that account, and as no row where no row
+/// lists it. The rows judged enrolled are corrected the same way
+/// ([`super::observe::Login::enrolled`]). This is the one rule the task launcher follows and a
+/// survey and the report state, so what they say a launch would start on cannot drift from what
+/// the launch does.
 #[must_use]
 pub fn claude_worker_move<'a>(
     roster: &'a Roster,
     state: &State,
     enrolled: &BTreeSet<String>,
-    who: &ProcessLogin,
+    login: &super::observe::Login,
     mode: Mode,
     now: i64,
-) -> Option<(&'a str, &'a Row)> {
-    if !claude_worker_may_move(mode, who) || !roster.several() {
+) -> Option<(&'a Row, &'a Row)> {
+    if !claude_worker_may_move(mode, &login.who) || !roster.several() {
         return None;
     }
-    let from = judged_label(roster, who)?;
-    worker_row(roster, state, enrolled, from, mode, now).map(|row| (from, row))
+    let from = login.reconciled(roster).row()?;
+    let enrolled = login.enrolled(roster, enrolled);
+    worker_row(roster, state, &enrolled, &from.label, mode, now).map(|row| (from, row))
 }
 
 /// The row a Claude Code worker spawned from a tab on the row `from` starts under, where that is
@@ -12664,7 +12740,7 @@ impl Store {
             ));
         }
         self.ensure()?;
-        super::upgrade_models::write_atomic_before_publish(&self.logins_file(), &text, || {
+        super::atomic_write::write_atomic_before_publish(&self.logins_file(), &text, || {
             self.retain_witness(&self.logins_witness_file())
         })?;
         aterm_durable::durable_dir(&self.dir)
@@ -12675,7 +12751,7 @@ impl Store {
     /// The directory cannot be made or the write or rename failed.
     pub fn touch_wake(&self) -> io::Result<()> {
         self.ensure()?;
-        super::upgrade_models::write_atomic_ordered(&self.wake_path(), "")
+        super::atomic_write::write_atomic_ordered(&self.wake_path(), "")
     }
 
     /// Loads the state snapshot as of now. An absent snapshot reads as empty only when neither
@@ -12915,7 +12991,7 @@ impl Store {
             ));
         }
         self.ensure()?;
-        super::upgrade_models::write_atomic_before_publish(&self.state_file(), &text, || {
+        super::atomic_write::write_atomic_before_publish(&self.state_file(), &text, || {
             self.retain_witness(&self.state_witness_file())
         })?;
         aterm_durable::durable_dir(&self.dir)

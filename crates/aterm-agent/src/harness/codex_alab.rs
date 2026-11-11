@@ -514,7 +514,7 @@ impl std::fmt::Display for AuthPathUnread {
 /// Why the Codex `program` a launch types would not run a pool row's own login, which reaches
 /// it only as [`AUTH_PATH_ENV`] beside the shared `$CODEX_HOME`, or `None` where it would: the
 /// binary it execs (itself, or the one an atpkg launcher's last `exec '<path>' "$@"` names,
-/// [`super::upgrade_catalog::twin_binary`]) is codex-alab ([`alab_bytes`]) and holds
+/// [`super::twin::twin_binary`]) is codex-alab ([`alab_bytes`]) and holds
 /// [`AUTH_PATH_MARK`]. A build that does not read the variable reads and refreshes
 /// `$CODEX_HOME/auth.json`, the machine's default login, so a launch under a row of its own
 /// would run, and renew, on that login while the pool counts its turns as the row's.
@@ -964,7 +964,7 @@ pub fn default_row_staging(label: &str, why: &AuthPathUnread) -> String {
 }
 
 /// The binary `program` execs: the one an atpkg launcher script names (a `sh` twin, or on
-/// Windows a `.cmd` one, whose lines start with `@`; [`super::upgrade_catalog::twin_binary`]),
+/// Windows a `.cmd` one, whose lines start with `@`; [`super::twin::twin_binary`]),
 /// else `program` itself; `None` for a bare word, a relative path, and a script that names no
 /// binary so. Off Windows a file that starts with `@` is no launcher, as no other host runs one.
 fn exec_target(program: &Path) -> Option<PathBuf> {
@@ -982,7 +982,7 @@ fn exec_target(program: &Path) -> Option<PathBuf> {
         if head.len() as u64 > LAUNCHER_MAX {
             return None;
         }
-        return super::upgrade_catalog::twin_binary(std::str::from_utf8(&head).ok()?);
+        return super::twin::twin_binary(std::str::from_utf8(&head).ok()?);
     }
     Some(program.to_path_buf())
 }

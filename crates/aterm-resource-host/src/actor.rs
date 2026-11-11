@@ -21,7 +21,8 @@ use std::{
 mod owner;
 pub(super) use owner::bootstrap_graph::{
     EnrollmentAttachment as BootstrapGraphAttachment, OutputTransfer as BootstrapGraphOutput,
-    Preparing as BootstrapGraphPreparing, Support as BootstrapGraphSupport,
+    Preparing as BootstrapGraphPreparing, SourceTransfer as BootstrapGraphSource,
+    Support as BootstrapGraphSupport,
 };
 pub(super) use owner::bootstrap_object::SourceOffer as BootstrapObjectOffer;
 pub(super) use owner::runtime_inputs::Attachment as RuntimeInputsAttachment;
@@ -76,6 +77,15 @@ enum Message {
         token: Box<BootstrapGraphAttachment>,
         descriptions: [std::os::fd::OwnedFd; 2],
         control: std::os::fd::OwnedFd,
+        reply: SyncSender<io::Result<trust_resource_controller::ContextReply>>,
+    },
+    BootstrapGraphSourceBegin {
+        token: Box<BootstrapGraphSource>,
+        reply: SyncSender<io::Result<BootstrapGraphSource>>,
+    },
+    BootstrapGraphSourceRetain {
+        token: Box<BootstrapGraphSource>,
+        descriptions: [std::os::fd::OwnedFd; 4],
         reply: SyncSender<io::Result<trust_resource_controller::ContextReply>>,
     },
     BootstrapGraphOutputBegin {
@@ -631,6 +641,28 @@ pub(super) fn bootstrap_graph_retain(
     })?;
     receive_reply(read).map_err(|_| unavailable())?
 }
+pub(super) fn bootstrap_graph_source_begin(
+    token: BootstrapGraphSource,
+) -> io::Result<BootstrapGraphSource> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::BootstrapGraphSourceBegin {
+        token: Box::new(token),
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn bootstrap_graph_source_retain(
+    token: BootstrapGraphSource,
+    descriptions: [std::os::fd::OwnedFd; 4],
+) -> io::Result<trust_resource_controller::ContextReply> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::BootstrapGraphSourceRetain {
+        token: Box::new(token),
+        descriptions,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
 pub(super) fn bootstrap_graph_output_begin(
     token: BootstrapGraphOutput,
 ) -> io::Result<BootstrapGraphOutput> {
@@ -906,6 +938,17 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                 } => {
                     let _ =
                         reply.try_send(owner.bootstrap_graph_retain(*token, descriptions, control));
+                }
+                Message::BootstrapGraphSourceBegin { token, reply } => {
+                    let _ = reply.try_send(owner.bootstrap_graph_source_begin(*token));
+                }
+                Message::BootstrapGraphSourceRetain {
+                    token,
+                    descriptions,
+                    reply,
+                } => {
+                    let _ =
+                        reply.try_send(owner.bootstrap_graph_source_retain(*token, descriptions));
                 }
                 Message::BootstrapGraphOutputBegin { token, reply } => {
                     let _ = reply.try_send(owner.bootstrap_graph_output_begin(*token));

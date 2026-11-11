@@ -231,7 +231,7 @@ fn code_unchanged(pinned: &Pinned) -> bool {
     std::fs::metadata(&pinned.path).is_ok_and(|meta| Stamp::of(&meta) == pinned.stamp)
 }
 
-/// The SHA-256 over the SHA-256 of each 4 MiB of `file`, hashed in parallel.
+/// The SHA-256 over the SHA-256 of each 4 MiB of `file`, within the caller's worker policy.
 fn file_digest(mut file: std::fs::File) -> Option<Digest> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
@@ -240,18 +240,22 @@ fn file_digest(mut file: std::fs::File) -> Option<Digest> {
     let chunks: Vec<&[u8]> = bytes.chunks(CHUNK).collect();
     let width = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let per = chunks.len().div_ceil(width.max(1)).max(1);
-    let digests: Vec<Digest> = std::thread::scope(|scope| {
-        let running: Vec<_> = chunks
-            .chunks(per)
-            .map(|group| {
-                scope.spawn(move || group.iter().map(|c| digest(&[c])).collect::<Vec<_>>())
-            })
-            .collect();
-        running
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    });
+    let digests: Vec<Digest> = if SERIAL.get() {
+        chunks.iter().map(|chunk| digest(&[chunk])).collect()
+    } else {
+        std::thread::scope(|scope| {
+            let running: Vec<_> = chunks
+                .chunks(per)
+                .map(|group| {
+                    scope.spawn(move || group.iter().map(|c| digest(&[c])).collect::<Vec<_>>())
+                })
+                .collect();
+            running
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    };
     (digests.len() == chunks.len()).then(|| {
         let refs: Vec<&[u8]> = digests.iter().map(<[u8; 32]>::as_slice).collect();
         digest(&[b"exe", &digest(&refs)])
@@ -479,19 +483,103 @@ pub(crate) fn unit<R>(shared: &Arc<Shared>, f: impl FnOnce() -> R) -> (R, Trace)
 #[derive(Clone, Copy)]
 pub(crate) struct Threads<'scope, 'env>(&'scope std::thread::Scope<'scope, 'env>);
 
+thread_local! {
+    static SERIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run nested census work on the calling thread. Memo scopes and input captures still follow
+/// each job. This bounds a caller that already owns one CPU permit without another executor.
+/// # Panics
+/// The work panics.
+pub fn without_parallel_workers<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SERIAL.set(self.0);
+        }
+    }
+    let _restore = Restore(SERIAL.replace(true));
+    work()
+}
+
+/// Run census work on one worker with the same 8 MiB stack as its named parallel workers.
+/// Nested jobs run inline, carrying their ordinary memo scopes and input captures.
+/// # Errors
+/// The worker could not be started.
+/// # Panics
+/// The work panics; its panic is resumed on the caller.
+pub fn on_one_worker<T: Send>(work: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+    if SERIAL.get() {
+        return Ok(work());
+    }
+    threads(|scope| {
+        scope
+            .spawn_named("census-serial".into(), 8 << 20, || {
+                without_parallel_workers(work)
+            })
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+    })
+}
+
+/// A census job, run on a thread or inline under its caller's single-worker policy.
+#[must_use]
+pub(crate) enum Joined<'scope, T> {
+    Thread(std::thread::ScopedJoinHandle<'scope, T>),
+    Inline(Completed<T>),
+}
+
+/// An inline job's unjoined panic still ends its scope, as a scoped thread's does.
+pub(crate) struct Completed<T>(Option<std::thread::Result<T>>);
+
+impl<T> Completed<T> {
+    fn join(mut self) -> std::thread::Result<T> {
+        self.0.take().expect("the completed job has one answer")
+    }
+}
+
+impl<T> Drop for Completed<T> {
+    fn drop(&mut self) {
+        if let Some(Err(panic)) = self.0.take()
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+impl<T> Joined<'_, T> {
+    pub(crate) fn join(self) -> std::thread::Result<T> {
+        match self {
+            Self::Thread(worker) => worker.join(),
+            Self::Inline(answer) => answer.join(),
+        }
+    }
+}
+
 impl<'scope> Threads<'scope, '_> {
     /// Starts `f` on a new thread of this scope, in the starting thread's memo scope and input
     /// capture ([`crate::inputs::capture`]).
     pub(crate) fn spawn<T: Send + 'scope>(
         self,
         f: impl FnOnce() -> T + Send + 'scope,
-    ) -> std::thread::ScopedJoinHandle<'scope, T> {
+    ) -> Joined<'scope, T> {
         let scope = SCOPE.with_borrow(Scope::clone);
         let capture = crate::inputs::carried();
-        self.0.spawn(move || {
+        let work = move || {
             let _restore = Restore(Some(swap_scope(scope)));
             capture.enter(f)
-        })
+        };
+        if SERIAL.get() {
+            Joined::Inline(Completed(Some(std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(work),
+            ))))
+        } else {
+            Joined::Thread(self.0.spawn(work))
+        }
     }
 
     /// [`Self::spawn`] on a thread named `name` with a `stack`-byte stack.
@@ -500,7 +588,10 @@ impl<'scope> Threads<'scope, '_> {
         name: String,
         stack: usize,
         f: impl FnOnce() -> T + Send + 'scope,
-    ) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>> {
+    ) -> std::io::Result<Joined<'scope, T>> {
+        if SERIAL.get() {
+            return Ok(self.spawn(f));
+        }
         let scope = SCOPE.with_borrow(Scope::clone);
         let capture = crate::inputs::carried();
         std::thread::Builder::new()
@@ -510,6 +601,7 @@ impl<'scope> Threads<'scope, '_> {
                 let _restore = Restore(Some(swap_scope(scope)));
                 capture.enter(f)
             })
+            .map(Joined::Thread)
     }
 }
 
@@ -517,6 +609,81 @@ impl<'scope> Threads<'scope, '_> {
 /// ([`Threads`]).
 pub(crate) fn threads<'env, T>(f: impl for<'scope> FnOnce(Threads<'scope, 'env>) -> T) -> T {
     std::thread::scope(|scope| f(Threads(scope)))
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    #[test]
+    fn serial_fingerprinting_keeps_the_parallel_code_identity() {
+        use std::io::Write as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("code");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&vec![1; 4 << 20]).unwrap();
+        file.write_all(&vec![2; 4 << 20]).unwrap();
+        file.write_all(&[3]).unwrap();
+        drop(file);
+        let read = || file_digest(std::fs::File::open(&path).unwrap()).unwrap();
+        let parallel = read();
+        assert_eq!(without_parallel_workers(read), parallel);
+    }
+
+    #[test]
+    fn one_worker_keeps_nested_jobs_inline_and_preserves_joins() {
+        let answer = on_one_worker(|| {
+            let owner = std::thread::current().id();
+            threads(|scope| {
+                let jobs: Vec<_> = (0..3)
+                    .map(|i| {
+                        scope.spawn(move || {
+                            assert_eq!(std::thread::current().id(), owner);
+                            threads(|nested| {
+                                nested
+                                    .spawn(move || {
+                                        assert_eq!(std::thread::current().id(), owner);
+                                        i + 1
+                                    })
+                                    .join()
+                                    .unwrap()
+                            })
+                        })
+                    })
+                    .collect();
+                assert!(scope.spawn(|| panic!("joined control")).join().is_err());
+                jobs.into_iter()
+                    .map(|job| job.join().unwrap())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap();
+        assert_eq!(answer, [1, 2, 3]);
+        let caller = std::thread::current().id();
+        let parallel = threads(|scope| scope.spawn(|| std::thread::current().id()).join().unwrap());
+        assert_ne!(parallel, caller, "the ordinary path still starts workers");
+        without_parallel_workers(|| {
+            let inline =
+                threads(|scope| scope.spawn(|| std::thread::current().id()).join().unwrap());
+            assert_eq!(inline, caller);
+        });
+        assert!(!SERIAL.get(), "the caller's policy was restored");
+    }
+
+    #[test]
+    fn an_unjoined_panic_is_preserved_in_both_execution_modes() {
+        for serial in [false, true] {
+            let work = || threads(|scope| drop(scope.spawn(|| panic!("unjoined control"))));
+            let result = std::panic::catch_unwind(|| {
+                if serial {
+                    without_parallel_workers(work)
+                } else {
+                    work()
+                }
+            });
+            assert!(result.is_err());
+        }
+    }
 }
 
 /// Runs `f`, inside a unit, with its reads answering none of the unit's questions: for a

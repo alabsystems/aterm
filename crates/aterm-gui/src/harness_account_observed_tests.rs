@@ -233,3 +233,67 @@ fn an_unlisted_tap_reading_is_published_once() {
         now + 10
     ));
 }
+
+/// A session on a Mac that lists no account is sighted: the worker's sighting names the login
+/// its home's profile holds and opens its session under that account, with no roster path, no
+/// roster file, a roster that lists none, and the account rotation and login repair both off;
+/// the same tab is named at every look (the store keeps the machine id its first look made),
+/// and the account advice of that Mac stays inert.
+/// NEGATIVE CONTROL: with `sight` taking its roster from `account_roster(&seat)?` (the gate
+/// `account_note` sat behind), the Mac with no roster is not sighted: `no roster path: left:
+/// None right: Some(["seen", "session-start"])`.
+#[test]
+fn a_session_on_a_mac_that_lists_no_account_is_sighted() {
+    use aterm_agent::harness::journal::{self, LoginState};
+    journal::with_keyer(
+        |_, email| (email == UNICORN).then(|| "ac-00000000000000a1".to_owned()),
+        || {
+            let a = Accts::new();
+            std::fs::write(
+                a.tmp.path().join("home").join(".claude.json"),
+                format!(r#"{{"oauthAccount":{{"emailAddress":"{UNICORN}"}}}}"#),
+            )
+            .unwrap();
+            a.spawn("s-sighted", ACCT_TALK_A, "main");
+            let mut quiet = on();
+            quiet.set("accounts", "off").unwrap();
+            quiet.set("logins", "off").unwrap();
+            let kinds = |sighted: &Option<observe::Sighted>| {
+                sighted
+                    .as_ref()
+                    .map(|sighted| sighted.notes.iter().map(|n| n.kind).collect::<Vec<_>>())
+            };
+            let mut tabs = Vec::new();
+            let mut first = |why: &str, cfg: &SupervisorConfig| {
+                let idle = a.worker("s-sighted", cfg);
+                let sighted = idle.sight();
+                assert_eq!(
+                    kinds(&sighted),
+                    Some(vec!["seen", "session-start"]),
+                    "{why}"
+                );
+                let login = sighted.unwrap().login.expect("the registry's login");
+                assert_eq!(
+                    (login.email.as_str(), login.state),
+                    (UNICORN, LoginState::Running),
+                    "{why}"
+                );
+                tabs.push(login.tab.expect("its tab"));
+                assert_eq!(kinds(&idle.sight()), Some(vec![]), "{why}: noted once");
+                assert_eq!(idle.account(AccountPoint::TurnEnd), None, "{why}");
+            };
+            a.listed.store(false, Ordering::SeqCst);
+            first("no roster path", &on());
+            a.listed.store(true, Ordering::SeqCst);
+            std::fs::remove_file(a.roster_path()).unwrap();
+            first("no roster file", &on());
+            std::fs::write(a.roster_path(), "").unwrap();
+            first("a roster that lists none", &on());
+            first("accounts and logins off", &quiet);
+            assert!(
+                tabs.windows(2).all(|pair| pair[0] == pair[1]),
+                "one tab, by the kept machine id: {tabs:?}"
+            );
+        },
+    );
+}

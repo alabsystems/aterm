@@ -218,6 +218,19 @@ pub(super) fn run(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     } else {
         row.fail("the outgoing GUI did not exit before the one-minute hang detector".into());
     }
+    let metrics = g.run(
+        &format!(
+            "{GUEST_NUX}/{GUEST_HELPER} socket-metrics {SOCKET} > {GUEST_NUX}/successor-metrics.txt 2> {GUEST_NUX}/successor-metrics-error.txt; cat {GUEST_NUX}/successor-metrics.txt",
+        ),
+        WAIT,
+    )?;
+    let metrics: aterm_json::Value = aterm_json::from_str(&metrics)
+        .map_err(|error| Fail::die(format!("successor metrics unavailable: {error}")))?;
+    if metrics["peer"].as_str() != Some(after.token().as_str()) {
+        row.fail("the metrics responder was not the observed successor".into());
+    } else {
+        row.cell("startup metrics peer", Value::Text(after.token()));
+    }
     let quit = ctl(g, "invoke Quit")?;
     row.cell("quit", Value::Text(quit.trim().to_owned()));
     if !quit.starts_with("OK ") {

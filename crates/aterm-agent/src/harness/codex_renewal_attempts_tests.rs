@@ -290,7 +290,7 @@ fn receipt_barrier_precedes_pool_retirement_even_after_a_visible_consume() {
         .native_rotations
         .insert(root.id.clone(), binding.clone());
     // A retained starting pool snapshot, not an authorized new handoff.
-    super::super::super::upgrade_models::write_atomic_mode(
+    super::super::super::atomic_write::write_atomic_mode(
         &store.logins_file(),
         &logins.to_json(),
         Some(0o600),
@@ -513,7 +513,7 @@ fn durable_cancellation_survives_stale_root_projection_and_blocks_all_new_attemp
     .unwrap();
     // A durable tombstone also wins if a crash or an older writer left the old
     // projection on disk. This deliberate fault bypasses the production writer.
-    super::super::super::upgrade_models::write_atomic_mode(
+    super::super::super::atomic_write::write_atomic_mode(
         &receipt_path(&env, &root.id).unwrap(),
         &aterm_json::to_string(&root).unwrap(),
         Some(0o600),
@@ -622,7 +622,7 @@ fn changed_immediate_parent_recipe_makes_the_current_journal_unavailable() {
     }
     first.native_prepare = NativeRequest::prepare(changed).encode().unwrap();
     // Deliberate external corruption, not a permitted immutable journal write.
-    super::super::super::upgrade_models::write_atomic_mode(
+    super::super::super::atomic_write::write_atomic_mode(
         &attempt_path(&env, &root.id, &first.reference.id).unwrap(),
         &aterm_json::to_string(&first).unwrap(),
         Some(0o600),

@@ -842,7 +842,8 @@ impl Replica {
         // vault (the first of `sources`, this vault's), which keeps every writer of the
         // state lock's files out from before the admission until the batch returns, and
         // its session keeps it: the batch's own checks (its currency, its stores'
-        // contexts, its peers' roster) judge the moment its admission did. A write's
+        // contexts, its peers' roster) judge the moment its admission did, and its
+        // store opens and store read batches hold the vault through it. A write's
         // look observes the lock beside the sources and ends before its batch runs,
         // whose checks each observe the vault again.
         let look = if write || sources.is_empty() {
@@ -872,7 +873,7 @@ impl Replica {
         if write {
             drop(look);
         } else {
-            session.keep_look(look);
+            session.keep_look(look)?;
         }
         run(&session)
     }

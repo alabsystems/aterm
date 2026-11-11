@@ -280,18 +280,17 @@ pub fn shorter(line: &str) -> Vec<String> {
     out
 }
 
-/// Build the resume line for a live Claude Code process from `entry`, `argv`, and harness `state` ([`super::upgrade_drive::resume_command_kept`]).
+/// Build the resume line for a live Claude Code process from `entry` and `argv` ([`super::upgrade_drive::resume_command_kept`]).
 #[must_use]
 pub fn of_entry(
     argv: &[String],
     entry: &super::footer::SessionEntry,
     started: Option<u64>,
-    state: Option<&Path>,
 ) -> Option<String> {
     if started.is_some_and(|started| entry.proc_start != Some(started)) {
         return None;
     }
-    super::upgrade_drive::resume_command_kept(state, argv, &entry.session_id)
+    super::upgrade_drive::resume_command_kept(argv, &entry.session_id)
 }
 
 /// `argv` from the program on: the script of a script launch

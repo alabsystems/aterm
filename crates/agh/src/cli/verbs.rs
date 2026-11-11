@@ -798,7 +798,7 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["repo", "fetch"],
         class: Class::Git,
-        usage: "agh repo fetch REPO DIR (--ref REF --into REF | --input FILE) [--anonymous]",
+        usage: "agh repo fetch REPO DIR (--ref REF --into REF [--checkout-closure [--checkout-cache DIR]] | --input FILE | --objects FILE) [--anonymous]",
         summary: "fetch exact sources into agh's private namespace without moving other refs",
         example: "agh repo fetch alabsystems/aterm . --input refs.json --anonymous",
         noun: Noun::Repo,
@@ -807,9 +807,21 @@ pub static VERBS: &[Verb] = &[
         flags: &[
             value("--ref", "full ref or forty-digit object id"),
             value("--into", "destination beneath refs/agh/"),
+            on(
+                "--checkout-closure",
+                "exact commit ancestry and selected checkout blobs only",
+            ),
+            value(
+                "--checkout-cache",
+                "read-only immutable object cache for checkout closure",
+            ),
             value(
                 "--input",
                 "1–2048 JSON rows: {source, into, expected_oid}; all OIDs must match",
+            ),
+            value(
+                "--objects",
+                "a JSON array of 1–2048 raw object IDs to import; publishes no ref",
             ),
         ],
         positionals: &["REPO", "DIR"],
@@ -1076,13 +1088,16 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["rate"],
         class: Class::Read,
-        usage: "agh rate [--as PROFILE | --anonymous]",
+        usage: "agh rate [--as PROFILE | --anonymous] [--calls-hour UNIX_HOUR]",
         summary: "rate limits of each present profile and anonymous: GitHub's (no quota) and agh's rate book",
         example: "agh rate --anonymous",
         noun: Noun::Rate,
         gh: "gh api rate_limit",
         milestone: 1,
-        flags: &[],
+        flags: &[value(
+            "--calls-hour",
+            "local per-attempt attribution for Unix seconds / 3600; no network; storage errors and the 64 MiB/hour bound are reported at the caller",
+        )],
         positionals: &[],
         run: cmd_rate::rate,
     },

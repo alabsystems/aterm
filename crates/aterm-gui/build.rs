@@ -13,6 +13,9 @@ mod clean_islands;
 #[path = "../aterm-spec-anchor/anchor_rules.rs"]
 mod anchor_rules;
 
+#[path = "../aterm-toolchain/link_rules.rs"]
+mod link_rules;
+
 /// Zero sentinel used when no paper master is pinned (`pins::PAPER_MASTER_PUBKEYS`).
 const UNPINNED_UPDATE_PIN_SENTINEL: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -27,6 +30,7 @@ fn main() {
     }
     clean_islands::emit();
     anchor_rules::emit();
+    link_rules::emit();
 
     let update_pin_sha256 = match pins::PAPER_MASTER_PUBKEYS.first() {
         Some(encoded) if !encoded.is_empty() => {

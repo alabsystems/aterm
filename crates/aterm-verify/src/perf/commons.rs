@@ -27,29 +27,48 @@ const LATE_JOINER_TEST: &str =
     "replica::tests::compatibility::a_quiet_late_joiner_over_a_long_log_reports_its_cpu";
 const SUSTAINED_LATE_JOINER_TEST: &str =
     "replica::tests::compatibility::a_sustained_quiet_late_joiner_over_a_long_log_reports_its_cpu";
+const LARGE_TABLE_TEST: &str =
+    "replica::tests::compatibility::a_quiet_pair_over_a_large_table_reports_its_cpu";
+const SUSTAINED_LARGE_TABLE_TEST: &str =
+    "replica::tests::compatibility::a_sustained_quiet_pair_over_a_large_table_reports_its_cpu";
 const PREFIX: &str = "COMMONS-QUIET ";
 
 /// What the measured rounds repair: one explicit table (the default), the catalog's tables
-/// (`--catalog`), one explicit table over a long vault history (`--long-log`), or the same where
+/// (`--catalog`), one explicit table over a long vault history (`--long-log`), the same where
 /// the second Mac was admitted after that history and opens it through handoffs
-/// (`--late-joiner`).
+/// (`--late-joiner`), or one explicit table holding 3,000 rows (`--large-table`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Workload {
     Explicit,
     Catalog,
     LongLog,
     LateJoiner,
+    LargeTable,
 }
 
 impl Workload {
-    fn of(catalog: bool, long_log: bool, late_joiner: bool) -> Result<Self, Halt> {
-        match (catalog, long_log, late_joiner) {
-            (false, false, false) => Ok(Self::Explicit),
-            (true, false, false) => Ok(Self::Catalog),
-            (false, true, false) => Ok(Self::LongLog),
-            (false, false, true) => Ok(Self::LateJoiner),
+    /// The workload the flags set name: the explicit table where none is set.
+    fn of(
+        catalog: bool,
+        long_log: bool,
+        late_joiner: bool,
+        large_table: bool,
+    ) -> Result<Self, Halt> {
+        let named: Vec<Self> = [
+            (catalog, Self::Catalog),
+            (long_log, Self::LongLog),
+            (late_joiner, Self::LateJoiner),
+            (large_table, Self::LargeTable),
+        ]
+        .into_iter()
+        .filter_map(|(set, workload)| set.then_some(workload))
+        .collect();
+        match named[..] {
+            [] => Ok(Self::Explicit),
+            [workload] => Ok(workload),
             _ => Err(Halt::Fail(
-                "--catalog, --long-log and --late-joiner each name a workload; measure one at a time"
+                "--catalog, --long-log, --late-joiner and --large-table each name a workload; \
+                 measure one at a time"
                     .into(),
             )),
         }
@@ -62,6 +81,7 @@ impl Workload {
             Self::Catalog => "catalog",
             Self::LongLog => "long-log",
             Self::LateJoiner => "late-joiner",
+            Self::LargeTable => "large-table",
         }
     }
 
@@ -69,7 +89,7 @@ impl Workload {
     const fn tables(self) -> u64 {
         match self {
             Self::Catalog => 2,
-            Self::Explicit | Self::LongLog | Self::LateJoiner => 1,
+            Self::Explicit | Self::LongLog | Self::LateJoiner | Self::LargeTable => 1,
         }
     }
 
@@ -84,6 +104,8 @@ impl Workload {
             (Self::LongLog, true) => SUSTAINED_LONG_LOG_TEST,
             (Self::LateJoiner, false) => LATE_JOINER_TEST,
             (Self::LateJoiner, true) => SUSTAINED_LATE_JOINER_TEST,
+            (Self::LargeTable, false) => LARGE_TABLE_TEST,
+            (Self::LargeTable, true) => SUSTAINED_LARGE_TABLE_TEST,
         }
     }
 }
@@ -94,9 +116,10 @@ pub(crate) fn run(
     catalog: bool,
     long_log: bool,
     late_joiner: bool,
+    large_table: bool,
 ) -> LaneRun {
     outcome(
-        Workload::of(catalog, long_log, late_joiner)
+        Workload::of(catalog, long_log, late_joiner, large_table)
             .and_then(|workload| measure(json_out, sustained, workload)),
     )
 }
@@ -324,31 +347,41 @@ mod tests {
             .insert("workload".into(), json!("late-joiner"));
         assert!(parse_report(&format!("{PREFIX}{late}"), Workload::LateJoiner).is_ok());
         assert!(parse_report(&format!("{PREFIX}{late}"), Workload::LongLog).is_err());
+        let mut large = report();
+        large
+            .as_object_mut()
+            .unwrap()
+            .insert("workload".into(), json!("large-table"));
+        assert!(parse_report(&format!("{PREFIX}{large}"), Workload::LargeTable).is_ok());
+        assert!(parse_report(&format!("{PREFIX}{large}"), Workload::Explicit).is_err());
     }
 
     /// Each set of flags names one workload and its fixture test, or is refused.
     #[test]
     fn the_flags_name_one_workload_and_its_test() {
-        assert_eq!(
-            Workload::of(false, false, false).unwrap(),
-            Workload::Explicit
-        );
-        assert_eq!(Workload::of(true, false, false).unwrap(), Workload::Catalog);
-        assert_eq!(Workload::of(false, true, false).unwrap(), Workload::LongLog);
-        assert_eq!(
-            Workload::of(false, false, true).unwrap(),
-            Workload::LateJoiner
-        );
-        for both in [
-            (true, true, false),
-            (true, false, true),
-            (false, true, true),
-        ] {
-            assert!(Workload::of(both.0, both.1, both.2).is_err(), "{both:?}");
+        let of = |set: [bool; 4]| Workload::of(set[0], set[1], set[2], set[3]);
+        assert_eq!(of([false; 4]).unwrap(), Workload::Explicit);
+        let named = [
+            Workload::Catalog,
+            Workload::LongLog,
+            Workload::LateJoiner,
+            Workload::LargeTable,
+        ];
+        for (at, workload) in named.into_iter().enumerate() {
+            let mut set = [false; 4];
+            set[at] = true;
+            assert_eq!(of(set).unwrap(), workload);
+            for other in (0..4).filter(|other| *other != at) {
+                let mut both = set;
+                both[other] = true;
+                assert!(of(both).is_err(), "{both:?}");
+            }
         }
         assert_eq!(Workload::LongLog.test(false), LONG_LOG_TEST);
         assert_eq!(Workload::LongLog.test(true), SUSTAINED_LONG_LOG_TEST);
         assert_eq!(Workload::LateJoiner.test(false), LATE_JOINER_TEST);
         assert_eq!(Workload::LateJoiner.test(true), SUSTAINED_LATE_JOINER_TEST);
+        assert_eq!(Workload::LargeTable.test(false), LARGE_TABLE_TEST);
+        assert_eq!(Workload::LargeTable.test(true), SUSTAINED_LARGE_TABLE_TEST);
     }
 }

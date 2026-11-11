@@ -32,7 +32,7 @@ impl Profile {
             Self::WorkloadMember => b"TRUSTMEMBER00002",
             Self::PairedQualification => b"TRUSTPAIRQUAL002",
             Self::BootstrapFixed => b"TRUSTBTFIX000001",
-            Self::BootstrapGraph => b"TRUSTBGRAPH00001",
+            Self::BootstrapGraph => b"TRUSTBGRAPH00002",
         }
     }
     fn fields(self) -> [u64; 6] {
@@ -42,7 +42,7 @@ impl Profile {
             Self::WorkloadMember => [3, 2, 50, 56, 57, 58],
             Self::PairedQualification => [3, 6, 7, 60, 48, 2],
             Self::BootstrapFixed => [1, 1, 1, 1, 0, 0],
-            Self::BootstrapGraph => [3, 71, 72, 73, 74, 1],
+            Self::BootstrapGraph => [3, 71, 72, 73, 74, 2],
         }
     }
 }
@@ -594,8 +594,17 @@ mod tests {
         use std::io::Write as _;
         let deadline = Instant::now() + std::time::Duration::from_secs(60);
         assert_eq!(Profile::BootstrapGraph.section(), b"__trust_bgraph\0\0");
-        assert_eq!(Profile::BootstrapGraph.magic(), b"TRUSTBGRAPH00001");
-        assert_eq!(Profile::BootstrapGraph.fields(), [3, 71, 72, 73, 74, 1]);
+        assert_eq!(Profile::BootstrapGraph.magic(), b"TRUSTBGRAPH00002");
+        assert_eq!(Profile::BootstrapGraph.fields(), [3, 71, 72, 73, 74, 2]);
+        let mut old = image(Profile::BootstrapGraph);
+        old[256..272].copy_from_slice(b"TRUSTBGRAPH00001");
+        old[312..320].copy_from_slice(&1u64.to_be_bytes());
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&old).unwrap();
+        assert!(
+            require(&file, Profile::BootstrapGraph, &expected(Profile::BootstrapGraph), deadline)
+                .is_err()
+        );
         for profile in [
             Profile::Resolver,
             Profile::Workload,

@@ -3747,7 +3747,7 @@ pub fn here(
     sys: &dyn System,
     mode: Mode,
     source: HereBaseline<'_>,
-    name: Option<&str>,
+    name: Option<&aterm_types::machine_name::GeneratedNames>,
     output: HereOutput,
 ) -> ExitCode {
     match here_report(sys, mode, source, name, output) {
@@ -3783,11 +3783,12 @@ pub fn here(
 /// ([`crate::root_steps`]), and with `name` (a [`crate::init_clt::plain_name`]) gives the Mac
 /// that name; whether those rows changed or failed goes to the journal, and the exit says the
 /// tools alone, so a step macOS refused never reads as tools that did not install.
+/// The explicit naming-permission plan instead has one decisive naming-rule row.
 fn here_report(
     sys: &dyn System,
     mode: Mode,
     source: HereBaseline<'_>,
-    name: Option<&str>,
+    name: Option<&aterm_types::machine_name::GeneratedNames>,
     output: HereOutput,
 ) -> Result<Option<(Host, HostReport)>, ExitCode> {
     let plain = output == HereOutput::Plain;
@@ -3827,7 +3828,25 @@ fn here_report(
             "aterm machines here: takes plan|apply <baseline.toml>"
         ),
     };
-    let mut facts = crate::facts::gather_without_keyboards(sys);
+    let name_rule_only = matches!(
+        source,
+        HereBaseline::BuiltIn(crate::init_clt::RootPlan::NameRuleOnly)
+    );
+    let permission_console = if name_rule_only {
+        match crate::facts::console_account(sys) {
+            Ok(user) => Some(user),
+            Err(why) => refuse!(ExitCode::FAILURE, "aterm machines here: {why}"),
+        }
+    } else {
+        None
+    };
+    let mut facts = match &permission_console {
+        Some(user) => crate::model::HostFacts {
+            console_user: Some(user.name.clone()),
+            ..crate::model::HostFacts::default()
+        },
+        None => crate::facts::gather_without_keyboards(sys),
+    };
     let name = facts.local_host_name.clone();
     let text = match crate::baseline::fill(
         &text,
@@ -3865,15 +3884,21 @@ fn here_report(
         baseline.users.clone()
     };
     for u in &wanted {
+        if let Some(user) = permission_console.as_ref().filter(|user| &user.name == u) {
+            users.push(user.clone());
+            continue;
+        }
         match crate::facts::user(sys, u) {
             Ok(user) => users.push(user),
             Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
         }
     }
-    let console = facts
-        .console_user
-        .as_ref()
-        .and_then(|c| crate::facts::user(sys, c).ok());
+    let console = permission_console.or_else(|| {
+        facts
+            .console_user
+            .as_ref()
+            .and_then(|c| crate::facts::user(sys, c).ok())
+    });
     let ctx = crate::items::Ctx {
         cache_dir: Path::new(crate::AGENT_ROOT).join("cache"),
         disrupt: true,
@@ -3882,10 +3907,35 @@ fn here_report(
         console,
         host_name: name,
     };
-    let items = match crate::items::expand(&baseline, &ctx) {
-        Ok(i) => i,
-        Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
+    let mut items = if name_rule_only {
+        vec![Box::new(crate::root_steps::NameRule::refresh()) as Box<dyn crate::items::Item>]
+    } else {
+        // The built-in naming operation has narrower authority than a general machine
+        // baseline: ComputerName must not implicitly add SMB preference writes.
+        let root_names = if plain { baseline.names.take() } else { None };
+        let expanded = (|| {
+            let mut items = match root_names {
+                Some(ref table) => crate::items::names::expand_system_names(table, &ctx)?,
+                None => Vec::new(),
+            };
+            items.extend(crate::items::expand(&baseline, &ctx)?);
+            Ok::<_, String>(items)
+        })();
+        match expanded {
+            Ok(i) => i,
+            Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
+        }
     };
+    // The compiled transaction already admits this permission beside its other
+    // root work. Refresh it once so matching bytes with an old read ACL are
+    // repaired within that same authorization. User baselines keep their policy.
+    if matches!(source, HereBaseline::BuiltIn(_)) && !name_rule_only {
+        for item in &mut items {
+            if item.id() == "names.admitted-name-rule" {
+                *item = Box::new(crate::root_steps::NameRule::refresh());
+            }
+        }
+    }
     let mut journal = match sys.journal() {
         Ok(journal) => journal,
         Err(why) => refuse!(ExitCode::FAILURE, "aterm machines here: {why}"),
@@ -3896,6 +3946,9 @@ fn here_report(
         }
         HereBaseline::BuiltIn(crate::init_clt::RootPlan::StepsOnly) => {
             "sudo aterm machines here apply --plain --root-steps-only".into()
+        }
+        HereBaseline::BuiltIn(crate::init_clt::RootPlan::NameRuleOnly) => {
+            "sudo aterm machines here apply --plain --name-rule-only".into()
         }
         HereBaseline::File(path) => format!("sudo aterm machines here apply {}", path.display()),
     });
@@ -3913,6 +3966,17 @@ fn here_report(
         Err(refused) => refuse!(ExitCode::FAILURE, "aterm machines here: {refused}"),
     };
     if plain {
+        if name_rule_only {
+            return match rows.as_slice() {
+                [row]
+                    if row.id == "names.admitted-name-rule"
+                        && matches!(row.outcome, Outcome::Ok | Outcome::Changed) =>
+                {
+                    Ok(None)
+                }
+                _ => Err(other()),
+            };
+        }
         // The tools and an applicable broker must finish before accepted root custody
         // ends successfully. Optional naming and debugger failures remain journaled;
         // they cannot cause another automatic administrator episode.
@@ -6702,6 +6766,142 @@ mod tests {
             independent.calls()
         );
 
+        // Explicit naming authorization is a different, fixed root scope. No tools,
+        // LAN, host-name or private-preference inventory is needed to install it.
+        for permit_acl in [true, false] {
+            let permission = Fake::root();
+            permission.stat_of(
+                "/dev/console",
+                crate::port::Stat {
+                    uid: 501,
+                    gid: 20,
+                    mode: 0o600,
+                    dir: false,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+            permission
+                .on("/usr/bin/dscl . -list /Users UniqueID", Ran::ok("alice 501\n"))
+                .on("/usr/bin/dscl . -read /Groups/admin GroupMembership", Ran::ok("GroupMembership: alice\n"))
+                .on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+                    Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+            permission.simulate(move |_, command| {
+                if command.program == Path::new("/bin/chmod") {
+                    return Some(if permit_acl {
+                        Ran::ok("")
+                    } else {
+                        Ran::exit(1, "ACL refused")
+                    });
+                }
+                (command.program == Path::new(crate::root_steps::VISUDO)).then(|| Ran::ok(""))
+            });
+            let authorize = || {
+                here_report(
+                    &permission,
+                    Mode::Apply,
+                    HereBaseline::BuiltIn(crate::init_clt::RootPlan::NameRuleOnly),
+                    None,
+                    HereOutput::Plain,
+                )
+            };
+            if permit_acl {
+                assert!(matches!(authorize(), Ok(None)));
+                let bytes = permission
+                    .read_file(Path::new(crate::root_steps::ADMITTED_NAME_RULE))
+                    .unwrap();
+                // Same-text opaque rules must still receive the read ACL on explicit repair.
+                assert!(matches!(authorize(), Ok(None)));
+                assert_eq!(
+                    permission
+                        .read_file(Path::new(crate::root_steps::ADMITTED_NAME_RULE))
+                        .unwrap(),
+                    bytes
+                );
+                assert_eq!(
+                    permission
+                        .calls()
+                        .iter()
+                        .filter(|call| call.starts_with("/bin/chmod +a "))
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    permission.mode_of(crate::root_steps::ADMITTED_NAME_RULE),
+                    Some(0o440)
+                );
+            } else {
+                assert!(authorize().err() == class(Unfinished::Other));
+                assert!(
+                    permission
+                        .written(crate::root_steps::ADMITTED_NAME_RULE)
+                        .is_none()
+                );
+            }
+            assert!(
+                permission
+                    .calls()
+                    .iter()
+                    .filter(|call| call.starts_with('/'))
+                    .all(|call| call.starts_with("/usr/bin/dscl ")
+                        || call.starts_with("/bin/chmod +a ")
+                        || call.starts_with(crate::root_steps::VISUDO)),
+                "{:?}",
+                permission.calls()
+            );
+            if permit_acl {
+                // A naming repair remains in the same compiled root transaction
+                // when setup also owes another root step. Matching bytes alone do
+                // not prove the ordinary account can read the rule's current ACL.
+                let before = permission
+                    .calls()
+                    .iter()
+                    .filter(|call| call.starts_with("/bin/chmod +a "))
+                    .count();
+                assert!(matches!(
+                    here_report(
+                        &permission,
+                        Mode::Apply,
+                        HereBaseline::BuiltIn(crate::init_clt::RootPlan::StepsOnly),
+                        None,
+                        HereOutput::Plain,
+                    ),
+                    Ok(None)
+                ));
+                assert_eq!(
+                    permission
+                        .calls()
+                        .iter()
+                        .filter(|call| call.starts_with("/bin/chmod +a "))
+                        .count(),
+                    before + 1,
+                    "the existing batch must refresh its one naming permission"
+                );
+                assert!(
+                    !permission.calls().iter().any(
+                        |call| call.contains("scutil --set") || call.contains("softwareupdate")
+                    )
+                );
+            }
+        }
+        let no_console = mac();
+        assert!(
+            here_report(
+                &no_console,
+                Mode::Apply,
+                HereBaseline::BuiltIn(crate::init_clt::RootPlan::NameRuleOnly),
+                None,
+                HereOutput::Plain,
+            )
+            .err()
+                == class(Unfinished::Other)
+        );
+        assert!(
+            no_console
+                .written(crate::root_steps::ADMITTED_NAME_RULE)
+                .is_none()
+        );
+
         // Apple's catalog out of reach waits in the same process until an explicit Stop.
         let unreached = mac();
         unreached
@@ -7242,6 +7442,8 @@ mod tests {
     #[test]
     fn here_apply_plain_names_the_mac_and_exits_on_the_tools_alone() {
         use crate::init_clt::Unfinished;
+        use aterm_types::machine_name::{GeneratedNames, Number};
+        let target = GeneratedNames::number_only(Number::parse("m42").unwrap());
         let console = crate::port::Stat {
             uid: 0,
             gid: 0,
@@ -7322,7 +7524,7 @@ mod tests {
             .on("/usr/sbin/scutil --set ComputerName m42", Ran::ok(""))
             .on("/usr/sbin/scutil --set LocalHostName m42", Ran::ok(""))
             .on("/usr/sbin/scutil --set HostName m42", Ran::ok(""));
-        assert!(matches!(plain(&named, Some("m42")), Ok(None)));
+        assert!(matches!(plain(&named, Some(&target)), Ok(None)));
         assert_eq!(
             sets(&named),
             [
@@ -7336,12 +7538,42 @@ mod tests {
         assert!(said.contains("names.local-host-name"), "{said}");
         assert!(said.contains("names.host-name"), "{said}");
 
+        let generated = aterm_types::machine_name::GeneratedNames::new(
+            Number::parse("m85").unwrap(),
+            &aterm_types::machine_name::Nickname::parse("Dog").unwrap(),
+        );
+        let dog = tools();
+        let mut expected = Vec::new();
+        for pref in crate::root_steps::NAME_PREFS {
+            let slot = aterm_types::machine_name::OsSlot::from_macos_preference(pref).unwrap();
+            let value = generated.for_slot(slot).unwrap();
+            let get = format!("/usr/sbin/scutil --get {pref}");
+            for _ in 0..if pref == "HostName" { 1 } else { 2 } {
+                dog.on(&get, Ran::ok("old"));
+            }
+            dog.on(&get, Ran::ok(value));
+            let set = crate::port::Cmd::new(crate::items::names::SCUTIL)
+                .args(["--set", pref, value])
+                .display();
+            dog.on(&set, Ran::ok(""));
+            expected.push(set);
+        }
+        assert!(matches!(plain(&dog, Some(&generated)), Ok(None)));
+        assert_eq!(sets(&dog), expected);
+        assert!(
+            !dog.calls().iter().any(
+                |call| call.contains("com.apple.smb.server") || call.contains("scutil --prefs")
+            ),
+            "generated naming must not touch SMB preferences: {:?}",
+            dog.calls()
+        );
+
         // Already named: nothing is set again.
         let already = tools();
         already
             .on("/usr/sbin/scutil --get ComputerName", Ran::ok("m42\n"))
             .on("/usr/sbin/scutil --get LocalHostName", Ran::ok("m42\n"));
-        assert!(matches!(plain(&already, Some("m42")), Ok(None)));
+        assert!(matches!(plain(&already, Some(&target)), Ok(None)));
         assert_eq!(sets(&already), Vec::<String>::new());
 
         // macOS refuses the name: the tools' exit stands.
@@ -7363,7 +7595,7 @@ mod tests {
                 "/usr/sbin/scutil --set LocalHostName m42",
                 Ran::exit(1, "SCPreferencesCommitChanges() failed"),
             );
-        assert!(matches!(plain(&refused, Some("m42")), Ok(None)));
+        assert!(matches!(plain(&refused, Some(&target)), Ok(None)));
         assert_eq!(sets(&refused).len(), 2, "{:?}", refused.calls());
 
         // NEGATIVE CONTROL: no name, no rename.
@@ -7393,7 +7625,7 @@ mod tests {
             sys.stop_now();
         });
         assert!(
-            plain(&unreached, Some("m42")).err()
+            plain(&unreached, Some(&target)).err()
                 == Some(ExitCode::from(Unfinished::Stopped.code().unwrap()))
         );
     }

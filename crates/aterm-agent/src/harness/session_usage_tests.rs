@@ -392,7 +392,7 @@ fn the_traffic_view_is_the_whole_sessions() {
     assert!(session.refresh(BIG).caught_up);
     let view = session.traffic();
     let minute = i64::try_from(
-        crate::harness::upgrade_models::parse_utc("2026-10-19T12:00:00Z").expect("a stamp"),
+        crate::harness::unix_time::parse_utc("2026-10-19T12:00:00Z").expect("a stamp"),
     )
     .expect("fits");
     assert_eq!((view.start_s, view.width_s), (minute, 60));

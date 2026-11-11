@@ -147,8 +147,14 @@ pub const MOST_CUTS: usize = 2;
 /// package, its kind.
 #[must_use]
 pub fn unit_key(checkout: &str, name: &UnitName) -> Key {
+    compiler_unit_key(UNIT_STAGE, checkout, name)
+}
+
+/// The key compiler unit `name`'s peak is kept under for `stage`, in `checkout`.
+#[must_use]
+pub fn compiler_unit_key(stage: &str, checkout: &str, name: &UnitName) -> Key {
     Key {
-        stage: UNIT_STAGE.to_owned(),
+        stage: stage.to_owned(),
         checkout: checkout.to_owned(),
         crates: Some(vec![name.package.clone()]),
         variant: Some(name.kind.clone()),

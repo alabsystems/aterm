@@ -26,6 +26,10 @@ enum Command {
     Poll(String),
     Cancel(String),
     Discover(String),
+    Diagnostics {
+        request: String,
+        operation: String,
+    },
 }
 
 fn hex(value: &str, len: usize) -> bool {
@@ -53,6 +57,10 @@ fn parse(line: &str, read: bool) -> Option<Command> {
         ("enrollment-poll", false, 3) => Some(Command::Poll(field(2, "operation=", 32)?)),
         ("enrollment-cancel", false, 3) => Some(Command::Cancel(field(2, "operation=", 32)?)),
         ("enrollment-status", true, 3) => Some(Command::Discover(field(2, "request=", 32)?)),
+        ("enrollment-diagnostics", true, 4) => Some(Command::Diagnostics {
+            request: field(2, "request=", 32)?,
+            operation: field(3, "operation=", 32)?,
+        }),
         _ => None,
     }
 }
@@ -64,6 +72,7 @@ impl Command {
             | Self::Poll(operation)
             | Self::Cancel(operation)
             | Self::Discover(operation) => operation,
+            Self::Diagnostics { request, .. } => request,
         }
     }
     fn kind(&self) -> &'static str {
@@ -72,6 +81,7 @@ impl Command {
             Self::Poll(_) => "poll",
             Self::Cancel(_) => "cancel",
             Self::Discover(_) => "discover",
+            Self::Diagnostics { .. } => "diagnostics",
         }
     }
     fn may_publish(&self) -> bool {
@@ -465,6 +475,30 @@ fn discovery_with(
     ))
 }
 
+fn diagnostics(
+    env: &Env,
+    sid: &str,
+    proof: &crate::self_claim::Proven,
+    operation: &str,
+) -> Result<Option<Value>, ()> {
+    let store = env.accounts_store_for(accounts::Cli::Codex).ok_or(())?;
+    // Canonical witnessed metadata only: a read never repairs pending publication.
+    let (logins, warning) = store.load_logins(env.now).map_err(|_| ())?;
+    if warning.is_some() {
+        return Err(());
+    }
+    let (intent, status, stage) = logins
+        .enrollment
+        .diagnostics(operation, &caller(sid, proof))
+        .map_err(|_| ())?;
+    let mut value = progress(&intent, &status);
+    value.as_object_mut().ok_or(())?.insert(
+        "preparation_stage".into(),
+        json!(stage.map(|stage| stage.as_str())),
+    );
+    Ok(Some(value))
+}
+
 fn run(
     command: &Command,
     sid: &str,
@@ -650,6 +684,9 @@ fn run_in(
 ) -> Result<Option<Value>, ()> {
     if let Command::Discover(_) = command {
         return discovery(env, sid, proof);
+    }
+    if let Command::Diagnostics { operation, .. } = command {
+        return diagnostics(env, sid, proof, operation);
     }
     // The authenticated worker owns recovery of an already admitted record
     // publication too. Keep it counted before reading metadata that a pending
@@ -853,7 +890,7 @@ fn run_in(
             }
             Ok(Some(progress(&request, &status)))
         }
-        Command::Discover(_) => unreachable!(),
+        Command::Discover(_) | Command::Diagnostics { .. } => unreachable!(),
     }
 }
 
@@ -1021,7 +1058,9 @@ fn reply(
     if read {
         object.insert("request".into(), json!(command.id()));
     }
-    let prefix = if read {
+    let prefix = if matches!(command, Command::Diagnostics { .. }) {
+        "OK codex-accounts enrollment-diagnostics "
+    } else if read {
         "OK codex-accounts enrollment-status "
     } else {
         "OK codex-accounts-change enrollment "
@@ -1092,6 +1131,7 @@ mod tests {
         Failed,
         Held,
         Panic,
+        Preparation(login_drive::NativePreparationStage),
     }
 
     #[test]
@@ -1263,12 +1303,92 @@ mod tests {
                     login_drive::Outcome::CompletedHeld
                 }
                 ProviderEnd::Panic => panic!("controlled provider unwind after durable admission"),
+                ProviderEnd::Preparation(stage) => login_drive::Outcome::PreparationFailed(stage),
             };
             login_drive::Drove {
                 outcome,
                 host: None,
             }
         }
+    }
+
+    #[test]
+    fn exact_preparation_diagnostics_are_read_only_and_keep_the_original_operation() {
+        let _serial = serial();
+        let (_root, env, proof, sid) = fixture();
+        let lifetime = account_work::Lifetime::default();
+        let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+        let mut expected = Vec::new();
+        for (index, stage) in [
+            login_drive::NativePreparationStage::RowPolicy,
+            login_drive::NativePreparationStage::GrantCustody,
+            login_drive::NativePreparationStage::NativeScope,
+            login_drive::NativePreparationStage::RowAdmission,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let view = discovery(&env, &sid, &proof).unwrap().unwrap();
+            let operation = format!("{index:032x}");
+            let command = Command::Enroll {
+                operation: operation.clone(),
+                revision: view["revision"].as_str().unwrap().into(),
+                account: accounts_control::account_id("main"),
+            };
+            let provider = FailedProvider(
+                Cell::new(0),
+                ProviderEnd::Preparation(stage),
+                Default::default(),
+            );
+            let refused = run_in(&command, &sid, &proof, &lifetime, &env, |work, env| {
+                work.run_with_host(env, &provider)
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(refused["phase"].as_str(), Some("refused"));
+            assert!(refused.get("preparation_stage").is_none());
+            assert_eq!(provider.0.get(), 1);
+            expected.push((operation, stage));
+        }
+        let original = std::fs::read(store.logins_file()).unwrap();
+        let ledger = std::fs::read(store.ledger_path()).unwrap();
+        let paused = lifetime.pause().unwrap();
+        for (operation, stage) in expected {
+            let command = Command::Diagnostics {
+                request: "f".repeat(32),
+                operation: operation.clone(),
+            };
+            assert!(!command.may_publish());
+            let diagnosed = run_in(&command, &sid, &proof, &lifetime, &env, |_, _| {
+                panic!("diagnostic read cannot drive or recover an enrollment")
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                diagnosed,
+                json!({
+                    "operation": operation,
+                    "account_id": accounts_control::account_id("main"),
+                    "phase": "refused", "generation": null,
+                    "preparation_stage": stage.as_str(),
+                })
+            );
+            assert!(diagnosed.as_object().unwrap().values().all(|value| {
+                value.as_str().is_none_or(|text| {
+                    !text.contains('/') && !text.contains('@') && !text.contains("token")
+                })
+            }));
+            let foreign = crate::self_claim::Proven {
+                start: "another-process-birth".into(),
+                ..proof.clone()
+            };
+            assert!(diagnostics(&env, &sid, &foreign, &operation).is_err());
+            assert!(diagnostics(&env, "other-session", &proof, &operation).is_err());
+        }
+        assert!(diagnostics(&env, &sid, &proof, &"e".repeat(32)).is_err());
+        assert_eq!(std::fs::read(store.logins_file()).unwrap(), original);
+        assert_eq!(std::fs::read(store.ledger_path()).unwrap(), ledger);
+        paused.try_wait().unwrap().resume().unwrap();
     }
 
     #[test]
@@ -1458,7 +1578,9 @@ mod tests {
         let pending = std::fs::read(&receipt).unwrap();
         let ledger = std::fs::read(store.ledger_path()).unwrap();
         assert!(discovery(&env, &sid, &proof).is_err());
+        assert!(diagnostics(&env, &sid, &proof, &"f".repeat(32)).is_err());
         assert_eq!(std::fs::read(&receipt).unwrap(), pending);
+        assert_eq!(std::fs::read(store.ledger_path()).unwrap(), ledger);
         std::fs::remove_dir(&wake).unwrap();
         let paused = lifetime.pause().unwrap();
         assert!(
@@ -2264,6 +2386,26 @@ mod tests {
             )
             .is_some()
         );
+        let diagnostic = format!(
+            "enrollment-diagnostics schema=1 request={} operation={operation}",
+            "b".repeat(32)
+        );
+        assert_eq!(
+            parse(&diagnostic, true),
+            Some(Command::Diagnostics {
+                request: "b".repeat(32),
+                operation: operation.clone(),
+            })
+        );
+        assert!(parse(&diagnostic, false).is_none());
+        for bad in [
+            diagnostic.replace("schema=1", "schema=2"),
+            diagnostic.replace("request=", "caller="),
+            format!("{diagnostic} account={}", "c".repeat(64)),
+            diagnostic.replace(&operation, &"A".repeat(32)),
+        ] {
+            assert!(parse(&bad, true).is_none());
+        }
         for bad in [
             format!("enrollment-poll schema=2 operation={operation}"),
             format!(

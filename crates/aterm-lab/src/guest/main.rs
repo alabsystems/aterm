@@ -44,6 +44,7 @@
 //!   as LaunchServices opens it; never a command run from it): `up` with the kernel's start time
 //!   for each that appears, `down` for each that goes ([`procs`]).
 //! - `socket-owner PATH`: the serving process's kernel identity, read through a local socket.
+//! - `socket-metrics PATH`: startup metrics and kernel peer identity on one control connection.
 //! - `member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE]`: the Allowing member of the `vault-phrase` row, F10's
 //!   members desk on the vault custody under HOME behind an `ask`-only listener on loopback
 //!   or, with `--advertise`, at the guest's address under a private lab service,
@@ -67,6 +68,8 @@ use std::io::Write as _;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod captures;
+#[cfg(unix)]
+mod control_metrics;
 mod dns_sd_text;
 #[cfg(target_os = "macos")]
 mod mac_setup;
@@ -126,7 +129,7 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
-    let usage = "usage: aterm-lab-guest census OUT | reader OUT | ax-texts PID | socket-owner PATH | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY | genesis HOME OUT | repair HOME PEER ROUNDS [AUTHORITY]";
+    let usage = "usage: aterm-lab-guest census OUT | reader OUT | ax-texts PID | socket-owner PATH | socket-metrics PATH | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY | genesis HOME OUT | repair HOME PEER ROUNDS [AUTHORITY]";
     match args.first().map(String::as_str) {
         Some("census") => census(&Out::open(args.get(1).ok_or(usage)?)?),
         Some("person") => {
@@ -169,6 +172,8 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("reader") => reader(&Out::open(args.get(1).ok_or(usage)?)?),
         Some("ax-texts") => ax_texts(args.get(1).ok_or(usage)?, &mut std::io::stdout().lock()),
         Some("socket-owner") if args.len() == 2 => socket_owner(&args[1]),
+        #[cfg(unix)]
+        Some("socket-metrics") if args.len() == 2 => control_metrics::run(&args[1]),
         Some("procs") => {
             let exe = args.get(1).ok_or(usage)?;
             procs(exe, &Out::open(args.get(2).ok_or(usage)?)?)

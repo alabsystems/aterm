@@ -388,9 +388,10 @@ public issue.
 Bounded protocols and state machines are Rust-derived models that an embedded
 exhaustive checker verifies on every test run, tied to shipping code by
 conformance tests. The Apple-silicon slice of each release is compiled by the
-Trust toolchain, whose verification covers chosen crates, not the workspace:
-these checks cover named, bounded contracts, not the whole emulator, renderer
-or OS. There is no hosted CI; every release runs `targo --unverified verify
+Trust toolchain. Not on yet: no release runs the Trust proof lane; releases
+compile with Trust's unverified lane. This is a known gap, not a policy. The
+model checks above cover named, bounded contracts, not the whole emulator,
+renderer or OS. There is no hosted CI; every release runs `targo --unverified verify
 release` first. [CONTRIBUTING.md](CONTRIBUTING.md) says what you can run here.
 
 aterm makes no aggregate performance claim; `aterm ctl metrics` measures render

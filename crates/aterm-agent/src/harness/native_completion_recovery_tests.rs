@@ -157,7 +157,7 @@ fn rollback_pool_receipt(
         receipt.id.clone(),
         codex_rotation::receipt_binding(&receipt).unwrap(),
     );
-    crate::harness::upgrade_models::write_atomic_mode(
+    crate::harness::atomic_write::write_atomic_mode(
         &store.logins_file(),
         &logins.to_json(),
         Some(0o600),

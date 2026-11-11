@@ -137,14 +137,11 @@ fn bench(dir: &Path) -> Result<String, super::floors::MeasureError> {
         .args(args)
         .env("ATERM_DECK_COST", &out)
         .current_dir(workspace_root())
+        .stderr(aterm_uds::spawnfd::Stdio::inherit())
         .output()
         .map_err(|e| format!("could not build the bench: {e}"))?;
     if !built.status.success() {
-        return Err(format!(
-            "deck bench build failed: {}",
-            String::from_utf8_lossy(&built.stderr)
-        )
-        .into());
+        return Err(format!("deck bench build exited {}", built.status).into());
     }
     let executable = super::bench_build::built_executable(
         &String::from_utf8_lossy(&built.stdout),

@@ -13,6 +13,7 @@ use super::*;
 mod admission;
 pub use admission::EntryAdmission;
 mod read_context;
+mod view;
 pub use read_context::{EntryRead, EntryReader};
 mod claim;
 pub use claim::{EntryClaim, EntryClaimRelation, MAX_ENTRY_CLAIM_BYTES};
@@ -114,13 +115,7 @@ pub(crate) fn current_public_roster_until(
             "public roster source is not currently applied and authenticated",
         ));
     };
-    if a.config != b.config
-        || a.recipient != b.recipient
-        || a.seq != b.seq
-        || a.envelope != b.envelope
-        || a.log_ids != b.log_ids
-        || a.mailbox_stamp != b.mailbox_stamp
-    {
+    if a.vault != b.vault {
         return Err(Error::new(
             "public roster halves belong to different source snapshots",
         ));
@@ -145,13 +140,28 @@ std::thread_local! {
 /// is absent or not safely materialized. Carries no secret commitment.
 #[derive(Clone)]
 pub struct EntryVersion {
-    config: Config,
     name: String,
+    vault: VaultVersion,
+}
+
+/// Authenticated recipient view, independent of whether a named entry exists.
+#[derive(Clone, PartialEq)]
+struct VaultVersion {
+    config: Config,
     recipient: Recipient,
     seq: u64,
     envelope: [u8; 32],
     log_ids: Option<std::sync::Arc<std::collections::BTreeSet<[u8; 32]>>>,
     mailbox_stamp: [u8; 32],
+}
+
+impl VaultVersion {
+    fn named(&self, name: &str) -> EntryVersion {
+        EntryVersion {
+            name: name.into(),
+            vault: self.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for EntryVersion {
@@ -165,7 +175,7 @@ impl EntryVersion {
     /// includes no plaintext entry fingerprint and cannot identify a password.
     #[must_use]
     pub fn mailbox_source_stamp(&self) -> Option<[u8; 32]> {
-        (self.name == crate::mailbox_component::SOURCE_ENTRY).then_some(self.mailbox_stamp)
+        (self.name == crate::mailbox_component::SOURCE_ENTRY).then_some(self.vault.mailbox_stamp)
     }
 
     /// The same authenticated source and entry at a nondecreasing version.
@@ -235,11 +245,13 @@ impl EntryVersion {
         )
     )]
     pub fn not_before(&self, floor: &Self) -> bool {
-        self.config == floor.config
+        self.vault.config == floor.vault.config
             && self.name == floor.name
-            && self.recipient == floor.recipient
-            && (self.seq > floor.seq || (self.seq == floor.seq && self.envelope == floor.envelope))
-            && match (&self.log_ids, &floor.log_ids) {
+            && self.vault.recipient == floor.vault.recipient
+            && (self.vault.seq > floor.vault.seq
+                || (self.vault.seq == floor.vault.seq
+                    && self.vault.envelope == floor.vault.envelope))
+            && match (&self.vault.log_ids, &floor.vault.log_ids) {
                 (Some(current), Some(previous)) => previous.is_subset(current),
                 (None, Some(_)) => false,
                 _ => true,
@@ -323,13 +335,15 @@ impl std::fmt::Debug for VerifiedEntry {
 impl EntrySnapshot {
     pub fn version(&self) -> EntryVersion {
         EntryVersion {
-            config: self.config.clone(),
             name: self.name.clone(),
-            recipient: self.recipient,
-            seq: self.seq,
-            envelope: self.envelope,
-            log_ids: self.log_ids.clone(),
-            mailbox_stamp: self.mailbox_stamp,
+            vault: VaultVersion {
+                config: self.config.clone(),
+                recipient: self.recipient,
+                seq: self.seq,
+                envelope: self.envelope,
+                log_ids: self.log_ids.clone(),
+                mailbox_stamp: self.mailbox_stamp,
+            },
         }
     }
 
@@ -696,11 +710,11 @@ pub(crate) fn read_claude_token_until(
             return Ok(None);
         };
         if let Some((first, _)) = &seen
-            && (first.config != version.config
-                || first.recipient != version.recipient
-                || first.seq != version.seq
-                || first.envelope != version.envelope
-                || first.log_ids != version.log_ids)
+            && (first.vault.config != version.vault.config
+                || first.vault.recipient != version.vault.recipient
+                || first.vault.seq != version.vault.seq
+                || first.vault.envelope != version.vault.envelope
+                || first.vault.log_ids != version.vault.log_ids)
         {
             return Ok(None);
         }
@@ -848,10 +862,10 @@ fn selected_entry_reader_allowed(
     entries: &[Entry],
     log: Option<&crate::membership_log::Log>,
     config: &Config,
-    name: &str,
+    reading_roster: bool,
     recipient: Recipient,
 ) -> bool {
-    if name != crate::SWARM_ROSTER_ENTRY
+    if !reading_roster
         && let Some(entry) = entries
             .iter()
             .find(|entry| entry.name == crate::SWARM_ROSTER_ENTRY)
@@ -916,103 +930,23 @@ fn read_entry_held_observing(
         reading,
         Reading::Materialized | Reading::SigningMaterial | Reading::PublicationMaterial
     );
-    let Some(config) = config(paths)? else {
+    let Some(view::View {
+        state,
+        entries,
+        version: context,
+        is_admin,
+        trusted_log,
+        selected_log,
+        envelope_context,
+    }) = view::read(
+        paths,
+        expected,
+        view::Request::Entry { name, reading },
+        _observation,
+    )?
+    else {
         return Ok(None);
     };
-    if config != *expected || !pin_admitted(&config, None) {
-        return Ok(None);
-    }
-    let state = load_state(paths)?;
-    if state.membership != Stored::In || state.failed || !state.pending.is_empty() {
-        return Ok(None);
-    }
-    let Some(identity) = read_identity(paths)? else {
-        return Ok(None);
-    };
-    // Selection happens after the shared register and anchor resolution. Reserved readers
-    // also retain the roster used below to establish this recipient's policy.
-    let requested = [name, crate::SWARM_ROSTER_ENTRY];
-    let (entries, envelope_digest, is_admin, trusted_log, selected_log, envelope_context) =
-        if state.digest.is_none() && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
-            if state.source_identity != Some(source_identity(&config)) {
-                return Ok(None);
-            }
-            let Some(configured) = super::log_entries::trusted_configured_log(paths, &config)?
-            else {
-                return Ok(None);
-            };
-            if !log_entry_reader_allowed(&configured.log, &identity) {
-                return Ok(None);
-            }
-            let selected = super::log_entries::SelectedVaultEntries::from_log(
-                configured.log.open_selection(
-                    &identity,
-                    if materialized { None } else { Some(&requested) },
-                )?,
-                *configured.log.genesis().id(),
-            );
-            let Some(entries) = selected.entries else {
-                return Ok(None);
-            };
-            let digest = *configured.log.genesis().id();
-            (
-                entries,
-                digest,
-                false,
-                Some(configured.log),
-                selected.log,
-                None,
-            )
-        } else {
-            if !source_bound(&config, &state) {
-                return Ok(None);
-            }
-            let Some(cached) = read_held_copy(paths, &config, &state)? else {
-                return Ok(None);
-            };
-            let envelope = envelope::parse(&cached)?;
-            let seeded = super::log_entries::trusted_seeded_log(paths, &config, &envelope)?;
-            if !super::log_entries::applied_log_available(
-                &state,
-                seeded.as_ref().map(|(_, digest)| *digest),
-            ) {
-                return Ok(None);
-            }
-            let selected = super::log_entries::select_entries_with_log(
-                seeded.as_ref().map(|(log, digest)| (log, *digest)),
-                &envelope,
-                &identity,
-                if materialized { None } else { Some(&requested) },
-            )?;
-            let Some(entries) = selected.entries else {
-                return Ok(None);
-            };
-            let trusted_log = seeded.map(|(log, _)| log);
-            // Admin standing reads the base roster. A reserved read of that roster must not ask
-            // for standing again; only the caller returning admin status needs that proof.
-            let admin = matches!(reading, Reading::ReservedAndAdmin)
-                && holds_admin_locker(paths, &config, &envelope, &identity)?;
-            (
-                entries,
-                envelope.digest(),
-                admin,
-                trusted_log,
-                selected.log,
-                Some(super::version::EnvelopeVersion {
-                    seq: state.seq,
-                    digest: envelope.digest(),
-                }),
-            )
-        };
-    if !selected_entry_reader_allowed(
-        &entries,
-        trusted_log.as_ref(),
-        &config,
-        name,
-        identity.recipient(),
-    ) {
-        return Ok(None);
-    }
     let entry = entries.iter().find(|entry| entry.name == name);
     if matches!(reading, Reading::PublicRoster)
         && entry.is_some_and(|entry| entry.audience != Audience::Everyone)
@@ -1027,18 +961,7 @@ fn read_entry_held_observing(
     {
         return Ok(None);
     }
-    let log_ids = trusted_log
-        .as_ref()
-        .map(|log| std::sync::Arc::new(log.records().map(|record| *record.id()).collect()));
-    *version = Some(EntryVersion {
-        config: config.clone(),
-        name: name.into(),
-        recipient: identity.recipient(),
-        seq: state.seq,
-        envelope: envelope_digest,
-        log_ids: log_ids.clone(),
-        mailbox_stamp: public_state_stamp(&config, &state, identity.recipient()),
-    });
+    *version = Some(context.named(name));
     *present = entry.is_some();
     let Some(entry) = entry else {
         *trusted = trusted_log;
@@ -1070,15 +993,15 @@ fn read_entry_held_observing(
             value,
             unanchored_default: entry.if_absent && entry.anchor.is_none(),
             snapshot: EntrySnapshot {
-                mailbox_stamp: public_state_stamp(&config, &state, identity.recipient()),
-                config,
+                mailbox_stamp: context.mailbox_stamp,
+                config: context.config,
                 name: name.into(),
                 fingerprint: fingerprint(entry),
-                recipient: identity.recipient(),
-                seq: state.seq,
-                envelope: envelope_digest,
+                recipient: context.recipient,
+                seq: context.seq,
+                envelope: context.envelope,
                 envelope_context,
-                log_ids,
+                log_ids: context.log_ids,
                 source,
             },
         },

@@ -370,6 +370,28 @@ pub(super) fn with_global_code_fixture(
         codex_enrollment::Artifact,
     ),
 ) {
+    with_preparation_fixture(|env, request, auth, turn, admission, artifact| {
+        let prepared = prepare(env, request, auth, &"d".repeat(64))
+            .unwrap()
+            .with_native_scope(env, Some(turn.clone()))
+            .unwrap()
+            .with_row_admission(admission)
+            .unwrap();
+        test(env, request, auth, turn, prepared, artifact);
+    });
+}
+
+#[cfg(test)]
+pub(in crate::harness) fn with_preparation_fixture(
+    test: impl FnOnce(
+        &Env,
+        &codex_enrollment::Request,
+        &Path,
+        std::sync::Arc<super::super::native_enrollment_admission::NativeBrowserTurn>,
+        super::super::codex_native_row::NativeRowAdmission,
+        codex_enrollment::Artifact,
+    ),
+) {
     let (world, env, _) = create(&"d".repeat(64));
     let old = world.path().join("old-global-code");
     aterm_secrets::fsx::ensure_private_dir(&old).unwrap();
@@ -395,12 +417,6 @@ pub(super) fn with_global_code_fixture(
             env.now,
         )
         .unwrap();
-    let auth = directory.join("auth.json");
-    let prepared = prepare(&env, &request, &auth, &"d".repeat(64))
-        .unwrap()
-        .with_native_scope(&env, Some(turn.clone()))
-        .unwrap()
-        .with_row_admission(admission)
-        .unwrap();
-    test(&env, &request, &auth, turn, prepared, artifact);
+    let auth = std::fs::canonicalize(&directory).unwrap().join("auth.json");
+    test(&env, &request, &auth, turn, admission, artifact);
 }

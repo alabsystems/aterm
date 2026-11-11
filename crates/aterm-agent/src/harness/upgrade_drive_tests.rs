@@ -5,10 +5,9 @@ use super::super::relaunch::{
     Adopted, AtPrompt, CARRIED_DONE, CAUSE_ASKED, CAUSE_EXIT, CAUSE_HOST, CONTINUE_FENCE_TRIES,
     EXIT_LOOK, ExitRecord, MODEL_WAIT, NOBODY_ASKED, PERSON_FIRST, RELAUNCH_FENCE_TRIES,
     RelaunchLineError, Restart, RestartAsk, STALE_S, Snapshot, after_exit, after_host_ended,
-    after_host_ended_from, await_new, carry_on_with_tab_probe, continuation_session, exit_fallback,
-    exit_record, fallback_origin, follow, line_for, look_at_exit, model_restart, owed,
-    relaunch_by_parent, restart_from, resume, resume_as, resume_at_point, resumed_prompt,
-    shell_dialect, type_relaunch_line, with_model,
+    after_host_ended_from, await_new, carry_on_with_tab_probe, continuation_session, exit_record,
+    follow, line_for, look_at_exit, owed, relaunch_by_parent, restart_from, resume, resume_as,
+    resume_at_point, resumed_prompt, shell_dialect, type_relaunch_line,
 };
 use super::super::upgrade::Dialect;
 use super::*;
@@ -902,7 +901,6 @@ fn a_state_main_wrote_reads_with_the_owners_fields_at_their_defaults() {
             asks: 1,
         }
     );
-    assert_eq!(st.model_list, "claude-opus-5-5");
     assert_eq!(st.model_before, "claude-opus-5");
     assert_eq!((st.from.as_str(), st.to.as_str()), ("2.1.281", "2.1.282"));
     assert_eq!(st.notice_pid, 9162);
@@ -1608,320 +1606,6 @@ fn checked_native_state_refuses_an_unavailable_directory_barrier_and_retries() {
     }
 }
 
-/// The models report's settings read never waits on or swallows whatever stands at
-/// `.claude/settings.json`: an ordinary file parses; an oversized file and a fifo read
-/// as no settings (the fifo is the control — an unbounded read would not return).
-#[test]
-fn the_models_reports_settings_read_is_bounded() {
-    let dir = scratch("models-report-settings");
-    let home = dir.join("home");
-    let claude = home.join(".claude");
-    std::fs::create_dir_all(&claude).expect("the config dir");
-    assert_eq!(
-        user_settings(&home),
-        models::UserModelSettings::default(),
-        "absent"
-    );
-    std::fs::write(claude.join("settings.json"), r#"{"model":"opus"}"#).expect("settings");
-    assert_eq!(user_settings(&home).default.as_deref(), Some("opus"));
-    std::fs::write(claude.join("settings.json"), "x".repeat(1024 * 1024 + 1)).expect("oversized");
-    assert_eq!(
-        user_settings(&home),
-        models::UserModelSettings::default(),
-        "oversized"
-    );
-    #[cfg(unix)]
-    {
-        let fifo = claude.join("settings.json");
-        std::fs::remove_file(&fifo).expect("clear the file");
-        let name = std::ffi::CString::new(fifo.to_str().expect("a name")).expect("nul-free");
-        // SAFETY: a live NUL-terminated scratch path; mkfifo retains no pointer.
-        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        assert_eq!(
-            user_settings(&home),
-            models::UserModelSettings::default(),
-            "a fifo is not waited on"
-        );
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The home's model caches are not read while two or more accounts are listed
-/// ([`Opts::several_logins`]).
-#[test]
-fn the_homes_model_caches_are_not_read_under_several_logins() {
-    let dir = scratch("model-evidence-logins");
-    let home = dir.join("home");
-    let catalog = home.join(".claude/cache/model-catalog");
-    std::fs::create_dir_all(&catalog).expect("the catalog cache");
-    std::fs::write(
-        catalog.join("0000-cc.json"),
-        r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"}]}}}"#,
-    )
-    .expect("served");
-    std::fs::write(
-        home.join(".claude.json"),
-        r#"{"modelAccessCache":[{"apiName":"claude-opus-5","entitled":false}],
-            "additionalModelOptionsCache":[{"value":"claude-fable-5[1m]","disabled":true}],
-            "cachedGrowthBookFeatures":{"tengu_startup_announcements":[{"id":"opus-5-5-launch","text":"t","requiresModel":"claude-opus-5-5"}]}}"#,
-    )
-    .expect("the profile");
-    let one = Opts {
-        dry_run: true,
-        ..drive(&dir)
-    };
-    seed_builds(&one);
-    assert!(
-        !one.several_logins,
-        "control: the packaged state is one login"
-    );
-    let read = model_evidence(&one, &Records::of(&one.home, None));
-    assert_eq!(read.denied, ["claude-opus-5"]);
-    assert_eq!(read.disabled_options, ["claude-fable-5"]);
-    assert_eq!(read.served.as_ref().map(Vec::len), Some(1));
-    assert_eq!(read.announcements.len(), 1);
-    assert!(
-        !models::availability("claude-opus-5", "9.9.9", &read, None).ok(),
-        "control: the cache's denial is read"
-    );
-
-    let several = Opts {
-        several_logins: true,
-        instances: Instances::Listed(Vec::new()),
-        ..one.clone()
-    };
-    let unknown = model_evidence(&several, &Records::of(&several.home, None));
-    assert_eq!(
-        unknown,
-        models::Evidence {
-            credits_billed: vec!["fable".to_string()],
-            ..models::Evidence::default()
-        },
-        "nothing of the home's"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A model the account bills to usage credits is offered to no upgrade under
-/// `[harness] usage_credits = false`.
-#[test]
-fn a_model_billed_to_usage_credits_is_offered_to_no_upgrade_under_the_key_off() {
-    let dir = scratch("model-evidence-credits");
-    let home = dir.join("home");
-    let catalog = home.join(".claude/cache/model-catalog");
-    std::fs::create_dir_all(&catalog).expect("the catalog cache");
-    std::fs::write(
-        catalog.join("0000-cc.json"),
-        r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},
-            {"id":"claude-fable-5-1","section":"current"}]}}}"#,
-    )
-    .expect("served");
-    let profile = |tiers: &str| {
-        std::fs::write(
-            home.join(".claude.json"),
-            format!(
-                r#"{{"oauthAccount":{{"organizationType":"claude_max","seatTier":"standard",
-                    "userRateLimitTier":"default_claude_max_5x"}},
-                    "cachedGrowthBookFeatures":{{"tengu_saffron_credits_only_tiers":[{tiers}],
-                    "tengu_saffron_lattice":{{}}}}}}"#
-            ),
-        )
-        .expect("the profile");
-    };
-    let off = Opts {
-        dry_run: true,
-        ..drive(&dir)
-    };
-    assert!(!off.usage_credits, "the packaged state");
-    let on = Opts {
-        usage_credits: true,
-        ..off.clone()
-    };
-    let list = models::Priority::seed(0);
-    let offer = |opts: &Opts| {
-        let ev = model_evidence(opts, &Records::of(&opts.home, None));
-        models::offered(&list, "9.9.9", &ev, None, None)
-    };
-    profile(r#""max""#);
-    let held = offer(&off);
-    assert_eq!(held, ["claude-opus-5-5"]);
-    assert_eq!(
-        models::family_successor("claude-fable-5", false, &held),
-        None
-    );
-    let today = offer(&on);
-    assert_eq!(today, ["claude-opus-5-5", "claude-fable-5-1"]);
-    assert_eq!(
-        models::family_successor("claude-fable-5", false, &today).as_deref(),
-        Some("claude-fable-5-1")
-    );
-    profile(r#""enterprise""#);
-    assert_eq!(offer(&off), today);
-    use super::super::profile::Selection;
-    let records = Records::of(&off.home, None);
-    let context = |selection| super::super::profile::Context {
-        plain: home.join(".claude.json"),
-        records: home.join(".claude"),
-        selection,
-        home: Some(home.to_string_lossy().into_owned()),
-        config: None,
-        login: None,
-    };
-    let legacy = home.join(".claude/.config.json");
-    let custom = home.join(".claude-custom-oauth.json");
-    let included = std::fs::read(home.join(".claude.json")).expect("included bytes");
-    let mut cached = ModelCtx::none();
-    cached.list = list.clone();
-    cached.versions.0 = "9.9.9".to_string();
-    cached.offer(&model_evidence(&off, &records));
-    assert_eq!(cached.offered, today);
-    profile(r#""max""#);
-    let billed = std::fs::read(home.join(".claude.json")).expect("billed bytes");
-    let known_billed = Some(vec!["fable".to_string()]);
-    let known_included = Some(Vec::<String>::new());
-
-    std::fs::write(home.join(".claude.json"), &included).expect("stale plain Included");
-    std::fs::write(&legacy, &billed).expect("legacy billed account");
-    assert_eq!(
-        credits_billed_for(&off, Some(&context(Selection::Standard))),
-        None
-    );
-    assert!(
-        cached
-            .for_profile(&off, &records, Some(&context(Selection::Standard)))
-            .offered
-            .is_empty()
-    );
-    std::fs::write(&legacy, &included).expect("legacy Included");
-    std::fs::write(home.join(".claude.json"), &billed).expect("plain billed");
-    assert_eq!(
-        credits_billed_for(&off, Some(&context(Selection::Standard))),
-        None
-    );
-    std::fs::write(&legacy, "").expect("empty legacy beside a plain profile");
-    std::fs::write(home.join(".claude.json"), &included).expect("plain Included");
-    assert_eq!(
-        credits_billed_for(&off, Some(&context(Selection::Standard))),
-        known_included
-    );
-    std::fs::remove_file(&legacy).expect("remove legacy");
-
-    let standard = Selection::of_exec_env(&["HOME=/invented".to_string()]);
-    let selected = Selection::of_exec_env(&[
-        "HOME=/invented".to_string(),
-        "CLAUDE_CODE_CUSTOM_OAUTH_URL=https://auth.example.invalid".to_string(),
-    ]);
-    assert_eq!(standard, Selection::Standard);
-    assert_eq!(selected, Selection::CustomOauth);
-    assert_eq!(Selection::of_exec_env(&[]), Selection::Unknown);
-    assert_eq!(
-        Selection::of_exec_env(&[
-            "CLAUDE_CODE_CUSTOM_OAUTH_URL=".to_string(),
-            "CLAUDE_CODE_CUSTOM_OAUTH_URL=https://auth.example.invalid".to_string(),
-        ]),
-        Selection::Unknown
-    );
-    std::fs::write(&custom, &billed).expect("custom billed");
-    assert_eq!(
-        credits_billed_for(&off, Some(&context(standard))),
-        known_included
-    );
-    assert_eq!(
-        credits_billed_for(&off, Some(&context(selected))),
-        known_billed
-    );
-    assert_eq!(
-        credits_billed_for(&off, Some(&context(Selection::Unknown))),
-        None
-    );
-    assert!(
-        cached
-            .for_profile(&off, &records, Some(&context(Selection::Unknown)))
-            .offered
-            .is_empty()
-    );
-    assert_eq!(
-        credits_billed_for(&on, Some(&context(Selection::Unknown))),
-        known_included
-    );
-
-    assert_eq!(
-        cached
-            .for_profile(&off, &records, Some(&context(selected)))
-            .offered,
-        ["claude-opus-5-5"]
-    );
-    std::fs::write(&custom, &included).expect("custom Included");
-    std::fs::write(home.join(".claude.json"), &billed).expect("plain billed again");
-    assert_eq!(
-        credits_billed_for(&off, Some(&context(selected))),
-        known_included
-    );
-    assert_eq!(
-        cached
-            .for_profile(&off, &records, Some(&context(selected)))
-            .offered,
-        today
-    );
-    std::fs::remove_file(&custom).expect("remove custom");
-    assert_eq!(credits_billed_for(&off, Some(&context(selected))), None);
-
-    #[cfg(unix)]
-    {
-        std::fs::write(home.join(".claude.json"), &included).expect("plain Included again");
-        std::os::unix::fs::symlink(".config.json", &legacy).expect("owned legacy cycle");
-        assert_eq!(credits_billed_for(&off, Some(&context(standard))), None);
-        assert_eq!(
-            credits_billed_for(&on, Some(&context(standard))),
-            known_included
-        );
-        std::fs::remove_file(&legacy).expect("remove owned cycle");
-    }
-    let other = home.join("other-home");
-    let record_cwd = home.join("record-cwd");
-    std::fs::create_dir_all(&other).expect("owned other HOME");
-    std::fs::create_dir_all(&record_cwd).expect("owned record cwd");
-    std::fs::write(other.join(".claude.json"), &billed).expect("own HOME billed");
-    std::fs::write(home.join(".claude.json"), &included).expect("supervisor plain Included");
-    let env = vec![
-        format!("HOME={}", other.display()),
-        "CLAUDE_CONFIG_DIR=".to_string(),
-    ];
-    let captured = super::super::profile::Context::of_exec_env(&home, &record_cwd, &env)
-        .expect("captured context");
-    assert_eq!(captured.plain, other.join(".claude.json"));
-    assert_eq!(captured.records, record_cwd);
-    let old_identity = Records::at(&home, HomeVars::config(Some("")), || {
-        Some(record_cwd.clone())
-    });
-    assert_eq!(old_identity.profile(&home), Some(home.join(".claude.json")));
-    assert_ne!(old_identity.profile(&home), Some(captured.plain.clone()));
-    assert_eq!(credits_billed_for(&off, Some(&captured)), known_billed);
-    assert_eq!(
-        credits_billed_for(&off, None),
-        None,
-        "a restored/unread snapshot grants nothing"
-    );
-    assert_eq!(
-        credits_billed_for(&on, None),
-        known_included,
-        "explicit opt-in control"
-    );
-    profile(r#""max""#);
-    let several = Opts {
-        several_logins: true,
-        ..off.clone()
-    };
-    assert_eq!(credits_billed_for(&several, Some(&context(standard))), None);
-    std::fs::remove_file(home.join(".claude.json")).expect("the profile gone");
-    assert_eq!(credits_billed_for(&off, Some(&context(standard))), None);
-    assert_eq!(
-        credits_billed_for(&on, Some(&context(standard))),
-        known_included
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn a_second_sweeper_does_nothing_while_the_first_holds_the_lock() {
     let dir = scratch("lock");
@@ -1971,7 +1655,6 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
             exe,
             argv,
             Some(session),
-            None,
             None,
             &[],
         )
@@ -2342,7 +2025,7 @@ fn ready_from_tab_a_never_announces_or_terminates_tab_b() {
         model.action_enabled("Terminate", &duplicate),
         unique_live_owner(&files, &sf_a) && st.notice_belongs_to(&sf_a, "s-a")
     );
-    let report = visit_with_claim(
+    let report = visit_build(
         &opts,
         &sf_b,
         Some(&files),
@@ -2369,7 +2052,7 @@ fn ready_from_tab_a_never_announces_or_terminates_tab_b() {
         "Tier-1: B cannot consume A's READY after A exits"
     );
     let no_env = atpkg::caller_shell::ProcArgs::default();
-    let report = visit_with_claim(
+    let report = visit_build(
         &opts,
         &sf_b,
         Some(&files),
@@ -2472,7 +2155,7 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_of_the_live_holder() {
         let args = atpkg::caller_shell::process_args(b.id()).expect("B's argv");
         let visit_as = |opts: &Opts| {
             let files = session_files(&opts.home).expect("complete session scan");
-            visit_with_claim(
+            visit_build(
                 opts,
                 &sf_b,
                 Some(&files),
@@ -2641,7 +2324,7 @@ fn a_gone_notices_row_promises_no_ask_to_a_holder_already_current() {
     let args = atpkg::caller_shell::process_args(b.id()).expect("B's argv");
     let visit_b = || {
         let files = session_files(&opts.home).expect("complete session scan");
-        visit_with_claim(
+        visit_build(
             &opts,
             &sf_b,
             Some(&files),
@@ -2838,7 +2521,7 @@ fn malformed_or_unreadable_sibling_vetoes_a_valid_owner() {
         let sweep = sweep(&opts);
         assert_eq!(sweep.len(), 1);
         assert_eq!(sweep[0].step, "wait:session-files-unreadable");
-        let report = visit_with_claim(&opts, &sf, None, &[], &newer(), &Live, Some(&args), None);
+        let report = visit_build(&opts, &sf, None, &[], &newer(), &Live, Some(&args), None);
         assert_eq!(report.step, "wait:session-files-unreadable");
         assert_eq!(load(&opts, SESSION), Some(st.clone()));
         assert!(alive(sf.pid), "the valid owner was never signalled");
@@ -2934,8 +2617,6 @@ fn drive(dir: &Path) -> Opts {
         background: false,
         aterm_state: None,
         ask: !QUIET.with(std::cell::Cell::get),
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -2960,63 +2641,6 @@ fn probe_finds(found: build_start::Probe) -> std::rc::Rc<std::cell::Cell<usize>>
         }));
     });
     ran
-}
-
-/// Seeds `opts`'s state with the baked-catalog cache ([`catalog::baked_cached`], keyed by the
-/// binary's path, size and mtime) for the machine's managed Claude Code build, scanned once per
-/// process: a scan reads the whole build (230 MB, 0.7 s of CPU in a debug build), and every
-/// test's fresh state would scan it anew.
-fn seed_builds(opts: &Opts) {
-    type Key = (PathBuf, u64, Option<SystemTime>);
-    type Files = Vec<(std::ffi::OsString, Vec<u8>)>;
-    static SCANNED: std::sync::Mutex<Option<(Key, Files)>> = std::sync::Mutex::new(None);
-    let Some(bin) = atpkg::store::resolve_configured()
-        .and_then(|layout| std::fs::read_to_string(layout.agents_dir().join("claude")).ok())
-        .and_then(|twin| catalog::twin_binary(&twin))
-    else {
-        return;
-    };
-    let Ok(meta) = std::fs::metadata(&bin) else {
-        return;
-    };
-    let key = (bin.clone(), meta.len(), meta.modified().ok());
-    let mut scanned = SCANNED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if scanned.as_ref().is_none_or(|(k, _)| *k != key) {
-        let once = ScratchDir::new("upgrade", "builds");
-        // The shared temporary parent may belong to root. Put the cache beneath our
-        // owned scratch directory, as a real state directory owns its builds cache.
-        let cache = once.join("builds");
-        let recording = aterm_durable::seam::Recording::start();
-        let first = catalog::baked_cached(&bin, &cache);
-        assert_eq!(
-            recording.take(),
-            [aterm_durable::Flush::Ordered],
-            "the facts cache is only ordered"
-        );
-        assert_eq!(
-            catalog::baked_cached(&bin, &cache),
-            first,
-            "the cache file reads back as the scan that wrote it"
-        );
-        let files = std::fs::read_dir(&cache)
-            .expect("the builds cache")
-            .flatten()
-            .map(|e| {
-                (
-                    e.file_name(),
-                    std::fs::read(e.path()).expect("a cache file"),
-                )
-            })
-            .collect();
-        *scanned = Some((key, files));
-    }
-    let builds = state_dir(opts).join("builds");
-    std::fs::create_dir_all(&builds).expect("the builds cache");
-    for (name, bytes) in scanned.iter().flat_map(|(_, files)| files) {
-        std::fs::write(builds.join(name), bytes).expect("a cache file");
-    }
 }
 
 thread_local! {
@@ -3157,7 +2781,7 @@ fn upgrade_ledger_does_not_append_to_a_cut_in_progress() {
     let kept = format!("{}\n", snapshot.lines().next_back().unwrap());
     ledger(&opts, &ledger_report("during-cut"), "held");
     let after_append = std::fs::read(&path).unwrap();
-    super::super::upgrade_models::write_atomic_ordered(&path, &kept).unwrap();
+    super::super::atomic_write::write_atomic_ordered(&path, &kept).unwrap();
     drop(held);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), kept);
     assert_eq!(
@@ -4202,11 +3826,14 @@ fn a_retarget_is_told_by_the_arm_that_made_it() {
         left_typed: "[aterm harness] Claude Code 2.1.290 (man".to_string(),
         ..St::default()
     };
+    let another_process = St {
+        from: "2.1.289".to_string(),
+        ..prior.clone()
+    };
     let (st, how) = St::retarget(
-        Some(prior.clone()),
+        Some(another_process),
         &v("2.1.290"),
         &to,
-        Some("claude-opus-5-5"),
         Proc::default(),
         900,
     );
@@ -4218,7 +3845,6 @@ fn a_retarget_is_told_by_the_arm_that_made_it() {
         Some(prior.clone()),
         &v("2.1.290"),
         &to,
-        None,
         Proc::default(),
         900,
     );
@@ -4778,7 +4404,7 @@ fn stale_preliminary_roster_cannot_authorize_an_announcement() {
     let table = vec![(shell, 1, "zsh".into())];
     let args = atpkg::caller_shell::process_args(a.id()).expect("agent argv");
     let run = || {
-        visit_with_claim(
+        visit_build(
             &opts,
             &sf_a,
             Some(&initial_files),
@@ -6866,7 +6492,6 @@ fn a_crashs_relaunch_moves_only_onto_a_build_proved_to_start() {
             ..drive(&dir)
         };
         let ran = probe_finds(found);
-        seed_builds(&opts);
         let versions = native_root(&opts.home);
         std::fs::create_dir_all(&versions).expect("versions");
         for build in ["2.1.281", "99.9.9"] {
@@ -7322,90 +6947,6 @@ fn the_owners_now_probes_a_blind_build_again() {
     assert_ne!(r.step, "wait:build-fails", "moved: {r:?}");
 }
 
-/// The model rule reads an agent's `--settings` off its process's argv only where that process is
-/// the record's (its kernel start against Claude's `procStart`).
-#[cfg(unix)]
-#[test]
-fn the_settings_chain_reads_no_recycled_pids_settings_flag() {
-    let dir = scratch("model-settings-recycled-pid");
-    let opts = Opts {
-        dry_run: true,
-        usage_credits: true,
-        ..drive(&dir)
-    };
-    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
-    let user = opts.home.join(".claude");
-    let catalog = user.join("cache/model-catalog");
-    std::fs::create_dir_all(&catalog).expect("the catalog cache");
-    std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
-    let targets = Targets {
-        managed: None,
-        native: None,
-        unanswered: false,
-    };
-    let mctx = ModelCtx::read(&opts, &targets);
-    let work = dir.join("work");
-    std::fs::create_dir_all(&work).expect("work");
-    let proj = user.join("projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    let at = i64::try_from(now_s()).expect("now") - 7_200;
-    std::fs::write(
-        proj.join(format!("{SESSION}.jsonl")),
-        format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
-            crate::harness::usage::rfc3339_utc(at)
-        ),
-    )
-    .expect("transcript");
-    let flag = dir.join("team.json");
-    std::fs::write(&flag, r#"{"availableModels":["claude-fable-5-1"]}"#).expect("team");
-    let mut holder =
-        aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sh")))
-            .arg("-c")
-            .arg("read line")
-            .arg("--settings")
-            .arg(&flag)
-            .stdin(aterm_uds::spawnfd::Stdio::piped())
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .spawn()
-            .expect("the process");
-    for _ in 0..3_000 {
-        if atpkg::caller_shell::process_args(holder.id())
-            .is_some_and(|a| a.argv.iter().any(|arg| arg == "--settings"))
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let its_start = kernel_start(holder.id()).expect("its start");
-    let verdict = |proc_start: &str| {
-        let sf = SessionFile {
-            pid: holder.id(),
-            proc_start: proc_start.to_string(),
-            claude_dir: Some(user.clone()),
-            cwd: work.to_string_lossy().into_owned(),
-            ..record("2.1.296")
-        };
-        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
-        model_read_for(&opts, &sf, None, &mctx, false, None, None).verdict
-    };
-    let own = verdict(&its_start);
-    let recycled = verdict("Thu Oct  1 00:00:00 2026");
-    let _ = holder.kill();
-    let _ = holder.wait();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(own, ModelVerdict::Keep("model-current"), "its own flag");
-    assert_eq!(
-        recycled,
-        ModelVerdict::Due {
-            from: "claude-fable-5-1".to_string(),
-            to: "claude-opus-5-5".to_string(),
-        },
-        "a recycled pid's flag is not the record's"
-    );
-}
-
 /// [`St::keep_stop`] at [`St::retarget`].
 #[test]
 fn a_hand_resume_keeps_the_stop_of_the_build_that_failed_to_start_for_it() {
@@ -7436,14 +6977,7 @@ fn a_hand_resume_keeps_the_stop_of_the_build_that_failed_to_start_for_it() {
         notices: 2,
         ..St::default()
     };
-    let (st, how) = St::retarget(
-        Some(stopped("no-resume")),
-        &running,
-        &to,
-        None,
-        proc("B"),
-        1_029,
-    );
+    let (st, how) = St::retarget(Some(stopped("no-resume")), &running, &to, proc("B"), 1_029);
     assert_eq!(how, Retarget::Rested);
     assert_eq!(st.phase, Phase::Failed("no-resume".to_string()));
     assert_eq!(
@@ -7467,7 +7001,7 @@ fn a_hand_resume_keeps_the_stop_of_the_build_that_failed_to_start_for_it() {
         (0, 0, 0, 0),
         "nothing of the ended agent's: its exit, what its relaunch brought up, its asks"
     );
-    let (again, how) = St::retarget(Some(st.clone()), &running, &to, None, proc("B"), 1_100);
+    let (again, how) = St::retarget(Some(st.clone()), &running, &to, proc("B"), 1_100);
     assert_eq!(
         (how, again.phase.clone()),
         (Retarget::Kept, st.phase.clone())
@@ -7499,18 +7033,11 @@ fn a_hand_resume_keeps_the_stop_of_the_build_that_failed_to_start_for_it() {
     );
     let _ = std::fs::remove_dir_all(&dir);
     let fresh = |prior: St, to: &Candidate| {
-        let (st, how) = St::retarget(Some(prior), &running, to, None, proc("B"), 1_029);
+        let (st, how) = St::retarget(Some(prior), &running, to, proc("B"), 1_029);
         (st.phase, how)
     };
     let pending = (Phase::Pending, Retarget::Anew);
-    let (kept, how) = St::retarget(
-        Some(stopped("no-resume")),
-        &running,
-        &to,
-        None,
-        proc("A"),
-        1_029,
-    );
+    let (kept, how) = St::retarget(Some(stopped("no-resume")), &running, &to, proc("A"), 1_029);
     assert_eq!(
         (kept.phase, how),
         (Phase::Failed("no-resume".to_string()), Retarget::Kept),
@@ -7579,7 +7106,7 @@ fn a_restart_on_its_own_program_keeps_the_stop_of_a_build_that_failed_to_start()
         stop_streak: 1,
         ..St::default()
     };
-    let (rested, how) = St::retarget(Some(stopped), &running, &to, None, proc("B"), 1_029);
+    let (rested, how) = St::retarget(Some(stopped), &running, &to, proc("B"), 1_029);
     assert_eq!(how, Retarget::Rested, "precondition: the hand resume rests");
     let restarted = |prior: &St, cause: &str, phase: Phase| {
         let mut st = St {
@@ -7596,7 +7123,7 @@ fn a_restart_on_its_own_program_keeps_the_stop_of_a_build_that_failed_to_start()
         St::from_json(&st.to_json()).expect("the record reads back")
     };
     let landed = restarted(&rested, CAUSE_MEMORY, Phase::Done);
-    let (next, how) = St::retarget(Some(landed.clone()), &running, &to, None, proc("C"), 1_700);
+    let (next, how) = St::retarget(Some(landed.clone()), &running, &to, proc("C"), 1_700);
     assert_eq!(how, Retarget::Rested, "{next:?}");
     assert_eq!(next.phase, Phase::Failed("no-resume".to_string()));
     assert_eq!(
@@ -7610,11 +7137,11 @@ fn a_restart_on_its_own_program_keeps_the_stop_of_a_build_that_failed_to_start()
         "bound to the process that holds the conversation now"
     );
     let twice = restarted(&landed, CAUSE_EXIT, Phase::Done);
-    let (next, how) = St::retarget(Some(twice), &running, &to, None, proc("D"), 1_800);
+    let (next, how) = St::retarget(Some(twice), &running, &to, proc("D"), 1_800);
     assert_eq!((how, next.failed_at), (Retarget::Rested, 995), "twice");
     let mut refused = restarted(&rested, CAUSE_MEMORY, Phase::Exiting { at_s: 1_500 });
     refused.stop("relaunch-refused", 1_510);
-    let (next, how) = St::retarget(Some(refused), &running, &to, None, proc("B"), 1_600);
+    let (next, how) = St::retarget(Some(refused), &running, &to, proc("B"), 1_600);
     assert_eq!(
         (how, next.phase, next.failed_at),
         (
@@ -7628,7 +7155,6 @@ fn a_restart_on_its_own_program_keeps_the_stop_of_a_build_that_failed_to_start()
         Some(landed),
         &running,
         &target("2.1.1000"),
-        None,
         proc("C"),
         1_700,
     );
@@ -7649,7 +7175,6 @@ fn a_restart_on_its_own_program_keeps_the_stop_of_a_build_that_failed_to_start()
         Some(restarted(&plain, CAUSE_MEMORY, Phase::Done)),
         &running,
         &to,
-        None,
         proc("C"),
         1_700,
     );
@@ -9312,11 +8837,62 @@ fn the_tab() -> [LiveTab; 1] {
     }]
 }
 
-/// An announced round whose notice carried a model is looked at with the build current (the
-/// pre-filter [`due`] asks).
+/// An announced round no build is ahead of is released: one whose build the session already runs,
+/// and, once every target probe answered, one whose build no target offers any more. While a
+/// probe is unanswered a round still ahead of the running build stands, and a round that was never
+/// announced owes nothing.
 #[test]
-fn an_announced_round_carrying_a_model_is_looked_at_with_the_build_current() {
-    let dir = scratch("due-announced-model");
+fn an_announced_round_no_build_is_ahead_of_is_released() {
+    let running = Version::parse("2.1.320").expect("running");
+    let who = Proc {
+        start: "Mon Nov  9 08:00:00 2026",
+        started_s: 1_794_200_000,
+    };
+    let round = |to: &str| {
+        let target = Candidate {
+            exe: PathBuf::from("/p/agents/claude"),
+            version: Version::parse(to).expect("target"),
+            source: upgrade::Source::Managed,
+        };
+        let mut st = St::for_target(None, &running, &target, who, 1_794_200_100);
+        st.announced("m1".to_string(), 1_794_200_160, 1);
+        st
+    };
+    for (to, answered, released) in [
+        ("2.1.322", true, true),
+        ("2.1.322", false, false),
+        ("2.1.320", false, true),
+        ("2.1.319", true, true),
+    ] {
+        let mut st = round(to);
+        assert_eq!(
+            st.release_untargeted(&running, answered, 1_794_200_200),
+            released,
+            "to {to}, answered {answered}"
+        );
+        if released {
+            assert_eq!(st.release, "no-target", "to {to}");
+            assert_eq!(st.phase, Phase::Pending, "to {to}");
+        } else {
+            assert!(st.release.is_empty(), "to {to}");
+            assert!(matches!(st.phase, Phase::Announced { .. }), "to {to}");
+        }
+    }
+    let target = Candidate {
+        exe: PathBuf::from("/p/agents/claude"),
+        version: Version::parse("2.1.322").expect("target"),
+        source: upgrade::Source::Managed,
+    };
+    let mut pending = St::for_target(None, &running, &target, who, 1_794_200_100);
+    assert!(!pending.release_untargeted(&running, true, 1_794_200_200));
+    assert!(pending.release.is_empty());
+}
+
+/// An announced round is looked at with the build current (the pre-filter [`due`] asks), so the
+/// visit can release a round no build is ahead of ([`St::release_untargeted`]).
+#[test]
+fn an_announced_round_is_looked_at_with_the_build_current() {
+    let dir = scratch("due-announced-current");
     let mut opts = drive(&dir);
     opts.only_sid = Some(TAB.to_string());
     let tabs = the_tab();
@@ -9346,15 +8922,13 @@ fn an_announced_round_carrying_a_model_is_looked_at_with_the_build_current() {
         from: "1.0.0".to_string(),
         to: "1.0.0".to_string(),
         source: "managed".to_string(),
-        model_list: "claude-opus-5-5".to_string(),
         ..St::default()
     };
-    assert_eq!(look(&announced), Due::Yes, "the model's round is looked at");
-    let no_model = St {
-        model_list: String::new(),
-        ..announced.clone()
-    };
-    assert_eq!(look(&no_model), Due::No, "no model carried");
+    assert_eq!(
+        look(&announced),
+        Due::Yes,
+        "the announced round is looked at"
+    );
     let gave_up = St {
         phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
         ..announced.clone()
@@ -9794,7 +9368,6 @@ fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
         only_sid: Some(TAB.to_string()),
         ..drive(&dir)
     };
-    seed_builds(&opts);
     let versions = native_root(&opts.home);
     std::fs::create_dir_all(&versions).expect("versions");
     for build in ["2.1.281", "99.9.9"] {
@@ -10054,7 +9627,6 @@ fn a_restart_on_its_own_program_keeps_the_owners_hold_and_the_round_after_it_too
         Some(restart.clone()),
         &running,
         &build("2.1.300"),
-        None,
         Proc::default(),
         now,
     );
@@ -10066,7 +9638,6 @@ fn a_restart_on_its_own_program_keeps_the_owners_hold_and_the_round_after_it_too
         Some(restart),
         &running,
         &build("2.1.301"),
-        None,
         Proc::default(),
         now,
     );
@@ -10078,7 +9649,6 @@ fn a_restart_on_its_own_program_keeps_the_owners_hold_and_the_round_after_it_too
         Some(kept),
         &running,
         &build("2.1.300"),
-        None,
         Proc::default(),
         now,
     );
@@ -10089,14 +9659,7 @@ fn a_restart_on_its_own_program_keeps_the_owners_hold_and_the_round_after_it_too
         (skip.clone(), "s-0ther"),
     ] {
         let r = restarted(&upgrade_record(word.clone(), tab));
-        let next = St::for_target(
-            Some(r),
-            &running,
-            &build("2.1.300"),
-            None,
-            Proc::default(),
-            now,
-        );
+        let next = St::for_target(Some(r), &running, &build("2.1.300"), Proc::default(), now);
         assert!(
             !next.request.holds(&next.phase, "2.1.300", now),
             "{word:?} {tab}: {next:?}"
@@ -10147,7 +9710,6 @@ fn a_restart_that_stops_keeps_the_owners_skip_of_the_build_it_held_off() {
             Some(restart.clone()),
             &running,
             &build("2.1.300"),
-            None,
             Proc::default(),
             now,
         );
@@ -10160,7 +9722,6 @@ fn a_restart_that_stops_keeps_the_owners_skip_of_the_build_it_held_off() {
             Some(restart),
             &running,
             &build("2.1.301"),
-            None,
             Proc::default(),
             now,
         );
@@ -10172,7 +9733,6 @@ fn a_restart_that_stops_keeps_the_owners_skip_of_the_build_it_held_off() {
         Some(stopped),
         &running,
         &build("2.1.301"),
-        None,
         Proc::default(),
         now,
     );
@@ -10219,14 +9779,13 @@ fn a_restart_keeps_the_move_clock_only_of_a_record_about_the_build_it_keeps() {
     };
     let restart = restarted(&resumed_by_hand);
     assert_eq!(restart.behind_since(), now, "behind anew from the restart");
-    let next = St::for_target(Some(restart), &running, &newer, None, Proc::default(), now);
+    let next = St::for_target(Some(restart), &running, &newer, Proc::default(), now);
     assert_eq!(next.behind_since(), now, "the next build's round");
     assert_eq!(next.rung_at(now), upgrade::Rung::Prefer, "its first rung");
     let direct = St::for_target(
         Some(resumed_by_hand.clone()),
         &running,
         &newer,
-        None,
         Proc::default(),
         now,
     );
@@ -10270,7 +9829,6 @@ fn a_restart_keeps_the_move_clock_only_of_a_record_about_the_build_it_keeps() {
         Some(stopped_relaunch.clone()),
         &running,
         &newer,
-        None,
         Proc::default(),
         now,
     );
@@ -10292,9 +9850,9 @@ fn a_restart_keeps_the_move_clock_only_of_a_record_about_the_build_it_keeps() {
     let restart = restarted(&skipped);
     assert_eq!(restart.request_for(TAB), skip);
     assert_eq!(restart.behind_since(), now);
-    let next = St::for_target(Some(restart), &running, &newer, None, Proc::default(), now);
+    let next = St::for_target(Some(restart), &running, &newer, Proc::default(), now);
     assert!(next.request.holds(&next.phase, "2.1.300", now), "{next:?}");
-    let direct = St::for_target(Some(skipped), &running, &newer, None, Proc::default(), now);
+    let direct = St::for_target(Some(skipped), &running, &newer, Proc::default(), now);
     assert!(direct.request.holds_build("2.1.300", now), "{direct:?}");
 }
 
@@ -10328,7 +9886,6 @@ fn a_stopped_rounds_retarget_keeps_what_says_its_tui_was_told_to_wind_down() {
         Some(round(codex, refused, now - 3_600)),
         &running,
         &newer,
-        None,
         Proc::default(),
         now,
     );
@@ -10337,7 +9894,8 @@ fn a_stopped_rounds_retarget_keeps_what_says_its_tui_was_told_to_wind_down() {
         (now - 3_600, "")
     );
     let announced = St {
-        model_list: "gpt-5.5".to_string(),
+        from: "0.156.0".to_string(),
+        proc_start: "A".to_string(),
         ..round(
             codex,
             Phase::Announced {
@@ -10347,28 +9905,19 @@ fn a_stopped_rounds_retarget_keeps_what_says_its_tui_was_told_to_wind_down() {
             now - 3_600,
         )
     };
-    let (next, how) = St::retarget(
-        Some(announced),
-        &running,
-        &newer,
-        None,
-        Proc::default(),
-        now,
-    );
+    let (next, how) = St::retarget(Some(announced), &running, &newer, proc("A"), now);
     assert_eq!(how, Retarget::Anew);
     assert_eq!(next.noticed_at, now - 3_600);
     let rearmed = St {
-        model_list: "gpt-5.5".to_string(),
         last_stop: upgrade::GAVE_UP.to_string(),
         ..round(codex, Phase::Pending, 0)
     };
-    let next = St::for_target(Some(rearmed), &running, &newer, None, Proc::default(), now);
+    let next = St::for_target(Some(rearmed), &running, &newer, Proc::default(), now);
     assert_eq!(next.last_stop, upgrade::GAVE_UP);
     let next = St::for_target(
         Some(round(upgrade::Agent::Claude, gave_up, now - 3_600)),
         &running,
         &newer,
-        None,
         Proc::default(),
         now,
     );
@@ -10385,7 +9934,6 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
         only_sid: Some(TAB.to_string()),
         ..drive(&dir)
     };
-    seed_builds(&opts);
     std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("home");
     let project = opts.home.join(".claude/projects/-w");
     let later = "0badf00d-9999-2222-3333-444455556666";
@@ -10554,7 +10102,6 @@ impl DeadAgent {
             only_sid: Some(TAB.to_string()),
             ..drive(&dir)
         };
-        seed_builds(&opts);
         let sessions = opts.home.join(".claude/sessions");
         std::fs::create_dir_all(&sessions).expect("home");
         file_transcript_in(&opts.home.join(".claude"), "p");
@@ -10744,8 +10291,6 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
         ("", "told:stale-exit"),
         (CAUSE_UPGRADE_FRESH, "told:stale-exit"),
         (CAUSE_MEMORY, "refused:stale-exit"),
-        ("model:claude-fable-5-1", "refused:stale-exit"),
-        ("model-back:", "refused:stale-exit"),
     ] {
         save(
             &opts,
@@ -11559,7 +11104,6 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
         only_sid: Some(TAB.to_string()),
         ..drive(&dir)
     };
-    seed_builds(&opts);
     let mut shell = stand_in_shell();
     let mut agent = parked().spawn().expect("agent");
     wait_exec(agent.id());
@@ -11674,8 +11218,7 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A main-chain answer by `model` stamped `at` (RFC 3339): what the live
-/// model is read from past a process's start ([`models::live_model_at`]).
+/// A main-chain answer by `model` stamped `at` (RFC 3339), on Claude Code 2.1.283.
 #[cfg(unix)]
 fn answer_at(model: &str, at: &str) -> String {
     format!(
@@ -11722,31 +11265,36 @@ fn write_transcript(home: &Path, rows: &[String]) {
     .expect("transcript");
 }
 
-/// The model a person chose for `SESSION` with `/model`, as the harness's
-/// record remembers it past the answers that follow ([`ModelRecord::human`]).
+/// What an older build left on disk for `SESSION`, written as raw text: a model list and a
+/// per-session record that both name `claude-opus-5-5`.
 #[cfg(unix)]
-fn chose_by_hand(opts: &Opts, model: &str) {
-    let dir = state_dir(opts).join("models");
-    std::fs::create_dir_all(&dir).expect("models");
-    let rec = ModelRecord {
-        human: model.to_string(),
-        ..ModelRecord::default()
-    };
-    std::fs::write(dir.join(format!("{SESSION}.json")), rec.render()).expect("record");
+fn older_model_records(opts: &Opts) {
+    let dir = state_dir(opts);
+    std::fs::create_dir_all(dir.join("models")).expect("models");
+    std::fs::write(
+        dir.join("models.json"),
+        r#"{"priority":["claude-opus-5-5"],"history":[]}"#,
+    )
+    .expect("list");
+    std::fs::write(
+        dir.join("models").join(format!("{SESSION}.json")),
+        r#"{"human":"claude-opus-5-5","set":"claude-opus-5-5","applied":"claude-opus-5-5"}"#,
+    )
+    .expect("record");
 }
 
-/// A `/model` choice rides a memory restart only over a launch's `--model` (which overrides the
-/// default `/model` saves; driven: `a_restart_in_place_saves_the_fallback_origin_it_decides`).
+/// A memory restart of a launch that named no `--model` plans its line as the plain restart
+/// (`would-restart`), over a `/model` pick the transcript shows and an older build's model
+/// records.
 #[cfg(unix)]
 #[test]
-fn a_memory_restart_asks_no_hand_chosen_model_of_a_launch_that_named_none() {
-    let dir = scratch("memory-hand-model");
+fn a_memory_restart_of_a_launch_that_named_no_model_plans_the_plain_restart() {
+    let dir = scratch("memory-no-model");
     let opts = Opts {
         dry_run: true,
         only_sid: Some(TAB.to_string()),
         ..drive(&dir)
     };
-    seed_builds(&opts);
     let mut shell = stand_in_shell();
     let mut agent = parked().spawn().expect("agent");
     wait_exec(agent.id());
@@ -11774,9 +11322,12 @@ fn a_memory_restart_asks_no_hand_chosen_model_of_a_launch_that_named_none() {
     register(&opts.home, agent.id(), SESSION);
     write_transcript(
         &opts.home,
-        &[answer_at("claude-opus-5-5", "2099-01-01T00:00:00Z")],
+        &[
+            user_row("<local-command-stdout>Set model to `Opus 5.5`</local-command-stdout>"),
+            answer_at("claude-opus-5-5", "2099-01-01T00:00:00Z"),
+        ],
     );
-    chose_by_hand(&opts, "claude-opus-5-5");
+    older_model_records(&opts);
     assert_eq!(
         restart_from(
             &opts,
@@ -11793,301 +11344,6 @@ fn a_memory_restart_asks_no_hand_chosen_model_of_a_launch_that_named_none() {
     let _ = shell.kill();
     let _ = shell.wait();
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A stalled agent ended with no record left takes its process start from the host's snapshot.
-#[cfg(unix)]
-#[test]
-fn an_exit_relaunch_with_no_record_carries_no_choice_older_than_the_process() {
-    let mut a = DeadAgent::new("exit-hand-older");
-    a.snap.argv = ["/opt/claude/bin/claude", "--model", "claude-sonnet-5"]
-        .iter()
-        .map(|w| (*w).to_string())
-        .collect();
-    chose_by_hand(&a.opts, "claude-opus-5-5");
-    let stalled = |a: &DeadAgent| {
-        after_exit(
-            &a.opts,
-            &a.snap,
-            &ExitRecord::Removed,
-            true,
-            Some(super::super::restart_stamp::Cause::Stall),
-        )
-    };
-    write_transcript(
-        &a.opts.home,
-        &[answer_at("claude-opus-5-5", "2026-09-23T00:00:00Z")],
-    );
-    assert_eq!(stalled(&a).step, "would-relaunch");
-    write_transcript(
-        &a.opts.home,
-        &[answer_at("claude-opus-5-5", "2026-09-25T00:00:00Z")],
-    );
-    assert_eq!(stalled(&a).step, "would-relaunch:model=claude-opus-5-5");
-}
-
-/// The way back outlives a memory restart.
-#[test]
-fn the_way_back_from_a_fallback_returns_to_the_launched_model_across_a_memory_restart() {
-    let launched = "claude-fable-5-1";
-    let fallback = "claude-opus-5";
-    let fell = model_restart(
-        &Restart::Model {
-            to: fallback.to_string(),
-        },
-        None,
-        launched.to_string(),
-        None,
-        None,
-    );
-    assert_eq!(fell.model.as_deref(), Some(fallback));
-    let memory = model_restart(
-        &Restart::Memory,
-        Some(&saved_restart(&fell)),
-        fallback.to_string(),
-        None,
-        None,
-    );
-    assert_eq!(memory.cause, "memory");
-    assert_eq!(memory.model, None);
-    assert_eq!(memory.fallback_from.as_deref(), Some(launched));
-    let back = model_restart(
-        &Restart::ModelBack { to: None },
-        Some(&saved_restart(&memory)),
-        fallback.to_string(),
-        None,
-        None,
-    );
-    assert_eq!(back.model.as_deref(), Some(launched));
-    assert_eq!(back.cause, format!("model-back:{launched}"));
-    let argv = |w: &[&str]| w.iter().map(|a| (*a).to_string()).collect::<Vec<_>>();
-    assert_eq!(
-        with_model(
-            argv(&["--model", fallback, "--resume", SESSION]),
-            back.model.as_deref()
-        ),
-        argv(&["--model", launched, "--resume", SESSION])
-    );
-    assert_eq!(fallback_origin(&saved_restart(&back)), None);
-    let again = model_restart(
-        &Restart::ModelBack { to: None },
-        Some(&saved_restart(&back)),
-        launched.to_string(),
-        None,
-        None,
-    );
-    assert_eq!(again.model.as_deref(), Some(""), "no fallback: none");
-    let second = model_restart(
-        &Restart::Model {
-            to: "claude-sonnet-5".to_string(),
-        },
-        Some(&saved_restart(&memory)),
-        fallback.to_string(),
-        None,
-        None,
-    );
-    assert_eq!(second.fallback_from.as_deref(), Some(launched));
-    let legacy = St {
-        phase: Phase::Done,
-        cause: format!("model:{fallback}"),
-        launch_model: launched.to_string(),
-        ..St::default()
-    };
-    assert_eq!(fallback_origin(&legacy).as_deref(), Some(launched));
-}
-
-/// The way back prefers what the person had over the notice's alias.
-#[test]
-fn the_way_back_prefers_the_persons_model_over_the_notices_alias() {
-    let launched = "claude-fable-5-1[1m]";
-    let fell = model_restart(
-        &Restart::Model {
-            to: "claude-opus-5-5".to_string(),
-        },
-        None,
-        launched.to_string(),
-        None,
-        None,
-    );
-    let named = || Restart::ModelBack {
-        to: Some("fable".to_string()),
-    };
-    let back = model_restart(
-        &named(),
-        Some(&saved_restart(&fell)),
-        "claude-opus-5-5".to_string(),
-        None,
-        None,
-    );
-    assert_eq!(back.model.as_deref(), Some(launched), "the exact origin");
-    let chosen = model_restart(
-        &named(),
-        Some(&saved_restart(&fell)),
-        "claude-opus-5-5".to_string(),
-        None,
-        Some("claude-sonnet-5-5".to_string()),
-    );
-    assert_eq!(
-        chosen.model.as_deref(),
-        Some("claude-sonnet-5-5"),
-        "a /model since the fallback is kept"
-    );
-    let bare = model_restart(
-        &Restart::Model {
-            to: "claude-opus-5-5".to_string(),
-        },
-        None,
-        String::new(),
-        None,
-        None,
-    );
-    let to_default = model_restart(
-        &named(),
-        Some(&saved_restart(&bare)),
-        "claude-opus-5-5".to_string(),
-        None,
-        None,
-    );
-    assert_eq!(to_default.model.as_deref(), Some(""));
-    let alias = model_restart(&named(), None, "claude-opus-5-5".to_string(), None, None);
-    assert_eq!(alias.model.as_deref(), Some("fable"));
-}
-
-/// The record a restart saves, as the state file keeps it.
-fn saved_restart(r: &super::super::relaunch::ModelRestart) -> St {
-    let st = St {
-        phase: Phase::Done,
-        cause: r.cause.clone(),
-        launch_model: r.launch_model.clone(),
-        fallback_from: r.fallback_from.clone(),
-        ..St::default()
-    };
-    St::from_json(&st.to_json()).expect("the record reads back")
-}
-
-/// A fallback from a launch that named no model still stands (recorded apart from the model it
-/// replaced).
-#[test]
-fn a_second_fallback_from_a_launch_with_no_model_goes_back_to_no_model() {
-    let first = model_restart(
-        &Restart::Model {
-            to: "claude-opus-5".to_string(),
-        },
-        None,
-        String::new(),
-        None,
-        None,
-    );
-    assert_eq!(
-        fallback_origin(&saved_restart(&first)).as_deref(),
-        Some(""),
-        "a fallback stands, from no model"
-    );
-    let second = model_restart(
-        &Restart::Model {
-            to: "claude-sonnet-5".to_string(),
-        },
-        Some(&saved_restart(&first)),
-        "claude-opus-5".to_string(),
-        None,
-        None,
-    );
-    let back = model_restart(
-        &Restart::ModelBack { to: None },
-        Some(&saved_restart(&second)),
-        "claude-sonnet-5".to_string(),
-        None,
-        None,
-    );
-    assert_eq!(
-        back.model.as_deref(),
-        Some(""),
-        "drop --model: Claude's default"
-    );
-    assert_eq!(
-        with_model(
-            vec!["--model".into(), "claude-sonnet-5".into()],
-            back.model.as_deref()
-        ),
-        Vec::<String>::new()
-    );
-}
-
-/// A `/model` made with no fallback standing is no fallback's origin.
-#[test]
-fn a_hand_choice_with_no_fallback_standing_is_no_fallbacks_origin() {
-    let dir = scratch("hand-over-fallback");
-    let opts = drive(&dir);
-    std::fs::create_dir_all(state_dir(&opts)).expect("state");
-    save(
-        &opts,
-        SESSION,
-        &St {
-            phase: Phase::Done,
-            ..St::default()
-        },
-    );
-    assert_eq!(
-        exit_fallback(&opts, SESSION, None, Some("claude-sonnet-5")),
-        None
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The way back outlives an upgrade.
-#[test]
-fn an_upgrade_record_keeps_the_fallbacks_origin() {
-    let from = Version::parse("2.1.280").expect("v");
-    let to = Candidate {
-        exe: PathBuf::from("/pkg/agents/claude"),
-        version: Version::parse("2.1.283").expect("v"),
-        source: Source::Managed,
-    };
-    let fell = saved_restart(&model_restart(
-        &Restart::Model {
-            to: "claude-opus-5".to_string(),
-        },
-        None,
-        "claude-fable-5-1".to_string(),
-        None,
-        None,
-    ));
-    let pending = St {
-        phase: Phase::Pending,
-        to: "2.1.282".to_string(),
-        ..fell.clone()
-    };
-    for (name, prior) in [("done", fell.clone()), ("retargeted", pending)] {
-        let next = St::for_target(Some(prior), &from, &to, None, Proc::default(), 900);
-        assert_eq!(
-            fallback_origin(&next).as_deref(),
-            Some("claude-fable-5-1"),
-            "{name}"
-        );
-    }
-    let mut legacy = St {
-        phase: Phase::Failed("unanswered".to_string()),
-        cause: "model:claude-opus-5".to_string(),
-        launch_model: "claude-fable-5-1".to_string(),
-        ..St::default()
-    };
-    legacy.rearm(900);
-    assert_eq!(
-        fallback_origin(&legacy).as_deref(),
-        Some("claude-fable-5-1")
-    );
-    let none = St::for_target(
-        Some(St {
-            phase: Phase::Done,
-            ..St::default()
-        }),
-        &from,
-        &to,
-        None,
-        Proc::default(),
-        900,
-    );
-    assert_eq!(fallback_origin(&none), None);
 }
 
 /// The profile context a live snapshot captures of an agent started under the test's own home,
@@ -12114,32 +11370,11 @@ fn live_profile(opts: &Opts, login: Option<&str>) -> super::super::profile::Cont
     context
 }
 
-/// A restart in place of a stand-in agent launched `--model <launch>`,
-/// driven for real ([`restart_with`], its job and terminal scripted): the
-/// conversation's last record `prior`, a `/model` of `hand` answered since
-/// the agent started — and what it says, and the record it saved.
-#[cfg(unix)]
-fn restart_saved(
-    name: &str,
-    why: &Restart,
-    launch: &str,
-    prior: Option<&St>,
-    hand: Option<&str>,
-) -> (Report, Option<St>) {
-    restart_saved_as(
-        name,
-        why,
-        launch,
-        prior,
-        hand,
-        None,
-        &crate::harness::accounts::Roster::default(),
-    )
-}
-
-/// [`restart_saved`] of an agent whose own exec environment named `login`
-/// ([`Snapshot::login`]), by a host that keeps `roster`
-/// ([`crate::harness::relaunch::restart_as`]).
+/// A restart in place of a stand-in agent launched `--model <launch>`, driven for real
+/// ([`crate::harness::relaunch::restart_as`], its job and terminal scripted): the conversation's
+/// last record `prior`, its transcript answering on `launch`, the agent's own exec environment
+/// naming `login` ([`Snapshot::login`]) and a host that keeps `roster` — and what it says, and
+/// the record it saved.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn restart_saved_as(
@@ -12147,20 +11382,10 @@ fn restart_saved_as(
     why: &Restart,
     launch: &str,
     prior: Option<&St>,
-    hand: Option<&str>,
     login: Option<&str>,
     roster: &crate::harness::accounts::Roster,
 ) -> (Report, Option<St>) {
-    restart_saved_on(
-        name,
-        why,
-        launch,
-        prior,
-        hand,
-        login,
-        roster,
-        Answers::default(),
-    )
+    restart_saved_on(name, why, launch, prior, login, roster, Answers::default())
 }
 
 /// [`restart_saved_as`] with the tab's stand-in answering as `answers` says (the screen it draws).
@@ -12171,12 +11396,11 @@ fn restart_saved_on(
     why: &Restart,
     launch: &str,
     prior: Option<&St>,
-    hand: Option<&str>,
     login: Option<&str>,
     roster: &crate::harness::accounts::Roster,
     answers: Answers,
 ) -> (Report, Option<St>) {
-    restart_saved_until(name, why, launch, prior, hand, login, roster, answers, None)
+    restart_saved_until(name, why, launch, prior, login, roster, answers, None)
 }
 
 /// The native restart with its account owner retiring at one cancellation check.
@@ -12187,14 +11411,13 @@ fn restart_saved_until(
     why: &Restart,
     launch: &str,
     prior: Option<&St>,
-    hand: Option<&str>,
     login: Option<&str>,
     roster: &crate::harness::accounts::Roster,
     answers: Answers,
     cancel_at: Option<usize>,
 ) -> (Report, Option<St>) {
     let (r, saved, _) = restart_driven(
-        name, why, launch, prior, hand, login, roster, answers, false, cancel_at,
+        name, why, launch, prior, login, roster, answers, false, cancel_at,
     );
     (r.report, saved)
 }
@@ -12209,7 +11432,6 @@ fn restart_driven(
     why: &Restart,
     launch: &str,
     prior: Option<&St>,
-    hand: Option<&str>,
     login: Option<&str>,
     roster: &crate::harness::accounts::Roster,
     answers: Answers,
@@ -12223,7 +11445,6 @@ fn restart_driven(
         only_sid: Some(TAB.to_string()),
         ..drive(&dir)
     };
-    seed_builds(&opts);
     let mut shell = stand_in_shell_with(None, &[OUTSIDE_ROUTE]);
     let mut agent = parked_bare().spawn().expect("agent");
     wait_exec(agent.id());
@@ -12237,11 +11458,7 @@ fn restart_driven(
         let _ = std::fs::remove_file(&record);
         std::fs::create_dir(&record).expect("a directory at the claim path");
     }
-    let answered = hand.unwrap_or(launch);
-    write_transcript(&opts.home, &[answer_at(answered, "2099-01-01T00:00:00Z")]);
-    if let Some(hand) = hand {
-        chose_by_hand(&opts, hand);
-    }
+    write_transcript(&opts.home, &[answer_at(launch, "2099-01-01T00:00:00Z")]);
     let snap = Snapshot {
         launch_env: None,
         auth_observed: true,
@@ -12329,7 +11546,6 @@ fn a_restart_in_place_signals_only_once_its_claim_is_written() {
         launch,
         None,
         None,
-        None,
         &roster,
         Answers::default(),
         true,
@@ -12349,7 +11565,6 @@ fn a_restart_in_place_signals_only_once_its_claim_is_written() {
         "claim-written",
         &Restart::Memory,
         launch,
-        None,
         None,
         None,
         &roster,
@@ -12481,7 +11696,6 @@ fn restart_asked_with(
         hand_back: true,
         ..drive(&dir)
     };
-    seed_builds(&opts);
     let mut shell = stand_in_shell();
     let mut agent = parked_bare().spawn().expect("agent");
     wait_exec(agent.id());
@@ -12861,8 +12075,8 @@ fn idle_under(above: &[&str]) -> String {
 /// AT THE SIGNAL (ATERM-KI-1101-3): the restart's own check before its signal reads the screen
 /// again, and a done row naming a background agent still running (` · 1 local agent still
 /// running`, at an idle turn's end or under a weekly limit's notice: work Claude Code runs in its
-/// own process, which no process row names) holds a lost line's restart, a model's move, its way
-/// back and an account move: `wait:changed`, nothing signalled, nothing claimed. The loop's read
+/// own process, which no process row names) holds a lost line's restart and an account move:
+/// `wait:changed`, nothing signalled, nothing claimed. The loop's read
 /// of the line's rest (`custody::Rest::working`) reads the same screen, but the screen can change
 /// between that read and the signal. A memory restart is the remedy for that very process's
 /// memory, whose in-process work its crash would end anyway: it signals over it. The wait Claude
@@ -12898,18 +12112,6 @@ fn no_restart_but_the_memory_restart_signals_over_the_agents_own_work_its_screen
                 },
             ),
             (
-                "model",
-                Restart::Model {
-                    to: "claude-sonnet-5-5".to_string(),
-                },
-            ),
-            (
-                "model-back",
-                Restart::ModelBack {
-                    to: Some("claude-sonnet-5-5".to_string()),
-                },
-            ),
-            (
                 "account",
                 Restart::Account {
                     to: "work-2".to_string(),
@@ -12938,7 +12140,6 @@ fn no_restart_but_the_memory_restart_signals_over_the_agents_own_work_its_screen
                     &name,
                     &why,
                     "claude-fable-5-1",
-                    None,
                     None,
                     None,
                     &roster,
@@ -13011,14 +12212,13 @@ fn a_restart_asked_while_its_asker_is_exiting_waits_on_that_exit() {
 
 /// A RESTART THAT NAMES NO PROCESS, ASKED AGAIN OVER ITS OWN RECORD, CARRIES IT: the restart's
 /// relaunch answered a wait (the process it started not yet registered within the held wait, or
-/// its ledger's evidence unread), so the loop asks it again under the same ask (on its back-off,
-/// or for a way back put off to a quiet moment at a later turn end), and the conversation's record
-/// is that restart's own, `Relaunched` and landed in the asker (adopted, or
-/// not yet), claimed by an ask of that restart (`St::ask`, the [`RestartAsk`] every ask of it
-/// carries). Made over it, the restart would end the very process it started; carried, it adopts
-/// that process: `adopted`, nothing signalled, the asker running on, the record its own. A memory
-/// restart's, a model's move's and its way back's alike, each asked in the run that claimed it,
-/// and a lost line's whose line was written where the host named no process, asked again for the
+/// its ledger's evidence unread), so the loop asks it again under the same ask (on its back-off),
+/// and the conversation's record is that restart's own, `Relaunched` and landed in the asker
+/// (adopted, or not yet), claimed by an ask of that restart (`St::ask`, the [`RestartAsk`] every
+/// ask of it carries). Made over it, the restart would end the very process it started; carried,
+/// it adopts that process: `adopted`, nothing signalled, the asker running on, the record its own.
+/// A memory restart's, asked in the run that claimed it, and a lost line's whose line was written
+/// where the host named no process, asked again for the
 /// line an ask of it claimed the record for (`Restart::InputLost { of: (None, None), line }`),
 /// which [`crate::harness::relaunch::asked_of`] takes as asked of whatever process holds the tab:
 /// superseded, its re-ask would signal the process its first ask had started, a second relaunch
@@ -13031,24 +12231,15 @@ fn a_restart_asked_while_its_asker_is_exiting_waits_on_that_exit() {
 #[test]
 fn a_restart_asked_again_over_its_own_record_carries_it() {
     let mut wrong = Vec::new();
-    for (tag, cause) in [
-        ("memory", "memory"),
-        ("model", "model:claude-fable-5-2"),
-        ("model-back", "model-back:claude-opus-5-5"),
-        ("input-lost", "input-lost"),
-    ] {
+    for (tag, cause) in [("memory", "memory"), ("input-lost", "input-lost")] {
         for adopted in [true, false] {
             let name = format!("own-{tag}-{adopted}");
             let why = |_| match tag {
                 "memory" => Restart::Memory,
-                "model" => Restart::Model {
-                    to: "claude-fable-5-2".to_string(),
-                },
-                "input-lost" => Restart::InputLost {
+                _ => Restart::InputLost {
                     of: (None, None),
                     line: LINE_A,
                 },
-                _ => Restart::ModelBack { to: None },
             };
             let own = why(0);
             let (r, saved, asked, runs) = restart_over(&name, why, |agent, _| St {
@@ -13084,13 +12275,11 @@ fn a_restart_asked_again_over_its_own_record_carries_it() {
 /// A RESTART ASKED AGAIN OVER ITS OWN RECORD ALREADY CARRIED ON IS MADE (ATERM-KI-1101-3): the
 /// restart's relaunch answered a wait once its signal had gone (`wait:resume`, the process it
 /// started not registered within the held wait; `wait:exiting`; `wait:shell-prompt`), so the
-/// loop asks it again under the same ask (on its back-off, or for a move put off to a quiet
-/// moment at a later turn end), and before that ask the sweep carried the relaunch on, booking
-/// the record `Done`. Only a record in flight was carried (`St::in_flight`), so this one fell
-/// through to a fresh restart: the process the restart's own relaunch had started was signalled
-/// again, a second relaunch for one restart (a memory restart's, a lost line's whose line named
-/// no process), or a model's move and its way back went past the record to their own path, which
-/// this stand-in's profile refuses for billing (`refused:model-…`). Now a `Done` record that is
+/// loop asks it again under the same ask (on its back-off), and before that ask the sweep carried
+/// the relaunch on, booking the record `Done`. Only a record in flight was carried
+/// (`St::in_flight`), so this one fell through to a fresh restart: the process the restart's own
+/// relaunch had started was signalled again, a second relaunch for one restart (a memory
+/// restart's, a lost line's whose line named no process). Now a `Done` record that is
 /// the asked restart's own ([`crate::harness::relaunch::its_own`]: of its cause, claimed by an
 /// ask of it) and landed in the asker (adopted, `relaunched_pid`, or the process its line started
 /// by its parent, up by the time the record was carried on) answers
@@ -13100,29 +12289,19 @@ fn a_restart_asked_again_over_its_own_record_carries_it() {
 /// own record whose relaunch landed in another process than the asker, and its own record whose
 /// asker, a child of the record's shell on the same conversation, started after the record was
 /// carried on (`claude -c` typed once the relaunch ended: another launch, not the relaunch, which
-/// was made of it on that code); each restarted over takes the claim where it signals, and holds
-/// none where it is refused (the record as it stood, the old code saying it claimed).
+/// was made of it on that code); each restarted over is signalled and takes the claim.
 #[cfg(unix)]
 #[test]
 fn a_restart_asked_again_over_its_own_record_already_carried_on_is_made() {
     use crate::harness::relaunch::ALREADY_MADE;
     let mut wrong = Vec::new();
-    for (tag, cause) in [
-        ("memory", "memory"),
-        ("model", "model:claude-fable-5-2"),
-        ("model-back", "model-back:claude-opus-5-5"),
-        ("input-lost", "input-lost"),
-    ] {
+    for (tag, cause) in [("memory", "memory"), ("input-lost", "input-lost")] {
         let of = |line| match tag {
             "memory" => Restart::Memory,
-            "model" => Restart::Model {
-                to: "claude-fable-5-2".to_string(),
-            },
-            "input-lost" => Restart::InputLost {
+            _ => Restart::InputLost {
                 of: (None, None),
                 line,
             },
-            _ => Restart::ModelBack { to: None },
         };
         let why = of(LINE_A);
         let own = ask_of(&why);
@@ -13169,15 +12348,7 @@ fn a_restart_asked_again_over_its_own_record_already_carried_on_is_made() {
                         st.phase == Phase::Done && st.ask == own.word() && st.cause == cause
                     })
             } else {
-                let refused = r.report.step.starts_with("refused:model-");
-                r.report.step != ALREADY_MADE
-                    && (signalled || refused)
-                    && r.claim
-                        == if signalled {
-                            RestartClaim::Taken
-                        } else {
-                            RestartClaim::Unclaimed
-                        }
+                r.report.step != ALREADY_MADE && signalled && r.claim == RestartClaim::Taken
             };
             if !ok {
                 wrong.push(format!(
@@ -13205,9 +12376,7 @@ fn a_restart_asked_again_over_its_own_record_already_carried_on_is_made() {
 #[cfg(unix)]
 #[test]
 fn a_restart_asked_over_its_own_record_in_another_tab_holds_no_claim() {
-    let why = Restart::Model {
-        to: "claude-fable-5-2".to_string(),
-    };
+    let why = Restart::Memory;
     let Asks { said, asked, .. } = restart_asked(
         "own-record-other-tab",
         |_| vec![(why.clone(), Scene::default())],
@@ -13216,7 +12385,7 @@ fn a_restart_asked_over_its_own_record_in_another_tab_holds_no_claim() {
             pid: dead_pid(),
             shell: std::process::id(),
             tab: "s-another-tab".to_string(),
-            cause: "model:claude-fable-5-2".to_string(),
+            cause: "memory".to_string(),
             ask: ask_of(&why).word().to_string(),
             exited_at: now_s() - 3,
             ..St::default()
@@ -13241,18 +12410,16 @@ fn a_restart_asked_over_its_own_record_in_another_tab_holds_no_claim() {
 }
 
 /// A RESTART ASKED OVER AN EARLIER RESTART'S LANDED RECORD OF ITS CAUSE IS MADE OF ITS ASKER
-/// (ATERM-KI-1101-3): the conversation's record is an earlier memory restart's, an earlier move
-/// onto the same model's or an earlier way back's, `Relaunched` in the very process that now asks
-/// (adopted, `relaunched_pid`, or not yet), its carry-on still owed (a line held in custody keeps
-/// it so past `CARRY_HOLD`), and the loop asks that restart again in a later run: Claude Code's
-/// critical-memory banner in the process the earlier restart started, say. That record is no
-/// restart of this ask's: carried, its held wait finds the asker and answers `adopted`, nothing
-/// signalled, and the loop books a restart that left the process it was asked for running (and,
-/// for a line held where the host named no process, settles that line as ended). So the ask
-/// supersedes it as any other cause's record: the asker is signalled under the asked restart's own
-/// claim, which keeps its ask (`St::ask`); a model's move or its way back, past the record, meets
-/// its own billing check, which this stand-in's profile refuses (`refused:model-…`), its word and
-/// never the carried record's. Only a record an ask of the same restart claimed is carried
+/// (ATERM-KI-1101-3): the conversation's record is an earlier memory restart's, `Relaunched` in
+/// the very process that now asks (adopted, `relaunched_pid`, or not yet), its carry-on still
+/// owed (a line held in custody keeps it so past `CARRY_HOLD`), and the loop asks that restart
+/// again in a later run: Claude Code's critical-memory banner in the process the earlier restart
+/// started, say. That record is no restart of this ask's: carried, its held wait finds the asker
+/// and answers `adopted`, nothing signalled, and the loop books a restart that left the process
+/// it was asked for running (and, for a line held where the host named no process, settles that
+/// line as ended). So the ask supersedes it as any other cause's record: the asker is signalled
+/// under the asked restart's own claim, which keeps its ask (`St::ask`). Only a record an ask of
+/// the same restart claimed is carried
 /// ([`a_restart_asked_again_over_its_own_record_carries_it`]). Before, the cause alone decided:
 /// each case answered `adopted`, `signalled=false`, the asker running (shown for the memory
 /// restart, adopted or not). Negative control: the ask ignored in `relaunch::its_own` (the cause
@@ -13261,58 +12428,36 @@ fn a_restart_asked_over_its_own_record_in_another_tab_holds_no_claim() {
 #[test]
 fn a_restart_asked_over_an_earlier_restarts_landed_record_of_its_cause_is_made_of_its_asker() {
     let mut wrong = Vec::new();
-    for (tag, cause, why) in [
-        ("memory", "memory", Restart::Memory),
-        (
-            "model",
-            "model:claude-fable-5-2",
-            Restart::Model {
-                to: "claude-fable-5-2".to_string(),
+    let why = Restart::Memory;
+    let earlier = RestartAsk::of(&why, RUN_AT - 600);
+    for adopted in [true, false] {
+        let name = format!("earlier-memory-{adopted}");
+        let (r, saved, asked, runs) = restart_over(
+            &name,
+            |_| why.clone(),
+            |agent, _| St {
+                phase: Phase::Relaunched { at_s: now_s() },
+                pid: dead_pid(),
+                shell: std::process::id(),
+                tab: TAB.to_string(),
+                cause: "memory".to_string(),
+                ask: earlier.word().to_string(),
+                exited_at: now_s() - 3,
+                relaunched_pid: if adopted { agent } else { 0 },
+                ..St::default()
             },
-        ),
-        (
-            "model-back",
-            "model-back:claude-opus-5-5",
-            Restart::ModelBack { to: None },
-        ),
-    ] {
-        let earlier = RestartAsk::of(&why, RUN_AT - 600);
-        for adopted in [true, false] {
-            let name = format!("earlier-{tag}-{adopted}");
-            let (r, saved, asked, runs) = restart_over(
-                &name,
-                |_| why.clone(),
-                |agent, _| St {
-                    phase: Phase::Relaunched { at_s: now_s() },
-                    pid: dead_pid(),
-                    shell: std::process::id(),
-                    tab: TAB.to_string(),
-                    cause: cause.to_string(),
-                    ask: earlier.word().to_string(),
-                    exited_at: now_s() - 3,
-                    relaunched_pid: if adopted { agent } else { 0 },
-                    ..St::default()
-                },
-            );
-            let signalled = asked.iter().any(|l| l.contains(" signal "));
-            let claimed = saved
-                .as_ref()
-                .is_some_and(|st| st.ask == ask_of(&why).word() && st.pid == r.pid && r.pid != 0);
-            let truthful = !runs || r.step.starts_with("wait:");
-            // A model's move is refused here for its billing past the record (the stand-in's
-            // profile bills it to credits): its own word, never the carried record's `adopted`.
-            let made = if tag == "memory" {
-                signalled && claimed && truthful
-            } else {
-                r.step.starts_with("refused:model-") && !signalled
-            };
-            if !made {
-                wrong.push(format!(
-                    "{name}: {:?} signalled={signalled} claimed={claimed} runs={runs} saved={:?}",
-                    r.step,
-                    saved.map(|st| (st.phase, st.cause, st.ask, st.pid, st.relaunched_pid))
-                ));
-            }
+        );
+        let signalled = asked.iter().any(|l| l.contains(" signal "));
+        let claimed = saved
+            .as_ref()
+            .is_some_and(|st| st.ask == ask_of(&why).word() && st.pid == r.pid && r.pid != 0);
+        let truthful = !runs || r.step.starts_with("wait:");
+        if !(signalled && claimed && truthful) {
+            wrong.push(format!(
+                "{name}: {:?} signalled={signalled} claimed={claimed} runs={runs} saved={:?}",
+                r.step,
+                saved.map(|st| (st.phase, st.cause, st.ask, st.pid, st.relaunched_pid))
+            ));
         }
     }
     assert!(
@@ -13327,7 +12472,7 @@ fn a_restart_asked_over_an_earlier_restarts_landed_record_of_its_cause_is_made_o
 /// still bound in it (`St::native`), which the host has committed. Carrying the record observes
 /// and completes that operation (`native_restart::complete`), so it is carried; but its held wait
 /// then finds the asker and answered `adopted`, nothing signalled, and the loop books a memory
-/// restart, a model's move and its way back on that word: the restart asked was never made, the
+/// restart on that word: the restart asked was never made, the
 /// process it was asked for left running (a lost line's, its process named, stood asked). Now
 /// the carry answers `wait:native-carried`, a deferral the loop asks again under the same ask (on
 /// its back-off, or for a move put off to a quiet moment at a later turn end), the native move
@@ -13431,81 +12576,11 @@ fn a_retired_account_selection_stops_before_connect_and_before_signal() {
             "sonnet",
             None,
             None,
-            None,
             &roster,
             Answers::default(),
             Some(check),
         );
         assert_eq!(report.step, "wait:account-changed", "check {check}");
-    }
-}
-
-/// The restart in place saves the fallback origin it decides ([`restart_from`] into
-/// [`model_restart`]), driven past its signal.
-#[cfg(unix)]
-#[test]
-fn a_restart_in_place_saves_the_fallback_origin_it_decides() {
-    let origin = "claude-fable-5-1";
-    let fallback = "claude-sonnet-5-5";
-    let hand = "claude-opus-5-5";
-    let fell = saved_restart(&model_restart(
-        &Restart::Model {
-            to: fallback.to_string(),
-        },
-        None,
-        origin.to_string(),
-        None,
-        None,
-    ));
-    for (name, why, launch, prior, chose, asks, want) in [
-        (
-            "saved-memory-hand",
-            Restart::Memory,
-            fallback,
-            Some(&fell),
-            Some(hand),
-            hand,
-            hand,
-        ),
-        (
-            "saved-memory-nobody",
-            Restart::Memory,
-            fallback,
-            Some(&fell),
-            None,
-            fallback,
-            origin,
-        ),
-        (
-            "saved-fallback-hand",
-            Restart::Model {
-                to: fallback.to_string(),
-            },
-            origin,
-            None,
-            Some(hand),
-            fallback,
-            hand,
-        ),
-    ] {
-        let (r, saved) = restart_saved(name, &why, launch, prior, chose);
-        let saved = saved.unwrap_or_else(|| panic!("{name}: no record: {r:?}"));
-        assert!(
-            !matches!(saved.phase, Phase::Pending | Phase::Done),
-            "{name}: signalled: {r:?} {saved:?}"
-        );
-        assert_eq!(saved.fallback_from.as_deref(), Some(want), "{name}: {r:?}");
-        assert!(
-            saved.line.contains(&format!("'--model' '{asks}'")),
-            "{name}: {}",
-            saved.line
-        );
-        assert_eq!(
-            saved.line.contains("'CLAUDE_CODE_CUSTOM_OAUTH_URL='"),
-            matches!(why, Restart::Model { .. }),
-            "{name}: {}",
-            saved.line
-        );
     }
 }
 
@@ -13550,8 +12625,7 @@ fn a_restart_in_place_types_back_the_login_its_process_had() {
         ),
         ("login-memory-none", None, line("")),
     ] {
-        let (r, saved) =
-            restart_saved_as(name, &Restart::Memory, launch, None, None, login, &roster);
+        let (r, saved) = restart_saved_as(name, &Restart::Memory, launch, None, login, &roster);
         let saved = saved.unwrap_or_else(|| panic!("{name}: no record: {r:?}"));
         assert_eq!(saved.line, want, "{name}");
         assert_eq!(saved.login.as_deref(), login, "{name}");
@@ -13572,7 +12646,8 @@ fn a_restart_in_place_types_back_the_login_its_process_had() {
 }
 
 /// An account move types the target's login from the roster (`work-2`'s directory, or the empty
-/// value for `main`, the row with none) and records `account:<label>`.
+/// value for `main`, the row with none) and records `account:<label>`; its line keeps the launch's
+/// own `--model`, once.
 #[cfg(unix)]
 #[test]
 fn an_account_move_types_the_rosters_login_and_a_label_nobody_lists_is_refused() {
@@ -13587,7 +12662,6 @@ fn an_account_move_types_the_rosters_login_and_a_label_nobody_lists_is_refused()
         "account-to-work",
         &to("work-2"),
         launch,
-        None,
         None,
         None,
         &roster,
@@ -13608,7 +12682,6 @@ fn an_account_move_types_the_rosters_login_and_a_label_nobody_lists_is_refused()
         &to("main"),
         launch,
         None,
-        None,
         Some(LOGIN_DIR),
         &roster,
     );
@@ -13625,33 +12698,17 @@ fn an_account_move_types_the_rosters_login_and_a_label_nobody_lists_is_refused()
         (saved.cause.as_str(), saved.login.as_deref()),
         ("account:main", Some(""))
     );
-    let origin = "claude-fable-5-1";
-    let fallback = "claude-sonnet-5-5";
-    let fell = saved_restart(&model_restart(
-        &Restart::Model {
-            to: fallback.to_string(),
-        },
-        None,
-        origin.to_string(),
-        None,
-        None,
-    ));
-    let (r, saved) = restart_saved_as(
-        "account-way-back",
-        &to("work-2"),
-        fallback,
-        Some(&fell),
-        None,
-        None,
-        &roster,
+    assert_eq!(
+        saved.line.matches("'--model'").count(),
+        1,
+        "the launch's own model, once: {}",
+        saved.line
     );
-    let saved = saved.unwrap_or_else(|| panic!("no record: {r:?}"));
     assert!(
-        saved.line.contains(&format!("'--model' '{origin}'")),
+        saved.line.contains(&format!("'--model' '{launch}'")),
         "{}",
         saved.line
     );
-    assert_eq!(saved.fallback_from, None, "{r:?}");
     for (name, roster) in [
         ("account-not-listed", &roster),
         (
@@ -13659,7 +12716,7 @@ fn an_account_move_types_the_rosters_login_and_a_label_nobody_lists_is_refused()
             &crate::harness::accounts::Roster::default(),
         ),
     ] {
-        let (r, saved) = restart_saved_as(name, &to("pool-a"), launch, None, None, None, roster);
+        let (r, saved) = restart_saved_as(name, &to("pool-a"), launch, None, None, roster);
         assert_eq!(r.step, "refused:account-not-listed", "{name}");
         assert_eq!(saved, None, "{name}");
     }
@@ -13719,7 +12776,6 @@ fn an_account_move_is_relaunched_over_a_sign_in_menu() {
         launch,
         None,
         None,
-        None,
         &roster,
         drawn(&menu),
     );
@@ -13730,8 +12786,7 @@ fn an_account_move_is_relaunched_over_a_sign_in_menu() {
         ("memory-over-sign-in-menu", &Restart::Memory, &menu),
         ("account-over-no-composer", &moved, &unwalled),
     ] {
-        let (r, saved) =
-            restart_saved_on(name, why, launch, None, None, None, &roster, drawn(rows));
+        let (r, saved) = restart_saved_on(name, why, launch, None, None, &roster, drawn(rows));
         assert_eq!(r.step, "wait:changed", "{name}");
         assert_eq!(saved, None, "{name}");
     }
@@ -13804,16 +12859,7 @@ fn an_exit_relaunch_types_back_the_login_the_agent_ran_under() {
 fn a_move_outlives_the_relaunch_records_written_over_it() {
     const WRITTEN: u64 = 1_791_477_331;
     let weekly = include_str!("../supervise/fixtures/claude-2.1.294-transcript-weekly-limit.jsonl");
-    let sonnet = weekly
-        .replace(
-            "You've hit your weekly limit · resets Oct 11 at 9:35am (America/Los_Angeles)",
-            "You've hit your Sonnet limit · resets Oct 11 at 9:35am (America/Los_Angeles)",
-        )
-        .replace(
-            "\"rateLimitType\":\"seven_day\"",
-            "\"rateLimitType\":\"seven_day_sonnet\"",
-        );
-    let case = |name: &str, cause: &str, moved: u64, host_ended: bool, tail: &str| {
+    let case = |name: &str, cause: &str, moved: u64, host_ended: bool| {
         let mut a = DeadAgent::new(name);
         let (sock, _asked) = instance_with(&a.dir, Answers::default());
         a.opts = Opts {
@@ -13853,44 +12899,25 @@ fn a_move_outlives_the_relaunch_records_written_over_it() {
         };
         let saved = load(&a.opts, SESSION).expect("state");
         assert_eq!(saved.cause, want, "{name}: {r:?}");
-        if account || cause.starts_with("model:") {
+        if account {
             assert_eq!(
                 saved.moved_login.as_deref(),
-                account.then_some("/accts/work-2"),
+                Some("/accts/work-2"),
                 "{name}"
             );
         }
         let live = Snapshot {
             login: account.then(|| "/accts/work-2".to_string()),
-            argv: if cause.starts_with("model:") {
-                vec![
-                    a.snap.program.to_string_lossy().into_owned(),
-                    "--model".to_string(),
-                    "opus".to_string(),
-                ]
-            } else {
-                a.snap.argv.clone()
-            },
             ..a.snap.clone()
         };
-        super::super::relaunch::standing_limit(&a.opts, &live, tail)
+        super::super::relaunch::standing_limit(&a.opts, &live, weekly)
     };
     let after = WRITTEN + 600;
     let before = WRITTEN - 600;
     std::thread::scope(|scope| {
         let cold = [
-            scope.spawn(|| case("moved-account-cold", "account:work-2", after, true, weekly)),
-            scope.spawn(|| case("moved-model-cold", "model:opus", after, true, &sonnet)),
-            scope.spawn(|| {
-                case(
-                    "moved-account-crash",
-                    "account:work-2",
-                    after,
-                    false,
-                    weekly,
-                )
-            }),
-            scope.spawn(|| case("moved-model-crash", "model:opus", after, false, &sonnet)),
+            scope.spawn(|| case("moved-account-cold", "account:work-2", after, true)),
+            scope.spawn(|| case("moved-account-crash", "account:work-2", after, false)),
         ];
         for (n, moved) in cold.into_iter().enumerate() {
             assert_eq!(
@@ -13900,9 +12927,8 @@ fn a_move_outlives_the_relaunch_records_written_over_it() {
             );
         }
         let controls = [
-            scope.spawn(|| case("row-after-account", "account:work-2", before, true, weekly)),
-            scope.spawn(|| case("row-after-model", "model:opus", before, false, &sonnet)),
-            scope.spawn(|| case("no-move", CAUSE_EXIT, after, true, weekly)),
+            scope.spawn(|| case("row-after-account", "account:work-2", before, true)),
+            scope.spawn(|| case("no-move", CAUSE_EXIT, after, true)),
         ];
         for (n, stands) in controls.into_iter().enumerate() {
             assert!(
@@ -14159,7 +13185,6 @@ fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place()
         only_sid: Some(TAB.to_string()),
         ..drive(&dir)
     };
-    seed_builds(&opts);
     std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("the user's sessions");
     let mut shell = stand_in_shell();
     let mut agent = parked().spawn().expect("agent");
@@ -14225,7 +13250,6 @@ fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under()
         only_sid: Some(TAB.to_string()),
         ..drive(&dir)
     };
-    seed_builds(&opts);
     std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("the user's sessions");
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     let work = dir.join("work");
@@ -14325,7 +13349,6 @@ fn a_restart_in_place_types_the_usage_tap_under_the_switch_and_writes_no_setting
             usage_tap,
             ..drive(&dir)
         };
-        seed_builds(&opts);
         let claude_dir = opts.home.join(".claude");
         std::fs::create_dir_all(claude_dir.join("sessions")).expect("the user's sessions");
         std::fs::create_dir_all(state_dir(&opts)).expect("state");
@@ -14774,7 +13797,6 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         only_sid: Some(TAB.to_string()),
         ..drive(&dir)
     };
-    seed_builds(&opts);
     let start = kernel_start(pid).expect("lstart");
     register_running_in(&opts.home.join(".claude"), pid, &start, &work);
     write_transcript(
@@ -14798,14 +13820,12 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         agent: pid,
         argv: &snap.argv,
         exe: &snap.program,
-        model: None,
         mode: None,
         home: None,
         homedir: None,
         login: None,
         route: crate::harness::accounts::AuthRoute::Outside,
         launch_env: None,
-        billing: crate::harness::relaunch::ModelBilling::Keep,
         serve: crate::harness::relaunch::Serve::Judge,
     };
     let planned = match plan(&opts, &launch, NO_SHELL, &[]) {
@@ -15106,7 +14126,6 @@ fn every_reader_finds_a_relative_homes_records_where_its_agent_filed_them() {
             only_sid: Some(TAB.to_string()),
             ..drive(&dir)
         };
-        seed_builds(&opts);
         std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("the user's sessions");
         register_as(&claude_dir, pid, SESSION, "unknown");
         file_transcript_in(&claude_dir, "-work");
@@ -15165,7 +14184,6 @@ fn the_live_upgrade_finds_an_agent_under_another_claude_home() {
             only_sid: Some(TAB.to_string()),
             ..drive(&dir)
         };
-        seed_builds(&opts);
         let users = opts.home.join(".claude");
         if users_records {
             std::fs::create_dir_all(users.join("sessions")).expect("the user's sessions");
@@ -15468,67 +14486,6 @@ fn an_upgrades_record_names_the_claude_home_its_agent_runs_under() {
             "{name}: read back where its agent keeps its records"
         );
     }
-}
-
-/// An exit's relaunch saves the fallback origin it decides ([`after_exit`] into [`exit_fallback`]).
-#[cfg(unix)]
-#[test]
-fn an_exit_relaunch_saves_the_fallback_origin_it_decides() {
-    let origin = "claude-fable-5-1";
-    let fallback = "claude-sonnet-5-5";
-    let hand = "claude-opus-5-5";
-    let case = |name: &str, chose: Option<&str>, want: &str| {
-        let mut a = DeadAgent::new(name);
-        let (sock, _asked) = instance_with(&a.dir, Answers::default());
-        a.opts = Opts {
-            sock: Some(sock),
-            dry_run: false,
-            ..a.opts.clone()
-        };
-        a.snap.argv = ["/opt/claude/bin/claude", "--model", fallback]
-            .iter()
-            .map(|w| (*w).to_string())
-            .collect();
-        write_transcript(
-            &a.opts.home,
-            &[answer_at(chose.unwrap_or(fallback), "2026-09-25T00:00:00Z")],
-        );
-        if let Some(hand) = chose {
-            chose_by_hand(&a.opts, hand);
-        }
-        std::fs::create_dir_all(state_dir(&a.opts)).expect("state");
-        save(
-            &a.opts,
-            SESSION,
-            &saved_restart(&model_restart(
-                &Restart::Model {
-                    to: fallback.to_string(),
-                },
-                None,
-                origin.to_string(),
-                None,
-                None,
-            )),
-        );
-        a.write_record();
-        let left = a.look(|_| {});
-        let r = after_exit(&a.opts, &a.snap, &left, true, None);
-        let saved = load(&a.opts, SESSION).expect("state");
-        assert_eq!(saved.cause, CAUSE_EXIT, "{name}: {r:?}");
-        assert_eq!(saved.fallback_from.as_deref(), Some(want), "{name}: {r:?}");
-        assert!(
-            saved
-                .line
-                .contains(&format!("'--model' '{}'", chose.unwrap_or(fallback))),
-            "{name}: {}",
-            saved.line
-        );
-    };
-    std::thread::scope(|scope| {
-        let hand_case = scope.spawn(|| case("exit-saved-hand", Some(hand), hand));
-        case("exit-saved-nobody", None, origin);
-        hand_case.join().expect("exit-saved-hand");
-    });
 }
 
 /// A relaunch left in flight finds its process under the Claude home its line carried
@@ -16750,7 +15707,6 @@ fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
             only_sid: Some(TAB.to_string()),
             ..drive(&dir)
         };
-        seed_builds(&opts);
         let mut agent = parked_bare().spawn().expect("agent");
         let pid = agent.id();
         wait_exec(pid);
@@ -17563,7 +16519,6 @@ fn a_move_onto_a_build_that_fails_only_at_a_real_start_is_taken_back_onto_the_bu
         }),
         &Version::parse("1.0.0").expect("the build it runs"),
         &to,
-        None,
         Proc::default(),
         now_s(),
     );
@@ -17734,7 +16689,7 @@ fn a_restart_records_the_model_its_ready_answer_ran_and_where_that_read_ended() 
         .extend(["--model".to_string(), "claude-sonnet-5".to_string()]);
     let files = session_files(&opts.home);
     let script = Script::new(shell, 3, None);
-    let r = visit_with_claim(
+    let r = visit_build(
         &opts,
         &sf,
         files.as_deref(),
@@ -17847,242 +16802,6 @@ fn a_new_upgrade_waits_for_the_last_restarts_model() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A refusal with a model due (`models::model_moves_now` answers `build-restart` every pass) is
-/// said and ledgered once.
-#[cfg(unix)]
-#[test]
-fn a_refusal_with_a_model_due_is_said_once_not_every_pass() {
-    let dir = scratch("job-model");
-    let opts = drive(&dir);
-    let mut agent = parked().spawn().expect("spawn");
-    wait_exec(agent.id());
-    let sf = register(&opts.home, agent.id(), SESSION);
-    let now = i64::try_from(now_s()).expect("now");
-    let proj = opts.home.join(".claude/projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    std::fs::write(
-        proj.join(format!("{SESSION}.jsonl")),
-        format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-opus-5\"}}}}\n",
-            crate::harness::usage::rfc3339_utc(now)
-        ),
-    )
-    .expect("transcript");
-    let mctx = ModelCtx {
-        list: Priority::seed(0),
-        baked: None,
-        offered: vec!["claude-opus-5-5".to_string()],
-        default_model: None,
-        versions: Default::default(),
-        native: None,
-    };
-    let mread = model_read(&opts, &sf, None, &mctx);
-    assert!(
-        matches!(&mread.verdict, ModelVerdict::Due { to, .. } if to == "claude-opus-5-5"),
-        "the move must be due for this test to mean anything"
-    );
-    assert!(!mread.cold, "the transcript must read WARM");
-    assert_eq!(
-        models::model_moves_now(mread.cold, true, mread.due_for_s),
-        Some("build-restart")
-    );
-    let files = session_files(&opts.home);
-    let pass = || {
-        visit_models(
-            &opts,
-            &sf,
-            files.as_deref(),
-            &table(),
-            &newer(),
-            &Live,
-            None,
-            None,
-            &mctx,
-        )
-    };
-    let first = pass();
-    let again = pass();
-    let third = pass();
-    let _ = agent.kill();
-    let _ = agent.wait();
-    assert_eq!(first.step, "refused:not-a-shell-job", "{first:?}");
-    assert_eq!(
-        load(&opts, SESSION).map(|s| s.phase),
-        Some(Phase::Failed("not-a-shell-job".to_string()))
-    );
-    for later in [&again, &third] {
-        assert!(
-            !later.is_act(),
-            "a final refusal was said again on a later pass: {later:?}"
-        );
-    }
-    assert_eq!(ledger_lines(&opts), 1, "one refusal, one ledger row");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The ride is re-judged at every visit.
-#[cfg(unix)]
-#[test]
-fn a_barred_ride_is_dropped_once_and_the_round_goes_on_without_it() {
-    let dir = scratch("ride-barred");
-    let opts = drive(&dir);
-    let mut agent = parked().spawn().expect("spawn");
-    wait_exec(agent.id());
-    let sf = register(&opts.home, agent.id(), SESSION);
-    let now = now_s();
-    let proj = opts.home.join(".claude/projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    std::fs::write(
-        proj.join(format!("{SESSION}.jsonl")),
-        format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-opus-5\"}}}}\n",
-            crate::harness::usage::rfc3339_utc(i64::try_from(now).expect("now"))
-        ),
-    )
-    .expect("transcript");
-    let mctx = ModelCtx {
-        list: Priority::seed(0),
-        baked: None,
-        offered: vec!["claude-opus-5-5".to_string()],
-        default_model: None,
-        versions: Default::default(),
-        native: None,
-    };
-    let salt = now - 500;
-    let announced = |to: &str| St {
-        phase: Phase::Announced { at_s: now, asks: 1 },
-        from: "1.0.0".to_string(),
-        to: to.to_string(),
-        source: "managed".to_string(),
-        model_list: "claude-opus-5-5".to_string(),
-        marker: "ATERM-UPGRADE-READY-0badf00d".to_string(),
-        tab: TAB.to_string(),
-        notice_pid: sf.pid,
-        notice_start: squash(&sf.proc_start),
-        salt,
-        ..St::default()
-    };
-    let current = Targets {
-        managed: Some(Candidate {
-            exe: PathBuf::from("/nonexistent/claude"),
-            version: Version::parse("1.0.0").expect("version"),
-            source: Source::Managed,
-        }),
-        native: None,
-        unanswered: false,
-    };
-    let files = session_files(&opts.home);
-    let kernel = Script::new(1, 1_000, None);
-    let pass = |targets: &Targets| {
-        visit_models(
-            &opts,
-            &sf,
-            files.as_deref(),
-            &table(),
-            targets,
-            &kernel,
-            None,
-            None,
-            &mctx,
-        )
-    };
-    let dropped = || -> Vec<String> {
-        std::fs::read_to_string(ledger_path(&opts))
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| l.contains("\"step\":\"model-ride-dropped\""))
-            .map(str::to_string)
-            .collect()
-    };
-
-    save(&opts, SESSION, &announced("9.9.9"));
-    let _ = pass(&newer());
-    assert!(dropped().is_empty(), "{:?}", dropped());
-    let kept = load(&opts, SESSION).expect("state");
-    assert_eq!(kept.model_list, "claude-opus-5-5");
-
-    let failed = ModelRecord {
-        failed: vec!["claude-opus-5-5".to_string()],
-        ..ModelRecord::default()
-    };
-    save_model_record(&opts, SESSION, &failed);
-    save(&opts, SESSION, &announced("9.9.9"));
-    let _ = pass(&newer());
-    let rows = dropped();
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(
-        rows[0].contains("model:claude-opus-5-5") && rows[0].contains("model-failed-before"),
-        "{rows:?}"
-    );
-    let kept = load(&opts, SESSION).expect("state");
-    assert!(kept.model_list.is_empty(), "the round forgot the model");
-    assert!(
-        matches!(kept.phase, Phase::Announced { .. }),
-        "{:?}",
-        kept.phase
-    );
-    assert_eq!(
-        (kept.to.as_str(), kept.salt),
-        ("9.9.9", salt),
-        "the round kept"
-    );
-    assert_eq!(kept.marker, "ATERM-UPGRADE-READY-0badf00d");
-    let _ = pass(&newer());
-    assert_eq!(dropped().len(), 1, "said once");
-
-    save(&opts, SESSION, &announced("1.0.0"));
-    let _ = pass(&current);
-    let rows = dropped();
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    let released = load(&opts, SESSION).expect("state");
-    assert_eq!(released.phase, Phase::Pending);
-    assert!(released.model_list.is_empty() && released.marker.is_empty());
-    assert_eq!(
-        released.release, "model-dropped",
-        "the agent is owed its release"
-    );
-
-    save_model_record(&opts, SESSION, &ModelRecord::default());
-    std::fs::write(
-        proj.join(format!("{SESSION}.jsonl")),
-        format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5\"}}}}\n",
-            crate::harness::usage::rfc3339_utc(i64::try_from(now).expect("now"))
-        ),
-    )
-    .expect("transcript");
-    let fable = ModelCtx {
-        list: Priority::seed(0),
-        baked: None,
-        offered: vec![
-            "claude-opus-5-5".to_string(),
-            "claude-fable-5-1".to_string(),
-        ],
-        default_model: None,
-        versions: Default::default(),
-        native: None,
-    };
-    save(&opts, SESSION, &announced("9.9.9"));
-    let _ = visit_models(
-        &opts,
-        &sf,
-        files.as_deref(),
-        &table(),
-        &newer(),
-        &kernel,
-        None,
-        None,
-        &fable,
-    );
-    let rows = dropped();
-    assert_eq!(rows.len(), 3, "{rows:?}");
-    assert!(rows[2].contains("model-off-list"), "{rows:?}");
-
-    let _ = agent.kill();
-    let _ = agent.wait();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// A RELAUNCH INTO THE SHELL'S OWN DIRECTORY, SPELLED ANOTHER WAY, NEEDS NO `cd`; ONE THAT DOES
 /// NEED IT, IN BASH, OPENS WITH A SIMPLE COMMAND. The session file records the agent's logical
 /// `$PWD` (here a symlink to the directory the shell is in) while the kernel names the shell's
@@ -18110,7 +16829,6 @@ fn a_relaunch_into_the_shells_own_directory_spelled_another_way_needs_no_cd() {
             auth_observed: true,
             route: crate::harness::accounts::AuthRoute::Outside,
             launch_env: None,
-            billing: crate::harness::relaunch::ModelBilling::Keep,
             serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
             resume: true,
@@ -18118,7 +16836,6 @@ fn a_relaunch_into_the_shells_own_directory_spelled_another_way_needs_no_cd() {
             agent: 0,
             argv: &argv,
             exe: Path::new("/opt/claude"),
-            model: None,
             mode: None,
             login: None,
             home: None,
@@ -18173,7 +16890,6 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
             auth_observed: true,
             route: crate::harness::accounts::AuthRoute::Stored.unless(!stored),
             launch_env: None,
-            billing: crate::harness::relaunch::ModelBilling::Keep,
             serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
             resume: true,
@@ -18181,7 +16897,6 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
             agent: 0,
             argv,
             exe: Path::new("/opt/claude"),
-            model: None,
             mode: None,
             login: None,
             home: None,
@@ -18235,7 +16950,6 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
             login: Some(renewed),
             route: crate::harness::accounts::AuthRoute::Stored,
             launch_env: None,
-            billing: crate::harness::relaunch::ModelBilling::Keep,
             serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
             resume: true,
@@ -18243,7 +16957,6 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
             agent: 0,
             argv: &argv,
             exe: Path::new("/opt/claude"),
-            model: None,
             mode: None,
             home: None,
             homedir: None,
@@ -18392,764 +17105,6 @@ fn the_tap_profile_store_counts_the_hosts_xdg_store_beside_the_homes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `--model` this harness asked and the record marks failed never rides the line.
-#[test]
-fn a_failed_model_on_the_launch_line_is_dropped_by_a_relaunch_asking_none() {
-    let dir = scratch("line-failed");
-    let opts = drive(&dir);
-    let argv = |model: &str| -> Vec<String> {
-        ["claude", "--model", model, "--verbose"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect()
-    };
-    let line = |argv: &[String], model: Option<&str>| {
-        line_for(
-            Dialect::Bash,
-            None,
-            None,
-            Path::new("/opt/claude"),
-            argv,
-            Some(SESSION),
-            line_model_of(&opts, SESSION, argv, model),
-            None,
-            &[],
-        )
-        .unwrap_or_else(|_| panic!("a line"))
-    };
-    let ours = argv("claude-opus-5-5[1m]");
-    let kept = format!(
-        " CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 '/opt/claude' '--model' 'claude-opus-5-5[1m]' \
-         '--verbose' '--resume' '{SESSION}'"
-    );
-    let planned = || {
-        let launch = crate::harness::relaunch::Launch {
-            auth_observed: true,
-            route: crate::harness::accounts::AuthRoute::Outside,
-            launch_env: None,
-            billing: crate::harness::relaunch::ModelBilling::Keep,
-            serve: crate::harness::relaunch::Serve::Judge,
-            session: SESSION,
-            resume: true,
-            cwd: "/tmp",
-            agent: 0,
-            argv: &ours,
-            exe: Path::new("/opt/claude"),
-            model: None,
-            mode: None,
-            login: None,
-            home: None,
-            homedir: None,
-        };
-        crate::harness::relaunch::plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
-            .unwrap_or_else(|_| panic!("a plan"))
-            .line
-    };
-    let told = || resume_command_kept(Some(&opts.state), &ours, SESSION).expect("a resume line");
-    register(&opts.home, std::process::id(), SESSION);
-    let footer = || {
-        let offset = |_: Option<&str>, _: i64| None;
-        crate::harness::footer::read_pid(
-            &opts.home.join(".claude"),
-            std::process::id(),
-            None,
-            |_| (crate::harness::footer::LaunchFacts::default(), ours.clone()),
-            &mut crate::harness::footer::TailCache::default(),
-            &mut crate::harness::footer::FooterCache::default(),
-            &crate::harness::footer::ReadClock {
-                read_at: std::time::SystemTime::now(),
-                now: 0,
-                offset_at: &offset,
-            },
-            Some(&opts.state),
-            Some(&opts.home),
-        )
-        .and_then(|facts| facts.resume)
-        .expect("the footer's line")
-    };
-    assert_eq!(line(&ours, None), kept);
-    assert!(planned().contains("'--model'"), "{}", planned());
-    assert!(told().contains("--model"), "{}", told());
-    assert_eq!(footer(), told());
-    assert_eq!(
-        launch_kept(&opts, SESSION, &ours).as_deref(),
-        Some("claude-opus-5-5[1m]")
-    );
-    save_model_record(
-        &opts,
-        SESSION,
-        &ModelRecord {
-            failed: vec!["claude-opus-5-5".to_string()],
-            ..ModelRecord::default()
-        },
-    );
-    assert_eq!(
-        line(&ours, None),
-        format!(
-            " CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 '/opt/claude' '--verbose' '--resume' \
-             '{SESSION}'"
-        )
-    );
-    assert_eq!(launch_kept(&opts, SESSION, &ours), None);
-    assert!(!planned().contains("--model"), "{}", planned());
-    assert!(
-        !told().contains("--model") && told().contains(&format!("--resume {SESSION}")),
-        "{}",
-        told()
-    );
-    assert_eq!(footer(), told());
-    assert!(line(&ours, Some("claude-fable-5-1")).contains("'--model' 'claude-fable-5-1'"));
-    for theirs in ["claude-fable-5-1", "opus"] {
-        let argv = argv(theirs);
-        assert!(line(&argv, None).contains(&format!("'--model' '{theirs}'")));
-        assert_eq!(launch_kept(&opts, SESSION, &argv).as_deref(), Some(theirs));
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A due model rides every restart (a relaunch on exit, the restart in place), even on a warm
-/// conversation.
-#[test]
-fn a_due_model_rides_a_restart_made_for_another_reason() {
-    let dir = scratch("riding-model");
-    let opts = drive(&dir);
-    let sf = register(&opts.home, std::process::id(), SESSION);
-    let now = i64::try_from(now_s()).expect("now");
-    let proj = opts.home.join(".claude/projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    std::fs::write(
-        proj.join(format!("{SESSION}.jsonl")),
-        format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-opus-5\"}}}}\n",
-            crate::harness::usage::rfc3339_utc(now)
-        ),
-    )
-    .expect("transcript");
-    let argv = vec!["/opt/claude/bin/claude".to_string()];
-    let due = ModelCtx {
-        list: Priority::seed(0),
-        baked: None,
-        offered: vec!["claude-opus-5-5".to_string()],
-        default_model: None,
-        versions: Default::default(),
-        native: None,
-    };
-    assert_eq!(
-        riding_model_in(&opts, &sf, &argv, &due, None).as_deref(),
-        Some("claude-opus-5-5"),
-        "warm, and it rides all the same"
-    );
-    record_asked(&opts, SESSION, "claude-opus-5-5");
-    assert_eq!(load_model_record(&opts, SESSION).set, "claude-opus-5-5");
-    assert_eq!(
-        riding_model_in(&opts, &sf, &argv, &ModelCtx::none(), None),
-        None
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The due clock survives an unknown read (`model-unknown`, e.g. a tail holding no answer), or an
-/// active session's one-hour bound would restart every visit.
-#[test]
-fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
-    let dir = scratch("due-clock");
-    let opts = drive(&dir);
-    let sf = register(&opts.home, std::process::id(), SESSION);
-    let now = i64::try_from(now_s()).expect("now");
-    let proj = opts.home.join(".claude/projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    let path = proj.join(format!("{SESSION}.jsonl"));
-    let answered = format!(
-        "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-opus-5\"}}}}\n",
-        crate::harness::usage::rfc3339_utc(now)
-    );
-    let mctx = ModelCtx {
-        list: Priority::seed(0),
-        baked: None,
-        offered: vec!["claude-opus-5-5".to_string()],
-        default_model: None,
-        versions: Default::default(),
-        native: None,
-    };
-    std::fs::write(&path, &answered).expect("transcript");
-    assert!(matches!(
-        model_read(&opts, &sf, None, &mctx).verdict,
-        ModelVerdict::Due { .. }
-    ));
-    let mut rec = load_model_record(&opts, SESSION);
-    assert_eq!(
-        rec.due_to, "claude-opus-5-5",
-        "the clock started on the due visit"
-    );
-    rec.due_since = now_s() - 3000;
-    save_model_record(&opts, SESSION, &rec);
-
-    std::fs::write(&path, "{\"type\":\"user\"}\n").expect("tail with no answer");
-    let unknown = model_read(&opts, &sf, None, &mctx);
-    assert_eq!(unknown.verdict, ModelVerdict::Keep("model-unknown"));
-    let kept = load_model_record(&opts, SESSION);
-    assert_eq!(
-        (kept.due_to.as_str(), kept.due_since),
-        ("claude-opus-5-5", rec.due_since),
-        "an unknown read reset the due clock"
-    );
-
-    std::fs::write(&path, &answered).expect("transcript");
-    let back = model_read(&opts, &sf, None, &mctx);
-    assert!(
-        back.due_for_s >= 3000,
-        "the bound restarted: {}",
-        back.due_for_s
-    );
-
-    let mut ahead = load_model_record(&opts, SESSION);
-    ahead.due_since = now_s() + 10_000;
-    save_model_record(&opts, SESSION, &ahead);
-    let _ = model_read(&opts, &sf, None, &mctx);
-    assert!(
-        load_model_record(&opts, SESSION).due_since <= now_s(),
-        "a future-dated start survived and would postpone the bound"
-    );
-
-    let none = ModelCtx {
-        offered: Vec::new(),
-        ..mctx
-    };
-    let _ = model_read(&opts, &sf, None, &none);
-    let cleared = load_model_record(&opts, SESSION);
-    assert!(
-        cleared.due_to.is_empty() && cleared.due_since == 0,
-        "the early return left a stale clock: {cleared:?}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// An ask that ran stands.
-#[test]
-fn an_ask_that_ran_is_never_recorded_failed_when_a_person_moves_off_it() {
-    let dir = scratch("ask-ran-stands");
-    let opts = drive(&dir);
-    let sf = register(&opts.home, std::process::id(), SESSION);
-    let now = i64::try_from(now_s()).expect("now");
-    let proj = opts.home.join(".claude/projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    let answered = format!(
-        "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
-        crate::harness::usage::rfc3339_utc(now)
-    );
-    std::fs::write(proj.join(format!("{SESSION}.jsonl")), &answered).expect("transcript");
-    let mctx = ModelCtx {
-        list: Priority::seed(0),
-        baked: None,
-        offered: vec!["claude-opus-5-5".to_string()],
-        default_model: None,
-        versions: Default::default(),
-        native: None,
-    };
-    let asked = |applied: bool| {
-        let mut rec = ModelRecord {
-            set: "claude-opus-5-5".to_string(),
-            set_at: now_s() - 2 * models::MODEL_SETTLE_S,
-            ..ModelRecord::default()
-        };
-        if applied {
-            rec.applied.push(rec.set.clone());
-        }
-        save_model_record(&opts, SESSION, &rec);
-    };
-
-    asked(true);
-    let _ = model_read(&opts, &sf, None, &mctx);
-    let rec = load_model_record(&opts, SESSION);
-    assert!(
-        rec.failed.is_empty(),
-        "an ask that ran was recorded failed: {rec:?}"
-    );
-    assert_eq!(
-        rec.set, "claude-opus-5-5",
-        "the ask stays the harness's own"
-    );
-
-    asked(false);
-    let _ = model_read(&opts, &sf, None, &mctx);
-    let rec = load_model_record(&opts, SESSION);
-    assert_eq!(rec.failed, ["claude-opus-5-5"], "{rec:?}");
-    assert!(rec.set.is_empty(), "{rec:?}");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The transcript of a conversation whose last answer, on `model`, came
-/// `ago_s` seconds ago.
-fn answered_on(opts: &Opts, model: &str, ago_s: i64) {
-    let at = i64::try_from(now_s()).expect("now") - ago_s;
-    let proj = opts.home.join(".claude/projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    std::fs::write(
-        proj.join(format!("{SESSION}.jsonl")),
-        format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"{model}\"}}}}\n",
-            crate::harness::usage::rfc3339_utc(at)
-        ),
-    )
-    .expect("transcript");
-}
-
-/// A session on the native build is judged by the native build's own catalog and offer (here Fable
-/// 5.1, where the managed view offers Opus 5.5).
-#[test]
-fn a_native_session_is_judged_by_the_native_builds_own_offer() {
-    let dir = scratch("native-view");
-    let opts = drive(&dir);
-    let sf = register(&opts.home, std::process::id(), SESSION);
-    answered_on(&opts, "claude-opus-5", 7200);
-    let mctx = ModelCtx {
-        list: Priority::seed(0),
-        baked: None,
-        offered: vec!["claude-opus-5-5".to_string()],
-        default_model: None,
-        versions: Default::default(),
-        native: Some((None, vec!["claude-fable-5-1".to_string()])),
-    };
-    let due_to = |native: bool, ctx: &ModelCtx| match model_read_for(
-        &opts, &sf, None, ctx, native, None, None,
-    )
-    .verdict
-    {
-        ModelVerdict::Due { to, .. } => Some(to),
-        ModelVerdict::Keep(_) => None,
-    };
-    assert_eq!(due_to(false, &mctx).as_deref(), Some("claude-opus-5-5"));
-    assert_eq!(due_to(true, &mctx).as_deref(), Some("claude-fable-5-1"));
-    let no_native = ModelCtx {
-        native: None,
-        ..mctx
-    };
-    assert_eq!(due_to(true, &no_native).as_deref(), Some("claude-opus-5-5"));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The host's pre-filter never restarts a native session's warm wait.
-#[test]
-fn the_pre_filter_never_restarts_a_native_sessions_warm_wait() {
-    let dir = scratch("prefilter-views");
-    let opts = drive(&dir);
-    let sf = register(&opts.home, std::process::id(), SESSION);
-    answered_on(&opts, "claude-opus-5", 0);
-    let mctx = ModelCtx {
-        list: Priority::seed(0),
-        baked: None,
-        offered: vec!["claude-opus-5".to_string()],
-        default_model: None,
-        versions: Default::default(),
-        native: Some((None, vec!["claude-opus-5-5".to_string()])),
-    };
-    let first = model_read_for(&opts, &sf, None, &mctx, true, None, None);
-    assert!(
-        matches!(&first.verdict, ModelVerdict::Due { to, .. } if to == "claude-opus-5-5"),
-        "the native view must see the move due: {:?}",
-        first.verdict
-    );
-    let mut rec = load_model_record(&opts, SESSION);
-    rec.due_since = now_s() - 3000;
-    save_model_record(&opts, SESSION, &rec);
-    for sweep in 0..3 {
-        assert!(model_wants_a_look(&opts, &sf, &mctx), "sweep {sweep}");
-        let read = model_read_for(&opts, &sf, None, &mctx, true, None, None);
-        assert!(
-            read.due_for_s >= 3000,
-            "sweep {sweep}: the pre-filter restarted the warm wait ({} s due)",
-            read.due_for_s
-        );
-    }
-    let mut over = load_model_record(&opts, SESSION);
-    over.due_since = now_s() - models::MODEL_WARM_MAX_S;
-    save_model_record(&opts, SESSION, &over);
-    assert!(model_wants_a_look(&opts, &sf, &mctx));
-    let read = model_read_for(&opts, &sf, None, &mctx, true, None, None);
-    assert_eq!(
-        models::model_moves_now(read.cold, false, read.due_for_s),
-        Some("warm-wait-over"),
-        "the warm wait must end for an active native session"
-    );
-
-    let agree = ModelCtx {
-        offered: vec!["claude-opus-5-5".to_string()],
-        ..mctx
-    };
-    record_asked(&opts, SESSION, "claude-opus-5-5");
-    answered_on(&opts, "claude-opus-5-5", 0);
-    assert!(!model_wants_a_look(&opts, &sf, &agree), "nothing due");
-    assert_eq!(
-        load_model_record(&opts, SESSION).applied,
-        ["claude-opus-5-5"],
-        "the pre-filter's settle step was not kept where the views agree"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A crashed native session's riding model is the native build's.
-#[test]
-fn a_crashed_native_sessions_riding_model_is_the_native_builds() {
-    let dir = scratch("riding-native");
-    let opts = drive(&dir);
-    let mut sf = register(&opts.home, std::process::id(), SESSION);
-    sf.pid = dead_pid();
-    assert_eq!(exe_of(sf.pid), None, "the pid must be gone for this test");
-    answered_on(&opts, "claude-opus-5", 0);
-    let mctx = ModelCtx {
-        list: Priority::seed(0),
-        baked: None,
-        offered: vec!["claude-opus-5".to_string()],
-        default_model: None,
-        versions: Default::default(),
-        native: Some((None, vec!["claude-opus-5-5".to_string()])),
-    };
-    let native = native_root(&opts.home).join("2.1.283");
-    let argv = vec![native.to_string_lossy().into_owned()];
-    assert_eq!(
-        riding_model_in(&opts, &sf, &argv, &mctx, None).as_deref(),
-        Some("claude-opus-5-5"),
-        "a crashed native session was judged by the managed view"
-    );
-    let managed = vec!["/opt/aterm/pkg/agents/claude".to_string()];
-    assert_eq!(riding_model_in(&opts, &sf, &managed, &mctx, None), None);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// An agent under another Claude home is judged by that home's model files ([`ModelCtx::at`]).
-#[test]
-fn an_agent_under_another_claude_home_is_judged_by_its_homes_model_files() {
-    let dir = scratch("model-home");
-    let opts = Opts {
-        dry_run: true,
-        usage_credits: true,
-        ..drive(&dir)
-    };
-    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
-    let served_in = |claude_dir: &Path| {
-        let catalog = claude_dir.join("cache/model-catalog");
-        std::fs::create_dir_all(&catalog).expect("the catalog cache");
-        std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
-    };
-    served_in(&opts.home.join(".claude"));
-    let targets = Targets {
-        managed: None,
-        native: None,
-        unanswered: false,
-    };
-    let mctx = ModelCtx::read(&opts, &targets);
-    let other = dir.join("work/.claude");
-    served_in(&other);
-    let answered = |claude_dir: &Path| {
-        let proj = claude_dir.join("projects/-work");
-        std::fs::create_dir_all(&proj).expect("projects");
-        let at = i64::try_from(now_s()).expect("now") - 7_200;
-        std::fs::write(
-            proj.join(format!("{SESSION}.jsonl")),
-            format!(
-                "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
-                crate::harness::usage::rfc3339_utc(at)
-            ),
-        )
-        .expect("transcript");
-    };
-    answered(&other);
-    let sf = SessionFile {
-        claude_dir: Some(other.clone()),
-        ..record("2.1.296")
-    };
-    let verdict = |opts: &Opts, sf: &SessionFile| {
-        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
-        model_read_for(opts, sf, None, &mctx, false, None, None).verdict
-    };
-    let due = ModelVerdict::Due {
-        from: "claude-fable-5-1".to_string(),
-        to: "claude-opus-5-5".to_string(),
-    };
-    assert_eq!(verdict(&opts, &sf), due, "the judge is not switched off");
-    assert!(model_wants_a_look(&opts, &sf, &mctx));
-    let settings = other.join("settings.json");
-    let profile = other.join(".claude.json");
-    for (name, file, text, kept) in [
-        (
-            "its saved default",
-            &settings,
-            r#"{"model":"claude-fable-5-1"}"#,
-            "model-chosen-by-hand",
-        ),
-        (
-            "its login's denial",
-            &profile,
-            r#"{"modelAccessCache":[{"apiName":"claude-opus-5-5","entitled":false}]}"#,
-            "model-current",
-        ),
-    ] {
-        std::fs::write(file, text).expect("the home's file");
-        assert_eq!(
-            verdict(&opts, &sf),
-            ModelVerdict::Keep(kept),
-            "{name}: judged by the user's home"
-        );
-        assert!(!model_wants_a_look(&opts, &sf, &mctx), "{name}");
-        let argv = vec!["claude".to_string()];
-        assert_eq!(
-            riding_model_in(&opts, &sf, &argv, &mctx, None),
-            None,
-            "{name}"
-        );
-        answered(&opts.home.join(".claude"));
-        let own = SessionFile {
-            claude_dir: Some(opts.home.join(".claude")),
-            ..sf.clone()
-        };
-        assert_eq!(verdict(&opts, &own), due, "{name}: the user's own home");
-        let _ = std::fs::remove_file(file);
-    }
-    let several = Opts {
-        several_logins: true,
-        instances: Instances::Listed(Vec::new()),
-        ..opts.clone()
-    };
-    assert_eq!(
-        verdict(&several, &sf),
-        ModelVerdict::Keep("no-model-available")
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// [`agent_settings`] resolves `model` and `availableModels` by precedence across managed, project,
-/// and user files.
-#[test]
-fn the_model_rule_takes_each_key_from_the_highest_document_that_sets_it() {
-    let dir = scratch("model-settings-order");
-    let opts = Opts {
-        dry_run: true,
-        usage_credits: true,
-        ..drive(&dir)
-    };
-    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
-    let user = opts.home.join(".claude");
-    let catalog = user.join("cache/model-catalog");
-    std::fs::create_dir_all(&catalog).expect("the catalog cache");
-    std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
-    let targets = Targets {
-        managed: None,
-        native: None,
-        unanswered: false,
-    };
-    let mctx = ModelCtx::read(&opts, &targets);
-    let work = dir.join("work");
-    let proj = user.join("projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    let at = i64::try_from(now_s()).expect("now") - 7_200;
-    std::fs::write(
-        proj.join(format!("{SESSION}.jsonl")),
-        format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
-            crate::harness::usage::rfc3339_utc(at)
-        ),
-    )
-    .expect("transcript");
-    let sf = SessionFile {
-        claude_dir: Some(user.clone()),
-        cwd: work.to_string_lossy().into_owned(),
-        ..record("2.1.296")
-    };
-    let managed = dir.join("managed");
-    std::fs::create_dir_all(managed.join("managed-settings.d")).expect("the managed tier");
-    std::fs::create_dir_all(work.join(".claude")).expect("the project's .claude");
-    MANAGED_SETTINGS.with(|m| *m.borrow_mut() = Some(managed.clone()));
-    let due = ModelVerdict::Due {
-        from: "claude-fable-5-1".to_string(),
-        to: "claude-opus-5-5".to_string(),
-    };
-    let only_fable = r#"{"availableModels":["claude-fable-5-1"]}"#;
-    let both_allowed = r#"{"availableModels":["claude-opus-5-5","claude-fable-5-1"]}"#;
-    let files = [
-        ("managed", managed.join("managed-settings.json")),
-        ("drop-in", managed.join("managed-settings.d/10-models.json")),
-        ("project", work.join(".claude/settings.json")),
-        ("local", work.join(".claude/settings.local.json")),
-        ("user", user.join("settings.json")),
-    ];
-    let case = |name: &str, docs: &[(&str, &str)]| {
-        for (_, path) in &files {
-            let _ = std::fs::remove_file(path);
-        }
-        for (which, text) in docs {
-            let path = &files
-                .iter()
-                .find(|(w, _)| w == which)
-                .expect("a document")
-                .1;
-            std::fs::write(path, text).expect("the document");
-        }
-        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
-        let verdict = model_read_for(&opts, &sf, None, &mctx, false, None, None).verdict;
-        let _ = name;
-        verdict
-    };
-    assert_eq!(
-        case("nothing set", &[]),
-        due,
-        "the judge is not switched off"
-    );
-    assert_eq!(
-        case(
-            "managed over project",
-            &[("managed", only_fable), ("project", both_allowed)]
-        ),
-        ModelVerdict::Keep("model-current")
-    );
-    assert_eq!(
-        case(
-            "a drop-in over the managed file",
-            &[("managed", both_allowed), ("drop-in", only_fable)]
-        ),
-        ModelVerdict::Keep("model-current")
-    );
-    assert_eq!(
-        case(
-            "the local file over the user's",
-            &[("local", only_fable), ("user", both_allowed)]
-        ),
-        ModelVerdict::Keep("model-current")
-    );
-    assert_eq!(
-        case(
-            "a higher list replaces a lower one whole",
-            &[("project", both_allowed), ("user", only_fable)]
-        ),
-        due
-    );
-    assert_eq!(
-        case(
-            "the managed model",
-            &[("managed", r#"{"model":"claude-fable-5-1"}"#)]
-        ),
-        ModelVerdict::Keep("model-chosen-by-hand")
-    );
-    assert_ne!(
-        case("a document that does not parse", &[("project", "{")]),
-        due,
-        "unknown: nothing is moved"
-    );
-    assert_ne!(
-        case(
-            "an allowlist that is no list",
-            &[("project", r#"{"availableModels":"opus"}"#)]
-        ),
-        due,
-        "an empty allowlist"
-    );
-    MANAGED_SETTINGS.with(|m| *m.borrow_mut() = None);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// An agent under an empty `CLAUDE_CONFIG_DIR` keeps its records and settings in the directory it
-/// runs in.
-#[test]
-fn an_agent_under_an_empty_claude_home_is_judged_by_the_profile_claude_code_keeps_for_it() {
-    let dir = scratch("model-empty-home-profile");
-    let opts = Opts {
-        dry_run: true,
-        usage_credits: true,
-        ..drive(&dir)
-    };
-    let work = dir.join("work");
-    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
-    for claude_dir in [opts.home.join(".claude"), work.clone()] {
-        let catalog = claude_dir.join("cache/model-catalog");
-        std::fs::create_dir_all(&catalog).expect("the catalog cache");
-        std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
-    }
-    let targets = Targets {
-        managed: None,
-        native: None,
-        unanswered: false,
-    };
-    let mctx = ModelCtx::read(&opts, &targets);
-    const LEADER: u32 = 4_242;
-    std::fs::create_dir_all(work.join("sessions")).expect("sessions");
-    std::fs::write(
-        work.join(format!("sessions/{LEADER}.json")),
-        aterm_json::to_string(&aterm_json::json!({
-            "pid": LEADER,
-            "sessionId": SESSION,
-            "cwd": work.to_string_lossy().as_ref(),
-            "version": "2.1.296",
-            "status": "idle",
-            "statusUpdatedAt": 1,
-            "procStart": "start",
-            "kind": "interactive",
-            "entrypoint": "cli",
-        }))
-        .expect("json"),
-    )
-    .expect("the record");
-    let proj = work.join("projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    let at = i64::try_from(now_s()).expect("now") - 7_200;
-    std::fs::write(
-        proj.join(format!("{SESSION}.jsonl")),
-        format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
-            crate::harness::usage::rfc3339_utc(at)
-        ),
-    )
-    .expect("transcript");
-    let tabs = [LiveTab {
-        sid: TAB.to_string(),
-        fgpgid: Some(i64::from(LEADER)),
-    }];
-    let read = |home: &str| {
-        let args = |_: u32| {
-            Some(atpkg::caller_shell::ProcArgs {
-                env: vec![format!("CLAUDE_CONFIG_DIR={home}")],
-                ..atpkg::caller_shell::ProcArgs::default()
-            })
-        };
-        Homes::read(&opts, Some(&tabs), args, |_| Some(work.clone()))
-            .roster(Some(Vec::new()))
-            .and_then(|files| files.into_iter().find(|sf| sf.pid == LEADER))
-            .expect("the record is read where its Claude Code files it")
-    };
-    let verdict = |sf: &SessionFile| {
-        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
-        model_read_for(&opts, sf, None, &mctx, false, None, None).verdict
-    };
-    let denial = r#"{"modelAccessCache":[{"apiName":"claude-opus-5-5","entitled":false}]}"#;
-    let due = ModelVerdict::Due {
-        from: "claude-fable-5-1".to_string(),
-        to: "claude-opus-5-5".to_string(),
-    };
-    let empty = read("");
-    assert_eq!(verdict(&empty), due, "the judge is not switched off");
-    let home_profile = opts.home.join(".claude.json");
-    std::fs::write(&home_profile, denial).expect("the profile");
-    assert_eq!(
-        verdict(&empty),
-        ModelVerdict::Keep("model-current"),
-        "an empty home's login is read in $HOME/.claude.json"
-    );
-    std::fs::remove_file(&home_profile).expect("rm");
-    let cwd_profile = work.join(".claude.json");
-    std::fs::write(&cwd_profile, denial).expect("a stray file");
-    assert_eq!(
-        verdict(&empty),
-        due,
-        "an empty home's working directory holds no profile of its"
-    );
-    let dot = read(".");
-    assert_eq!(dot.claude_dir.as_deref(), Some(work.as_path()));
-    assert_eq!(
-        verdict(&dot),
-        ModelVerdict::Keep("model-current"),
-        "a relative home's profile is inside it"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// The CLI's sweep (no roster, [`sweep`]) finds an agent under another Claude home that no visit
 /// has recorded.
 #[cfg(unix)]
@@ -19175,7 +17130,6 @@ fn the_clis_sweep_finds_an_agent_under_another_claude_home_no_visit_recorded() {
         dry_run: true,
         ..drive(&dir)
     };
-    seed_builds(&opts);
     std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("the user's sessions");
     register_as(&claude_dir, pid, SESSION, "unknown");
     let reports = sweep(&opts);
@@ -20120,13 +18074,11 @@ fn a_pressed_notices_turn_waits_out_a_late_echo_as_a_hang() {
         })
         .collect();
     let notice = upgrade::with_running(
-        &upgrade::prepare_prompt_with_model(
+        &upgrade::prepare_prompt(
             &v("2.1.290"),
             &v("2.1.291"),
             Source::Managed,
             &upgrade::ready_marker(SESSION, &v("2.1.291"), 1),
-            None,
-            None,
         ),
         &upgrade::running_clause(&held),
     );
@@ -20384,14 +18336,7 @@ pub(super) fn last_wrapped_row(text: &str, width: usize) -> String {
 fn a_pressed_notices_enter_is_guarded_on_its_own_last_row() {
     let v = |s: &str| Version::parse(s).expect("version");
     let marker = upgrade::ready_marker(SESSION, &v("2.1.291"), 1);
-    let notice = upgrade::prepare_prompt_with_model(
-        &v("2.1.290"),
-        &v("2.1.291"),
-        Source::Managed,
-        &marker,
-        None,
-        None,
-    );
+    let notice = upgrade::prepare_prompt(&v("2.1.290"), &v("2.1.291"), Source::Managed, &marker);
     let release = upgrade::release_prompt(upgrade::Agent::Claude, false);
     let the_box = [
         " Do you want to proceed?",
@@ -22623,13 +20568,7 @@ fn only_a_restart_that_ended_its_agent_dates_a_persons_keys() {
             ..St::default()
         })
     };
-    for asked in [
-        "",
-        CAUSE_UPGRADE_FRESH,
-        CAUSE_MEMORY,
-        "model:opus",
-        "model-back:",
-    ] {
+    for asked in ["", CAUSE_UPGRADE_FRESH, CAUSE_MEMORY] {
         assert_eq!(at(asked), 1_790_880_325, "{asked:?} ended its agent itself");
     }
     for seen in [
@@ -23151,7 +21090,7 @@ fn a_newer_target_keeps_the_age_and_the_owners_word_but_not_a_skip() {
         request_tab: TAB.to_string(),
         ..St::default()
     };
-    let next = St::for_target(Some(prior.clone()), &from, &to, None, Proc::default(), 900);
+    let next = St::for_target(Some(prior.clone()), &from, &to, Proc::default(), 900);
     assert_eq!(next.phase, Phase::Pending, "a new target is asked afresh");
     assert_eq!(next.to, "2.1.283");
     assert_eq!(next.behind_since(), 100);
@@ -23162,7 +21101,7 @@ fn a_newer_target_keeps_the_age_and_the_owners_word_but_not_a_skip() {
         request: Request::Skip("2.1.282".to_string()),
         ..prior.clone()
     };
-    let unskipped = St::for_target(Some(skipped), &from, &to, None, Proc::default(), 900);
+    let unskipped = St::for_target(Some(skipped), &from, &to, Proc::default(), 900);
     assert_eq!(
         unskipped.request,
         Request::None,
@@ -23173,7 +21112,7 @@ fn a_newer_target_keeps_the_age_and_the_owners_word_but_not_a_skip() {
         phase: Phase::Done,
         ..prior.clone()
     };
-    let fresh = St::for_target(Some(done), &from, &to, None, Proc::default(), 900);
+    let fresh = St::for_target(Some(done), &from, &to, Proc::default(), 900);
     assert_eq!(fresh.behind_since(), 900, "behind again from now");
     assert_eq!(fresh.request, Request::None);
     let same_target = Candidate {
@@ -23184,22 +21123,10 @@ fn a_newer_target_keeps_the_age_and_the_owners_word_but_not_a_skip() {
         Some(prior.clone()),
         &from,
         &same_target,
-        None,
         Proc::default(),
         900,
     );
     assert_eq!(same, prior, "the same target is the same upgrade");
-    let remodel = St::for_target(
-        Some(prior.clone()),
-        &from,
-        &same_target,
-        Some("claude-opus-5-5"),
-        Proc::default(),
-        900,
-    );
-    assert_eq!(remodel.phase, Phase::Pending, "a new model is asked afresh");
-    assert_eq!(remodel.behind_since(), 100);
-    assert_eq!(remodel.request, Request::Now);
     let pending = St {
         phase: Phase::Pending,
         ..prior.clone()
@@ -23209,7 +21136,6 @@ fn a_newer_target_keeps_the_age_and_the_owners_word_but_not_a_skip() {
             Some(pending.clone()),
             &from,
             &same_target,
-            Some("claude-opus-5-5"),
             Proc::default(),
             900
         ),
@@ -23246,23 +21172,23 @@ fn an_age_belongs_to_one_process() {
     };
     for phase in [Phase::Pending, Phase::Announced { at_s: 5, asks: 1 }] {
         let stale = minted("2.1.274", "A", phase.clone());
-        let next = St::for_target(Some(stale), &running, &to, None, proc("B"), 900);
+        let next = St::for_target(Some(stale), &running, &to, proc("B"), 900);
         assert_eq!(next.behind_since(), 900, "{phase:?}: B's age begins now");
         assert_eq!(next.proc_start, "B");
         assert_eq!(next.from, "2.1.283");
     }
     let legacy = minted("2.1.274", "", Phase::Pending);
-    let next = St::for_target(Some(legacy), &running, &to, None, proc("B"), 900);
+    let next = St::for_target(Some(legacy), &running, &to, proc("B"), 900);
     assert_eq!(next.behind_since(), 900, "found behind another build");
     let same_proc = minted("2.1.283", "B", Phase::Pending);
-    let next = St::for_target(Some(same_proc), &running, &to, None, proc("B"), 900);
+    let next = St::for_target(Some(same_proc), &running, &to, proc("B"), 900);
     assert_eq!(next.behind_since(), 100, "the same process is still behind");
     let same_build = minted("2.1.283", "", Phase::Pending);
-    let next = St::for_target(Some(same_build), &running, &to, None, proc("B"), 900);
+    let next = St::for_target(Some(same_build), &running, &to, proc("B"), 900);
     assert_eq!(next.behind_since(), 100, "a legacy record, the same build");
     assert_eq!(next.proc_start, "B", "and it learns its process");
     let unknown = minted("", "", Phase::Pending);
-    let next = St::for_target(Some(unknown), &running, &to, None, proc("B"), 900);
+    let next = St::for_target(Some(unknown), &running, &to, proc("B"), 900);
     assert_eq!(next.behind_since(), 100, "names nothing: carried as ever");
     let waiting = St {
         wait: "background".to_string(),
@@ -23285,7 +21211,7 @@ fn an_age_belongs_to_one_process() {
         ..to.clone()
     };
     let from = Version::parse("2.1.275").expect("v");
-    let next = St::for_target(Some(waiting.clone()), &from, &target, None, proc("B"), 900);
+    let next = St::for_target(Some(waiting.clone()), &from, &target, proc("B"), 900);
     assert_eq!(
         (
             next.behind_since(),
@@ -23311,7 +21237,7 @@ fn an_age_belongs_to_one_process() {
         from: "2.1.275".to_string(),
         ..waiting
     };
-    let kept_same = St::for_target(Some(same), &from, &target, None, proc("B"), 900);
+    let kept_same = St::for_target(Some(same), &from, &target, proc("B"), 900);
     assert_eq!(
         (kept_same.stop_streak, kept_same.streak_why.as_str()),
         (3, "signal-refused"),
@@ -23326,13 +21252,13 @@ fn an_age_belongs_to_one_process() {
         salt: 10,
         ..minted("2.1.274", "A", Phase::Announced { at_s: 50, asks: 1 })
     };
-    let kept = St::for_target(Some(announced), &from, &target, None, proc("B"), 900);
+    let kept = St::for_target(Some(announced), &from, &target, proc("B"), 900);
     assert_eq!(kept.proc_start, "A", "not stamped with the holder's start");
     let target_next = Candidate {
         version: Version::parse("2.1.284").expect("v"),
         ..to.clone()
     };
-    let later = St::for_target(Some(kept), &from, &target_next, None, proc("B"), 950);
+    let later = St::for_target(Some(kept), &from, &target_next, proc("B"), 950);
     assert_eq!(
         later.behind_since(),
         950,
@@ -23360,7 +21286,6 @@ fn an_age_belongs_to_one_process() {
             Some(old_record.clone()),
             &running,
             &target_284,
-            None,
             born(started_s),
             900,
         );
@@ -23376,14 +21301,14 @@ fn an_age_belongs_to_one_process() {
         pending_since: 600,
         ..old_record
     };
-    let next = St::for_target(Some(after), &running, &target_284, None, born(500), 900);
+    let next = St::for_target(Some(after), &running, &target_284, born(500), 900);
     assert_eq!(
         next.behind_since(),
         600,
         "an age from within the process stands"
     );
     let stopped = minted("2.1.275", "B", Phase::Failed("no-resume".to_string()));
-    let next = St::for_target(Some(stopped.clone()), &from, &target, None, proc("B"), 900);
+    let next = St::for_target(Some(stopped.clone()), &from, &target, proc("B"), 900);
     assert_eq!((next.phase, next.pending_since), (stopped.phase, 100));
     let of_a = St {
         wait: "failed".to_string(),
@@ -23399,7 +21324,7 @@ fn an_age_belongs_to_one_process() {
         tells: 1,
         ..minted("2.1.274", "A", Phase::Failed(upgrade::GAVE_UP.to_string()))
     };
-    let next = St::for_target(Some(of_a), &from, &target, None, proc("B"), 900);
+    let next = St::for_target(Some(of_a), &from, &target, proc("B"), 900);
     assert_eq!(
         (
             next.phase.clone(),
@@ -23454,7 +21379,6 @@ fn a_newer_build_landing_in_a_rest_keeps_the_process_s_history() {
         Some(rested("B", gave_up.clone())),
         &running,
         &to,
-        None,
         proc("B"),
         900,
     );
@@ -23477,7 +21401,7 @@ fn a_newer_build_landing_in_a_rest_keeps_the_process_s_history() {
         stop_streak: 2,
         ..rested("B", Phase::Failed("no-resume".to_string()))
     };
-    let next = St::for_target(Some(refused), &running, &to, None, proc("B"), 900);
+    let next = St::for_target(Some(refused), &running, &to, proc("B"), 900);
     assert_eq!(
         (
             next.behind_since(),
@@ -23486,14 +21410,7 @@ fn a_newer_build_landing_in_a_rest_keeps_the_process_s_history() {
         ),
         (100, "no-resume", 2)
     );
-    let next = St::for_target(
-        Some(rested("A", gave_up)),
-        &running,
-        &to,
-        None,
-        proc("B"),
-        900,
-    );
+    let next = St::for_target(Some(rested("A", gave_up)), &running, &to, proc("B"), 900);
     assert_eq!(
         (next.behind_since(), next.stop_streak, next.waits.len()),
         (900, 0, 0),
@@ -23611,7 +21528,6 @@ fn the_real_age_conforms_to_the_age_model() {
                         rec,
                         &running(s),
                         &target("2.1.284"),
-                        None,
                         proc(holder(s["proc"])),
                         now,
                     );
@@ -23669,7 +21585,7 @@ fn a_stopped_upgrade_retargeted_keeps_its_clock_word_and_streak() {
         stop_streak: 3,
         ..St::default()
     };
-    let next = St::for_target(Some(prior.clone()), &from, &to, None, Proc::default(), 900);
+    let next = St::for_target(Some(prior.clone()), &from, &to, Proc::default(), 900);
     assert_eq!(next.phase, Phase::Pending, "a new target is asked afresh");
     assert_eq!(next.behind_since(), 100, "the move clock is kept");
     assert_eq!(
@@ -23691,7 +21607,6 @@ fn a_stopped_upgrade_retargeted_keeps_its_clock_word_and_streak() {
         }),
         &from,
         &to,
-        None,
         Proc::default(),
         900,
     );
@@ -23710,7 +21625,6 @@ fn a_stopped_upgrade_retargeted_keeps_its_clock_word_and_streak() {
         }),
         &from,
         &to,
-        None,
         Proc::default(),
         900,
     );
@@ -23722,7 +21636,6 @@ fn a_stopped_upgrade_retargeted_keeps_its_clock_word_and_streak() {
         }),
         &from,
         &to,
-        None,
         Proc::default(),
         900,
     );
@@ -23745,14 +21658,7 @@ fn a_reused_state_names_the_build_the_sweep_would_start_now() {
             source: "native".to_string(),
             ..St::default()
         };
-        let next = St::for_target(
-            Some(prior.clone()),
-            &from,
-            &managed,
-            None,
-            Proc::default(),
-            900,
-        );
+        let next = St::for_target(Some(prior.clone()), &from, &managed, Proc::default(), 900);
         assert_eq!(next.source, "managed", "{phase:?}: relabelled");
         assert_eq!(
             St {
@@ -23773,14 +21679,7 @@ fn a_reused_state_names_the_build_the_sweep_would_start_now() {
             source: "native".to_string(),
             ..St::default()
         };
-        let next = St::for_target(
-            Some(prior.clone()),
-            &from,
-            &managed,
-            None,
-            Proc::default(),
-            900,
-        );
+        let next = St::for_target(Some(prior.clone()), &from, &managed, Proc::default(), 900);
         assert_eq!(next, prior, "{phase:?}: begun or final, kept as it was");
     }
 }
@@ -24170,163 +22069,6 @@ fn the_upgrade_ledger_is_cut_back_to_its_newest_rows() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The model on the relaunch line.
-#[test]
-fn a_listed_model_replaces_every_launch_model_spelling() {
-    use super::super::relaunch::with_model;
-    let v = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
-    assert_eq!(
-        with_model(
-            v(&[
-                "--model",
-                "opus",
-                "--verbose",
-                "--model=sonnet",
-                "--resume",
-                "ID"
-            ]),
-            Some("claude-opus-5-5")
-        ),
-        v(&["--verbose", "--model", "claude-opus-5-5", "--resume", "ID"])
-    );
-    assert_eq!(
-        with_model(v(&["--resume", "ID"]), Some("claude-fable-5-1")),
-        v(&["--model", "claude-fable-5-1", "--resume", "ID"])
-    );
-    let kept = v(&["--model", "opus", "--resume", "ID"]);
-    assert_eq!(with_model(kept.clone(), None), kept);
-    assert_eq!(
-        with_model(
-            v(&[
-                "--model",
-                "opus",
-                "--verbose",
-                "--model=x",
-                "--resume",
-                "ID"
-            ]),
-            Some("")
-        ),
-        v(&["--verbose", "--resume", "ID"])
-    );
-    assert_eq!(
-        with_model(
-            v(&[
-                "--append-system-prompt",
-                "--model",
-                "--add-dir",
-                "--resume",
-                "--resume",
-                "ID"
-            ]),
-            Some("sonnet")
-        ),
-        v(&[
-            "--append-system-prompt",
-            "--model",
-            "--add-dir",
-            "--resume",
-            "--model",
-            "sonnet",
-            "--resume",
-            "ID"
-        ])
-    );
-}
-
-/// The relaunch argv end to end, through the calls the upgrade makes.
-#[test]
-fn the_relaunch_line_moves_the_model_within_its_family_first_and_keeps_the_rest() {
-    const ID: &str = "446a0b3c-1979-414f-ae20-e06e26a2ef44";
-    let offered: Vec<String> = [
-        "claude-opus-5-5",
-        "claude-sonnet-5-5",
-        "claude-fable-5-1",
-        "claude-opus-5",
-    ]
-    .map(String::from)
-    .to_vec();
-    let relaunch = |argv: &[&str], live: &str, offered: &[String]| -> String {
-        let argv: Vec<String> = argv.iter().map(|w| (*w).to_string()).collect();
-        let launch = upgrade::launch_model(&argv);
-        let live = models::LiveModel {
-            id: live.to_string(),
-            by_command: false,
-        };
-        let asked = match models::model_due(
-            &Priority::seed(0),
-            Some(&live),
-            offered,
-            launch.as_deref(),
-            None,
-            &ModelRecord::default(),
-        ) {
-            ModelVerdict::Due { to, .. } => Some(to),
-            ModelVerdict::Keep(_) => None,
-        };
-        line_for(
-            Dialect::Bash,
-            None,
-            None,
-            std::path::Path::new("/x/claude"),
-            &argv,
-            Some(ID),
-            asked.as_deref(),
-            None,
-            &[],
-        )
-        .unwrap_or_else(|_| panic!("a line for {argv:?}"))
-    };
-    let line = |words: &[&str]| {
-        std::iter::once("/x/claude")
-            .chain(words.iter().copied())
-            .chain(["--resume", ID])
-            .map(|w| format!(" '{w}'"))
-            .collect::<String>()
-            .replacen(' ', " CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 ", 1)
-    };
-    let rows: [(&[&str], &str, &[&str]); 4] = [
-        (
-            &["claude", "--dangerously-skip-permissions"],
-            "claude-opus-5",
-            &[
-                "--dangerously-skip-permissions",
-                "--model",
-                "claude-opus-5-5",
-            ],
-        ),
-        (
-            &[
-                "claude",
-                "--fallback-model",
-                "claude-opus-5",
-                "--model",
-                "claude-opus-5",
-            ],
-            "claude-opus-5",
-            &[
-                "--fallback-model",
-                "claude-opus-5",
-                "--model",
-                "claude-opus-5-5",
-            ],
-        ),
-        (
-            &["claude", "--model=claude-opus-5[1m]"],
-            "claude-opus-5",
-            &["--model", "claude-opus-5-5[1m]"],
-        ),
-        (
-            &["claude", "--model", "opus"],
-            "claude-opus-5",
-            &["--model", "opus"],
-        ),
-    ];
-    for (argv, live, want) in rows {
-        assert_eq!(relaunch(argv, live, &offered), line(want), "{argv:?}");
-    }
-}
-
 /// A move outlives its record's removal (closed or pruned) and rides the next record, until the
 /// longest limit and its grace have passed.
 #[test]
@@ -24411,15 +22153,15 @@ fn a_move_outlives_its_records_removal() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// [`forget_settled_pending`] forgets a same-build (model) restart the list no longer asks for
-/// before it begins.
+/// [`forget_settled_pending`] forgets a pending round whose build the session already runs before
+/// it begins, and keeps every round that still has work or a word to give.
 #[test]
-fn an_unwanted_model_restart_is_forgotten_before_it_begins() {
-    let dir = scratch("forget-model-restart");
+fn a_pending_round_the_build_already_reached_is_forgotten() {
+    let dir = scratch("forget-reached-round");
     let opts = drive(&dir);
     let running = Version::parse("2.1.282").expect("v");
-    let model_only = St {
-        from: "2.1.282".to_string(),
+    let reached = St {
+        from: "2.1.274".to_string(),
         to: "2.1.282".to_string(),
         pending_since: 5,
         ..St::default()
@@ -24427,21 +22169,19 @@ fn an_unwanted_model_restart_is_forgotten_before_it_begins() {
     let build = St {
         from: "2.1.281".to_string(),
         to: "2.1.283".to_string(),
-        ..model_only.clone()
+        ..reached.clone()
     };
     let announced = St {
         phase: Phase::Announced { at_s: 9, asks: 1 },
-        ..model_only.clone()
+        ..reached.clone()
     };
     let stopped = St {
         phase: Phase::Failed("unanswered".to_string()),
-        from: "2.1.281".to_string(),
-        ..model_only.clone()
+        ..reached.clone()
     };
     let owing = St {
         release: "gave-up".to_string(),
-        from: "2.1.281".to_string(),
-        ..model_only.clone()
+        ..reached.clone()
     };
     for (why, st) in [
         ("a build upgrade to a newer build", &build),
@@ -24457,35 +22197,26 @@ fn an_unwanted_model_restart_is_forgotten_before_it_begins() {
         );
         assert_eq!(load(&opts, SESSION), written, "{why} is kept");
     }
-    save(&opts, SESSION, &model_only);
+    save(&opts, SESSION, &reached);
     let dry = Opts {
         dry_run: true,
         ..opts.clone()
     };
-    forget_settled_pending(&dry, SESSION, Some(&model_only), &running);
+    forget_settled_pending(&dry, SESSION, Some(&reached), &running);
     assert!(load(&opts, SESSION).is_some(), "a dry run writes nothing");
-    assert_eq!(
-        forget_settled_pending(&opts, SESSION, Some(&model_only), &running),
-        None,
-        "a model restart is forgotten without a word"
-    );
-    assert!(
-        load(&opts, SESSION).is_none(),
-        "the pending model restart is gone"
-    );
-    let reached = St {
-        from: "2.1.274".to_string(),
-        to: "2.1.282".to_string(),
-        pending_since: 5,
-        ..St::default()
+    let same_build = St {
+        from: "2.1.282".to_string(),
+        ..reached.clone()
     };
-    save(&opts, SESSION, &reached);
-    assert_eq!(
-        forget_settled_pending(&opts, SESSION, Some(&reached), &running).as_ref(),
-        Some(&reached),
-        "reported, so the ledger says it once"
-    );
-    assert!(load(&opts, SESSION).is_none(), "and gone");
+    for st in [&reached, &same_build] {
+        save(&opts, SESSION, st);
+        assert_eq!(
+            forget_settled_pending(&opts, SESSION, Some(st), &running).as_ref(),
+            Some(st),
+            "reported, so the ledger says it once: {st:?}"
+        );
+        assert!(load(&opts, SESSION).is_none(), "and gone: {st:?}");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -25677,7 +23408,7 @@ fn visit_launched_probed<K: Kernel>(
     args.argv.extend(launch.iter().map(|w| (*w).to_string()));
     args.env.extend(env.iter().cloned());
     let stable = make_kernel(sf.pid, squash(&sf.proc_start));
-    let r = visit_with_claim(
+    let r = visit_build(
         &opts,
         &sf,
         files.as_deref(),
@@ -26803,163 +24534,119 @@ fn an_announcement_is_planned_in_the_mode_the_pill_shows() {
     }
 }
 
-/// A model chosen by hand (`/model`, answered on since) rides the relaunch line when the list moves
-/// none.
+/// The single-quoted words of a shell line, in order (a `'\''` inside a word is a literal quote).
+#[cfg(unix)]
+fn quoted_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        let mut step = c.len_utf8();
+        if c == '\'' {
+            if word.is_none() {
+                word = Some(String::new());
+            } else if rest.starts_with("'\\''") {
+                word.get_or_insert_with(String::new).push('\'');
+                step = "'\\''".len();
+            } else {
+                words.extend(word.take());
+            }
+        } else if let Some(w) = word.as_mut() {
+            w.push(c);
+        }
+        rest = &rest[step..];
+    }
+    words
+}
+
+/// A relaunch line carries exactly the `--model` words of the session's own launch argv, in
+/// their own spelling, and none otherwise: a launch without `--model` relaunches without one.
+///
+/// The bait names `claude-opus-5-5` everywhere the harness could look for a model: the transcript
+/// answers on it, the person picked it with `/model`, and an older build's model list and
+/// per-session record name it. None of them reaches the line the upgrade plans (`St::line`, the
+/// line typed once the agent exits), whether the round is announced or planned at once for a
+/// conversation with no task.
 #[cfg(unix)]
 #[test]
-fn an_upgrade_carries_a_model_chosen_by_hand_when_the_list_moves_none() {
+fn an_upgrade_relaunch_line_carries_exactly_the_launchs_model_flag() {
     let shell = dead_pid();
     let later = "2099-01-01T00:00:00Z";
+    let picked = user_row("<local-command-stdout>Set model to `Opus 5.5`</local-command-stdout>");
     let task = vec![
         harness_row("Claude Code 2.1.283 (managed) is installed"),
         user_row("fix the parser"),
+        picked.clone(),
         answer_at("claude-opus-5-5", later),
     ];
     let fresh = vec![
         harness_row("Claude Code 2.1.283 (managed) is installed"),
+        picked,
         answer_at("claude-opus-5-5", later),
     ];
-    let launch = ["--model", "claude-sonnet-5-5"];
-    let chose = |opts: &Opts| chose_by_hand(opts, "claude-opus-5-5");
-    for (name, rows, kernel, step, chosen) in [
-        ("hand-announce", &task, usize::MAX, "announced:1", true),
-        ("hand-fresh", &fresh, 4, "wait:changed-before-signal", true),
-        ("nobody-announce", &task, usize::MAX, "announced:1", false),
-        (
-            "nobody-fresh",
-            &fresh,
-            4,
-            "wait:changed-before-signal",
-            false,
-        ),
-    ] {
-        let seed: &dyn Fn(&Opts) = if chosen { &chose } else { &|_| {} };
-        let (r, saved, _) = visit_launched(
-            name,
-            rows,
-            false,
-            &Script::new(shell, kernel, None),
-            77,
-            None,
-            None,
-            Answers::default(),
-            &launch,
-            seed,
-        );
-        assert_eq!(r.step, step, "{name}: {r:?}");
-        let saved = saved.expect("state");
-        assert!(saved.model_list.is_empty(), "{name}: the list moved none");
-        let (want, gone) = if chosen {
-            ("'claude-opus-5-5'", "'claude-sonnet-5-5'")
-        } else {
-            ("'claude-sonnet-5-5'", "'claude-opus-5-5'")
-        };
-        assert!(saved.line.contains(want), "{name}: {}", saved.line);
-        assert!(!saved.line.contains(gone), "{name}: {}", saved.line);
-    }
-}
-
-/// A hand `/model` choice on a bucket's fallback is relaunched and, once the signal is sent, saved
-/// as the fallback's origin.
-#[cfg(unix)]
-#[test]
-fn an_upgrade_restart_makes_the_hand_choice_it_carries_the_fallbacks_origin() {
-    let shell = dead_pid();
-    let origin = "claude-fable-5-1";
-    let hand = "claude-opus-5-5";
-    let later = "2099-01-01T00:00:00Z";
-    let rows = |model: &str| {
-        vec![
-            harness_row("Claude Code 2.1.283 (managed) is installed"),
-            answer_at(model, later),
-        ]
-    };
-    let seed = |chose: bool| {
-        move |opts: &Opts| {
-            let mut st = load(opts, SESSION).expect("state");
-            st.fallback_from = Some(origin.to_string());
-            save(opts, SESSION, &st);
-            if chose {
-                chose_by_hand(opts, hand);
+    let launches: [(&str, &[&str]); 3] = [
+        ("none", &[]),
+        ("split", &["--model", "claude-sonnet-5-5"]),
+        ("joined", &["--model=claude-sonnet-5-5"]),
+    ];
+    for (spelling, launch) in launches {
+        for (moment, rows, kernel, step) in [
+            ("announce", &task, usize::MAX, "announced:1"),
+            ("fresh", &fresh, 4, "wait:changed-before-signal"),
+        ] {
+            let name = format!("launch-model-{spelling}-{moment}");
+            let (r, saved, _) = visit_launched(
+                &name,
+                rows,
+                false,
+                &Script::new(shell, kernel, None),
+                77,
+                None,
+                None,
+                Answers::default(),
+                launch,
+                &older_model_records,
+            );
+            assert_eq!(r.step, step, "{name}: {r:?}");
+            let line = saved.expect("state").line;
+            assert!(!line.is_empty(), "{name}: a planned line");
+            let words = quoted_words(&line);
+            let flags: Vec<usize> = words
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| *w == "--model" || w.starts_with("--model="))
+                .map(|(i, _)| i)
+                .collect();
+            match launch {
+                [] => assert!(flags.is_empty(), "{name}: {words:?}"),
+                [flag, value] => {
+                    assert_eq!(flags.len(), 1, "{name}: {words:?}");
+                    assert_eq!(words[flags[0]], *flag, "{name}: {words:?}");
+                    assert_eq!(words[flags[0] + 1], *value, "{name}: {words:?}");
+                }
+                [joined] => {
+                    assert_eq!(flags.len(), 1, "{name}: {words:?}");
+                    assert_eq!(words[flags[0]], *joined, "{name}: the spelling kept");
+                }
+                _ => unreachable!("three launches"),
+            }
+            assert!(
+                !words.iter().any(|w| w.contains("claude-opus-5-5")),
+                "{name}: no bait on the line: {words:?}"
+            );
+            if let Some(resume) = words.iter().position(|w| w == "--resume") {
+                assert_eq!(
+                    words.get(resume + 1).map(String::as_str),
+                    Some(SESSION),
+                    "{name}: {words:?}"
+                );
+                assert!(
+                    flags.iter().all(|&i| i < resume),
+                    "{name}: the model before the resume: {words:?}"
+                );
             }
         }
-    };
-    let refused = Answers {
-        signal: "ERR busy",
-        ..Answers::default()
-    };
-    let cases = [
-        (
-            "origin-hand-sent",
-            true,
-            usize::MAX,
-            Answers::default(),
-            None,
-            hand,
-        ),
-        (
-            "origin-nobody-sent",
-            false,
-            usize::MAX,
-            Answers::default(),
-            None,
-            origin,
-        ),
-        (
-            "origin-hand-changed",
-            true,
-            4,
-            Answers::default(),
-            Some("wait:changed-before-signal"),
-            origin,
-        ),
-        (
-            "origin-hand-refused",
-            true,
-            usize::MAX,
-            refused,
-            Some("wait:signal-held"),
-            origin,
-        ),
-    ];
-    std::thread::scope(|scope| {
-        let runs: Vec<_> = cases
-            .into_iter()
-            .map(|(name, chose, foreground, answers, step, want)| {
-                let seed = seed(chose);
-                scope.spawn(move || {
-                    let model = if chose { hand } else { "claude-sonnet-5-5" };
-                    let (r, saved, asked) = visit_launched(
-                        name,
-                        &rows(model),
-                        false,
-                        &Script::new(shell, foreground, None),
-                        77,
-                        None,
-                        None,
-                        answers,
-                        &["--model", "claude-sonnet-5-5"],
-                        &seed,
-                    );
-                    let signalled = asked.iter().any(|l| l.contains(" signal "));
-                    match step {
-                        Some(step) => assert_eq!(r.step, step, "{name}: {r:?}"),
-                        None => assert!(signalled, "{name}: {r:?}"),
-                    }
-                    let saved = saved.expect("state");
-                    assert_eq!(saved.fallback_from.as_deref(), Some(want), "{name}: {r:?}");
-                    assert!(
-                        saved.line.contains(&format!("'--model' '{model}'")),
-                        "{name}: {}",
-                        saved.line
-                    );
-                })
-            })
-            .collect();
-        for run in runs {
-            run.join().expect("case");
-        }
-    });
+    }
 }
 
 /// Unknown process identity, running background work or an unreadable process table vetoes the
@@ -27001,12 +24688,7 @@ fn the_restart_last_look_keeps_unknown_identity_and_background_work_fenced() {
                 ..Answers::default()
             },
             &["--model", "claude-sonnet-5-5"],
-            &|opts| {
-                let mut st = load(opts, SESSION).expect("state");
-                st.fallback_from = Some("claude-fable-5-1".to_string());
-                save(opts, SESSION, &st);
-                chose_by_hand(opts, "claude-opus-5-5");
-            },
+            &|_| {},
             &[],
             |pid, start| ParkedProcess {
                 script: &script,
@@ -27021,10 +24703,7 @@ fn the_restart_last_look_keeps_unknown_identity_and_background_work_fenced() {
             known && name == "last-look-stable",
             "{name}: {asked:?}"
         );
-        assert_eq!(
-            saved.expect("state").fallback_from.as_deref(),
-            Some("claude-fable-5-1")
-        );
+        assert!(saved.is_some(), "{name}: the record stays");
     }
 }
 
@@ -27108,7 +24787,6 @@ fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() 
         );
         let mut st = announced_to(&h, "ATERM-UPGRADE-READY-0badf00d");
         st.owe_release("void");
-        st.fallback_from = Some("claude-fable-5-1".to_string());
         let prior = st.clone();
         let record = state_path(&h.opts, SESSION);
         let kept = record.join("kept");
@@ -27140,12 +24818,10 @@ fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() 
             pressed: false,
             lagging: false,
             mode: None,
-            model: None,
             login: None,
             home: None,
             route: crate::harness::accounts::AuthRoute::Outside,
             auth_observed: true,
-            profile: None,
             launch_env: None,
         };
         let report = Report {
@@ -27192,7 +24868,6 @@ fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() 
         assert_eq!(st.marker, prior.marker);
         assert_eq!(st.markers, prior.markers);
         assert_eq!(st.release, prior.release);
-        assert_eq!(st.fallback_from, prior.fallback_from);
         assert!(st.cause.is_empty() && st.back_line.is_empty());
         if blocked {
             assert_eq!(
@@ -27263,241 +24938,6 @@ fn a_key_or_a_prompt_after_the_first_look_stops_the_restart_before_its_signal() 
         asked.last().is_some_and(|l| l.ends_with(&release)),
         "the hand given back: {asked:#?}"
     );
-}
-
-/// A refused signal takes back the model ask its restart recorded, and the earlier ask it replaced
-/// stands again, time and all.
-#[cfg(unix)]
-#[test]
-fn a_refused_signal_takes_back_the_model_it_asked() {
-    let dir = scratch("ask-refused");
-    let (sock, asked) = instance_with(
-        &dir,
-        Answers {
-            lease: "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000 hard=1",
-            signal: "ERR busy person human_ms=300",
-            ..Answers::default()
-        },
-    );
-    let opts = Opts {
-        sock: Some(sock),
-        ..drive(&dir)
-    };
-    let mut agent = parked_bare().spawn().expect("spawn");
-    let pid = agent.id();
-    wait_exec(pid);
-    let sf = register(&opts.home, pid, SESSION);
-    let marker = "ATERM-UPGRADE-READY-0badf00d";
-    let project = opts.home.join(".claude/projects/p");
-    std::fs::create_dir_all(&project).expect("project");
-    let body = [
-        ASKED.to_string(),
-        turn_by("claude-opus-5", &format!("Saved.\\n{marker}")),
-    ]
-    .join("\n")
-        + "\n";
-    std::fs::write(project.join(format!("{SESSION}.jsonl")), &body).expect("transcript");
-    let shell = dead_pid();
-    let now = now_s();
-    let st = St {
-        phase: Phase::Announced {
-            at_s: now - 60,
-            asks: 1,
-        },
-        marker: marker.to_string(),
-        model_list: "claude-opus-5-5".to_string(),
-        tab: TAB.to_string(),
-        notice_pid: sf.pid,
-        notice_start: squash(&sf.proc_start),
-        to: "9.9.9".to_string(),
-        source: "managed".to_string(),
-        last_seq: 77,
-        seq_since_s: now - 3600,
-        ..St::default()
-    };
-    std::fs::create_dir_all(state_dir(&opts)).expect("state");
-    std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
-    let earlier = ModelRecord {
-        set: "claude-fable-5-1".to_string(),
-        set_at: now - 10,
-        ..ModelRecord::default()
-    };
-    save_model_record(&opts, SESSION, &earlier);
-    let args = atpkg::caller_shell::process_args(pid).expect("agent argv");
-    let files = session_files(&opts.home);
-    let script = Script::new(shell, usize::MAX, None);
-    let r = visit_with_claim(
-        &opts,
-        &sf,
-        files.as_deref(),
-        &[(shell, 1, "zsh".into())],
-        &newer(),
-        &ParkedProcess::new(&script, pid, Some(&sf.proc_start)),
-        Some(&args),
-        None,
-    );
-    let record = load_model_record(&opts, SESSION);
-    let saved = load(&opts, SESSION).expect("state");
-    let asked = asked.lock().map(|a| a.clone()).unwrap_or_default();
-    let _ = agent.kill();
-    let _ = agent.wait();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.step, "wait:signal-held", "{r:?}\n{asked:#?}");
-    assert!(
-        saved.line.contains("'--model' 'claude-opus-5-5'"),
-        "the restart asked the model: {}",
-        saved.line
-    );
-    assert_eq!(
-        (record.set.as_str(), record.set_at),
-        ("claude-fable-5-1", now - 10),
-        "the refused restart's ask taken back, the one before it standing"
-    );
-    assert!(record.failed.is_empty(), "{record:?}");
-    assert_eq!(
-        (saved.model_list.as_str(), saved.marker.as_str()),
-        ("claude-opus-5-5", marker),
-        "the round, its model and its READY stand"
-    );
-}
-
-/// The restart in place records a model ask only once the relaunch line carrying it is typed (an
-/// ask recorded with no line would settle failed and bar the model).
-#[cfg(unix)]
-#[test]
-fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
-    let case = |name: &str, signal: &'static str, roster: bool| {
-        let dir = scratch(name);
-        let shell = tty_zsh();
-        let who = format!(
-            "OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={}",
-            shell.id()
-        );
-        let (sock, asked) = instance_with(
-            &dir,
-            Answers {
-                signal,
-                who: roster.then_some(who),
-                ..Answers::default()
-            },
-        );
-        let opts = Opts {
-            sock: Some(sock),
-            only_sid: Some(TAB.to_string()),
-            ..drive(&dir)
-        };
-        seed_builds(&opts);
-        let mut agent = Some(parked_bare().spawn().expect("agent"));
-        let pid = agent.as_ref().map_or(0, aterm_uds::spawnfd::Child::id);
-        wait_exec(pid);
-        register(&opts.home, pid, SESSION);
-        std::fs::create_dir_all(state_dir(&opts)).expect("state");
-        write_transcript(
-            &opts.home,
-            &[answer_at("claude-opus-5", "2099-01-01T00:00:00Z")],
-        );
-        let cat = opts.home.join(".claude/cache/model-catalog");
-        std::fs::create_dir_all(&cat).expect("catalog dir");
-        std::fs::write(
-            cat.join("a-cc.json"),
-            r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"main"},{"id":"claude-opus-5","section":"main"}]}}}"#,
-        )
-        .expect("catalog");
-        let snap = Snapshot {
-            launch_env: None,
-            auth_observed: true,
-            // The profile below names this fixture's default stored login.
-            route: crate::harness::accounts::AuthRoute::Stored,
-            profile: Some(live_profile(&opts, None)),
-            tab: TAB.to_string(),
-            pid,
-            start: kernel_start(pid).expect("lstart"),
-            shell: shell.id(),
-            program: PathBuf::from("/opt/claude/bin/claude"),
-            argv: vec!["/opt/claude/bin/claude".to_string()],
-            session: Some(SESSION.to_string()),
-            cwd: "/".to_string(),
-            version: Some("1.0.0".to_string()),
-            run: crate::harness::relaunch::AgentRun::Claude,
-            dialect: None,
-            login: None,
-            home: None,
-            claude_dir: None,
-        };
-        let ended = signal.is_empty().then(|| {
-            let mut sent = agent.take().expect("the agent");
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(sent.wait());
-            });
-            rx
-        });
-        let opts = Opts {
-            press: None,
-            timings: crate::harness::Timings {
-                held: Duration::from_millis(100),
-                ..opts.timings
-            },
-            ..opts
-        };
-        let script = Script::new(shell.id(), usize::MAX, None);
-        let restart = |start: Option<&str>| {
-            crate::harness::relaunch::restart_with(
-                &opts,
-                &Restart::Memory,
-                &ask_of(&Restart::Memory),
-                Ok(snap.clone()),
-                &ParkedProcess::new(&script, pid, start),
-            )
-            .report
-        };
-        let mut r = restart(Some(&snap.start));
-        if let Some(ended) = &ended {
-            assert!(
-                ended.recv_timeout(HANG_DETECTOR).is_ok(),
-                "{name}: the agent ended"
-            );
-            r = restart(None);
-        }
-        let record = load_model_record(&opts, SESSION);
-        let typed = turns(&asked);
-        if let Some(mut parked) = agent {
-            let _ = parked.kill();
-            let _ = parked.wait();
-        }
-        shell.end();
-        let _ = std::fs::remove_dir_all(&dir);
-        (r, record, typed)
-    };
-    let case = &case;
-    side_by_side(vec![
-        Box::new(move || {
-            let (r, record, typed) = case("ask-refused", "ERR busy person human_ms=300", false);
-            assert_eq!(r.step, "wait:signal-held", "{r:?}");
-            assert_eq!(typed, 0);
-            assert_eq!(
-                (record.set.as_str(), record.failed.len()),
-                ("", 0),
-                "nothing relaunched asked it: {record:?}"
-            );
-        }),
-        Box::new(move || {
-            let (r, record, typed) = case("ask-untyped", "", false);
-            assert_eq!(r.step, "wait:tab-ownership-changed", "{r:?}");
-            assert_eq!(typed, 0);
-            assert_eq!(
-                (record.set.as_str(), record.failed.len()),
-                ("", 0),
-                "no line asked it: {record:?}"
-            );
-        }),
-        Box::new(move || {
-            let (r, record, typed) = case("ask-typed", "", true);
-            assert_eq!(typed, 1, "{r:?}");
-            assert_eq!(record.set, "claude-opus-5-5", "{r:?} {record:?}");
-            assert!(record.failed.is_empty(), "{record:?}");
-        }),
-    ]);
 }
 
 /// The first request of `asked` that ends with `needle`.
@@ -27677,7 +25117,7 @@ fn ledger_typed_as(root: &Path, tab: &str, text: &str, ts_ms: i64, rule_id: &str
 #[test]
 fn a_cold_restored_tab_reads_its_earlier_tabs_loop_turns_as_the_harnesss() {
     let at = "2026-10-15T10:00:00.000Z";
-    let t_ms = i64::try_from(super::super::upgrade_models::parse_utc(at).expect("a time"))
+    let t_ms = i64::try_from(super::super::unix_time::parse_utc(at).expect("a time"))
         .expect("seconds")
         * 1000;
     let rows = vec![
@@ -27727,7 +25167,7 @@ fn a_cold_restored_tab_reads_its_earlier_tabs_loop_turns_as_the_harnesss() {
 fn a_cold_restores_note_of_its_earlier_tab_is_read_with_no_record() {
     const MID_TAB: &str = "s-00000000000000000002";
     let at = "2026-10-15T10:00:00.000Z";
-    let t_ms = i64::try_from(super::super::upgrade_models::parse_utc(at).expect("a time"))
+    let t_ms = i64::try_from(super::super::unix_time::parse_utc(at).expect("a time"))
         .expect("seconds")
         * 1000;
     let rows = vec![
@@ -27783,7 +25223,7 @@ fn a_cold_restores_note_of_its_earlier_tab_is_read_with_no_record() {
 fn an_older_restores_tab_is_linked_to_its_earlier_tab_by_the_upgrade_ledger() {
     const OTHER: &str = "0badf00d-9999-2222-3333-444455556666";
     let at = "2026-10-15T10:00:00.000Z";
-    let t_s = super::super::upgrade_models::parse_utc(at).expect("a time");
+    let t_s = super::super::unix_time::parse_utc(at).expect("a time");
     let t_ms = i64::try_from(t_s).expect("seconds") * 1000;
     let rows = vec![
         user_row("Fix the lexer and land it."),
@@ -28123,7 +25563,7 @@ fn a_moved_agents_finish_is_found_by_its_relaunch_when_the_host_never_noted_it()
 #[test]
 fn an_earlier_tabs_loop_turns_count_only_until_the_conversation_left_it() {
     let at = "2026-10-15T10:00:00.000Z";
-    let t_s = super::super::upgrade_models::parse_utc(at).expect("a time");
+    let t_s = super::super::unix_time::parse_utc(at).expect("a time");
     let t_ms = i64::try_from(t_s).expect("seconds") * 1000;
     let rows = vec![
         user_row("Fix the lexer and land it."),
@@ -28580,7 +26020,7 @@ fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
         DONE_CHECK, LAND, LAND_CHECK, RULE_API_RETRY, wall_retry_text,
     };
     let at = "2026-10-15T10:00:00.000Z";
-    let t_ms = i64::try_from(super::super::upgrade_models::parse_utc(at).expect("a time"))
+    let t_ms = i64::try_from(super::super::unix_time::parse_utc(at).expect("a time"))
         .expect("seconds")
         * 1000;
     let retry = wall_retry_text(
@@ -28681,9 +26121,7 @@ fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
 #[test]
 fn a_relaunch_the_tabs_loop_resumed_first_is_carried_on_with_nothing() {
     use crate::supervise::approvals;
-    use crate::supervise::policy::turn_end::{
-        RULE_API_RETRY, RULE_MODEL_FALLBACK, RULE_USAGE_PROBE,
-    };
+    use crate::supervise::policy::turn_end::{RULE_ACCOUNT, RULE_API_RETRY, RULE_USAGE_PROBE};
     let going = vec![
         user_row("Fix the lexer and land it."),
         turn_by("claude-opus-5-5", "Landed the parser; the lexer is next."),
@@ -28774,14 +26212,14 @@ fn a_relaunch_the_tabs_loop_resumed_first_is_carried_on_with_nothing() {
     );
     assert_eq!(
         case(
-            "carry-loop-switch",
+            "carry-loop-account",
             &going,
             TAB,
-            (RULE_MODEL_FALLBACK, "relaunch --model opus"),
+            (RULE_ACCOUNT, "relaunch under account w2"),
             after
         ),
         ("continued".to_string(), 1),
-        "CONTROL: the model switch's own restart row is this relaunch"
+        "CONTROL: the account move's own restart row is this relaunch"
     );
     assert_eq!(
         case(
@@ -30347,7 +27785,7 @@ fn closing_a_reached_pending_record_keeps_the_owners_defer() {
         version: Version::parse("2.1.285").expect("v"),
         source: Source::Managed,
     };
-    let next = St::for_target(Some(kept), &running, &to285, None, proc("B"), now_s());
+    let next = St::for_target(Some(kept), &running, &to285, proc("B"), now_s());
     assert!(
         matches!(next.request, Request::DeferUntil(t) if t > now_s()),
         "the snooze holds for the next build: {:?}",
@@ -30380,8 +27818,8 @@ fn an_unnamed_process_falls_back_to_the_build_test() {
         proc_start: "A".to_string(),
         ..St::default()
     };
-    let named = St::for_target(Some(rec.clone()), &running, &to285, None, proc("B"), 900);
-    let unnamed = St::for_target(Some(rec), &running, &to285, None, Proc::default(), 900);
+    let named = St::for_target(Some(rec.clone()), &running, &to285, proc("B"), 900);
+    let unnamed = St::for_target(Some(rec), &running, &to285, Proc::default(), 900);
     assert_eq!(named.behind_since(), 900, "B's age begins now");
     assert_eq!(
         unnamed.behind_since(),
@@ -31030,7 +28468,7 @@ fn the_account_move_that_signalled_an_agent_is_named_by_its_label() {
     );
     assert_eq!(account_restart(&opts, pid).as_deref(), Some("work-2"));
 
-    for cause in ["", "memory", "model:claude-sonnet-5-5"] {
+    for cause in ["", "memory"] {
         save(&opts, SESSION, &record(cause, exiting.clone(), 0));
         assert!(
             restarted(&opts, upgrade::Agent::Claude, Some(pid)),
@@ -31269,11 +28707,11 @@ fn the_transcript_is_found_under_the_live_processs_own_config_dir() {
     );
 }
 
-/// The CLI's sweep judges an empty-home agent by its login's profile (`$HOME/.claude.json`,
-/// [`profile_apart`]) also after a window recorded it.
+/// The CLI's sweep finds an empty-home agent from its tab, and from a window's record of it, with
+/// its login's profile (`$HOME/.claude.json`, [`profile_apart`]).
 #[cfg(unix)]
 #[test]
-fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
+fn the_clis_sweep_finds_an_empty_homes_agent_a_window_recorded_with_its_logins_profile() {
     const LEADER: u32 = 4_242;
     let dir = scratch("cli-empty-home-recorded");
     let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={LEADER}");
@@ -31287,27 +28725,13 @@ fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
     let listed = Opts {
         sock: Some(sock),
         dry_run: true,
-        usage_credits: true,
         ..drive(&dir)
     };
     let unlisted = Opts {
         dry_run: true,
-        usage_credits: true,
         ..drive(&dir)
     };
     let work = dir.join("work");
-    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
-    for claude_dir in [listed.home.join(".claude"), work.clone()] {
-        let catalog = claude_dir.join("cache/model-catalog");
-        std::fs::create_dir_all(&catalog).expect("the catalog cache");
-        std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
-    }
-    let targets = Targets {
-        managed: None,
-        native: None,
-        unanswered: false,
-    };
-    let mctx = ModelCtx::read(&listed, &targets);
     std::fs::create_dir_all(work.join("sessions")).expect("sessions");
     std::fs::write(
         work.join(format!("sessions/{LEADER}.json")),
@@ -31325,22 +28749,6 @@ fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
         .expect("json"),
     )
     .expect("the record");
-    let proj = work.join("projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    let at = i64::try_from(now_s()).expect("now") - 7_200;
-    std::fs::write(
-        proj.join(format!("{SESSION}.jsonl")),
-        format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
-            crate::harness::usage::rfc3339_utc(at)
-        ),
-    )
-    .expect("transcript");
-    std::fs::write(
-        listed.home.join(".claude.json"),
-        r#"{"modelAccessCache":[{"apiName":"claude-opus-5-5","entitled":false}]}"#,
-    )
-    .expect("the login's profile");
     let args = |_: u32| {
         Some(atpkg::caller_shell::ProcArgs {
             env: vec!["CLAUDE_CONFIG_DIR=".to_string()],
@@ -31352,15 +28760,14 @@ fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
             .roster(Some(Vec::new()))
             .and_then(|files| files.into_iter().find(|sf| sf.pid == LEADER))
     };
-    let verdict = |opts: &Opts| {
-        record(opts, None).map(|sf| {
-            let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
-            model_read_for(opts, &sf, None, &mctx, false, None, None).verdict
-        })
-    };
-    let keep = Some(ModelVerdict::Keep("model-current"));
-    assert_eq!(verdict(&listed), keep, "CONTROL: read from its tab");
-    assert_eq!(verdict(&unlisted), None, "CONTROL: nothing names its home");
+    let login_profile = Some(listed.home.join(".claude.json"));
+    let from_tab = record(&listed, None).expect("CONTROL: read from its tab");
+    assert_eq!(from_tab.claude_dir.as_deref(), Some(work.as_path()));
+    assert_eq!(from_tab.profile, login_profile, "its login's profile");
+    assert!(
+        record(&unlisted, None).is_none(),
+        "CONTROL: nothing names its home"
+    );
     std::fs::create_dir_all(state_dir(&listed)).expect("state");
     let older = St {
         home: Records::at(&listed.home, HomeVars::config(Some("")), || {
@@ -31371,8 +28778,8 @@ fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
     };
     std::fs::write(state_path(&listed, SESSION), older.to_json()).expect("the older record");
     assert_eq!(
-        verdict(&listed),
-        keep,
+        record(&listed, None).map(|sf| sf.profile),
+        Some(login_profile.clone()),
         "a home read off its live leader comes before a record's word"
     );
     std::fs::remove_file(state_path(&listed, SESSION)).expect("rm");
@@ -31395,12 +28802,15 @@ fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
         ),
         "noted behind"
     );
-    let (after_listed, after_unlisted) = (verdict(&listed), verdict(&unlisted));
+    let (after_listed, after_unlisted) = (
+        record(&listed, None).map(|sf| sf.profile),
+        record(&unlisted, None).map(|sf| sf.profile),
+    );
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         (after_listed, after_unlisted),
-        (keep.clone(), keep),
-        "judged by its login's denial, from its tab and from the window's record alike"
+        (Some(login_profile.clone()), Some(login_profile)),
+        "found with its login's profile, from its tab and from the window's record alike"
     );
 }
 
@@ -31685,189 +29095,6 @@ fn the_clis_sweep_waits_on_no_tab_it_only_learned_homes_from() {
         !cli,
         "the CLI's sweep reports no wait for a tab it only learned homes from"
     );
-}
-
-/// An agent under another Claude home is judged by a list grown from that home's announcements
-/// ([`ModelCtx::at`]).
-#[test]
-fn another_homes_announcement_grows_only_its_own_agents_list() {
-    let dir = scratch("model-home-grows-alone");
-    let opts = Opts {
-        dry_run: false,
-        ..drive(&dir)
-    };
-    let bin = dir.join("build/claude");
-    std::fs::create_dir_all(bin.parent().expect("dir")).expect("the build");
-    std::fs::write(
-        &bin,
-        concat!(
-            r#"VERSION:"2.1.300",models:[{id:"claude-opus-5",family:"opus",display_name:"Opus 5"},"#,
-            r#"{id:"claude-opus-5-5",family:"opus",display_name:"Opus 5.5"},"#,
-            r#"{id:"claude-opus-5-6",family:"opus",display_name:"Opus 5.6"},"#,
-            r#"{id:"claude-fable-5-1",family:"fable",display_name:"Fable 5.1"}],"#,
-            r#"latest_per_family:{fable:"claude-fable-5-1",opus:"claude-opus-5-5"},alias_migration:{}};"#,
-        ),
-    )
-    .expect("the build's catalog");
-    let twin = dir.join("agents/claude");
-    std::fs::create_dir_all(twin.parent().expect("dir")).expect("the twin");
-    std::fs::write(
-        &twin,
-        format!("#!/bin/sh\nexec '{}' \"$@\"\n", bin.display()),
-    )
-    .expect("the twin");
-    let targets = Targets {
-        managed: Some(Candidate {
-            exe: twin,
-            version: Version::parse("2.1.300").expect("version"),
-            source: Source::Managed,
-        }),
-        native: None,
-        unanswered: false,
-    };
-    let answered = |claude_dir: &Path| {
-        let proj = claude_dir.join("projects/-work");
-        std::fs::create_dir_all(&proj).expect("projects");
-        let at = i64::try_from(now_s()).expect("now") - 7_200;
-        std::fs::write(
-            proj.join(format!("{SESSION}.jsonl")),
-            format!(
-                "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-opus-5-5\"}}}}\n",
-                crate::harness::usage::rfc3339_utc(at)
-            ),
-        )
-        .expect("transcript");
-    };
-    let announced = r#"{"cachedGrowthBookFeatures":{"tengu_startup_announcements":[{"id":"opus-5-6-launch","text":"t","requiresModel":"claude-opus-5-6"}]}}"#;
-    let other = dir.join("work/.claude");
-    std::fs::create_dir_all(&other).expect("its home");
-    std::fs::write(other.join(".claude.json"), announced).expect("its profile");
-    answered(&other);
-    let users = opts.home.join(".claude");
-    answered(&users);
-    let verdict = |sf: &SessionFile, mctx: &ModelCtx| {
-        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
-        model_read_for(&opts, sf, None, mctx, false, None, None).verdict
-    };
-    let mctx = ModelCtx::read(&opts, &targets);
-    let path = state_dir(&opts).join("models.json");
-    let list = std::fs::read_to_string(&path).expect("the list");
-    let changed = ledger_details(&opts, "models-changed");
-    let theirs = SessionFile {
-        claude_dir: Some(other.clone()),
-        ..record("2.1.300")
-    };
-    let second = SessionFile {
-        pid: 102,
-        ..theirs.clone()
-    };
-    let moved = ModelVerdict::Due {
-        from: "claude-opus-5-5".to_string(),
-        to: "claude-opus-5-6".to_string(),
-    };
-    let judged = [verdict(&theirs, &mctx), verdict(&second, &mctx)];
-    let (list_after, changed_after) = (
-        std::fs::read_to_string(&path).expect("the list"),
-        ledger_details(&opts, "models-changed"),
-    );
-    let own = SessionFile {
-        claude_dir: Some(users.clone()),
-        ..record("2.1.300")
-    };
-    let next = verdict(&own, &ModelCtx::read(&opts, &targets));
-    std::fs::write(opts.home.join(".claude.json"), announced).expect("the user's profile");
-    let announced_to_user = verdict(&own, &ModelCtx::read(&opts, &targets));
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(
-        judged,
-        [moved.clone(), moved.clone()],
-        "each moved to the model its home announces"
-    );
-    assert_eq!(announced_to_user, moved, "CONTROL: the user's own agent");
-    assert_eq!(
-        (list_after, changed_after),
-        (list, changed),
-        "the shared list and its journal as the pass's own read left them"
-    );
-    assert!(
-        !matches!(next, ModelVerdict::Due { .. }),
-        "CONTROL: the user's agent, announced nothing, is not moved: {next:?}"
-    );
-}
-
-/// The pass's own growth of the list is only ordered (aterm-durable's counting seam).
-#[test]
-fn the_passs_growth_of_the_model_list_is_only_ordered() {
-    use aterm_durable::{Flush, seam::Recording};
-    let dir = scratch("model-growth-flush");
-    let opts = Opts {
-        dry_run: false,
-        ..drive(&dir)
-    };
-    let bin = dir.join("build/claude");
-    std::fs::create_dir_all(bin.parent().expect("dir")).expect("the build");
-    std::fs::write(
-        &bin,
-        concat!(
-            r#"VERSION:"2.1.300",models:[{id:"claude-opus-5",family:"opus",display_name:"Opus 5"},"#,
-            r#"{id:"claude-opus-5-5",family:"opus",display_name:"Opus 5.5"},"#,
-            r#"{id:"claude-opus-5-6",family:"opus",display_name:"Opus 5.6"},"#,
-            r#"{id:"claude-fable-5-1",family:"fable",display_name:"Fable 5.1"}],"#,
-            r#"latest_per_family:{fable:"claude-fable-5-1",opus:"claude-opus-5-5"},alias_migration:{}};"#,
-        ),
-    )
-    .expect("the build's catalog");
-    let twin = dir.join("agents/claude");
-    std::fs::create_dir_all(twin.parent().expect("dir")).expect("the twin");
-    std::fs::write(
-        &twin,
-        format!("#!/bin/sh\nexec '{}' \"$@\"\n", bin.display()),
-    )
-    .expect("the twin");
-    let targets = Targets {
-        managed: Some(Candidate {
-            exe: twin,
-            version: Version::parse("2.1.300").expect("version"),
-            source: Source::Managed,
-        }),
-        native: None,
-        unanswered: false,
-    };
-    let users = opts.home.join(".claude");
-    let proj = users.join("projects/-work");
-    std::fs::create_dir_all(&proj).expect("projects");
-    let at = i64::try_from(now_s()).expect("now") - 7_200;
-    std::fs::write(
-        proj.join(format!("{SESSION}.jsonl")),
-        format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-opus-5-5\"}}}}\n",
-            crate::harness::usage::rfc3339_utc(at)
-        ),
-    )
-    .expect("transcript");
-    std::fs::write(
-        opts.home.join(".claude.json"),
-        r#"{"cachedGrowthBookFeatures":{"tengu_startup_announcements":[{"id":"opus-5-6-launch","text":"t","requiresModel":"claude-opus-5-6"}]}}"#,
-    )
-    .expect("the user's profile");
-    let path = state_dir(&opts).join("models.json");
-    models::load_or_seed(&path, at).expect("the seeded list");
-    let _ = catalog::baked_cached(&bin, &state_dir(&opts).join("builds"));
-    let seeded = std::fs::read_to_string(&path).expect("the list");
-
-    let recording = Recording::start();
-    let _ = ModelCtx::read(&opts, &targets);
-    let grew = recording.take();
-    let grown = std::fs::read_to_string(&path).expect("the list");
-    let changed = ledger_details(&opts, "models-changed");
-    let _ = ModelCtx::read(&opts, &targets);
-    let again = recording.take();
-    drop(recording);
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_ne!(grown, seeded, "PRECONDITION: the user's home grew the list");
-    assert!(!changed.is_empty(), "and each change is journaled");
-    assert_eq!(grew, [Flush::Ordered], "the growth's write is only ordered");
-    assert_eq!(again, [], "CONTROL: nothing new to grow, nothing written");
 }
 
 /// Under a relative home, a Claude Code that changed directory leaves its record (status frozen)
@@ -32429,7 +29656,6 @@ fn a_crash_is_never_moved_onto_a_newer_build_not_proved_to_start() {
             ..drive(&dir)
         };
         build_start::PROBE.with(|named| *named.borrow_mut() = None);
-        seed_builds(&opts);
         let versions = native_root(&opts.home);
         std::fs::create_dir_all(&versions).expect("versions");
         std::fs::write(versions.join("2.1.281"), "").expect("the build it ran");
@@ -32902,7 +30128,6 @@ fn multiple_candidates_share_one_preliminary_session_scan() {
         dry_run: true,
         ..drive(&dir)
     };
-    seed_builds(&opts);
     let mut a = parked().spawn().expect("agent A");
     let mut b = parked().spawn().expect("agent B");
     wait_exec(a.id());
@@ -33746,6 +30971,17 @@ fn agy_limit_reset_aligns_with_live_screen_model_and_unnamed_refill() {
         }),
         Some(u64::try_from(opus_reset).unwrap())
     );
+    // The same two spent pools read from a screen that names `Gemini 3.1 Pro (High)` answer the
+    // Gemini pool's own reset, the later of the two: a wall waits for the pool its session runs
+    // on, even when another pool refills sooner.
+    assert!(gemini_reset > opus_reset);
+    let s2_gemini = Store::new(dir.path(), "s2-gemini");
+    assert_eq!(
+        agy_limit_reset_with(None, Some("Gemini 3.1 Pro (High)"), now, |asked| {
+            rotate_launch_at(asked, &s2_gemini, &both_spent, &rotation, now, true)
+        }),
+        Some(u64::try_from(gemini_reset).unwrap())
+    );
 
     let s3 = Store::new(dir.path(), "s3");
     assert_eq!(
@@ -33820,7 +31056,6 @@ fn a_token_decision_types_the_wrapper_before_the_store_build() {
             auth_observed: true,
             route: crate::harness::accounts::AuthRoute::Stored,
             launch_env: None,
-            billing: crate::harness::relaunch::ModelBilling::Keep,
             serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
             resume: true,
@@ -33828,7 +31063,6 @@ fn a_token_decision_types_the_wrapper_before_the_store_build() {
             agent: 0,
             argv: &argv,
             exe,
-            model: None,
             mode: None,
             login: None,
             home: None,
@@ -33954,7 +31188,6 @@ fn a_route_move_serves_its_target_and_a_token_session_comes_back_through_the_wra
             auth_observed: true,
             route,
             launch_env: None,
-            billing: relaunch::ModelBilling::Keep,
             serve,
             session: SESSION,
             resume: true,
@@ -33962,7 +31195,6 @@ fn a_route_move_serves_its_target_and_a_token_session_comes_back_through_the_wra
             agent: 0,
             argv: &argv,
             exe: &build,
-            model: None,
             mode: None,
             login: None,
             home: None,
@@ -34107,7 +31339,6 @@ fn a_store_shaped_build_outside_atpkgs_store_is_never_served_the_token() {
             auth_observed: true,
             route: AuthRoute::Stored,
             launch_env: None,
-            billing: relaunch::ModelBilling::Keep,
             serve,
             session: SESSION,
             resume: true,
@@ -34115,7 +31346,6 @@ fn a_store_shaped_build_outside_atpkgs_store_is_never_served_the_token() {
             agent: 0,
             argv: &argv,
             exe,
-            model: None,
             mode: None,
             login: None,
             home: None,

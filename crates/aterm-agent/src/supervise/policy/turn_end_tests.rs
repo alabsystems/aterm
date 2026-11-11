@@ -1299,10 +1299,7 @@ fn a_bucket_the_vendor_continued_by_itself_gets_no_usage_resume() {
         .cloned()
         .collect();
     let armed_here = captured_rows(&before);
-    let off = SupervisorConfig {
-        model_fallback: None,
-        ..cfg()
-    };
+    let off = cfg();
     let mut st = TurnEndState::default();
     at_under(&mut st, &armed_here, t, &off);
     let a = at_under(&mut st, &captured_rows(&chose), t + MIN / 2, &off);
@@ -3269,7 +3266,7 @@ fn with_resume_limits_off_a_limit_whose_notice_left_gets_nothing() {
 }
 
 #[test]
-fn a_sonnet_bucket_under_the_generic_banner_relaunches_on_the_fallback() {
+fn a_sonnet_bucket_under_the_generic_banner_waits_out_its_countdown() {
     let t = t0();
     let reset = t + 2 * 24 * 60 * MIN;
     let r = TurnEndReading {
@@ -3288,40 +3285,98 @@ fn a_sonnet_bucket_under_the_generic_banner_relaunches_on_the_fallback() {
     let mut st = TurnEndState::default();
     let a = act(&mut st, &r, t);
     assert!(
-        restarts(
-            &a,
-            &Restart::Model {
-                to: "opus".to_string()
-            },
-            RULE_MODEL_FALLBACK
-        ),
-        "{a:?}"
-    );
-    assert_eq!(
-        st.model_switch(),
-        Some(&ModelSwitch {
-            from: Some("sonnet".to_string()),
-            to: "opus".to_string(),
-            back_at: Some(reset),
-            proc: None,
-            unproven: false,
-        })
-    );
-    let none = SupervisorConfig {
-        model_fallback: None,
-        ..cfg()
-    };
-    let mut st = TurnEndState::default();
-    let a = at_under(&mut st, &r, t, &none);
-    assert!(
         matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
             if *until == reset + 10 * MIN && why == "model-bucket goes on by itself"),
         "{a:?}"
     );
 }
 
+/// A MODEL BUCKET WAITS FOR ITS RESET AND RELAUNCHES NOTHING: under the default config a bucket
+/// with a named reset, in a tab whose host can relaunch, waits for that reset and its grace; and
+/// under every setting of consent, `continue_policy`, `resume_limits` and `usage_credits`, with a
+/// reset named or none, at the wall, inside its wait and past it, no decision is a restart.
+/// NEGATIVE CONTROL: the same tab at a memory wall restarts.
 #[test]
-fn a_buckets_words_under_a_call_run_no_model_fallback() {
+fn a_model_bucket_waits_for_its_reset_and_relaunches_nothing() {
+    let t = t0();
+    let reset = t + 120 * MIN;
+    let named = TurnEndReading {
+        restartable: true,
+        ..bucket(Some(reset), 3 * MIN)
+    };
+    let mut st = TurnEndState::default();
+    let a = act(&mut st, &named, t);
+    assert!(waits_until(&a, reset + GRACE), "{a:?}");
+    let a = act(&mut st, &named, t + 30 * MIN);
+    assert!(waits_until(&a, reset + GRACE), "{a:?}");
+    let consent = TurnEndReading {
+        restartable: true,
+        ..walled(
+            WallKind::ModelBucket { consent: true },
+            "Fable limit reached · continuing on Sonnet uses usage credits, and the prompt to confirm",
+            Some(3 * MIN),
+        )
+    };
+    let unnamed = TurnEndReading {
+        restartable: true,
+        ..bucket(None, 3 * MIN)
+    };
+    let credits_only = TurnEndReading {
+        restartable: true,
+        ..walled(
+            WallKind::ModelBucket { consent: false },
+            "Fable 5.1 requires usage credits",
+            Some(3 * MIN),
+        )
+    };
+    let armed = TurnEndReading {
+        restartable: true,
+        ..captured(SONNET_BUCKET_ARMED, Some(reset), Duration::ZERO)
+    };
+    for on in [false, true] {
+        for limits in [false, true] {
+            for credits in [false, true] {
+                let c = SupervisorConfig {
+                    continue_policy: on,
+                    resume_limits: limits,
+                    usage_credits: credits,
+                    ..cfg()
+                };
+                for (what, r) in [
+                    ("a named reset", &named),
+                    ("consent", &consent),
+                    ("no reset named", &unnamed),
+                    ("only usage credits", &credits_only),
+                    ("the countdown", &armed),
+                ] {
+                    let mut st = TurnEndState::default();
+                    for now in [t, t + 30 * MIN, reset + GRACE, t + 400 * MIN] {
+                        let a = at_under(&mut st, r, now, &c);
+                        assert!(
+                            !matches!(a, TurnEndAction::Restart { .. }),
+                            "{what}, continue {on}, resume_limits {limits}, usage_credits \
+                             {credits}: {a:?}"
+                        );
+                        st.acted(&a, r, now);
+                    }
+                }
+            }
+        }
+    }
+    let memory = TurnEndReading {
+        restartable: true,
+        ..walled(
+            WallKind::Memory,
+            "JavaScript heap out of memory",
+            Some(3 * MIN),
+        )
+    };
+    let a = at(&mut TurnEndState::default(), &memory, t);
+    assert!(matches!(a, TurnEndAction::Restart { .. }), "{a:?}");
+}
+
+#[test]
+fn a_buckets_words_under_a_call_run_are_a_session_limit_and_relaunch_nothing() {
     let t = t0();
     let reset = t + 2 * 24 * 60 * MIN;
     let rows = screen(SONNET_BUCKET_ARMED);
@@ -3351,20 +3406,15 @@ fn a_buckets_words_under_a_call_run_no_model_fallback() {
         };
         assert_eq!(r.wall, Some(want), "{name}: {r:#?}");
         let a = act(&mut TurnEndState::default(), &r, t);
-        let relaunched = restarts(
-            &a,
-            &Restart::Model {
-                to: "opus".to_string(),
-            },
-            RULE_MODEL_FALLBACK,
+        let named = if name == "measured" {
+            "model-bucket"
+        } else {
+            "usage-session"
+        };
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.starts_with(named)),
+            "{name}: {a:?}"
         );
-        assert_eq!(relaunched, name == "measured", "{name}: {a:?}");
-        if name != "measured" {
-            assert!(
-                matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.starts_with("usage-session")),
-                "{name}: {a:?}"
-            );
-        }
     }
 }
 
@@ -3423,26 +3473,12 @@ fn a_bucket_no_relaunch_moved_off_is_waited_on_when_its_countdown_ends() {
         cancelled.auto_continue,
         Some(aterm_phase::AutoContinue::Unkept)
     );
-    let fallback = |f: Option<&str>| SupervisorConfig {
-        model_fallback: f.map(str::to_string),
-        ..cfg()
-    };
     let due = reset + GRACE + jitter;
-    for (what, armed, c, restartable) in [
-        ("model_fallback off", &sonnet, fallback(None), true),
-        ("no host to relaunch", &sonnet, cfg(), false),
-        (
-            "the fallback is the bucket's model",
-            &sonnet,
-            fallback(Some("sonnet")),
-            true,
-        ),
-        (
-            "an Opus bucket under the default fallback",
-            &opus,
-            cfg(),
-            true,
-        ),
+    let c = cfg();
+    for (what, armed, restartable) in [
+        ("a host to relaunch", &sonnet, true),
+        ("no host to relaunch", &sonnet, false),
+        ("an Opus bucket", &opus, true),
     ] {
         for (left, screen) in [
             ("a /resume", &resumed),
@@ -3482,33 +3518,11 @@ fn a_bucket_no_relaunch_moved_off_is_waited_on_when_its_countdown_ends() {
         chosen.since_limit.as_ref().is_some_and(|s| s.model_set),
         "{chosen:#?}"
     );
-    let off = fallback(None);
     let mut st = TurnEndState::default();
-    at_under(&mut st, &sonnet, t, &off);
+    at_under(&mut st, &sonnet, t, &c);
     assert_eq!(
-        at_under(&mut st, &chosen, t + MIN, &off),
+        at_under(&mut st, &chosen, t + MIN, &c),
         typed(RULE_LIMIT_RESUME)
-    );
-    assert!(!st.waits_on_named_reset());
-    let mut st = TurnEndState::default();
-    let relaunch = TurnEndReading {
-        restartable: true,
-        ..sonnet.clone()
-    };
-    assert!(
-        restarts(
-            &act(&mut st, &relaunch, t),
-            &Restart::Model {
-                to: "opus".to_string()
-            },
-            RULE_MODEL_FALLBACK
-        ),
-        "the relaunch"
-    );
-    let a = at(&mut st, &resumed, t + MIN);
-    assert!(
-        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("short turn")),
-        "the continue policy's back-off: {a:?}"
     );
     assert!(!st.waits_on_named_reset());
     let mut st = TurnEndState::default();
@@ -3519,10 +3533,10 @@ fn a_bucket_no_relaunch_moved_off_is_waited_on_when_its_countdown_ends() {
             ..sonnet.clone()
         },
         t,
-        &off,
+        &c,
     );
     assert_eq!(
-        at_under(&mut st, &cancelled, t + MIN, &off),
+        at_under(&mut st, &cancelled, t + MIN, &c),
         typed(RULE_LIMIT_RESUME)
     );
     let mut untied = screen(aterm_phase::prompt::fixtures::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300);
@@ -3533,8 +3547,8 @@ fn a_bucket_no_relaunch_moved_off_is_waited_on_when_its_countdown_ends() {
     untied.splice(top..top, ["❯ /model", set_row, ""].map(str::to_string));
     let untied = captured_rows(&untied);
     let mut st = TurnEndState::default();
-    at_under(&mut st, &sonnet, t, &off);
-    let a = at_under(&mut st, &untied, t + MIN, &off);
+    at_under(&mut st, &sonnet, t, &c);
+    let a = at_under(&mut st, &untied, t + MIN, &c);
     assert!(
         matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
             if *until == due && why == "model-bucket resets"),
@@ -3548,10 +3562,7 @@ fn a_model_choice_only_leaves_a_bucket_for_a_known_different_family() {
     let reset = t + 2 * 24 * 60 * MIN;
     let jitter = Duration::from_secs(17);
     let armed = captured(SONNET_BUCKET_ARMED, Some(reset), jitter);
-    let c = SupervisorConfig {
-        model_fallback: None,
-        ..cfg()
-    };
+    let c = cfg();
     let due = reset + GRACE + jitter;
     for (choices, escapes) in [
         (vec!["Sonnet 4.6"], false),
@@ -3593,197 +3604,6 @@ fn a_model_choice_only_leaves_a_bucket_for_a_known_different_family() {
 }
 
 #[test]
-fn a_relaunch_where_the_buckets_notice_left_knows_the_bucket() {
-    let t = t0();
-    let reset = t + 2 * 24 * 60 * MIN;
-    let armed = captured(SONNET_BUCKET_ARMED, Some(reset), Duration::ZERO);
-    let resumed = TurnEndReading {
-        restartable: true,
-        ..captured(
-            aterm_phase::prompt::fixtures::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
-            None,
-            Duration::ZERO,
-        )
-    };
-    let switched = ModelSwitch {
-        from: Some("sonnet".to_string()),
-        to: "opus".to_string(),
-        back_at: Some(reset),
-        proc: None,
-        unproven: false,
-    };
-    let fallback = |a: &TurnEndAction| {
-        restarts(
-            a,
-            &Restart::Model {
-                to: "opus".to_string(),
-            },
-            RULE_MODEL_FALLBACK,
-        )
-    };
-    let mut st = TurnEndState::default();
-    let a = at(&mut st, &armed, t);
-    assert!(
-        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why == "model-bucket goes on by itself"),
-        "no host to relaunch: {a:?}"
-    );
-    let a = act(&mut st, &resumed, t + MIN);
-    assert!(fallback(&a), "the bucket's own rule where it left: {a:?}");
-    assert_eq!(st.model_switch(), Some(&switched));
-    let mut st = TurnEndState::default();
-    let a = act(
-        &mut st,
-        &TurnEndReading {
-            restartable: true,
-            ..armed.clone()
-        },
-        t,
-    );
-    assert!(fallback(&a), "{a:?}");
-    assert_eq!(st.model_switch(), Some(&switched));
-}
-
-#[test]
-fn a_buckets_notice_written_before_the_relaunched_process_started_is_the_one_it_left() {
-    let t = t0();
-    let reset = t + 2 * 24 * 60 * MIN;
-    let armed = TurnEndReading {
-        restartable: true,
-        ..captured(SONNET_BUCKET_ARMED, Some(reset), Duration::ZERO)
-    };
-    let asked = 1_792_100_000;
-    let left = |written: i64, started: &[i64]| -> bool {
-        let mut st = TurnEndState::default();
-        let a = act(&mut st, &armed, t);
-        assert!(
-            restarts(
-                &a,
-                &Restart::Model {
-                    to: "opus".to_string()
-                },
-                RULE_MODEL_FALLBACK
-            ),
-            "{a:?}"
-        );
-        st.fallback_made_at(asked);
-        assert!(st.fallback_unasked());
-        for &at in started {
-            st.agent_started_unix(at);
-        }
-        st.notice_written_at(Some(written));
-        st.bucket_left(&armed)
-    };
-    let old = asked - 86_400;
-    assert!(left(asked + 300, &[old, asked + 900]), "the redraw");
-    assert!(
-        !left(asked + 960, &[old, asked + 900]),
-        "written by the relaunched process"
-    );
-    assert!(!left(asked + 300, &[]), "no start named");
-    assert!(!left(asked + 300, &[old]), "the old process's start");
-    assert!(
-        left(asked + 300, &[asked + 900, asked + 3600]),
-        "a later process moves nothing"
-    );
-    assert!(
-        !left(asked + 1000, &[asked + 900, asked + 3600]),
-        "nor reads the first one's answer as its redraw"
-    );
-}
-
-#[test]
-fn a_buckets_notice_nothing_dates_is_read_by_the_fallbacks_latch_alone() {
-    let t = t0();
-    let reset = t + 2 * 24 * 60 * MIN;
-    let armed = TurnEndReading {
-        restartable: true,
-        ..captured(SONNET_BUCKET_ARMED, Some(reset), Duration::ZERO)
-    };
-    let resumed = captured(
-        aterm_phase::prompt::fixtures::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
-        None,
-        Duration::ZERO,
-    );
-    let mut st = TurnEndState::default();
-    let a = act(&mut st, &armed, t);
-    assert!(
-        restarts(
-            &a,
-            &Restart::Model {
-                to: "opus".to_string()
-            },
-            RULE_MODEL_FALLBACK
-        ),
-        "{a:?}"
-    );
-    let asked = 1_792_100_000;
-    st.fallback_made_at(asked);
-    st.agent_started_unix(asked + 900);
-    st.notice_written_at(None);
-    assert!(st.bucket_left(&armed), "the redraw: the latch alone");
-    let ran = TurnEndReading {
-        worked: Some(3 * MIN),
-        ..resumed
-    };
-    let _ = at(&mut st, &ran, t + 10 * MIN);
-    st.notice_written_at(None);
-    assert!(!st.bucket_left(&armed), "a turn asked since: the wall");
-}
-
-#[test]
-fn a_bucket_the_fallbacks_relaunch_left_holds_no_point_for_an_unread_conversation() {
-    let t = t0();
-    let reset = t + 2 * 24 * 60 * MIN;
-    let unread = |r: TurnEndReading| TurnEndReading {
-        conversation: Conversation::Unknown,
-        restartable: true,
-        ..r
-    };
-    let armed = unread(captured(SONNET_BUCKET_ARMED, Some(reset), Duration::ZERO));
-    let resumed = unread(captured(
-        aterm_phase::prompt::fixtures::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
-        None,
-        Duration::ZERO,
-    ));
-    let fallback = Restart::Model {
-        to: "opus".to_string(),
-    };
-    let looks = |a: &TurnEndAction| {
-        matches!(a, TurnEndAction::WaitUntil { why, .. }
-            if why == "the remembered limit's conversation is unread; no act on its account")
-    };
-    let relaunched = |made: bool| {
-        let mut st = TurnEndState::default();
-        let a = at(&mut st, &armed, t);
-        assert!(restarts(&a, &fallback, RULE_MODEL_FALLBACK), "{a:?}");
-        st.restarted(&fallback, made, &armed, t);
-        st
-    };
-    let continues = |st: &TurnEndState, r: &TurnEndReading, a: &TurnEndAction| {
-        matches!(a, TurnEndAction::WaitUntil { until, .. }
-            if !looks(a) && decide_turn_end(st, r, &cfg(), *until) == typed(RULE_CONTINUE))
-    };
-    for (name, r) in [("the redraw", &armed), ("no redraw", &resumed)] {
-        let mut st = relaunched(true);
-        let a = at(&mut st, r, t + MIN);
-        assert!(continues(&st, r, &a), "{name}: {a:?}");
-    }
-    let mut st = relaunched(false);
-    let a = at(&mut st, &resumed, t + MIN);
-    assert!(looks(&a), "the relaunch not made: {a:?}");
-    let mut st = relaunched(true);
-    let a = act(&mut st, &resumed, t + MIN);
-    let a = match a {
-        TurnEndAction::WaitUntil { until, .. } => act(&mut st, &resumed, until),
-        other => other,
-    };
-    assert_eq!(a, typed(RULE_CONTINUE), "a turn asked on the fallback");
-    let _ = at(&mut st, &armed, t + 5 * MIN);
-    let a = at(&mut st, &resumed, t + 6 * MIN);
-    assert!(looks(&a), "the bucket answering again, then left: {a:?}");
-}
-
-#[test]
 fn a_bucket_waited_on_is_taken_up_by_the_loop_that_follows() {
     let t = t0();
     let reset = t + 2 * 24 * 60 * MIN;
@@ -3815,35 +3635,22 @@ fn a_bucket_waited_on_is_taken_up_by_the_loop_that_follows() {
         assert!(st.waits_on_named_reset());
         st
     };
-    let mut st = seeded("Opus");
-    let a = at(&mut st, &resumed, t + MIN);
-    assert!(
-        matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
-            if *until == reset + GRACE && why == "model-bucket resets"),
-        "{a:?}"
-    );
-    let mut st = seeded("Sonnet");
-    let a = at(&mut st, &resumed, t + MIN);
-    assert!(
-        restarts(
-            &a,
-            &Restart::Model {
-                to: "opus".to_string()
-            },
-            RULE_MODEL_FALLBACK
-        ),
-        "{a:?}"
-    );
+    for model in ["Opus", "Sonnet"] {
+        let mut st = seeded(model);
+        let a = at(&mut st, &resumed, t + MIN);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { until, why, .. }
+                if *until == reset + GRACE && why == "model-bucket resets"),
+            "{model}: {a:?}"
+        );
+    }
 }
 
 #[test]
 fn the_vendors_continuation_of_a_bucket_ends_its_wait_under_its_own_notice() {
     let t = t0();
     let reset = t + 2 * 24 * 60 * MIN;
-    let off = SupervisorConfig {
-        model_fallback: None,
-        ..cfg()
-    };
+    let off = cfg();
     let armed = captured(SONNET_BUCKET_ARMED, Some(reset), Duration::ZERO);
     let fired = captured_rows(&sonnet_bucket_then(
         &[],
@@ -3891,319 +3698,6 @@ fn the_vendors_continuation_of_a_bucket_ends_its_wait_under_its_own_notice() {
 }
 
 #[test]
-fn a_fable_limit_relaunches_on_opus_and_back_at_its_reset_never_by_model() {
-    let t = t0();
-    let mut st = TurnEndState::default();
-    let mut r = walled(
-        WallKind::ModelBucket { consent: false },
-        "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
-        Some(3 * MIN),
-    );
-    r.reset_at = Some(t + 120 * MIN);
-    let a = act(&mut st, &r, t);
-    assert!(
-        restarts(
-            &a,
-            &Restart::Model {
-                to: "opus".to_string()
-            },
-            RULE_MODEL_FALLBACK
-        ),
-        "{a:?}"
-    );
-    let TurnEndAction::Restart { otherwise, .. } = &a else {
-        unreachable!()
-    };
-    assert!(
-        waits_until(otherwise, t + 120 * MIN + GRACE),
-        "unmade, the reset is waited out: {otherwise:?}"
-    );
-    assert_eq!(
-        st.model_switch(),
-        Some(&ModelSwitch {
-            from: Some("fable".to_string()),
-            to: "opus".to_string(),
-            back_at: Some(t + 120 * MIN),
-            proc: None,
-            unproven: false,
-        })
-    );
-    let bare = TurnEndReading {
-        restartable: false,
-        ..r.clone()
-    };
-    let mut st = TurnEndState::default();
-    assert!(waits_until(&at(&mut st, &bare, t), t + 120 * MIN + GRACE));
-    let mut st = TurnEndState::default();
-    let a = at(&mut st, &r, t);
-    let TurnEndAction::Restart { why, .. } = &a else {
-        panic!("{a:?}")
-    };
-    st.restarted(why, false, &r, t);
-    assert!(waits_until(
-        &at(&mut st, &r, t + MIN),
-        t + 120 * MIN + GRACE
-    ));
-    assert_eq!(st.model_switch(), None, "nothing switched");
-}
-
-#[test]
-fn a_model_switch_is_its_relaunched_process_and_another_programs_bucket_falls_back() {
-    /// What the switch is to the process named: it rides it (its bucket waits, `back_at`
-    /// restores), it holds its return (its bucket waits, nothing restores yet), or it is over
-    /// (its bucket falls back, nothing restores).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Want {
-        Rides,
-        Holds,
-        Over,
-    }
-    let t = t0();
-    let reset = t + 2 * 24 * 60 * MIN;
-    let a = SwitchProc {
-        pid: 4100,
-        start: 1_000,
-        conversation: Some("conv-a".to_string()),
-    };
-    let switched = |proc: Option<SwitchProc>| {
-        let mut st = TurnEndState::default();
-        st.seed_model(ModelSwitch {
-            from: Some("sonnet".to_string()),
-            to: "opus".to_string(),
-            back_at: Some(reset),
-            proc,
-            unproven: false,
-        });
-        st
-    };
-    // The bucket the switch left, met in the tab after the host names the process.
-    let bucket = TurnEndReading {
-        restartable: true,
-        ..captured(
-            aterm_phase::prompt::fixtures::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300,
-            Some(reset),
-            Duration::ZERO,
-        )
-    };
-    let falls_back = |a: &TurnEndAction| {
-        restarts(
-            a,
-            &Restart::Model {
-                to: "opus".to_string(),
-            },
-            RULE_MODEL_FALLBACK,
-        )
-    };
-    let restores = |a: &TurnEndAction| {
-        matches!(
-            a,
-            TurnEndAction::Restart {
-                why: Restart::ModelBack { .. },
-                rule_id: RULE_MODEL_RESTORE,
-                ..
-            }
-        )
-    };
-    let named = |pid, start, conversation: Option<&str>| SwitchProc {
-        pid,
-        start,
-        conversation: conversation.map(str::to_string),
-    };
-    // What the loop saw before the host named the process: nothing, a step of the host's that
-    // started one, or its own restart, made (a memory restart's, a lost line's) or not.
-    let nothing: &dyn Fn(&mut TurnEndState) = &|_: &mut TurnEndState| {};
-    let host_step: &dyn Fn(&mut TurnEndState) = &|st: &mut TurnEndState| st.harness_started();
-    let restart = |why: Restart, made: bool| {
-        move |st: &mut TurnEndState| {
-            st.restarted(&why, made, &idle("Fixed the parser.", Some(JOB)), t);
-        }
-    };
-    let memory_restart = restart(Restart::Memory, true);
-    let memory_restart: &dyn Fn(&mut TurnEndState) = &memory_restart;
-    let lost_line = Restart::InputLost {
-        of: (Some(a.pid), Some(a.start)),
-        line: crate::supervise::custody::LineAsk {
-            at_ms: 900_000,
-            nth: 0,
-        },
-    };
-    let input_lost_restart = restart(lost_line, true);
-    let input_lost_restart: &dyn Fn(&mut TurnEndState) = &input_lost_restart;
-    let memory_unmade = restart(Restart::Memory, false);
-    let memory_unmade: &dyn Fn(&mut TurnEndState) = &memory_unmade;
-    let b = named(4200, 2_000, Some("conv-b"));
-    let p3 = |conversation| named(4300, 3_000, Some(conversation));
-    let mut wrong = Vec::new();
-    let rows = vec![
-        (
-            "the person's fresh program, B",
-            Some(a.clone()),
-            nothing,
-            vec![b.clone()],
-            false,
-            Some(SwitchScope::Closed),
-            Want::Over,
-        ),
-        (
-            "another program under the switch's pid, reused",
-            Some(a.clone()),
-            nothing,
-            vec![named(4100, 5_000, Some("conv-b"))],
-            false,
-            Some(SwitchScope::Closed),
-            Want::Over,
-        ),
-        (
-            "another process whose conversation the host does not name yet",
-            Some(a.clone()),
-            nothing,
-            vec![named(4200, 2_000, None)],
-            false,
-            None,
-            Want::Holds,
-        ),
-        (
-            "a relaunch the host still owes, on a conversation the switch never named",
-            Some(a.clone()),
-            nothing,
-            vec![p3("conv-z")],
-            true,
-            Some(SwitchScope::Moved(p3("conv-z"))),
-            Want::Rides,
-        ),
-        (
-            "a process a step of the host's started, afresh on a new conversation",
-            Some(a.clone()),
-            host_step,
-            vec![p3("conv-n")],
-            false,
-            Some(SwitchScope::Moved(p3("conv-n"))),
-            Want::Rides,
-        ),
-        (
-            "a process this loop's memory restart started, afresh on a new conversation",
-            Some(a.clone()),
-            memory_restart,
-            vec![p3("conv-n")],
-            false,
-            Some(SwitchScope::Moved(p3("conv-n"))),
-            Want::Rides,
-        ),
-        (
-            "a process this loop's lost-input restart started, afresh on a new conversation",
-            Some(a.clone()),
-            input_lost_restart,
-            vec![p3("conv-n")],
-            false,
-            Some(SwitchScope::Moved(p3("conv-n"))),
-            Want::Rides,
-        ),
-        (
-            "control: a memory restart the host did not make, then B",
-            Some(a.clone()),
-            memory_unmade,
-            vec![b.clone()],
-            false,
-            Some(SwitchScope::Closed),
-            Want::Over,
-        ),
-        (
-            "a process a step of the host's started, named first without its conversation",
-            Some(a.clone()),
-            host_step,
-            vec![named(4300, 3_000, None), p3("conv-n")],
-            false,
-            Some(SwitchScope::Moved(p3("conv-n"))),
-            Want::Rides,
-        ),
-        (
-            "control: a step of the host's spent on the switch's own process, then B",
-            Some(a.clone()),
-            host_step,
-            vec![a.clone(), b.clone()],
-            false,
-            Some(SwitchScope::Closed),
-            Want::Over,
-        ),
-        (
-            "control: the relaunched process",
-            Some(a.clone()),
-            nothing,
-            vec![a.clone()],
-            false,
-            None,
-            Want::Rides,
-        ),
-        (
-            "control: the relaunched process after a /clear",
-            Some(a.clone()),
-            nothing,
-            vec![named(4100, 1_000, Some("conv-a2"))],
-            false,
-            Some(SwitchScope::Moved(named(4100, 1_000, Some("conv-a2")))),
-            Want::Rides,
-        ),
-        (
-            "control: a relaunch that resumed A",
-            Some(a.clone()),
-            nothing,
-            vec![p3("conv-a")],
-            false,
-            Some(SwitchScope::Moved(p3("conv-a"))),
-            Want::Rides,
-        ),
-        (
-            "control: a switch no process was named for, as an older build wrote it",
-            None,
-            nothing,
-            vec![b.clone()],
-            false,
-            Some(SwitchScope::Moved(b.clone())),
-            Want::Rides,
-        ),
-        (
-            "control: a host that names a conversation for neither process",
-            Some(named(4100, 1_000, None)),
-            nothing,
-            vec![named(4200, 2_000, None)],
-            false,
-            Some(SwitchScope::Moved(named(4200, 2_000, None))),
-            Want::Rides,
-        ),
-    ];
-    for (case, proc, before, told, owed, scope, want) in rows {
-        let tell = |st: &mut TurnEndState| {
-            before(st);
-            told.iter()
-                .map(|now| {
-                    st.agent_process(now.pid, now.start, now.conversation.as_deref(), || owed)
-                })
-                .last()
-                .flatten()
-        };
-        let mut st = switched(proc.clone());
-        let scoped = tell(&mut st);
-        let open = st.model_switch().is_some();
-        let at_bucket = at(&mut st, &bucket, t);
-        let mut st = switched(proc);
-        tell(&mut st);
-        let back = at(&mut st, &idle("Fixed the parser.", Some(JOB)), reset);
-        let got = match (open, falls_back(&at_bucket), restores(&back)) {
-            (true, false, true) => Some(Want::Rides),
-            (true, false, false) => Some(Want::Holds),
-            (false, true, false) => Some(Want::Over),
-            _ => None,
-        };
-        if scoped != scope || got != Some(want) {
-            wrong.push(format!(
-                "{case}: told {scoped:?}, open {open}, at the bucket {at_bucket:?}, at back_at {back:?}"
-            ));
-        }
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-#[test]
 fn a_model_bucket_is_accepted_under_consent_never_under_a_box_and_waits_out_a_second() {
     let t = t0();
     let consent = walled(
@@ -4211,18 +3705,10 @@ fn a_model_bucket_is_accepted_under_consent_never_under_a_box_and_waits_out_a_se
         "Fable limit reached · continuing on Sonnet uses usage credits, and the prompt to confirm",
         Some(3 * MIN),
     );
-    let fallback = |a: &TurnEndAction| {
-        matches!(
-            a,
-            TurnEndAction::Restart {
-                rule_id: RULE_MODEL_FALLBACK,
-                ..
-            }
-        )
-    };
+    let laddered = |a: &TurnEndAction| matches!(a, TurnEndAction::WaitUntil { why, .. } if why.ends_with("(no reset named)"));
     let mut st = TurnEndState::default();
     let a = at(&mut st, &consent, t);
-    assert!(fallback(&a), "{a:?}");
+    assert!(is_escalate(&a, "usage_credits` is off"), "{a:?}");
     let credits = SupervisorConfig {
         usage_credits: true,
         ..cfg()
@@ -4237,14 +3723,14 @@ fn a_model_bucket_is_accepted_under_consent_never_under_a_box_and_waits_out_a_se
         Some(Duration::from_secs(5)),
     );
     let a = at_under(&mut st, &again, t + MIN, &credits);
-    assert!(fallback(&a), "{a:?}");
+    assert!(laddered(&a), "{a:?}");
     let no_continue = SupervisorConfig {
         continue_policy: false,
         ..credits.clone()
     };
     let mut st = TurnEndState::default();
     let a = at_under(&mut st, &consent, t, &no_continue);
-    assert!(fallback(&a), "{a:?}");
+    assert!(laddered(&a), "{a:?}");
     let r = walled(
         WallKind::ModelBucket { consent: false },
         "You've reached your Fable limit.",
@@ -4265,8 +3751,7 @@ fn a_model_bucket_is_accepted_under_consent_never_under_a_box_and_waits_out_a_se
         &at(&mut st, &opus, t + 5 * MIN),
         t + 90 * MIN + GRACE
     ));
-    let mut none = cfg();
-    none.model_fallback = None;
+    let mut c = cfg();
     let reset = TurnEndReading {
         reset_at: Some(t + 90 * MIN),
         ..r.clone()
@@ -4274,22 +3759,14 @@ fn a_model_bucket_is_accepted_under_consent_never_under_a_box_and_waits_out_a_se
     let mut st = TurnEndState::default();
     st.observe(&reset, t);
     assert!(waits_until(
-        &decide_turn_end(&st, &reset, &none, t),
+        &decide_turn_end(&st, &reset, &c, t),
         t + 90 * MIN + GRACE
     ));
-    none.resume_limits = false;
+    c.resume_limits = false;
     assert!(is_escalate(
-        &decide_turn_end(&st, &reset, &none, t),
+        &decide_turn_end(&st, &reset, &c, t),
         "resume_limits is off"
     ));
-    let mut st = TurnEndState::default();
-    let odd = walled(
-        WallKind::ModelBucket { consent: false },
-        "Nimbus requires usage credits.",
-        Some(3 * MIN),
-    );
-    act(&mut st, &odd, t);
-    assert_eq!(st.model_switch().and_then(|m| m.from.clone()), None);
 }
 
 #[test]
@@ -5298,8 +4775,6 @@ fn limits_place_rule_is_in_limits_place() {
         RULE_OUTAGE_RESUME,
         RULE_LOGIN_BACK,
         RULE_LIMIT_RESUME,
-        RULE_MODEL_FALLBACK,
-        RULE_MODEL_RESTORE,
         RULE_ACCOUNT,
         RULE_USAGE_PROBE,
         RULE_COMPACT,
@@ -6530,10 +6005,11 @@ fn a_wall_is_its_own_rules_even_where_the_upgrade_owns_the_turn_ends() {
         "waited out, no relaunch: {a:?}"
     );
     let mut st = TurnEndState::default();
-    assert!(matches!(
+    assert_eq!(
         at(&mut st, &bucket, t),
-        TurnEndAction::Restart { .. }
-    ));
+        a,
+        "the bucket's own wait, whoever owns the turn ends"
+    );
 
     let mut st = TurnEndState::default();
     let idle_owned = TurnEndReading {
@@ -9986,10 +9462,7 @@ fn a_restarted_loop_keeps_the_usage_act_it_already_made() {
         assert!(waits_until(&a, t + 7 * MIN), "{name}: {a:?}");
     }
     let bucket = WallKind::ModelBucket { consent: false };
-    let stay = SupervisorConfig {
-        model_fallback: None,
-        ..cfg()
-    };
+    let stay = cfg();
     let mut moved = TurnEndState::default();
     moved.seed_usage_attempt(3 * MIN, window, t);
     open(
@@ -10068,14 +9541,8 @@ fn the_reset_jitter_is_added_to_the_grace() {
     let mut st = TurnEndState::default();
     let a = at(&mut st, &shared, t);
     assert!(
-        restarts(
-            &a,
-            &Restart::Model {
-                to: "opus".to_string()
-            },
-            RULE_MODEL_FALLBACK
-        ),
-        "before the share the probe is not yet due, so the fallback is asked: {a:?}"
+        waits_until(&a, passed + GRACE + jitter),
+        "before the share the probe is not yet due: {a:?}"
     );
     let mut st = TurnEndState::default();
     assert_eq!(
@@ -10110,7 +9577,6 @@ fn a_wall_no_reset_ends_is_retried_on_the_entitlement_ladder() {
     for kind in [WallKind::Spend, WallKind::ModelBucket { consent: false }] {
         let mut st = TurnEndState::default();
         let mut cfg = cfg();
-        cfg.model_fallback = None;
         cfg.usage_credits = true;
         let mut r = walled(
             kind,
@@ -10456,7 +9922,6 @@ fn a_resume_owed_to_a_moved_login_stands_over_a_track_held_off_the_screen() {
 fn a_loop_that_follows_keeps_the_entitlement_ladders_rung() {
     let t = t0();
     let mut cfg = cfg();
-    cfg.model_fallback = None;
     cfg.usage_credits = true;
     let tried = |kind: WallKind, message: &str| {
         let mut st = TurnEndState::default();
@@ -10526,7 +9991,6 @@ fn a_loop_that_follows_keeps_the_entitlement_ladders_rung() {
 fn a_met_try_older_than_its_next_rung_is_owed_at_the_followers_first_point() {
     let t = t0();
     let mut cfg = cfg();
-    cfg.model_fallback = None;
     cfg.usage_credits = true;
     let five = Duration::from_secs(5);
     let watch = |kind: WallKind, message: &str, n: usize| {
@@ -10598,7 +10062,6 @@ fn a_met_try_older_than_its_next_rung_is_owed_at_the_followers_first_point() {
 fn a_try_no_loop_read_is_taken_up_met_where_its_answer_is_dated() {
     let t = t0();
     let mut cfg = cfg();
-    cfg.model_fallback = None;
     cfg.usage_credits = true;
     let limit = LimitTry {
         bucket: false,
@@ -10666,7 +10129,6 @@ fn a_try_no_loop_read_is_taken_up_met_where_its_answer_is_dated() {
 fn a_wall_that_goes_on_by_itself_is_tried_on_no_entitlement_ladder() {
     let t = t0();
     let mut cfg = cfg();
-    cfg.model_fallback = None;
     cfg.usage_credits = true;
     for kind in [WallKind::ModelBucket { consent: false }, WallKind::Spend] {
         for by_itself in [true, false] {
@@ -10734,7 +10196,6 @@ fn a_wall_that_goes_on_by_itself_is_tried_on_no_entitlement_ladder() {
 fn the_work_a_seeds_try_led_to_starts_its_episode_again() {
     let t = t0();
     let mut cfg = cfg();
-    cfg.model_fallback = None;
     cfg.usage_credits = true;
     let spend = |worked: Option<Duration>| {
         let mut r = walled(
@@ -12354,65 +11815,41 @@ fn advice_to_wait_for_the_walls_own_reset_keeps_the_walls_words() {
 }
 
 #[test]
-fn a_model_bucket_moves_account_first_and_the_fallback_is_its_otherwise() {
+fn a_model_bucket_moves_account_first_and_its_wait_is_the_otherwise() {
     let t = t0();
     let r = bucket(Some(t + 120 * MIN), 3 * MIN);
-    let fallback = at(&mut TurnEndState::default(), &r, t);
-    assert!(restarts(
-        &fallback,
-        &Restart::Model {
-            to: "opus".to_string()
-        },
-        RULE_MODEL_FALLBACK
-    ));
+    let wait = at(&mut TurnEndState::default(), &r, t);
+    assert!(waits_until(&wait, t + 120 * MIN + GRACE), "{wait:?}");
     let moved = at(&mut TurnEndState::default(), &advised(&r, "work-2"), t);
     assert!(
         restarts(&moved, &to_account("work-2", AccountAt::Wall), RULE_ACCOUNT),
         "{moved:?}"
     );
-    assert_eq!(otherwise_of(&moved), &fallback);
-    assert_eq!(
-        at(
-            &mut TurnEndState::default(),
-            &advised_wait(&r, t + 30 * MIN),
-            t
-        ),
-        fallback
+    assert_eq!(otherwise_of(&moved), &wait);
+    let sooner = at(
+        &mut TurnEndState::default(),
+        &advised_wait(&r, t + 30 * MIN),
+        t,
+    );
+    assert!(
+        matches!(&sooner, TurnEndAction::WaitUntil { until, why, .. }
+            if *until == t + 30 * MIN && why == "another account can be used then"),
+        "{sooner:?}"
     );
     let consent = walled(
         WallKind::ModelBucket { consent: true },
         "Fable limit reached · continuing on Sonnet uses usage credits, and the prompt to confirm",
         Some(3 * MIN),
     );
-    let moved = at(
-        &mut TurnEndState::default(),
-        &advised(&consent, "work-2"),
-        t,
-    );
-    assert!(
-        restarts(&moved, &to_account("work-2", AccountAt::Wall), RULE_ACCOUNT),
-        "{moved:?}"
-    );
-    assert!(
-        restarts(
-            otherwise_of(&moved),
-            &Restart::Model {
-                to: "opus".to_string()
-            },
-            RULE_MODEL_FALLBACK
+    let held = at(&mut TurnEndState::default(), &consent, t);
+    assert!(is_escalate(&held, "usage_credits` is off"), "{held:?}");
+    assert_eq!(
+        at(
+            &mut TurnEndState::default(),
+            &advised(&consent, "work-2"),
+            t
         ),
-        "{moved:?}"
-    );
-    let a = at(&mut TurnEndState::default(), &consent, t);
-    assert!(
-        restarts(
-            &a,
-            &Restart::Model {
-                to: "opus".to_string()
-            },
-            RULE_MODEL_FALLBACK
-        ),
-        "{a:?}"
+        held
     );
     let credits = SupervisorConfig {
         usage_credits: true,
@@ -12429,7 +11866,6 @@ fn a_model_bucket_moves_account_first_and_the_fallback_is_its_otherwise() {
     );
     let mut st = TurnEndState::default();
     act(&mut st, &r, t);
-    assert!(st.model_switch().is_some());
     let wall = advised(&session_wall(t + 10 * MIN), "work-2");
     let a = act(&mut st, &wall, t + 10 * MIN);
     assert!(restarts(
@@ -12437,17 +11873,8 @@ fn a_model_bucket_moves_account_first_and_the_fallback_is_its_otherwise() {
         &to_account("work-2", AccountAt::Wall),
         RULE_ACCOUNT
     ));
-    assert_eq!(st.model_switch(), None, "no return is owed");
     assert_eq!(st.wall_attempts(WallKind::UsageSession), None);
     assert_eq!(st.account_move().map(|m| m.to.as_str()), Some("work-2"));
-    let mut st = TurnEndState::default();
-    act(&mut st, &r, t);
-    let a = at(&mut st, &wall, t + 10 * MIN);
-    let TurnEndAction::Restart { why, .. } = &a else {
-        panic!("{a:?}")
-    };
-    st.restarted(why, false, &wall, t + 10 * MIN);
-    assert!(st.model_switch().is_some());
 }
 
 #[test]
@@ -12540,28 +11967,6 @@ fn a_plain_turn_end_moves_ahead_of_the_wall_around_its_own_act() {
         TurnEndAction::Nothing
     );
     assert!(st.task_done());
-}
-
-#[test]
-fn an_account_move_is_asked_ahead_of_the_models_return() {
-    let t = t0();
-    let mut st = TurnEndState::default();
-    act(&mut st, &bucket(Some(t + 120 * MIN), 3 * MIN), t);
-    let later = idle("Stage 3 done.", Some(30 * MIN));
-    let mut plain = st.clone();
-    assert!(restarts(
-        &at(&mut plain, &later, t + 130 * MIN),
-        &Restart::ModelBack {
-            to: Some("fable".to_string())
-        },
-        RULE_MODEL_RESTORE
-    ));
-    let a = act(&mut st, &advised(&later, "work-2"), t + 130 * MIN);
-    assert!(
-        restarts(&a, &to_account("work-2", AccountAt::Ahead), RULE_ACCOUNT),
-        "{a:?}"
-    );
-    assert_eq!(st.model_switch(), None);
 }
 
 fn moved_and_asked(t: Instant) -> TurnEndState {
@@ -13707,13 +13112,8 @@ fn a_told_moves_first_point_after_a_relaunch_is_its_start_up() {
     assert_eq!(st.account_answer(&worked), Some(AccountAnswer::Served));
     st.observe(&worked, t + MIN);
     assert_eq!(st.account_move(), None, "and the fold ends it there");
-    for why in [
-        Restart::Memory,
-        Restart::Model {
-            to: "sonnet".to_string(),
-        },
-        Restart::ModelBack { to: None },
-    ] {
+    {
+        let why = Restart::Memory;
         let mut st = seeded();
         st.observe(&drawn, t);
         st.restarted(&why, true, &drawn, t + MIN);
@@ -14179,9 +13579,9 @@ fn advice_to_resume_types_the_walls_continuation_once_a_clearing() {
     );
 
     let b = bucket(Some(t + 120 * MIN), 3 * MIN);
-    assert!(matches!(
-        at(&mut TurnEndState::default(), &b, t),
-        TurnEndAction::Restart { .. }
+    assert!(waits_until(
+        &at(&mut TurnEndState::default(), &b, t),
+        t + 120 * MIN + GRACE
     ));
     assert_eq!(
         at(&mut TurnEndState::default(), &advised_resume(&b, 1_000), t),
@@ -21541,71 +20941,32 @@ fn on_model_credits(r: &TurnEndReading, model: &str, reset: Option<Instant>) -> 
 }
 
 #[test]
-fn a_models_usage_credits_relaunch_onto_the_fallback_or_hold_until_the_process_changes() {
+fn a_models_usage_credits_hold_to_its_reset_or_until_the_process_changes() {
     let t = t0();
     let reset = t + 90 * MIN;
     let end = idle("Stage 2 done.", Some(JOB));
     let named = on_model_credits(&end, "fable", Some(reset));
     let mut st = TurnEndState::default();
     let a = act(&mut st, &named, t);
+    assert!(waits_until(&a, reset + GRACE), "{a:?}");
     assert!(
-        restarts(
-            &a,
-            &Restart::Model {
-                to: "opus".to_string()
-            },
-            RULE_MODEL_FALLBACK
-        ),
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("fable's requests")),
         "{a:?}"
-    );
-    let wait = otherwise_of(&a);
-    assert!(waits_until(wait, reset + GRACE), "{a:?}");
-    assert!(
-        matches!(wait, TurnEndAction::WaitUntil { why, .. } if why.contains("fable's requests")),
-        "{a:?}"
-    );
-    let switch = st.model_switch().expect("the switch made");
-    assert_eq!(
-        (switch.from.as_deref(), switch.back_at),
-        (Some("fable"), Some(reset))
     );
     let unnamed = on_model_credits(&end, "fable", None);
-    let a = at(&mut TurnEndState::default(), &unnamed, t);
-    assert!(
-        is_escalate(otherwise_of(&a), CREDITS_HOLD_MODEL_TOLD),
-        "{a:?}"
-    );
-    let mut none = cfg();
-    none.model_fallback = None;
     let mut st = TurnEndState::default();
-    let a = at_under(&mut st, &unnamed, t, &none);
+    let a = at(&mut st, &unnamed, t);
     assert!(is_escalate(&a, CREDITS_HOLD_MODEL_TOLD), "{a:?}");
     st.credits_told();
-    assert_eq!(
-        at_under(&mut st, &unnamed, t + MIN, &none),
-        TurnEndAction::Nothing
-    );
-    assert_eq!(
-        at_under(&mut st, &end, t + 10 * MIN, &none),
-        TurnEndAction::Nothing
-    );
-    assert_eq!(
-        at_under(&mut st, &end, t + 400 * MIN, &none),
-        TurnEndAction::Nothing
-    );
+    assert_eq!(at(&mut st, &unnamed, t + MIN), TurnEndAction::Nothing);
+    assert_eq!(at(&mut st, &end, t + 10 * MIN), TurnEndAction::Nothing);
+    assert_eq!(at(&mut st, &end, t + 400 * MIN), TurnEndAction::Nothing);
     st.agent_started(t + 401 * MIN);
-    assert_eq!(
-        at_under(&mut st, &end, t + 402 * MIN, &none),
-        typed(RULE_CONTINUE)
-    );
+    assert_eq!(at(&mut st, &end, t + 402 * MIN), typed(RULE_CONTINUE));
     assert_eq!(
         at_under(&mut TurnEndState::default(), &named, t, &credits_on()),
         typed(RULE_CONTINUE)
     );
-    let mut fable = cfg();
-    fable.model_fallback = Some("fable".to_string());
-    let a = at_under(&mut TurnEndState::default(), &named, t, &fable);
-    assert!(waits_until(&a, reset + GRACE), "{a:?}");
     let mut st = TurnEndState::default();
     st.credits_told();
     at(&mut st, &on_credits(&end, None), t);
@@ -21618,8 +20979,6 @@ fn a_models_usage_credits_relaunch_onto_the_fallback_or_hold_until_the_process_c
 #[test]
 fn a_buckets_own_act_is_held_while_usage_credits_carry_the_session() {
     let t = t0();
-    let mut none = cfg();
-    none.model_fallback = None;
     let bucket = TurnEndReading {
         reset_at: Some(t + 30 * MIN),
         ..walled(
@@ -21635,16 +20994,12 @@ fn a_buckets_own_act_is_held_while_usage_credits_carry_the_session() {
         st.observe(r, t);
         decide_turn_end(&st, r, cfg, past)
     };
-    let free = decided(&bucket, &none);
+    let free = decided(&bucket, &cfg());
     assert_eq!(free, typed(RULE_LIMIT_RESUME));
     let carried = on_credits(&bucket, Some(credits_reset));
-    let a = decided(&carried, &none);
+    let a = decided(&carried, &cfg());
     assert!(waits_until(&a, credits_reset + GRACE), "{a:?}");
-    let on = SupervisorConfig {
-        model_fallback: None,
-        ..credits_on()
-    };
-    assert_eq!(decided(&carried, &on), free);
+    assert_eq!(decided(&carried, &credits_on()), free);
     let login = walled(WallKind::Auth, "Please run /login", Some(3 * MIN));
     let mut st = TurnEndState::default();
     let a = at(&mut st, &on_credits(&login, Some(credits_reset)), t);
@@ -21654,8 +21009,6 @@ fn a_buckets_own_act_is_held_while_usage_credits_carry_the_session() {
 #[test]
 fn a_wall_only_usage_credits_lift_is_not_continued_under_the_key_off() {
     let t = t0();
-    let mut none = cfg();
-    none.model_fallback = None;
     let spend_named = "You're out of usage credits. Run /usage-credits to keep using Fable 5.1 \
                        or /model to switch models.";
     let spend = |message: &str| walled(WallKind::Spend, message, Some(3 * MIN));
@@ -21671,26 +21024,6 @@ fn a_wall_only_usage_credits_lift_is_not_continued_under_the_key_off() {
         st.observe(r, t);
         decide_turn_end(&st, r, cfg, now)
     };
-    let a = decided(&spend(spend_named), &cfg(), t);
-    assert!(
-        restarts(
-            &a,
-            &Restart::Model {
-                to: "opus".to_string()
-            },
-            RULE_MODEL_FALLBACK
-        ),
-        "{a:?}"
-    );
-    assert!(
-        is_escalate(otherwise_of(&a), "usage_credits` is off"),
-        "{a:?}"
-    );
-    let a = decided(&bucket("Fable 5.1 requires usage credits"), &cfg(), t);
-    assert!(
-        is_escalate(otherwise_of(&a), "usage_credits` is off"),
-        "{a:?}"
-    );
     for r in [
         spend(spend_named),
         spend("You're out of usage credits"),
@@ -21698,14 +21031,11 @@ fn a_wall_only_usage_credits_lift_is_not_continued_under_the_key_off() {
         bucket("Fable now uses usage credits"),
     ] {
         for now in [t, t + 30 * MIN, t + 360 * MIN] {
-            let a = decided(&r, &none, now);
+            let a = decided(&r, &cfg(), now);
             assert!(is_escalate(&a, "usage_credits` is off"), "{now:?}: {a:?}");
         }
     }
-    let on = SupervisorConfig {
-        model_fallback: None,
-        ..credits_on()
-    };
+    let on = credits_on();
     for r in [
         spend(spend_named),
         bucket("Fable 5.1 requires usage credits"),
@@ -21716,11 +21046,11 @@ fn a_wall_only_usage_credits_lift_is_not_continued_under_the_key_off() {
     let mut named = spend("You're out of extra usage · resets 4pm");
     named.reset_at = Some(t + 90 * MIN);
     assert!(waits_until(
-        &decided(&named, &none, t),
+        &decided(&named, &cfg(), t),
         t + 90 * MIN + GRACE
     ));
     let plain = bucket("You've reached your Fable limit.");
-    assert!(waits_until(&decided(&plain, &none, t), t + 30 * MIN));
+    assert!(waits_until(&decided(&plain, &cfg(), t), t + 30 * MIN));
 }
 
 #[test]

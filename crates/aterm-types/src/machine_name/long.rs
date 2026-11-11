@@ -141,26 +141,23 @@ impl OsSlot {
         }
     }
 
-    /// Whether `observed` is an accepted projection of `expected` in this slot.
-    /// A canonical machine number's Bonjour name may carry macOS's numeric collision suffix
-    /// (`m8-2`): canonical decimal `u32`, at least two. That is naming policy, not evidence
-    /// of who assigned the alias. Every other slot and every noncanonical target still require
-    /// exact equality.
+    /// A numeric Bonjour alias of the exact expected DNS label. This diagnoses a
+    /// collision without treating it as alignment or asking the setter to fight it.
     #[must_use]
-    pub fn accepts_projection(self, expected: &str, observed: &str) -> bool {
-        if observed == expected {
-            return true;
-        }
-        if self != Self::MacLocalHostName
-            || !Number::parse(expected).is_ok_and(|number| number.to_string() == expected)
-        {
-            return false;
-        }
-        observed
-            .strip_prefix(expected)
-            .and_then(|rest| rest.strip_prefix('-'))
-            .and_then(|suffix| suffix.parse::<u32>().ok().map(|number| (suffix, number)))
-            .is_some_and(|(suffix, number)| number >= 2 && number.to_string() == suffix)
+    pub fn collision(self, expected: &str, observed: &str) -> bool {
+        self == Self::MacLocalHostName
+            && !expected.is_empty()
+            && expected.len() <= DNS_LABEL_MAX
+            && !expected.starts_with('-')
+            && !expected.ends_with('-')
+            && expected
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && observed
+                .strip_prefix(expected)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .and_then(|suffix| suffix.parse::<u32>().ok().map(|n| (suffix, n)))
+                .is_some_and(|(suffix, n)| n >= 2 && n.to_string() == suffix)
     }
 
     /// The most bytes the slot holds as aterm writes it.

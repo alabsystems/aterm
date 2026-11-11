@@ -19778,14 +19778,16 @@ fn the_harness_tokens_connection_writes_the_log_by_harness_and_the_beside_one_by
     std::fs::write(dir.path().join(&names[0]), format!("{INSTANCE}\n")).expect("beside");
     let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
     let lanes = control_lanes::Lanes::new(control_lanes::LaneLimits {
-        rpc: 1,
+        // A lane for each connection: the one before still holds its lane until a worker reads
+        // its close, which a loaded machine may not have done when the next one is admitted.
+        rpc: 3,
         wait: 0,
         inline: 0,
         open: 4,
         subscriptions: 0,
     });
     let started = lanes.start();
-    assert_eq!(started.rpc, 1, "the request lane starts");
+    assert_eq!(started.rpc, 3, "the request lanes start");
     lanes.publish(Arc::new(LogService {
         active: active_for(&h),
         ctx: Arc::clone(&h.ctx),
@@ -20787,6 +20789,63 @@ fn a_turn_whose_first_write_is_refused_whole_gives_its_id_to_the_retry() {
         ("hihi", 4, 1),
         "typed nothing twice"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn fleet_binary_input_records_authenticated_actor_not_request_text() {
+    use aterm_slog::{Actor, Key, Kind, Val};
+    for remote in [false, true] {
+        for (verb, word) in [("feed-bin", "feed"), ("paste-bin", "paste")] {
+            let store = session_store::new_store();
+            let (h, rx) = pipe_session(1);
+            store.write().unwrap().register(h.clone());
+            let active = active_for_handle(&h);
+            let payload = "by=harness";
+            let input = format!("@1 {verb} {}\n{payload}", payload.len());
+            let mut reader = BufReader::new(std::io::Cursor::new(input.into_bytes()));
+            let line = read_request_line(&mut reader).expect("request line");
+            let mut out = Vec::new();
+            let driver = remote.then(|| {
+                crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+                    node: "authenticated-node".to_owned(),
+                    host: "m72 / remote=desk".to_owned(),
+                })
+            });
+            assert!(run_feed_bin(
+                &line,
+                &mut reader,
+                &active,
+                &store,
+                Scope::Owner,
+                &mut out
+            ));
+            drop(driver);
+            assert_eq!(String::from_utf8(out).unwrap(), "OK 10 bytes\n");
+            assert_eq!(
+                drain_pipe(&rx),
+                payload.as_bytes(),
+                "the actual bytes reached the owned pipe"
+            );
+            let timeline = h.ctx.timeline.lock().unwrap();
+            let rows: Vec<_> = timeline
+                .slog()
+                .log()
+                .window()
+                .filter(|row| row.k == Kind::Input)
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].by,
+                if remote {
+                    Actor::fleet("m72 / remote=desk")
+                } else {
+                    Actor::Ctl
+                }
+            );
+            assert_eq!(rows[0].f.get(Key::Verb), Some(&Val::Word(word)));
+        }
+    }
 }
 
 #[test]

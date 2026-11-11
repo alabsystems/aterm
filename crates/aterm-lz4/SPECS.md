@@ -7,7 +7,7 @@ Each spec below is to be proved through Trust/Clean about the compiled Rust func
 subsumes are then deleted.
 
 Gap numbers in `blocking_gaps` are the rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (an installed seal that publishes
+`docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (an installed seal that publishes
 Clean-discharged rows) blocks every spec and is listed on each.
 
 ## 0. Notation used in the statements
@@ -101,13 +101,6 @@ tests/round_trip.rs	malformed_literal_length_overruns_output_errors	decode-rejec
 tests/round_trip.rs	malformed_match_length_overruns_output_errors	decode-rejects-malformed	
 ```
 
-## 3. Coverage
-
-- All 17 live `#[test]` functions across `src/block/` (6), `src/fastcpy.rs` (1),
-  `tests/fuzz_decode_never_panics.rs` (3), and `tests/round_trip.rs` (7) map to the 12 specs in §1.
-- Every regression test (`compress::test_bug`, the `malformed_*` tests, the corrupt integer run) is
-  an instance of a spec above.
-
 ## 4. Tests that are not spec samples
 
 None: `src/block/mod.rs::lz4_block_const_helpers_invariants` is mapped in §2 (`prepend-size-header`).
@@ -135,25 +128,3 @@ None: `src/block/mod.rs::lz4_block_const_helpers_invariants` is mapped in §2 (`
    `#[test]` functions (`src/block/compress.rs` 3, `src/block/decompress_safe.rs` 2,
    `src/block/mod.rs` 1, `src/fastcpy.rs` 1, `tests/fuzz_decode_never_panics.rs` 3,
    `tests/round_trip.rs` 7) match §2 and §3 exactly.
-
-## 6. Proof order
-
-Smallest gap sets first:
-
-1. **`token-fit-table`** (gaps 0, 3). A scalar `u8` predicate over 256 values, decidable by
-   evaluation once E6 admits shifts and bitwise ops. It retires `check_token`, and the proof is the
-   smallest test case for the gap-3 widening.
-2. **`uncompressed-size-contract`** (gaps 0, 1, 3, 4). Straight-line slice `get`s and
-   `u32::from_le_bytes` with no loops. It is the first use of a slice carrier in this crate and the
-   header half of every size-prepended spec.
-3. **`prepend-size-header`** (gaps 0, 1, 3, 4). It composes with `compress` through callee-ensures
-   and needs Vec content, not only length. It is the encoder dual of item 2.
-4. **`slicesink-model`** (gaps 0, 1, 2, 3, 7). Small methods with explicit preconditions. Turning the
-   `trust::skip` caller contracts into `requires` is the prerequisite for both decoder specs.
-5. **`slice-copy-contract`** (gaps 0, 1, 2, 3, 11) and **`count-same-bytes-lcp`**
-   (gaps 0, 1, 2, 3, 5, 7). These are leaf lemmas for the decoder refinement and the compressor.
-6. **`decode-never-panics`**, then **`decode-rejects-malformed`**, then
-   **`decode-refines-reference-on-valid-blocks`**. Together they retire 9 tests and need
-   `decompress_internal`'s `trust::skip` removed (§5.4 and §5.5 are already resolved).
-7. **`compress-short-input-is-literal-and-conformant`**, **`compress-total-and-bounded`**, and last
-   **`lz4-round-trip`** (8 tests), which needs every gap above plus quantified clauses (gap 5).

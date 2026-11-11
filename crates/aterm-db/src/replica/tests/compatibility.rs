@@ -19,6 +19,10 @@ fn seed_log(lab: &Lab) -> aterm_secrets::membership_log::Log {
 /// (`docs/measured/commons-long-log-rounds-2026-11-07.md`).
 const LONG_LOG_ROTATIONS: u64 = 1_200;
 
+/// How many records the measured large table holds ([`Workload::LargeTable`]): about what a 4.4 MB
+/// table's journal holds of 1 KB rows, where m111's largest Commons table was 3.5 MB (2026-11-10).
+const LARGE_TABLE_RECORDS: usize = 3_000;
+
 /// How the second Mac holds the epochs of the long history's rotations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Holder {
@@ -707,6 +711,28 @@ fn quiet_rounds_of_a_late_joiner_move_nothing() {
     quiet_rounds(SUITE_ROUNDS, Workload::LateJoiner(41));
 }
 
+/// [`a_round_that_moves_nothing_reports_its_cpu`] over a table of [`LARGE_TABLE_RECORDS`] rows:
+/// how much a round that moves nothing costs for the records its table holds, which each of the
+/// round's store opens replays.
+#[test]
+#[ignore = "isolated CPU measurement; run with verify perf commons-quiet --large-table"]
+fn a_quiet_pair_over_a_large_table_reports_its_cpu() {
+    quiet_rounds(8, Workload::LargeTable(LARGE_TABLE_RECORDS));
+}
+
+#[test]
+#[ignore = "sustained isolated CPU measurement; run with verify perf commons-quiet --large-table --sustained"]
+fn a_sustained_quiet_pair_over_a_large_table_reports_its_cpu() {
+    quiet_rounds(256, Workload::LargeTable(LARGE_TABLE_RECORDS));
+}
+
+/// What the suite keeps of the large-table measurement: over a table of 64 rows, a converged
+/// pair's rounds move nothing.
+#[test]
+fn quiet_rounds_over_a_large_table_move_nothing() {
+    quiet_rounds(SUITE_ROUNDS, Workload::LargeTable(64));
+}
+
 #[test]
 #[ignore = "process-wide retained-history diagnostic; run this exact test alone with --ignored --nocapture"]
 fn a_quiet_catalog_pair_reports_retained_history_reads() {
@@ -815,6 +841,32 @@ fn one_root_policy_reads_report_their_retained_history_work() {
     );
 }
 
+/// [`log_pair`] whose table holds `records` more rows of 1 KB each, committed by the first Mac and
+/// ingested by the second, so both hold the same table before a round.
+fn large_table_pair(records: usize) -> Pair {
+    let pair = log_pair();
+    let wires = {
+        let bootstrap = pair.lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let mut store = Store::open(&session, &pair.paths[0], pair.scope).unwrap();
+        (0..records)
+            .map(|row| {
+                let mut payload = format!("large-table-row-{row}-").into_bytes();
+                payload.resize(1_000, b'.');
+                let receipt = store.commit_catalog(&session, &payload).unwrap();
+                store.wire(&session, &receipt.id).unwrap().unwrap().to_vec()
+            })
+            .collect::<Vec<_>>()
+    };
+    let bootstrap = pair.lab.bootstrap(1);
+    let session = Session::open(&bootstrap).unwrap();
+    let mut store = Store::open(&session, &pair.paths[1], pair.scope).unwrap();
+    for wire in &wires {
+        store.ingest(&session, wire).unwrap();
+    }
+    pair
+}
+
 fn catalog_pair() -> Pair {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
     seed_log(&lab);
@@ -867,6 +919,9 @@ enum Workload {
     /// [`Workload::LongLog`] whose second Mac opens every epoch but the newest through a
     /// handoff ([`Holder::Handoff`]).
     LateJoiner(u64),
+    /// [`Workload::Explicit`] whose table holds this many records ([`LARGE_TABLE_RECORDS`] when
+    /// measured), each a 1 KB catalog row its first Mac committed and its second ingested.
+    LargeTable(usize),
 }
 
 impl Workload {
@@ -877,20 +932,21 @@ impl Workload {
             Self::Catalog => "catalog",
             Self::LongLog(_) => "long-log",
             Self::LateJoiner(_) => "late-joiner",
+            Self::LargeTable(_) => "large-table",
         }
     }
     /// How many tables each of its rounds visits.
     const fn tables(self) -> u64 {
         match self {
             Self::Catalog => 2,
-            Self::Explicit | Self::LongLog(_) | Self::LateJoiner(_) => 1,
+            Self::Explicit | Self::LongLog(_) | Self::LateJoiner(_) | Self::LargeTable(_) => 1,
         }
     }
     /// How many rotations of the vault's key its log holds past [`seed_log`]'s.
     const fn history(self) -> u64 {
         match self {
             Self::LongLog(rotations) | Self::LateJoiner(rotations) => rotations,
-            Self::Explicit | Self::Catalog => 0,
+            Self::Explicit | Self::Catalog | Self::LargeTable(_) => 0,
         }
     }
 }
@@ -928,6 +984,7 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
             epochs,
             Holder::Handoff,
         ),
+        Workload::LargeTable(records) => large_table_pair(records),
     };
     let endpoint = |n| {
         if catalog {

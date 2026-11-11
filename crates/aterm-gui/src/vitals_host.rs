@@ -782,7 +782,7 @@ pub(crate) struct VitalsHost {
     /// A main thread's panic before the quit unwinds out of the event loop past it, so a run it
     /// takes down leaves its strip unclean, however its probe thread ends. One later in the quit,
     /// once this is set, leaves a clean stop where the probe thread writes it after that panic's
-    /// crash file (a thread still reading when the quit's wait for it ran out), and that crash
+    /// event time (a thread still reading when the quit's wait for it ran out), and that crash
     /// draws as a pause.
     stopping: Arc<AtomicBool>,
     thread: Option<(std::thread::JoinHandle<()>, Receiver<()>)>,
@@ -851,11 +851,12 @@ pub(crate) struct VitalsHost {
     /// Whether the run before this one handed it its place (a seamless adoption, a relaunch of
     /// the running app for an update, or Windows' update spawn) and the startup scan found no
     /// kill evidence, so that run stopped on purpose, perhaps without its final strip write:
-    /// [`open_strip`] reads its unclean checkpoint as a stop, never a crash, unless a crash file
+    /// [`open_strip`] reads its unclean checkpoint as a stop, never a crash, unless a crash event
     /// is newer than it ([`Self::crashed_at`]). Set before the probe thread starts
     /// ([`Self::note_handed_off_start`]).
     handed_off: bool,
-    /// When the run before this one crashed, by its crash file, where the startup scan found one
+    /// When the run before this one crashed, by its report's event time or artifact modification
+    /// time as fallback, where the startup scan found evidence
     /// (`vitals_startup::PriorStop::Crashed` or `CrashedAndKilled`): [`open_strip`] dates the
     /// crash from it where the kept strip is older than it and no live peer holds [`STRIP_LOCK`],
     /// in time order with a killed run's launch ([`Self::killed_since`]). Set before the probe
@@ -1194,7 +1195,7 @@ impl VitalsHost {
         self.handed_off = true;
     }
 
-    /// Notes that the run before this one crashed at `crash_ms`, by its crash file
+    /// Notes that the run before this one crashed at `crash_ms`, by its crash evidence
     /// ([`Self::crashed_at`]); it counts only before the probe thread starts.
     pub(crate) fn note_crash_at(&mut self, crash_ms: i64) {
         self.crashed_at = Some(crash_ms);
@@ -3993,7 +3994,7 @@ impl<T: Clone + Default + PartialEq> KeptFile<T> {
             return;
         };
         self.at = now;
-        match aterm_agent::harness::upgrade_models::write_atomic(path, &text) {
+        match aterm_agent::harness::atomic_write::write_atomic(path, &text) {
             Ok(()) => self.held = value.clone(),
             Err(error) => aterm_log::warn!(
                 "system vitals: {} could not be written to {}: {error}",
@@ -4056,21 +4057,21 @@ struct PriorRun {
 /// writes its own checkpoint as soon as it has restored, [`restore_strip`], so a start beside it
 /// finds that crash in the holder's checkpoint). Otherwise, after a kill, a kept strip that holds
 /// no checkpoint of the killed run gains one at its launch
-/// ([`crate::vitals_startup::date_unseen_kill`]), and a crash file newer than the kept strip as
+/// ([`crate::vitals_startup::date_unseen_kill`]), and a crash event newer than the kept strip as
 /// read dates the crash by its time ([`crate::vitals_startup::date_crash`]), the two in the order
 /// they came (one older than the launch is an earlier run's, which the killed run never took), and
-/// the crash file after a handoff too: no checkpoint says the run went on past that file, so a
+/// the crash event after a handoff too: no checkpoint says the run went on past that event, so a
 /// panic it caught and survived in the seconds between its last checkpoint and its handoff reads as
-/// a crash too. A strip is newer than the file by its last reading, and a clean one also by its
+/// a crash too. A strip is newer than the event by its last reading, and a clean one also by its
 /// file's last write: a quit's clean write takes no reading of its own, so a run that survived a
 /// panic (on any thread but the probe's) after its last reading and then quit wrote its clean stop
-/// after the crash file, and only a quit writes a stop clean ([`VitalsHost::stopping`], which names
+/// after the crash event, and only a quit writes a stop clean ([`VitalsHost::stopping`], which names
 /// the one late panic that still leaves one), never a probe thread that outlives the event loop of
 /// a run its main thread's panic takes down. A panic on the probe thread ends it with no stop
 /// written, so its run's quit leaves the last checkpoint, unclean, and that crash draws. A seamless
 /// update's predecessor `_exit`s at its Commit (`seamless::commit_and_exit`) and a relaunch's may
 /// still be running when this opens, so neither leaves `clean_stop = true`, and a handoff's start
-/// with no crash file that new marks the kept checkpoint clean the same way. A crash file no newer
+/// with no crash event that new marks the kept checkpoint clean the same way. A crash event no newer
 /// than the kept strip dates nothing: the strip's writer ran past it (a panic it caught and
 /// survived, or another aterm's crash).
 fn open_strip(
@@ -4096,7 +4097,7 @@ fn open_strip(
     let crash_ms = prior
         .crashed_at
         .filter(|&crash_ms| newer < crash_ms && crash_ms < now_ms);
-    // The stops are dated in the order they came. A crash file older than the killed run's launch
+    // The stops are dated in the order they came. A crash event older than the killed run's launch
     // is an earlier run's, which that run, killed before its startup scan, never took; the kill
     // dated after it moves the strip past the crash, so the crash's call below changes nothing.
     if let Some(crash_ms) = crash_ms.filter(|&ms| {

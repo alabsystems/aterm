@@ -368,8 +368,8 @@ fn pick_at_wall_and_full_opus_google_cycle_drain_entire_quota() {
         }
     );
 
-    // 4. Opus (`named = true`) keeps running at Low (0.08) until it reaches 0% (Spent),
-    //    then both pools are Spent and `pick` / `pick_at_wall` waits for the earliest refill.
+    // 4. Opus (`named = true`) keeps running at Low (0.08) until it reaches 0% (Spent), then both
+    //    pools are Spent and `pick_at_wall` waits for the refill of the asked model's own pool.
     assert_eq!(
         pick(&q, "claude-opus-5-5-medium", true, &r),
         Pick::Keep {
@@ -383,6 +383,14 @@ fn pick_at_wall_and_full_opus_google_cycle_drain_entire_quota() {
         Pick::Wait {
             model: "claude-opus-5-5-medium".to_owned(),
             until: aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z"),
+        }
+    );
+    // A session at a wall on spent Gemini waits for Gemini's own refill, though Opus's comes first.
+    assert_eq!(
+        pick_at_wall(&q, "gemini-4-argon-high", &r),
+        Pick::Wait {
+            model: "gemini-4-argon-high".to_owned(),
+            until: aterm_types::rfc3339::parse_utc_fractional("2026-10-28T00:19:03Z"),
         }
     );
 

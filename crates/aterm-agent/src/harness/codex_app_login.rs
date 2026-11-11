@@ -503,7 +503,7 @@ fn write_auth_doc(home: &Path, doc: &Value) -> std::io::Result<()> {
     let mut rendered =
         aterm_json::to_string(doc).map_err(|e| std::io::Error::other(e.to_string()))?;
     rendered.push('\n');
-    super::upgrade_models::write_atomic(&dest, &rendered)
+    super::atomic_write::write_atomic(&dest, &rendered)
 }
 
 /// The suffix of the lock file beside a login's `auth.json` ([`AuthLock`]).
@@ -877,7 +877,7 @@ fn materialize_enrollment_guarded(
         {
             return Err("enrollment recovery work expired".into());
         }
-        super::upgrade_models::write_atomic(&auth_path_in_home(home), &candidate.0)
+        super::atomic_write::write_atomic(&auth_path_in_home(home), &candidate.0)
             .map_err(|_| "enrollment credential publication failed")?;
     }
     guard.check(admission)?;
@@ -1135,7 +1135,7 @@ impl RefreshJournal {
         let mut rendered = aterm_json::to_string(&self.to_value())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         rendered.push('\n');
-        super::upgrade_models::write_atomic_before_publish(
+        super::atomic_write::write_atomic_before_publish(
             &beside_auth(home, JOURNAL_SUFFIX),
             &rendered,
             before_publish,
@@ -4027,7 +4027,7 @@ impl CodeExchange<'_> {
                 if current != predecessor {
                     return None;
                 }
-                super::upgrade_models::write_atomic(&auth_path_in_home(home), &candidate).ok()?;
+                super::atomic_write::write_atomic(&auth_path_in_home(home), &candidate).ok()?;
                 #[cfg(test)]
                 if cut == Some(EnrollmentCut::AfterAuthWrite) {
                     return None;

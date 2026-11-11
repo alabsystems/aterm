@@ -32,19 +32,5 @@ pub fn lookup(session: &str) -> io::Result<aterm_json::Value> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn missing_registration_and_replacement_fail_closed() {
-        assert!(lookup("s-a").is_err());
-        fn installed(session: &str) -> io::Result<aterm_json::Value> {
-            Ok(aterm_json::json!({"session":session}))
-        }
-        register(installed).unwrap();
-        assert_eq!(lookup("s-a").unwrap()["session"].as_str(), Some("s-a"));
-        assert_eq!(
-            register(installed).unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-    }
-}
+#[path = "native_resource_inspection_tests.rs"]
+mod tests;

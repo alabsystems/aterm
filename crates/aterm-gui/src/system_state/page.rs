@@ -2101,7 +2101,9 @@ impl<'a, 'b> Page<'a, 'b> {
                 ("→".to_owned(), StyleRef::Quiet),
                 (wanted.clone(), StyleRef::Primary),
             ],
-            RowValue::One(value) => vec![(value.clone(), StyleRef::Secondary)],
+            RowValue::One(value) | RowValue::LastKnown(value) => {
+                vec![(value.clone(), StyleRef::Secondary)]
+            }
             RowValue::Muted(value) => vec![(value.clone(), StyleRef::Quiet)],
         };
         let piece_w = |pieces: &[(String, StyleRef)]| {
@@ -2609,7 +2611,7 @@ impl<'a, 'b> Page<'a, 'b> {
 /// A row's small mark (§4.1's 12 pt glyph): its chip, as the row rule decided it.
 fn row_mark(row: &RowView) -> Mark {
     match row.chip {
-        Some(Chip::InPlace) => Mark::Done,
+        Some(Chip::InPlace | Chip::LastKnown) => Mark::Done,
         Some(Chip::WillChange { busy: true }) => Mark::Working,
         Some(Chip::WillChange { busy: false }) => Mark::Pending,
         Some(Chip::Waiting) => Mark::Waiting,

@@ -865,15 +865,5 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_args_rejects_plus_prefixed_jobs() {
-        let args = ["aterm", "/tmp/aterm", "--jobs", "+4"]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>();
-        assert!(parse_args(&args).is_err());
-    }
-}
+#[path = "build_local_tests.rs"]
+mod tests;

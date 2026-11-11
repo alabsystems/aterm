@@ -519,6 +519,7 @@ aterm_objc::declare_class! {
         @sel(flagsChanged:)
         fn flags_changed(&self, event: Id) {
             trace_scope!("flagsChanged:");
+            let _source = key_source(event);
 
             self.update_modifiers(event, true);
         }
@@ -1181,9 +1182,9 @@ fn mouse_button(event: Id) -> MouseButton {
 
 /// Classify the original key before replacement, interpretation or a deferred callback.
 fn key_source(event: Id) -> super::key_origin::Scope {
-    // SAFETY: keyDown:/keyUp: receive a live NSEvent key, and cancelOperation: checks its
-    // current event is non-nil and key-down/up first. `-keyCode` is S16@0:8, defined for these
-    // key events.
+    // SAFETY: keyDown:/keyUp:/flagsChanged: receive a live NSEvent key, and cancelOperation:
+    // checks its current event is non-nil and key-down/up first. `-keyCode` is S16@0:8, defined
+    // for these keyboard events.
     let keycode = unsafe { send_u16(event, sel!(keyCode)) };
     input_source(event, keycode)
 }

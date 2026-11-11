@@ -541,6 +541,43 @@ fn upload_never_creates_converges_and_conflicts() {
     assert!(world.writes_since(mark).is_empty());
 }
 
+/// Offline protocol accounting, with actual HTTP and no uplink or real credentials.
+#[test]
+fn upload_protocol_accounting_keeps_the_digest_guard() {
+    let world = world("upload-accounting");
+    let release = world.draft();
+    let file = world.file("account.zip", &[7; 1 << 20]);
+    let permit = world.permit();
+    let mark = world.mark();
+    let began = std::time::Instant::now();
+    let made = world
+        .releases()
+        .upload(&permit, &release, &file, Replace::Never)
+        .unwrap();
+    let elapsed = began.elapsed();
+    assert_eq!(made.effect, Effect::Created);
+    let requests = world.since(mark);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(method, _)| method == "POST")
+            .count(),
+        1
+    );
+    println!("agh upload offline: 1048576 bytes in {elapsed:?}; requests {requests:?}");
+    // Negative control: identical size and name do not authorize different bytes.
+    std::fs::remove_file(&file.path).unwrap();
+    let other = world.file("account.zip", &[8; 1 << 20]);
+    let mark = world.mark();
+    let error = world
+        .releases()
+        .upload(&permit, &release, &other, Replace::Never)
+        .unwrap_err();
+    assert_conflict(&error, "already_exists");
+    assert!(world.writes_since(mark).is_empty());
+    world.fake.assert_clean();
+}
+
 #[test]
 fn a_lost_upload_converges_on_the_guard_read() {
     let world = world("rw-upload-lost");

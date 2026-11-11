@@ -403,6 +403,44 @@ pub fn until(
     asked_until(fd, interest, deadline)
 }
 
+/// The same absolute wait, interrupted by a borrowed readable control source. Nothing is
+/// consumed; a Stop bell remains latched and a closed broker request remains observable.
+pub(crate) fn until_cancelled(
+    fd: BorrowedFd<'_>,
+    interest: Interest,
+    deadline: std::time::Instant,
+    cancel: Option<BorrowedFd<'_>>,
+) -> io::Result<()> {
+    let Some(cancel) = cancel else {
+        return until(fd, interest, deadline);
+    };
+    let ready = any_interests_until(
+        &[Watch::new(fd, interest), Watch::new(cancel, Interest::Read)],
+        deadline,
+    )?;
+    if ready.contains(&1) {
+        return Err(cancelled());
+    }
+    if ready.contains(&0) {
+        Ok(())
+    } else {
+        Err(expired())
+    }
+}
+
+pub(crate) fn check_cancelled(cancel: Option<BorrowedFd<'_>>) -> io::Result<()> {
+    if let Some(cancel) = cancel
+        && !any_now(&[cancel])?.is_empty()
+    {
+        return Err(cancelled());
+    }
+    Ok(())
+}
+
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "socket preparation cancelled")
+}
+
 fn expired() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "readiness deadline")
 }

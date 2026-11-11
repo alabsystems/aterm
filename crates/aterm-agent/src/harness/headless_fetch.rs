@@ -484,7 +484,7 @@ pub fn install(
         Err(why) if !stopped() => {
             // Best effort: a root that cannot be made keeps no record either.
             if root.is_dir() {
-                let _ = super::upgrade_models::write_atomic(
+                let _ = super::atomic_write::write_atomic(
                     &record,
                     &format!("{}\n", super::one_line(why, FAILED_WHY_MAX)),
                 );

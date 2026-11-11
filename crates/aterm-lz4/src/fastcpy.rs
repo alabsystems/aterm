@@ -79,17 +79,5 @@ fn double_copy_trick<const SIZE: usize>(src: &[u8], dst: &mut [u8]) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::slice_copy;
-    use alloc::vec::Vec;
-
-    #[test]
-    fn test_fast_short_slice_copy_edge_cases() {
-        for len in 0..(512 * 2) {
-            let left = (0..len).map(|i| i as u8).collect::<Vec<_>>();
-            let mut right = vec![0u8; len];
-            slice_copy(&left, &mut right);
-            assert_eq!(left, right);
-        }
-    }
-}
+#[path = "fastcpy_tests.rs"]
+mod tests;

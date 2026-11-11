@@ -473,9 +473,14 @@ pub fn on_converge_pass_ended(ended: fn()) {
 /// name writer, never the window thread, and this operation must not raise a password prompt.
 #[cfg(target_os = "macos")]
 pub fn on_system_machine_name_apply(
-    apply: fn(aterm_types::machine_name::Number) -> Result<(), String>,
+    apply: fn(
+        &std::path::Path,
+        &std::path::Path,
+        &aterm_types::machine_name::GeneratedNames,
+    ) -> Result<(), String>,
+    authorization: fn(&std::path::Path, &std::path::Path) -> Result<bool, String>,
 ) {
-    machine_title::on_system_name_apply(apply);
+    machine_title::on_system_name_apply(apply, authorization);
 }
 
 /// Start the converge pass's window lane (`converge_lane`: `aterm init --converge --trigger
@@ -3767,7 +3772,7 @@ enum Wake {
     },
     NativeUpdateReconcileFinished {
         purpose: app_native::NativeUpdateReconcilePurpose,
-        facts: app_native::NativeUpdateReconcileFacts,
+        facts: app_native::NativeUpdateReadResult,
     },
     NativeUpdateWorkerDrained,
     NativeDocumentQueueSlotAvailable,
@@ -9762,13 +9767,14 @@ mod focus_replayed_press_tests {
 }
 
 /// Where `event`, as it arrives from the OS, came from: a key an `hwkey` burst posted, or a key,
-/// click or scroll another process posted (`crate::hwkey::classify`), else the person's. Native
-/// callbacks retain the source verdict, including an input method's text; an App hold carries
-/// the answer through a later replay ([`App::input_origin`]).
+/// modifier change, click or scroll another process posted (`crate::hwkey::classify`), else the
+/// person's. Native callbacks retain the source verdict, including an input method's text; an App
+/// hold carries the answer through a later replay ([`App::input_origin`]).
 fn arriving_input_origin(event: &WindowEvent) -> InputOrigin {
     if matches!(
         event,
         WindowEvent::KeyboardInput { .. }
+            | WindowEvent::ModifiersChanged(_)
             | WindowEvent::Ime(_)
             | WindowEvent::MouseInput { .. }
             | WindowEvent::MouseWheel { .. }
@@ -10419,6 +10425,13 @@ fn restore_pass_sliced(site: RestorePassSite, carries_shells: bool) -> bool {
 const BOOT_HEALTH_RETRY_MIN: Duration = Duration::from_secs(1);
 const BOOT_HEALTH_RETRY_MAX: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootHealthConfirmation {
+    Pending,
+    InFlight,
+    Confirmed,
+}
+
 #[must_use]
 const fn metadata_change_needs_redraw(focused_session: bool, strip_changed: bool) -> bool {
     focused_session || strip_changed
@@ -10566,10 +10579,11 @@ struct App {
     handoff_deferred_input: Vec<(WinitWindowId, WindowEvent, InputOrigin)>,
     handoff_deferred_input_dropped: u32,
     /// Where the window event being handled came from: a key an `hwkey` burst posted, a key,
-    /// click or scroll another process posted, or the person's (`crate::hwkey::classify`). The
-    /// native callback retains the source verdict ([`crate::hwkey::window_callback_origin`]), and
-    /// it travels with the event while held for a spawn, a menu mark or a handoff's Commit and
-    /// replayed later, when the current event is another one ([`App::replay_window_event`]).
+    /// modifier change, click or scroll another process posted, or the person's
+    /// (`crate::hwkey::classify`). The native callback retains the source verdict
+    /// ([`crate::hwkey::window_callback_origin`]), and it travels with the event while held for a
+    /// spawn, a menu mark or a handoff's Commit and replayed later, when the current event is
+    /// another one ([`App::replay_window_event`]).
     input_origin: InputOrigin,
     handoff_deferred_input_incoherent: bool,
     tab_spawns: tab_spawn::TabSpawns,
@@ -10890,7 +10904,7 @@ struct App {
     handoff_history_loss_said: crate::handoff_history::LossSummary,
     handoff_repainted_tabs: usize,
     first_present_done: bool,
-    boot_health_confirmation_dispatched: bool,
+    boot_health_confirmation: BootHealthConfirmation,
     boot_health_confirmation_retry_at: Option<Instant>,
     boot_health_confirmation_backoff: Duration,
     seamless_position: Option<(i32, i32)>,
@@ -15900,7 +15914,7 @@ impl App {
             handoff_history_loss_said: crate::handoff_history::LossSummary::default(),
             handoff_repainted_tabs: 0,
             first_present_done: false,
-            boot_health_confirmation_dispatched: true,
+            boot_health_confirmation: BootHealthConfirmation::Confirmed,
             boot_health_confirmation_retry_at: None,
             boot_health_confirmation_backoff: BOOT_HEALTH_RETRY_MIN,
             seamless_position: None,
@@ -17465,7 +17479,7 @@ impl App {
             self.headless,
             self.headless_boot_health_checkpoint(),
             self.first_present_done,
-            self.boot_health_confirmation_dispatched,
+            self.boot_health_confirmation != BootHealthConfirmation::Pending,
             true,
             self.windows.values().any(|ws| ws.os_window.is_some()),
             self.incoming_handoff_pending,
@@ -17492,17 +17506,18 @@ impl App {
     ) {
         match outcome {
             app_native::NativeUpdateDispatch::Queued => {
-                self.boot_health_confirmation_dispatched = true;
+                self.boot_health_confirmation = BootHealthConfirmation::InFlight;
                 self.boot_health_confirmation_retry_at = None;
             }
-            app_native::NativeUpdateDispatch::Saturated => {
-                aterm_log::debug!("boot-health confirmation queue busy; retry on backoff");
+            app_native::NativeUpdateDispatch::Saturated
+            | app_native::NativeUpdateDispatch::Unavailable => {
+                let why = match outcome {
+                    app_native::NativeUpdateDispatch::Saturated => "queue busy",
+                    _ => "worker unavailable after restart",
+                };
+                aterm_log::debug!("boot-health confirmation {why}; retry on backoff");
+                self.boot_health_confirmation = BootHealthConfirmation::Pending;
                 self.arm_boot_health_retry(now);
-            }
-            app_native::NativeUpdateDispatch::Unavailable => {
-                self.boot_health_confirmation_dispatched = true;
-                self.boot_health_confirmation_retry_at = None;
-                aterm_log::warn!("boot-health confirmation worker unavailable after restart");
             }
         }
     }
@@ -20324,7 +20339,7 @@ impl App {
             }
             Wake::GrokSigninLooked { session } => self.refresh_presence_session(session),
             Wake::NativeUpdateReconcileFinished { purpose, facts } => {
-                self.finish_native_update_reconcile(purpose, facts);
+                self.finish_native_update_observation(purpose, facts);
             }
             Wake::NativeUpdateWorkerDrained => {
                 self.retry_pending_native_update_reconcile();
@@ -20573,19 +20588,9 @@ impl App {
                         aterm_log::info!("update apply (control request) held: {reason}");
                         aterm_update::record_apply_refusal(current_build, &reason);
                     }
-                    if !self.request_native_update_reconcile(
+                    self.request_native_update_reconcile(
                         app_native::NativeUpdateReconcilePurpose::ApplyControl,
-                    ) {
-                        let reason = "Updater facts could not be collected safely";
-                        aterm_update::record_apply_refusal(current_build, reason);
-                        self.surface_update_apply_outcome(
-                            "control request",
-                            native_app::UpdateOutcome::Blocked {
-                                reasons: vec![reason.to_string()],
-                            },
-                            false,
-                        );
-                    }
+                    );
                 }
             }
             Wake::UpdateStaged { build, version } => {
@@ -27200,6 +27205,22 @@ pub fn main_entry_with_network(
     let handoff_claimed_at: Option<std::time::Instant> = None;
     #[cfg(target_os = "macos")]
     let out_of_band_handoff = handoff_rendezvous::rendezvous_present(&handoff_env);
+    // AppKit's first run may wait for LaunchServices. Finish that work before
+    // dialling: the parent still serves every PTY and paints its own windows.
+    #[cfg(target_os = "macos")]
+    let prepared_loop = (out_of_band_handoff && !headless).then(|| {
+        use aterm_window::platform::macos::EventLoopExtMacOS as _;
+        let started = std::time::Instant::now();
+        let mut built = build_event_loop(false, true);
+        built.event_loop.prepare_launch();
+        aterm_log::info!(
+            "overlap handoff: AppKit launch finished in {} ms before the dial, with the parent's readers live",
+            started.elapsed().as_millis()
+        );
+        built
+    });
+    #[cfg(not(target_os = "macos"))]
+    let prepared_loop: Option<BuiltLoop> = None;
     #[cfg(target_os = "macos")]
     let device_proof_term =
         handoff_rendezvous::take_device_proof_term(&mut handoff_env).unwrap_or(out_of_band_handoff);
@@ -27656,8 +27677,9 @@ pub fn main_entry_with_network(
     }
 
     crate::metrics::stamp_claim(crate::metrics::ClaimStamp::Warmed);
-    let early_loop = loop_before_session0(headless)
-        .then(|| build_event_loop(headless, handoff_commit.is_some()));
+    let early_loop = prepared_loop.or_else(|| {
+        loop_before_session0(headless).then(|| build_event_loop(headless, handoff_commit.is_some()))
+    });
 
     let trace_latency = metrics::latency_trace_on();
     let lat_epoch = Instant::now();
@@ -29097,7 +29119,7 @@ pub fn main_entry_with_network(
         handoff_history_loss_said: crate::handoff_history::LossSummary::default(),
         handoff_repainted_tabs,
         first_present_done: false,
-        boot_health_confirmation_dispatched: false,
+        boot_health_confirmation: BootHealthConfirmation::Pending,
         boot_health_confirmation_retry_at: None,
         boot_health_confirmation_backoff: BOOT_HEALTH_RETRY_MIN,
         level_up: None,

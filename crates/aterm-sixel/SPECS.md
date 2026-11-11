@@ -45,7 +45,7 @@ the code disagree, and §6 orders the proofs. The claims come from reading `src/
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary ones in §2),
 `difficulty` (the Rust features the proof must handle), `blocking_gaps` (rows of §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`). Gap 0 (a seal that publishes Clean rows)
+`docs/TRUST-LANE.md` (Blocking gaps)). Gap 0 (a seal that publishes Clean rows)
 blocks every row.
 
 ```tsv
@@ -98,17 +98,6 @@ src/tests.rs	rgb_percent_scales_and_clamps_each_component	rgb-percent
 src/tests.rs	hls_to_rgb_follows_dec_shifted_hsl	hls-range	decode-refines-model
 ```
 
-## 3. Coverage
-
-- 24 live tests mapped in §2 across the 14 specs (0 non-spec tests remain; 25 original tests read in the initial 2026-10-15 audit).
-- The biggest collapse is `decode-refines-model`, with 8 primary tests plus 3 shared.
-  `unhook-accept` has 3 primary tests plus 3 shared, and `growth-amortized` has 3.
-- Gap histogram (gap → specs it blocks, out of 14): 0 → 14, 1 → 11, 2 → 11, 3 → 9, 5 → 8,
-  7 → 6, 4 → 5, 8 → 2, 13 → 2, 10 → 1. No spec is blocked by gap 0 alone.
-
-The module-level `const _` assert `SIXEL_MAX_PARAMS >= 5` in `src/tests.rs` guards the second clause
-of `params-bound`; it goes once that clause is proved.
-
 ## 4. Tests that are not spec samples
 
 None: all 24 live `#[test]` functions in `src/tests.rs` are mapped in §2.
@@ -138,27 +127,3 @@ None: all 24 live `#[test]` functions in `src/tests.rs` are mapped in §2.
 7. **Resolved: `dimensions_are_clamped` asserts exact `(4096, 6)` dimensions.**
 8. **Resolved: `register_select_out_of_range_is_clamped_no_panic` checks palette length, clamped
    register `1023`, and opaque black pixels (`0xFF00_0000`).**
-
-## 6. Proof order (easiest high-value first)
-
-Every row needs gap 3 (body widening) or gaps 1 and 2 (Vec content and `&mut self` views), so the
-order starts with the narrowest widening.
-
-1. **`rgb-percent`** (gaps 0, 3, 5): pure `u32` arithmetic with no heap and no `self`, once gap 3
-   admits unsigned `saturating_*`, division by a constant, shifts, `|` and a call to an admitted fn.
-   It is the lemma `default-palette` and `color-register` cite.
-2. **`spans`** (gaps 0, 2, 3): two `&self` scalar reads and a ceiling division, the crate's first
-   certified `&self` view.
-3. **`release`** with **`inactive-noop`** (gaps 0, 1, 2, 4): field assignments, `Vec::new` and a
-   bool early return, needing Vec length only. They give the frame lemmas every later spec uses.
-4. **`params-bound`** (gaps 0, 1, 2, 5): a length-only invariant over `Reach`.
-5. **`color-register`**, then **`default-palette`**: the first Vec content specs (gap 1 proper),
-   each indexed by a clamped register.
-6. **`unhook-accept`** and **`image-shape`**: the cap specs (no over-cap allocation, exact output
-   length). They need the fold over `put` (gaps 5, 7) and prove the dead-branch lemma (§5.5).
-7. **`growth-amortized`**, then **`lazy-alloc`**, once `ensure_capacity`'s `trust::skip` is lifted.
-   `RI` is the invariant `decode-refines-model` stands on.
-8. **`decode-refines-model`**, over `W(bs)*H(bs) ≤ CAP`; it needs every gap
-   above plus gap 10. **`hook-reset`** follows from it and `release`.
-9. **`hls-range`** last: f64 locals, `mul_add`, `round`, float-to-int casts and a closure, and no gap
-   row covers float reasoning.

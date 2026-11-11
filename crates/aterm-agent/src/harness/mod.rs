@@ -47,6 +47,7 @@ pub mod alab_exports;
 pub mod alab_roster;
 pub mod alab_seen;
 pub mod align;
+pub mod atomic_write;
 mod auth_deadline;
 #[cfg(test)]
 mod auth_deadline_tests;
@@ -57,6 +58,7 @@ mod challenge_window;
 pub mod claims;
 #[cfg(unix)]
 pub mod claude_homes;
+pub mod claude_model;
 #[cfg(unix)]
 mod claude_oauth_vault;
 pub mod cli;
@@ -172,6 +174,7 @@ pub mod spend;
 pub(crate) use aterm_uds::sqlite_read;
 pub mod stats;
 pub mod steps;
+pub mod switch_top;
 pub mod tap;
 /// The harness's clock: every bounded wait of the live upgrade and the relaunch, as one value ([`Timings`]).
 pub mod timings;
@@ -181,12 +184,12 @@ pub mod token_route;
 pub use timings::Timings;
 pub(crate) mod transcript;
 pub use transcript::{claude_reads, codex_reads};
+pub mod twin;
+pub mod unix_time;
 pub mod upgrade;
 pub mod upgrade_agy;
 pub mod upgrade_agy_live;
-pub mod upgrade_catalog;
 pub mod upgrade_drive;
-pub mod upgrade_models;
 pub mod upgrade_muse;
 pub mod upgrade_muse_live;
 pub mod upgrade_wake;

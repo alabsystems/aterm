@@ -47,6 +47,7 @@ fn passed_binary(spec: &str, executable: &str) -> Binary {
 
 fn passed_lint_package(spec: &str) -> LintPackage {
     LintPackage {
+        reused: false,
         spec: spec.into(),
         outcome: "ok".into(),
         content_key: Some("dd".repeat(32)),
@@ -300,7 +301,6 @@ struct World {
     /// The build fails before its slices claim memory; later branches wait for its end.
     build_claims_late: bool,
     build_admission_waits: usize,
-    lint_first: bool,
     /// The build and the export do their work once the tree's end is told, and not when their
     /// stop fired by then.
     after_tree: bool,
@@ -481,7 +481,6 @@ impl World {
             export_pushes: false,
             build_claims_late: false,
             build_admission_waits: 0,
-            lint_first: false,
             after_tree: false,
             keep_build_on_test_red: false,
             sign_code: 0,
@@ -635,8 +634,8 @@ fn ran(code: i32) -> Ran {
     }
 }
 
-/// The graph's branches over the world. A pending lint reserves memory before slices;
-/// other trees follow slice admission. Work runs past the other branch starts.
+/// The graph's branches over the world. The build's slices reserve memory before the tree;
+/// work runs past the other branch starts.
 /// A branch in [`World::holds`] runs unlocked until its stop fires.
 struct WorldBranches<'a> {
     w: std::sync::Mutex<&'a mut World>,
@@ -728,10 +727,6 @@ impl<'a> WorldBranches<'a> {
 }
 
 impl Branches for WorldBranches<'_> {
-    fn expect_tree_lint(&self) {
-        self.world().lint_first = true;
-        self.mark("lint-expected");
-    }
     fn keep_build_on_test_red(&self, _c: &Candidate) -> bool {
         self.world().keep_build_on_test_red
     }
@@ -843,11 +838,6 @@ impl Branches for WorldBranches<'_> {
         work: BuildWork,
         stop: &BranchStop,
     ) -> Built {
-        if self.entered.lock().unwrap().contains(&"lint-expected") {
-            self.wait("lint admission", |seen| seen.contains(&"tree"), &|| {
-                stop.fired()
-            });
-        }
         if self.world().build_claims_late {
             let mut world = self.world();
             world.calls.push("build".into());
@@ -1334,7 +1324,7 @@ impl Backend for World {
             || std::iter::once(previous.base.as_str())
                 .chain(previous.hops.iter().map(|hop| hop.commit.as_str()))
                 .any(|commit| self.published.contains_key(commit));
-        crate::line::require_unpublished([tagged, ledgered, published, false, false])
+        crate::line::require_unpublished([tagged, ledgered, published, false])
             .map_err(|why| Refusal::new(why, crate::release::fix_remedy(previous.head())))?;
         Ok(previous)
     }
@@ -2011,7 +2001,7 @@ impl Backend for World {
             line: format!("{build} {}", c.version),
         })
     }
-    fn qualify_begin(&mut self, _prover: &Prover, export: bool) -> Result<String, Refusal> {
+    fn qualify_begin(&mut self, _prover: &Prover, branches: &[Branch]) -> Result<String, Refusal> {
         if self.stop_at_qualify {
             self.qualify_boundary = Some(std::time::Instant::now());
             return Err(Refusal::new(
@@ -2021,7 +2011,7 @@ impl Backend for World {
         }
         Ok(format!(
             "8 slots of this Mac's 8 cores{}",
-            if export {
+            if branches.contains(&Branch::Export) {
                 ", 2 held for the export"
             } else {
                 ""
@@ -2336,16 +2326,16 @@ fn supersession_preflight_and_unknown_write_use_one_candidate_transaction() {
         dry_run,
         ..mac()
     };
-    let staged = || {
+    let published = || {
         Refusal::new(
-            "the line has a staged publication; cannot supersede",
+            "the line has a release object; cannot supersede",
             crate::release::fix_remedy(NEXT),
         )
     };
 
     for dry_run in [false, true] {
         let mut world = setup();
-        world.supersede_preflight_refusal = Some(staged());
+        world.supersede_preflight_refusal = Some(published());
         let journal_path = world.release_dir().join(JOURNAL_FILE);
         let before = std::fs::read(&journal_path).unwrap();
         let fleet = world.existing_fleet_line.clone();
@@ -2387,7 +2377,7 @@ fn supersession_preflight_and_unknown_write_use_one_candidate_transaction() {
     );
     assert!(selected.release_dir().join(SELECTION_FILE).exists());
     selected.own_cutter = true;
-    selected.supersede_preflight_refusal = Some(staged());
+    selected.supersede_preflight_refusal = Some(published());
     let (code, last) = selected.run(options(false));
     assert_ne!(code, 0, "{last}");
     assert_eq!(selected.head, NEXT);
@@ -2542,7 +2532,7 @@ fn supersession_preflight_and_unknown_write_use_one_candidate_transaction() {
 
     // Dry recovery performs the same read-only classification first. A newly red staging
     // surface cannot make it contradict the exact durable record, and dry writes nothing.
-    unknown.supersede_preflight_refusal = Some(staged());
+    unknown.supersede_preflight_refusal = Some(published());
     let (code, last) = unknown.run(options(true));
     assert_eq!(code, 0, "{last}\n{:#?}", unknown.out);
     assert_eq!(
@@ -2993,10 +2983,6 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
     let mut w = World::new();
     let (code, last) = w.run(bump());
     assert_eq!(code, 0, "{:#?}", w.out);
-    assert!(
-        w.lint_first,
-        "a full qualify must arm the lint admission gate before launching slices"
-    );
     let starts: Vec<_> = w
         .out
         .iter()
@@ -3891,7 +3877,7 @@ fn dry_prefreeze_wait(interrupted: bool, test: &str) {
                     .fixture
                     .root
                     .path()
-                    .join("release/cutter-cache/workspace-running")
+                    .join("release/.ubd/cutter-cache/workspace-running")
                     .exists(),
                 "interruption leaves the other holder alone"
             );
@@ -4741,6 +4727,33 @@ fn red_line() -> World {
     w
 }
 
+/// NEGATIVE CONTROL: choosing --fix before reading the fleet claim refuses the
+/// forgotten journal. Both dry and real preparation must carry onto the fleet's base.
+#[test]
+fn fix_after_forget_adopts_the_fleet_line() {
+    for dry_run in [true, false] {
+        let mut w = red_line();
+        let line = w.journal().unwrap().line();
+        w.existing_fleet_line = Some(line.clone());
+        let (code, last) = w.run(ReleaseOptions {
+            forget: true,
+            ..mac()
+        });
+        assert_eq!(code, 0, "{last}");
+        assert!(w.journal().is_none());
+        let (code, last) = w.run(ReleaseOptions {
+            dry_run,
+            ..fix(&[FIX])
+        });
+        assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+        if !dry_run {
+            let carried = w.journal().unwrap().line();
+            assert_eq!(carried.base, line.base);
+            assert_eq!(carried.hops[0].carries, FIX);
+        }
+    }
+}
+
 fn fix(commits: &[&str]) -> ReleaseOptions {
     ReleaseOptions {
         fix: commits.iter().map(|c| (*c).to_string()).collect(),
@@ -4756,7 +4769,7 @@ pub(super) fn real_carry_fixture(
     dry_run: bool,
     judge_changelog: bool,
 ) -> (i32, String, Vec<String>) {
-    carry_fixture(repo, line, fixes, dry_run, judge_changelog, false)
+    carry_fixture(repo, line, fixes, dry_run, judge_changelog, false, false)
 }
 
 /// Include real admission as well as carrying; only services beyond source git are faked.
@@ -4766,7 +4779,17 @@ pub(super) fn real_fix_fixture(
     fixes: &[Fix],
     dry_run: bool,
 ) -> (i32, String, Vec<String>) {
-    carry_fixture(repo, line, fixes, dry_run, false, true)
+    carry_fixture(repo, line, fixes, dry_run, false, true, false)
+}
+
+/// Real git admission and carrying after the local journal is forgotten.
+pub(super) fn forgotten_fix_fixture(
+    repo: &Path,
+    line: &Line,
+    fixes: &[Fix],
+    dry_run: bool,
+) -> (i32, String, Vec<String>) {
+    carry_fixture(repo, line, fixes, dry_run, false, true, true)
 }
 
 fn carry_fixture(
@@ -4776,6 +4799,7 @@ fn carry_fixture(
     dry_run: bool,
     judge_changelog: bool,
     real_admission: bool,
+    forget: bool,
 ) -> (i32, String, Vec<String>) {
     let mut w = World::new();
     w.carry_repo = Some(repo.to_path_buf());
@@ -4806,14 +4830,23 @@ fn carry_fixture(
     }
     .save(&w.release_dir().join(JOURNAL_FILE))
     .unwrap();
-    let before = w.journal().unwrap();
+    if forget {
+        w.existing_fleet_line = Some(line.clone());
+        let (code, last) = w.run(ReleaseOptions {
+            forget: true,
+            ..mac()
+        });
+        assert_eq!(code, 0, "{last}");
+        assert!(w.journal().is_none());
+    }
+    let before = w.journal();
     let names: Vec<&str> = fixes.iter().map(|fix| fix.commit.as_str()).collect();
     let (code, last) = w.run(ReleaseOptions {
         dry_run,
         ..fix(&names)
     });
     if dry_run || code != 0 {
-        assert_eq!(w.journal().unwrap(), before);
+        assert_eq!(w.journal(), before);
     }
     (code, last, w.out)
 }
@@ -7532,10 +7565,9 @@ fn a_persons_signal_is_no_red_and_adds_no_stop() {
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert_eq!(w.count("build"), 1, "{:?}", w.calls);
 
-    // With lint already judged, a signal before slice admission leaves the remaining
-    // tree checks unstarted: they still follow the slices' claims.
+    // A signal before slice admission leaves the tree checks unstarted: they follow the
+    // slices' claims.
     let mut w = World::new();
-    w.records.insert((BUMP.into(), None, "lint".into()), "ok");
     w.build_claims_late = true;
     w.signal_at = Some("build");
     interrupted(&mut w);
@@ -7552,8 +7584,6 @@ fn a_persons_signal_is_no_red_and_adds_no_stop() {
 #[test]
 fn a_red_stops_the_other_branches_and_one_not_started_never_starts() {
     let mut w = World::new();
-    // Lint's standing judgment leaves the tree's compile behind slice admission.
-    w.records.insert((BUMP.into(), None, "lint".into()), "ok");
     w.build_claims_late = true;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}\n{:#?}", w.out);
@@ -8255,6 +8285,52 @@ fn a_fail_refuses_its_own_tree_and_a_fix_hop_is_verified_anew() {
     );
 }
 
+/// A staged export can precede a bundle FAIL. Supersession clears the old candidate's
+/// admission, qualifies the selected main tree, and keeps the failed tree refused.
+#[test]
+fn a_staged_bundle_failure_can_supersede_onto_main_and_must_qualify_again() {
+    let mut w = World::new();
+    w.verify_outcomes.insert("appkit", "FAIL");
+    w.verify_half = Some(Half::Bundle);
+    w.verify_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 5/10 bundle"), "{last}");
+    assert_eq!(w.attested.as_deref(), Some(BUMP));
+    let previous = w.journal().unwrap().line();
+    w.existing_fleet_line = Some(previous.clone());
+    w.history.push(NEXT.into());
+    w.versions.insert(NEXT.into(), previous.version.clone());
+    w.verify_outcomes.clear();
+    w.verify_code = 0;
+    w.calls.clear();
+    let options = || ReleaseOptions {
+        commit: Some(NEXT.into()),
+        supersede: true,
+        ..mac()
+    };
+    w.fleet_refusal = Some("CUTTING ELSEWHERE: live progressing peer".into());
+    let (code, _) = w.run(options());
+    assert_eq!(code, 4);
+    assert!(w.supersession.is_none());
+    assert_eq!(w.count("stage"), 0);
+    w.fleet_refusal = None;
+    w.calls.clear();
+    let (code, last) = w.run(options());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.journal().unwrap().commit, NEXT);
+    assert_eq!(w.attested.as_deref(), Some(NEXT));
+    assert_eq!(w.count("verify --tree"), 1);
+    assert_eq!(w.count("stage"), 1);
+    assert_eq!(w.supersession.as_ref().unwrap().previous, previous);
+    assert!(
+        w.checks_of(BUMP, w.macho().as_deref())
+            .failed
+            .iter()
+            .any(|f| f.check == "appkit")
+    );
+}
+
 /// A run that could not run every check (exit 3) keeps the records of those that finished, and
 /// the resume runs exactly the missing checks of each half, carrying exactly the test binaries
 /// the test record lists as passed; once they pass the release goes on. Negative control: a
@@ -8653,7 +8729,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         "a FAIL is recorded: {}",
         judged.line()
     );
-    let verified = repo.join(".git/aterm-release/verified");
+    let verified = crate::check_record::root(&git).unwrap();
     std::fs::remove_dir_all(&verified).unwrap();
     set("1", "", "");
     verify(&mut real, &every(Half::Tree)).expect("it ran");

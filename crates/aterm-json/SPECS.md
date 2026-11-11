@@ -9,7 +9,7 @@ tests are digest-pinned sweeps that hash their verdicts and output bytes into on
 replaces the sweep, not the digest (§5.3). Every claim comes from reading the code; nothing was
 compiled or run.
 
-Gap numbers are rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+Gap numbers are rows of the gap table in `docs/TRUST-LANE.md` (Blocking gaps).
 Gap 0 (no Lean-discharged row is published) blocks every spec, so every row lists it.
 
 ## 0. Notation used in the statements
@@ -156,15 +156,6 @@ crates/aterm-json/tests/number_lexeme.rs	typed_array_paths_and_misses_return_the
 crates/aterm-json/tests/number_lexeme.rs	a_match_does_not_short_circuit_validation	json-number-lexeme-path	json-accepts-exactly-grammar
 ```
 
-## 3. Coverage
-
-- All 28 live `#[test]` functions in `crates/aterm-json/tests/json.rs` and the 4 in
-  `crates/aterm-json/tests/number_lexeme.rs` map to one of the 20 specs in §1 (`[lib] test = false`
-  in `Cargo.toml`, so tests live in `tests/*.rs` and doctests).
-- `number-normal-form` retires no test as primary; it is a lemma of `value-roundtrip`.
-- A test goes only when every spec it samples (`primary` and `also`) is Certified. For example,
-  `wide_integers_round_trip_or_fail` needs `typed-integer-targets`, `integer-format` and `to-value-exact`.
-
 ## 4. Tests that are not spec samples
 
 None. Two pieces of test-only code go with the tests:
@@ -214,23 +205,3 @@ None. Two pieces of test-only code go with the tests:
    `deserialize_wide` (`src/de.rs`) parses `-0` as `i128` `0` before the `NegZero` dispatch (matching
    `serde_json`), while `u128` and narrower integer targets reject `-0`. Both `visit_number`'s doc
    and `typed-integer-targets` state the `i128` path explicitly.
-
-## 6. Proof order (easiest, high value)
-
-Every spec needs gap 1 and, except the macro, gap 3.
-
-1. **`index-total`** (gaps 0, 1, 3): an enum match, `BTreeMap::get`, slice `get` and a static `Null`,
-   with no loops. It retires `index_sugar_is_total` and is the cleanest first `Value` carrier.
-2. **`number-normal-form`** (gaps 0, 1, 3): a private-field enum invariant plus three accessors, and
-   the lemma that makes `value-roundtrip` true.
-3. **`integer-format`** (gaps 0, 1, 2, 3, 5, 7): one digit loop over a `[u8; 39]` buffer on `u128`. It
-   retires `integer_formatting` and is the lemma behind integer keys in `key-serializer-refuses`.
-4. Then, in dependency order: `array_index` (the core of `json-pointer-rfc6901`), the writer half of
-   `string-escape-roundtrip`, `value-encoding` (floats assumed), `recursion-limit` (bounded stack on
-   any input), the `skip-equals-materialize` lemma (`skip_string_body` ≡ `parse_string_body`),
-   `json-accepts-exactly-grammar`, `json-number-lexeme-path` (its walker against the two above),
-   `value-roundtrip`, then `typed-integer-targets`, `to-value-exact`,
-   `key-serializer-refuses` and `serializer-data-model`.
-5. Last: `deserializer-faithful` (higher-order serde specs, gaps 9 and 13) and the float specs
-   (`float-parse-correctly-rounded`, `float-f64-shortest-roundtrip`, `float-f32-shortest`), a separate
-   chain that needs an IEEE model first (§5.6; the two writers also need gaps 8 and 14).

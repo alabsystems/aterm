@@ -6,6 +6,11 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static AGREEMENT_MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 fn proof_retained(proofs: &BTreeSet<ProofKey>, key: &ProofKey) -> bool {
     proofs.contains(key) || proofs.contains(&proof_key(key[..48].try_into().unwrap(), None))
 }
@@ -97,6 +102,22 @@ impl Store {
         self.check(session)
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbReplicaCertificateAgreement",
+            action = "Case",
+            reason = "The environment supplies independently retained certificate sets."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbReplicaCertificateAgreement",
+            action = "Combine",
+            project = "aterm_db::table::store::replicas::tests::transition"
+        )
+    )]
     pub(crate) fn with_observed_primary(
         mut self,
         session: &Session<'_>,
@@ -116,6 +137,11 @@ impl Store {
                 "combined table view requires two independent read observations",
             ));
         }
+        #[cfg(test)]
+        if AGREEMENT_MUTANT.get() == 2 {
+            return Err(Error::new("injected replica agreement refusal"));
+        }
+        primary.writers.clear();
         for (id, stored) in std::mem::take(&mut primary.records) {
             if let Some(existing) = self.records.get(&id) {
                 if existing.wire != stored.wire || existing.quarantine != stored.quarantine {
@@ -130,10 +156,26 @@ impl Store {
                 .insert(stored.header.clone())
                 .map_err(|_| Error::new("combined table index exceeds its bound"))?;
             self.operation_bytes += stored.wire.len();
-            self.records.insert(id, stored);
+            self.hold(id, stored);
         }
+        #[cfg(test)]
+        let compare = AGREEMENT_MUTANT.get() != 1;
+        #[cfg(not(test))]
+        let compare = true;
         for (key, stored) in std::mem::take(&mut primary.conflicts) {
-            if self.conflicts.contains_key(&key) {
+            if let Some(existing) = self.conflicts.get(&key) {
+                // Equal actor fences can carry different application evidence.
+                // Preserve strict ingestion's refusal rather than discarding a
+                // certificate whose source still matters to admission.
+                if compare && existing.conflict.wire() != stored.conflict.wire() {
+                    return Err(Error::new(
+                        "local table replicas disagree on retained certificates",
+                    ));
+                }
+                continue;
+            }
+            #[cfg(test)]
+            if AGREEMENT_MUTANT.get() == 3 {
                 continue;
             }
             self.admit_proof(&stored.conflict)?;
@@ -239,3 +281,6 @@ impl Store {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -17,13 +17,12 @@ use super::upgrade_drive::{
     Client, Hand, Job, Kernel, Live, Opts, Records, Report, SAME_PROGRAM, Screen,
     SessionRosterCache, St, TAIL_BYTES, Targets, Terminated, Typed, WhereWritten, alive,
     composer_clear, composer_empty, connect, continuation_composer_empty, conversation_live,
-    conversation_typed_by, credits_billed_for, cwd_of, earlier_tabs, exe_of,
-    finished_where_written, first_word, foreground_shell, held, home_carried, host_roster, ids,
-    is_our_ancestor, kept_move, kernel_start, launch_kept, ledger, left_to_person, line_model_of,
-    live_background, load_record, model_and_mark, native_root, note_stuck, now_s, owned_by_aterm,
-    process_in_tab, read_upgrade_dir, record_asked, restart_models, restore, roster, said, save,
-    save_checked, screen, since, squash, sweep_lock, table, tail_to_end, take_back_ask, terminate,
-    turn_fenced, type_line, typing_fence, under_hand, unique_tab_for_group,
+    conversation_typed_by, cwd_of, earlier_tabs, exe_of, finished_where_written, first_word,
+    foreground_shell, held, home_carried, host_roster, ids, is_our_ancestor, kept_move,
+    kernel_start, ledger, left_to_person, live_background, load_record, model_and_mark,
+    native_root, note_stuck, now_s, owned_by_aterm, process_in_tab, read_upgrade_dir, restore,
+    roster, said, save, save_checked, screen, since, squash, sweep_lock, table, tail_to_end,
+    terminate, turn_fenced, type_line, typing_fence, under_hand, unique_tab_for_group,
 };
 use crate::supervise::approvals;
 use crate::supervise::limit::one_line;
@@ -246,8 +245,6 @@ pub(super) struct Launch<'a> {
     /// ([`past_unmarked_twin`]) or in a cold plan ([`plan_with_cold`]), where the line executes
     /// the twin's build.
     pub(super) exe: &'a Path,
-    /// The model the relaunch asks for ([`with_model`]).
-    pub(super) model: Option<&'a str>,
     /// The permission mode to resume in ([`resume_mode`], [`with_permission_mode`]).
     pub(super) mode: Option<&'a str>,
     /// The Claude home the line must carry ([`required_env`]).
@@ -263,9 +260,6 @@ pub(super) struct Launch<'a> {
     /// What the replaced agent's own exec environment recorded of its shell's, where it was
     /// recorded ([`Snapshot::launch_env`]).
     pub(super) launch_env: Option<&'a accounts::LaunchEnv>,
-    /// Whether the line moves the model: without usage credits, a move needs a named model and a
-    /// captured Standard billing context equal to the target's.
-    pub(super) billing: ModelBilling<'a>,
     /// What the line does with its account's vault token ([`Serve`]).
     pub(super) serve: Serve,
 }
@@ -286,72 +280,11 @@ pub(super) enum Serve {
 /// What a plan answers where a move onto the token finds no line that serves it ([`Serve::Must`]).
 pub(super) const ROUTE_UNSERVED: &str = "route-unserved";
 
-/// Whether a planned line requests a new model, rather than retaining the session's existing choice.
-#[derive(Clone, Copy)]
-pub(super) enum ModelBilling<'a> {
-    Keep,
-    Move(Option<&'a super::profile::Context>),
-}
-
-fn billing_allows_launch(
-    usage_credits: bool,
-    billing: ModelBilling<'_>,
-    model: Option<&str>,
-    target: Option<&super::profile::Context>,
-) -> bool {
-    match billing {
-        ModelBilling::Keep => true,
-        ModelBilling::Move(_) if usage_credits => true,
-        ModelBilling::Move(from) => {
-            model.is_some_and(|model| !model.is_empty())
-                && from.zip(target).is_some_and(|(from, target)| {
-                    from.selection == super::profile::Selection::Standard && from == target
-                })
-        }
-    }
-}
-
-/// Reuse the original model-billing rule for a deferred login selection.
-#[must_use]
-pub fn cold_profile_allows(
-    intent: &super::native_act::ColdIntent,
-    seed: &super::native_act::RestartCommand,
-    resolved: &super::native_act::RestartCommand,
-    user_home: &Path,
-    cwd: &str,
-) -> bool {
-    if !seed.cold_resolution_agrees(resolved) {
-        return false;
-    }
-    if intent.billing != super::native_act::ColdBilling::PreserveProfile {
-        return true;
-    }
-    let required = resolved
-        .env
-        .iter()
-        .filter_map(|(key, value)| {
-            let key = match key.as_str() {
-                accounts::LOGIN_ENV => accounts::LOGIN_ENV,
-                accounts::HOME_ENV => accounts::HOME_ENV,
-                accounts::HOMEDIR_ENV => accounts::HOMEDIR_ENV,
-                _ => return None,
-            };
-            Some((key, value.as_str()))
-        })
-        .collect::<Vec<_>>();
-    let target = intent
-        .profile
-        .as_ref()
-        .and_then(|from| from.for_launch(user_home, cwd, &required));
-    cold_profile_allows_context(
-        intent,
-        seed,
-        resolved,
-        target.as_ref().map(|env| &env.context),
-    )
-}
-
-/// Apply the existing billing law to the actual helper's resolved profile context.
+/// Whether a deferred cold relaunch may run `resolved` for `intent`: it agrees with `seed`
+/// ([`super::native_act::RestartCommand::cold_resolution_agrees`]), and an intent whose billing
+/// is [`super::native_act::ColdBilling::PreserveProfile`] also has a `--model` on the seed's
+/// argv and a captured Standard profile context equal to `target`, the actual helper's resolved
+/// one.
 #[must_use]
 pub fn cold_profile_allows_context(
     intent: &super::native_act::ColdIntent,
@@ -370,12 +303,14 @@ pub fn cold_profile_allows_context(
         .windows(2)
         .find(|words| words[0] == "--model")
         .map(|words| words[1].as_str());
-    billing_allows_launch(
-        false,
-        ModelBilling::Move(intent.profile.as_ref()),
-        model,
-        target,
-    )
+    model.is_some_and(|model| !model.is_empty())
+        && intent
+            .profile
+            .as_ref()
+            .zip(target)
+            .is_some_and(|(from, target)| {
+                from.selection == super::profile::Selection::Standard && from == target
+            })
 }
 
 /// The required environment of a relaunch line for `login` ([`Launch::login`]).
@@ -466,36 +401,11 @@ fn plan_with_selection(
         launch.cwd.to_string()
     };
     let cd = (!want.is_empty() && !same_dir(cwd_of(shell).as_deref(), &want)).then(|| want.clone());
-    let model = line_model_of(opts, launch.session, launch.argv, launch.model);
     let required = required_env(launch.home, launch.homedir, launch.login);
-    let exact = match launch.billing {
-        ModelBilling::Move(Some(from)) if !opts.usage_credits => {
-            from.for_launch(&opts.home, &want, &required)
-        }
-        _ => None,
-    };
-    if !billing_allows_launch(
-        opts.usage_credits,
-        launch.billing,
-        model,
-        exact.as_ref().map(|env| &env.context),
-    ) {
-        return Err(NoPlan::Refused {
-            why: "model-billing-context".to_string(),
-            what: "model-billing-context".to_string(),
-            detail: "the target model's profile context is unknown or differs from the captured billing context".to_string(),
-        });
-    }
     let tap = opts
         .usage_tap
         .as_ref()
         .and_then(|armed| tap_of(opts, launch, armed, &want));
-    let exact_values: Vec<(&str, &str)> = exact.as_ref().map_or_else(Vec::new, |env| {
-        env.values
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect()
-    });
     // The one judgment (§5.3): a token decision types the wrapper before the store build. A cold
     // plan's route is resolved by its own helper, after this.
     let token = match launch.serve {
@@ -504,16 +414,12 @@ fn plan_with_selection(
     };
     // No inherited token state where the replaced process ran on its vault token: a line on the
     // stored login carries neither the descriptor nor the marker (§5.4). A line that serves the
-    // token unsets neither (`served_unset`), since the wrapper makes both afresh, and any line
-    // after another route keeps the length it had, so its usage tap still fits Darwin's cap.
-    let served_unset: Option<Vec<&str>> = exact.as_ref().map(|env| env.unset.clone());
+    // token unsets neither (its `served_unset` is `None`), since the wrapper makes both afresh,
+    // and any line after another route keeps the length it had, so its usage tap still fits
+    // Darwin's cap.
     let unset: Option<Vec<&str>> = match launch.route {
-        accounts::AuthRoute::VaultToken { .. } => {
-            let mut names = served_unset.clone().unwrap_or_default();
-            names.extend(token_route::TOKEN_STATE_ENV);
-            Some(names)
-        }
-        accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => served_unset.clone(),
+        accounts::AuthRoute::VaultToken { .. } => Some(token_route::TOKEN_STATE_ENV.to_vec()),
+        accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => None,
     };
     // A cold restart execs what its command names and holds the child to that image, and a script
     // twin's exec maps its build: named the twin, the agent runs and its outcome never matches.
@@ -525,22 +431,17 @@ fn plan_with_selection(
         cold_build.as_deref().unwrap_or(launch.exe),
         launch.argv,
         launch.resume.then_some(launch.session),
-        model,
         launch.mode,
-        if exact.is_some() {
-            &exact_values
-        } else {
-            &required
-        },
+        &required,
         unset.as_deref(),
-        served_unset.as_deref(),
+        None,
         tap.as_deref(),
         native_upgrade,
         token.as_ref(),
     )?;
     // What the selected line unsets, which the command's capture renders again.
     let unset = if selected.served.is_some() {
-        served_unset
+        None
     } else {
         unset
     };
@@ -553,7 +454,6 @@ fn plan_with_selection(
                 .to_string(),
         });
     }
-    // Profile reconstruction can supply a login absent from the original argv.
     // Bind the environment actually retained by this command, after selection.
     let selected_value = |name: &str| {
         selected
@@ -1038,13 +938,10 @@ pub(super) fn line_for(
     exe: &Path,
     argv: &[String],
     session: Option<&str>,
-    model: Option<&str>,
     mode: Option<&str>,
     required: &[(&str, &str)],
 ) -> Result<String, NoPlan> {
-    line_tapped(
-        dialect, heal, cd, exe, argv, session, model, mode, required, None,
-    )
+    line_tapped(dialect, heal, cd, exe, argv, session, mode, required, None)
 }
 
 /// [`line_for`] with the usage tap's `--settings` value `tap`, where its gate gave one ([`super::tap::gate`]; [`with_tap`]).
@@ -1056,13 +953,12 @@ pub(super) fn line_tapped(
     exe: &Path,
     argv: &[String],
     session: Option<&str>,
-    model: Option<&str>,
     mode: Option<&str>,
     required: &[(&str, &str)],
     tap: Option<&str>,
 ) -> Result<String, NoPlan> {
     line_tapped_clear(
-        dialect, heal, cd, exe, argv, session, model, mode, required, None, tap,
+        dialect, heal, cd, exe, argv, session, mode, required, None, tap,
     )
 }
 
@@ -1074,14 +970,13 @@ fn line_tapped_clear(
     exe: &Path,
     argv: &[String],
     session: Option<&str>,
-    model: Option<&str>,
     mode: Option<&str>,
     required: &[(&str, &str)],
     unset: Option<&[&str]>,
     tap: Option<&str>,
 ) -> Result<String, NoPlan> {
     line_tap_kept(
-        dialect, heal, cd, exe, argv, session, model, mode, required, unset, tap,
+        dialect, heal, cd, exe, argv, session, mode, required, unset, tap,
     )
     .map(|(line, _)| line)
 }
@@ -1099,15 +994,13 @@ pub(super) fn line_tap_kept(
     exe: &Path,
     argv: &[String],
     session: Option<&str>,
-    model: Option<&str>,
     mode: Option<&str>,
     required: &[(&str, &str)],
     unset: Option<&[&str]>,
     tap: Option<&str>,
 ) -> Result<(String, Option<String>), NoPlan> {
     line_tap_selected(
-        dialect, heal, cd, exe, argv, session, model, mode, required, unset, unset, tap, false,
-        None,
+        dialect, heal, cd, exe, argv, session, mode, required, unset, unset, tap, false, None,
     )
     .map(|selected| (selected.line, selected.tap_dropped))
 }
@@ -1141,7 +1034,6 @@ fn line_tap_selected(
     exe: &Path,
     argv: &[String],
     session: Option<&str>,
-    model: Option<&str>,
     mode: Option<&str>,
     required: &[(&str, &str)],
     unset: Option<&[&str]>,
@@ -1162,7 +1054,7 @@ fn line_tap_selected(
     if session.is_none() {
         flags.truncate(flags.len().saturating_sub(2));
     }
-    let flags = with_permission_mode(with_model(flags, model), mode);
+    let flags = with_permission_mode(flags, mode);
     let native = if native_upgrade {
         let twin = super::upgrade_drive::managed_agent_twin("claude");
         if twin.as_deref() == Some(exe) {
@@ -1426,34 +1318,6 @@ pub fn task_launch_line(
             ..super::worker::Fresh::default()
         },
     )
-}
-
-/// `flags` with every `--model` spelling replaced by `model` (before the trailing `--resume` pair), or dropped when it is empty.
-pub(super) fn with_model(flags: Vec<String>, model: Option<&str>) -> Vec<String> {
-    let Some(model) = model else {
-        return flags;
-    };
-    let spans = upgrade::parse_flag_spans(&flags);
-    let mut out = Vec::with_capacity(flags.len() + 2);
-    let mut tail = Vec::new();
-    let mut in_tail = false;
-    for (name, tokens) in spans {
-        if in_tail {
-            tail.extend(tokens);
-        } else if name == Some("--model") {
-        } else if name == Some("--resume") {
-            in_tail = true;
-            tail.extend(tokens);
-        } else {
-            out.extend(tokens);
-        }
-    }
-    if !model.is_empty() {
-        out.push("--model".to_string());
-        out.push(model.to_string());
-    }
-    out.extend(tail);
-    out
 }
 
 const PERMISSION_MODES: [&str; 7] = [
@@ -2274,7 +2138,6 @@ fn relaunch_held(
             account_guard
         }
     };
-    let asked = record_asked(opts, session, &st.model_list);
     let block = line_block(c, &tab);
     let typed = type_relaunch_line_admitted(
         opts,
@@ -2290,12 +2153,6 @@ fn relaunch_held(
         native.as_ref().map(|binding| (binding, native_phase)),
     );
     drop(legacy_account_guard);
-    if typed
-        .as_ref()
-        .is_err_and(|e| *e != RelaunchLineError::Unanswered)
-    {
-        take_back_ask(opts, session, asked);
-    }
     match typed {
         Ok(()) => {
             st.prompt = None;
@@ -2328,8 +2185,8 @@ fn relaunch_held(
 }
 
 /// A relaunch line whose request went unanswered ([`RelaunchLineError::Unanswered`]) may have
-/// run: it is recorded as typed (its ask kept), and the next step, on a new connection, reads the
-/// agent it started or the shell's prompt back ([`await_held`]).
+/// run: it is recorded as typed, and the next step, on a new connection, reads the agent it
+/// started or the shell's prompt back ([`await_held`]).
 pub(super) fn line_unanswered(
     opts: &Opts,
     r: Report,
@@ -3803,9 +3660,9 @@ fn carry_on_once(
     let text = if relaunch_cause(&st.cause) {
         Some(resumed_prompt(&latest.version, &st.cause))
     } else {
-        from.as_ref().zip(to.as_ref()).map(|(f, t)| {
-            upgrade::continue_prompt_with_model(f, t, before.as_deref(), recorded(&st.model_list))
-        })
+        from.as_ref()
+            .zip(to.as_ref())
+            .map(|(f, t)| upgrade::continue_prompt(f, t, before.as_deref()))
     };
     let typed = settled
         && match text {
@@ -4314,14 +4171,6 @@ fn restore_lost(opts: &Opts, r: &Report, st: &mut St, key: &str, why: &str) -> R
 }
 
 fn outcome_line(st: &St, to: &str, after: Option<&str>) -> String {
-    if !st.model_list.is_empty() {
-        return upgrade::restart_outcome_listed(
-            to,
-            recorded(&st.model_before),
-            after,
-            &st.model_list,
-        );
-    }
     upgrade::restart_outcome(
         to,
         recorded(&st.model_before),
@@ -4331,14 +4180,8 @@ fn outcome_line(st: &St, to: &str, after: Option<&str>) -> String {
 }
 
 fn quiet_outcome(st: &St, to: &str) -> String {
-    let before = recorded(&st.model_before);
-    let asked = recorded(&st.model_list);
-    let model = match (before, asked) {
-        (Some(b), Some(m)) => format!("; it ran {b} before, and the relaunch asked for {m}"),
-        (Some(b), None) => format!("; it ran {b} before the restart"),
-        (None, Some(m)) => format!("; the relaunch asked for {m}"),
-        (None, None) => String::new(),
-    };
+    let model = recorded(&st.model_before)
+        .map_or_else(String::new, |b| format!("; it ran {b} before the restart"));
     format!("claude restarted on {to} · resumed while idle, nothing typed{model}")
 }
 
@@ -4392,12 +4235,6 @@ pub(super) const CAUSE_ASKED: &str = "asked";
 
 /// The [`St::cause`] of a relaunch after aterm itself ended while the agent ran and the next launch reopened its tab ([`after_host_ended`]).
 pub(super) const CAUSE_HOST: &str = "host";
-
-/// The [`St::cause`] of a restart onto a bucket's fallback model, `model:` then the model ([`Restart::Model`]).
-pub(super) const CAUSE_MODEL: &str = "model:";
-
-/// The [`St::cause`] of a restart back from a bucket's fallback at its reset, `model-back:` then the model, empty for the launch's own ([`Restart::ModelBack`]).
-pub(super) const CAUSE_MODEL_BACK: &str = "model-back:";
 
 /// The [`St::cause`] of a restart under another of the owner's accounts, `account:` then the label ([`Restart::Account`]) and nothing else of the account.
 pub(super) const CAUSE_ACCOUNT: &str = "account:";
@@ -4481,8 +4318,7 @@ pub(super) fn asked_of(why: &Restart, snap: &Snapshot) -> bool {
     else {
         return true;
     };
-    let start =
-        super::upgrade_models::parse_lstart(&snap.start).and_then(|s| i64::try_from(s).ok());
+    let start = super::unix_time::parse_lstart(&snap.start).and_then(|s| i64::try_from(s).ok());
     pid.is_none_or(|pid| pid == snap.pid) && started.zip(start).is_none_or(|(was, is)| was == is)
 }
 
@@ -4532,8 +4368,8 @@ fn landed_in(st: &St, sf: &SessionFile, session: &str, k: &dyn Kernel) -> bool {
 /// the asker ([`carried_on_in`]). A restart whose relaunch answered a wait once its signal had gone
 /// (`wait:resume`, `wait:exiting`, `wait:shell-prompt`) is asked again under the same ask, and the
 /// sweep may carry its relaunch on first: made again over that record, it would end the process
-/// its own relaunch started, a second relaunch for one restart (a model's way back, put off to a
-/// quiet moment, the loop asks until it books it made). A record another ask claimed is another
+/// its own relaunch started, a second relaunch for one restart (a route move, put off to a quiet
+/// moment, the loop asks until it books it made). A record another ask claimed is another
 /// restart's, and one landed in another process says nothing of the asker: either is restarted
 /// over as any record that is not in flight.
 pub(super) fn already_made(
@@ -4564,7 +4400,7 @@ const CARRIED_ON_SLACK_S: u64 = 5;
 fn carried_on_in(st: &St, sf: &SessionFile, session: &str, k: &dyn Kernel) -> bool {
     let up_by_carry_on = || {
         st.done_at == 0
-            || super::upgrade_models::parse_lstart(&squash(&sf.proc_start))
+            || super::unix_time::parse_lstart(&squash(&sf.proc_start))
                 .is_none_or(|began| began <= st.done_at.saturating_add(CARRIED_ON_SLACK_S))
     };
     st.relaunched_pid == sf.pid
@@ -4589,13 +4425,12 @@ pub(super) fn native_carried(step: String) -> String {
 /// Whether the record `st` is the restart `why`'s own, asked again as `ask` ([`supersedes`]): the
 /// record an ask of that restart claimed ([`St::ask`], the [`RestartAsk`] every ask of one
 /// restart carries: a lost line's its line's, any other restart's its run's), of its cause
-/// ([`model_restart`]: a memory restart's, a model's move onto the same model, its way back, a lost
-/// line's). Asked again after a deferral, a restart meets its own record wherever the relaunch of
+/// ([`restart_cause`]: a memory restart's, a lost line's, a route move's, a click's). Asked again after a deferral, a restart meets its own record wherever the relaunch of
 /// the ask that claimed it landed, its first ask's or a later one's: carried, it adopts the process
 /// that relaunch started, which superseding would end, a second relaunch for one restart; carried
 /// on already (`Done`), it is made ([`already_made`]). Any other
 /// record of its cause is another restart's, made before this one was asked and landed in the
-/// process now asking (an earlier memory restart's, a model's earlier move, an earlier line's), and
+/// process now asking (an earlier memory restart's, an earlier line's), and
 /// so is one met where this restart's first ask was deferred before it claimed anything
 /// (`busy:another-sweep`, `wait:changed`, `wait:no-session-record`): carrying it would answer the
 /// restart asked with a word for a restart never made, the process it is asked for left running.
@@ -4606,8 +4441,6 @@ pub(super) fn its_own(why: &Restart, ask: &RestartAsk, st: &St) -> bool {
     let cause = st.cause.as_str();
     let of_cause = match why {
         Restart::Memory => cause == CAUSE_MEMORY,
-        Restart::Model { to } => cause.strip_prefix(CAUSE_MODEL) == Some(to.as_str()),
-        Restart::ModelBack { .. } => cause.starts_with(CAUSE_MODEL_BACK),
         Restart::InputLost { .. } => cause == CAUSE_INPUT_LOST,
         Restart::Account { .. } => false,
         Restart::Route { to } => cause.strip_prefix(CAUSE_ROUTE) == Some(to.word()),
@@ -4634,114 +4467,17 @@ pub(super) fn carried_word(why: &Restart, own: bool, cause: &str, step: String) 
     }
 }
 
-/// What a restart in place ([`restart_from`]) asks for and records, by `why`.
-pub(super) fn model_restart(
-    why: &Restart,
-    prior: Option<&St>,
-    launched: String,
-    riding: Option<String>,
-    hand: Option<String>,
-) -> ModelRestart {
-    let origin = prior.and_then(fallback_origin);
+/// The [`St::cause`] a restart in place ([`restart_from`]) records, by `why`. A click's is the
+/// resumed one; a line with no `--resume` takes [`CAUSE_PERMISSION_FRESH`] where the restart reads
+/// that ([`restart_fenced`]).
+pub(super) fn restart_cause(why: &Restart) -> String {
     match why {
-        Restart::Memory | Restart::InputLost { .. } => ModelRestart {
-            fallback_from: fallback_carried(origin, riding.as_deref(), hand.as_deref()),
-            model: riding.or(hand),
-            cause: if matches!(why, Restart::Memory) {
-                CAUSE_MEMORY
-            } else {
-                CAUSE_INPUT_LOST
-            }
-            .to_string(),
-            launch_model: launched,
-        },
-        Restart::Model { to } => ModelRestart {
-            model: Some(to.clone()),
-            cause: format!("{CAUSE_MODEL}{to}"),
-            fallback_from: Some(origin.or(hand).unwrap_or_else(|| launched.clone())),
-            launch_model: launched,
-        },
-        Restart::ModelBack { to } => {
-            let back = hand.or(origin).or_else(|| to.clone()).unwrap_or_default();
-            ModelRestart {
-                model: Some(back.clone()),
-                cause: format!("{CAUSE_MODEL_BACK}{back}"),
-                launch_model: launched,
-                fallback_from: None,
-            }
-        }
-        Restart::Account { to, .. } => ModelRestart {
-            model: riding.or(hand).or(origin),
-            cause: format!("{CAUSE_ACCOUNT}{to}"),
-            launch_model: launched,
-            fallback_from: None,
-        },
-        // The same account on another credential: the model it runs rides, as a memory
-        // restart's does, and a fallback it rides stays one.
-        Restart::Route { to } => ModelRestart {
-            fallback_from: fallback_carried(origin, riding.as_deref(), hand.as_deref()),
-            model: riding.or(hand),
-            cause: format!("{CAUSE_ROUTE}{}", to.word()),
-            launch_model: launched,
-        },
-        // A click changes the line's permission flags and moves no model: nothing rides, and a
-        // model picked by hand stays, as a press of the ⬆️ keeps it. Its cause is the resumed
-        // one; a line with no `--resume` takes [`CAUSE_PERMISSION_FRESH`] where the restart reads
-        // that ([`restart_fenced`]).
-        Restart::Permission { .. } => ModelRestart {
-            fallback_from: fallback_carried(origin, riding.as_deref(), hand.as_deref()),
-            model: riding.or(hand),
-            cause: CAUSE_PERMISSION.to_string(),
-            launch_model: launched,
-        },
+        Restart::Memory => CAUSE_MEMORY.to_string(),
+        Restart::InputLost { .. } => CAUSE_INPUT_LOST.to_string(),
+        Restart::Account { to, .. } => format!("{CAUSE_ACCOUNT}{to}"),
+        Restart::Route { to } => format!("{CAUSE_ROUTE}{}", to.word()),
+        Restart::Permission { .. } => CAUSE_PERMISSION.to_string(),
     }
-}
-
-/// [`model_restart`]'s answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ModelRestart {
-    /// The model the line asks for ([`Launch::model`]).
-    pub(super) model: Option<String>,
-    /// [`St::cause`].
-    pub(super) cause: String,
-    /// [`St::launch_model`].
-    pub(super) launch_model: String,
-    /// [`St::fallback_from`].
-    pub(super) fallback_from: Option<String>,
-}
-
-/// Whether a restart moves the session onto a model billed to usage credits.
-#[must_use]
-pub(super) fn moves_onto_credits(
-    why: &Restart,
-    model: Option<&str>,
-    billed: Option<&[String]>,
-) -> bool {
-    matches!(why, Restart::Model { .. } | Restart::ModelBack { .. })
-        && model.is_some_and(|m| {
-            billed.is_none_or(|billed| super::upgrade_models::billed_to_credits(m, billed))
-        })
-}
-
-/// The fallback origin on `st` ([`St::fallback_from`]), or for an older fallback record, the launch model it kept.
-pub(super) fn fallback_origin(st: &St) -> Option<String> {
-    st.fallback_from.clone().or_else(|| {
-        st.cause
-            .starts_with(CAUSE_MODEL)
-            .then(|| st.launch_model.clone())
-    })
-}
-
-/// The fallback origin a restart for another reason records.
-pub(super) fn fallback_carried(
-    origin: Option<String>,
-    riding: Option<&str>,
-    hand: Option<&str>,
-) -> Option<String> {
-    origin.map(|origin| match (riding, hand) {
-        (None, Some(hand)) => hand.to_string(),
-        _ => origin,
-    })
 }
 
 /// Whether a record of `cause` is a relaunch's (its continuation says why, [`resumed_prompt`]; an account move's is none, [`carried_quietly`]) rather than the upgrade's.
@@ -4752,8 +4488,6 @@ pub(super) fn relaunch_cause(cause: &str) -> bool {
         || cause == CAUSE_STALL
         || cause == CAUSE_ASKED
         || cause == CAUSE_HOST
-        || cause.starts_with(CAUSE_MODEL)
-        || cause.starts_with(CAUSE_MODEL_BACK)
         || cause.starts_with(CAUSE_ACCOUNT)
 }
 
@@ -4763,8 +4497,6 @@ pub(super) fn ends_its_agent(cause: &str) -> bool {
         || cause == CAUSE_UPGRADE_FRESH
         || cause == CAUSE_MEMORY
         || cause == CAUSE_INPUT_LOST
-        || cause.starts_with(CAUSE_MODEL)
-        || cause.starts_with(CAUSE_MODEL_BACK)
         || cause.starts_with(CAUSE_ACCOUNT)
         || clicked(cause)
 }
@@ -4778,7 +4510,6 @@ pub fn resumed_prompt(version: &str, cause: &str) -> String {
 /// [`resumed_prompt`] for the agent `agent` names.
 #[must_use]
 pub fn resumed_prompt_as(agent: &str, version: &str, cause: &str) -> String {
-    let session_only = "for this session only: your default model is unchanged";
     let why = if cause == CAUSE_MEMORY {
         format!(
             "Restarted: {agent}'s memory was critical (its own warning, or the Mac short of \
@@ -4803,22 +4534,6 @@ pub fn resumed_prompt_as(agent: &str, version: &str, cause: &str) -> String {
         format!(
             "Restarted: someone asked aterm to restart {agent} (`aterm ctl restart`), so this \
              session was ended and restarted"
-        )
-    } else if let Some(model) = cause.strip_prefix(CAUSE_MODEL) {
-        format!(
-            "Relaunched on {}: the model this session ran reached its usage limit, so it was \
-             restarted with that model ({session_only})",
-            one_line(model)
-        )
-    } else if let Some(model) = cause.strip_prefix(CAUSE_MODEL_BACK) {
-        let model = if model.is_empty() {
-            "the model it was launched with".to_string()
-        } else {
-            one_line(model)
-        };
-        format!(
-            "Relaunched on {model}: the usage limit that moved this session to another model has \
-             reset, so it was restarted back on it ({session_only})"
         )
     } else {
         format!("Relaunched: {agent} exited without anyone asking, and this session was restarted")
@@ -5498,8 +5213,8 @@ fn click_build(exe: &Path) -> Result<PathBuf, &'static str> {
 /// A CLICK ([`Restart::Permission`]) differs from every other restart here: it is of its own
 /// conversation alone; a standing press of the ⬆️ goes first ([`CLICK_PRESSED`]); its line is
 /// the launch's rid of every permission flag and given its own
-/// ([`upgrade::permission_click_argv`]), with no mode read, no model moved and the store build
-/// typed ([`click_build`]); its cause is read off whether that line resumes
+/// ([`upgrade::permission_click_argv`]), with no mode read and the store build typed
+/// ([`click_build`]); its cause is read off whether that line resumes
 /// ([`CAUSE_PERMISSION`], [`CAUSE_PERMISSION_FRESH`]); a record under native coordination no
 /// constructor here could restart is refused before the hand is taken or any record written
 /// ([`CLICK_COORDINATED`]); its signal goes as a press's does, past the agent's background shells
@@ -5625,38 +5340,7 @@ fn restart_locked(
     if is_our_ancestor(snap.pid, &t) {
         return said(r, "refused:self");
     }
-    let (riding, hand) = restart_models(
-        opts,
-        &records,
-        Some(&sf),
-        &snap.start,
-        &session,
-        &snap.argv,
-        matches!(
-            why,
-            Restart::Memory
-                | Restart::InputLost { .. }
-                | Restart::Account { .. }
-                | Restart::Route { .. }
-        ),
-        snap.profile.as_ref(),
-    );
-    let model_list = riding.clone().unwrap_or_default();
-    let launched = launch_kept(opts, &session, &snap.argv).unwrap_or_default();
-    let riding_move = riding.is_some();
-    let ModelRestart {
-        model,
-        mut cause,
-        launch_model,
-        fallback_from,
-    } = model_restart(why, prior.as_ref(), launched, riding, hand);
-    if moves_onto_credits(
-        why,
-        model.as_deref(),
-        credits_billed_for(opts, snap.profile.as_ref()).as_deref(),
-    ) {
-        return said(r, "refused:model-on-credits");
-    }
+    let mut cause = restart_cause(why);
     let resume = records.transcript_exists(&session) != Some(false);
     let (argv, exe, mode) = match clicked {
         Some((to, _)) => match click_build(&snap.program) {
@@ -5670,7 +5354,7 @@ fn restart_locked(
                 &records,
                 &session,
                 tab_mode(opts, &tab),
-                super::upgrade_models::parse_lstart(&snap.start),
+                super::unix_time::parse_lstart(&snap.start),
             ),
         ),
     };
@@ -5686,7 +5370,6 @@ fn restart_locked(
         agent: snap.pid,
         argv: &argv,
         exe: &exe,
-        model: model.as_deref(),
         mode: mode.as_deref(),
         home: snap.home.as_deref(),
         homedir: None,
@@ -5694,12 +5377,6 @@ fn restart_locked(
         route: moved_route(moves_account, snap.route),
         auth_observed: snap.auth_observed,
         launch_env: snap.launch_env.as_ref(),
-        billing: if riding_move || matches!(why, Restart::Model { .. } | Restart::ModelBack { .. })
-        {
-            ModelBilling::Move(snap.profile.as_ref())
-        } else {
-            ModelBilling::Keep
-        },
         serve: serve_for(why),
     };
     let mut st = St {
@@ -5709,9 +5386,7 @@ fn restart_locked(
         cause,
         ask: ask.word().to_string(),
         salt: now_s(),
-        launch_model,
-        model_list,
-        fallback_from,
+        launch_model: upgrade::launch_model(&snap.argv).unwrap_or_default(),
         login: login.clone(),
         ..St::default()
     };
@@ -5760,13 +5435,7 @@ fn restart_locked(
         Err(no) => return unplanned(opts, r, &mut st, no),
     };
     if opts.dry_run {
-        return said(
-            r,
-            match &model {
-                Some(m) => format!("would-restart:model={m}"),
-                None => "would-restart".to_string(),
-            },
-        );
+        return said(r, "would-restart");
     }
     if let Some(wait) = fence.broken() {
         return said(r, wait);
@@ -6108,8 +5777,6 @@ pub(super) const fn serve_for(why: &Restart) -> Serve {
         } => Serve::Never,
         Restart::Memory
         | Restart::InputLost { .. }
-        | Restart::Model { .. }
-        | Restart::ModelBack { .. }
         | Restart::Account { .. }
         | Restart::Permission { .. } => Serve::Judge,
     }
@@ -6414,16 +6081,14 @@ fn retry_checked_relaunch(
 /// waiting risks; the work's processes still hold it, as every restart's do ([`live_background`]).
 /// Every other restart waits for the work to end, as the upgrade's automatic restart does
 /// ([`super::upgrade_drive`]'s `turn_over_shown`): a lost line's restart, for a process that runs
-/// on and whose line the loop holds meanwhile (`custody::Rest::working`); a model's move onto its
-/// fallback, or back at its reset, and an account move, each a move a later turn's end makes as
-/// well, where the work it would end costs the session more than the wait. A click is none of
+/// on and whose line the loop holds meanwhile (`custody::Rest::working`); and an account move, a
+/// move a later turn's end makes as well, where the work it would end costs the session more than
+/// the wait. A click is none of
 /// these: [`at_rest_for`] reads a press's gate for it instead.
 const fn over_own_work(why: &Restart) -> bool {
     match why {
         Restart::Memory => true,
         Restart::InputLost { .. }
-        | Restart::Model { .. }
-        | Restart::ModelBack { .. }
         | Restart::Account { .. }
         | Restart::Route { .. }
         | Restart::Permission { .. } => false,
@@ -6490,7 +6155,7 @@ impl Snapshot {
             }
             #[cfg(not(windows))]
             {
-                super::upgrade_models::parse_lstart(&self.start)
+                super::unix_time::parse_lstart(&self.start)
             }
         })
     }
@@ -6751,7 +6416,6 @@ pub fn exit_line(user_home: &Path, snap: &Snapshot) -> Option<String> {
         &snap.argv,
         Some(session),
         None,
-        None,
         &required_env(
             snap.home.as_deref(),
             homedir.as_deref(),
@@ -6760,10 +6424,6 @@ pub fn exit_line(user_home: &Path, snap: &Snapshot) -> Option<String> {
     )
     .ok()
 }
-
-/// The longest model id [`tap_room`] keeps room for: a relaunch may name the conversation's model
-/// (`--model`), which only its records say.
-const TAP_ROOM_MODEL: usize = 64;
 
 /// The permission mode [`tap_room`] keeps room for: the longest one a relaunch names
 /// ([`with_permission_mode`] names none for `bypassPermissions`).
@@ -6775,9 +6435,8 @@ const TAP_ROOM_MODE: &str = "acceptEdits";
 /// so it never promises a tap the line would drop ([`line_tap_kept`]). The line is the one
 /// [`plan`] builds: the shell's dialect, atpkg's heal hook under `user_home`, a `cd` unless the
 /// shell is read standing in the agent's directory, its program, argv, conversation, home and
-/// login, and room besides for a `--model` of [`TAP_ROOM_MODEL`] bytes and a `--permission-mode`
-/// of [`TAP_ROOM_MODE`], which only the conversation's records say. `false` where no such line
-/// can be built at all.
+/// login, and room besides for a `--permission-mode` of [`TAP_ROOM_MODE`], which only the
+/// conversation's records say. `false` where no such line can be built at all.
 #[must_use]
 pub fn tap_room(user_home: &Path, snap: &Snapshot, tap: &str) -> bool {
     let (Some(dialect), Some(session)) = (
@@ -6806,7 +6465,6 @@ pub fn tap_room(user_home: &Path, snap: &Snapshot, tap: &str) -> bool {
             &snap.cwd,
         ))
     .then_some(snap.cwd.as_str());
-    let model = "m".repeat(TAP_ROOM_MODEL);
     line_tap_kept(
         dialect,
         heal.as_deref(),
@@ -6814,7 +6472,6 @@ pub fn tap_room(user_home: &Path, snap: &Snapshot, tap: &str) -> bool {
         &snap.program,
         &snap.argv,
         Some(session),
-        Some(&model),
         Some(TAP_ROOM_MODE),
         &required_env(
             snap.home.as_deref(),
@@ -6829,7 +6486,7 @@ pub fn tap_room(user_home: &Path, snap: &Snapshot, tap: &str) -> bool {
 
 /// The line a person is told to run to resume the agent `snap` describes by hand, for a user whose home is `user_home`.
 #[must_use]
-pub fn told_command(user_home: &Path, state: Option<&Path>, snap: &Snapshot) -> Option<String> {
+pub fn told_command(user_home: &Path, snap: &Snapshot) -> Option<String> {
     match &snap.run {
         AgentRun::Claude => {}
         AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) => {
@@ -6838,8 +6495,7 @@ pub fn told_command(user_home: &Path, state: Option<&Path>, snap: &Snapshot) -> 
     }
     let records = Records::of_snapshot(user_home, snap);
     let homedir = home_carried(user_home, snap.home.as_deref(), &snap.cwd, &records).ok()?;
-    let line =
-        super::upgrade_drive::resume_command_kept(state, &snap.argv, snap.session.as_deref()?)?;
+    let line = super::upgrade_drive::resume_command_kept(&snap.argv, snap.session.as_deref()?)?;
     let env: Vec<(&str, &str)> = snap
         .home
         .as_deref()
@@ -7871,7 +7527,7 @@ fn after_exit_as(
     if !alive(snap.shell) {
         return said(r, "refused:shell-gone");
     }
-    let (admitted, mut cold) = match admit {
+    let (admitted, cold) = match admit {
         Some(admit) => match admit(snap) {
             Ok(ColdAdmission::Immediate(chosen)) => (chosen, None),
             Ok(ColdAdmission::Deferred(intent)) => (None, Some(*intent)),
@@ -7916,25 +7572,11 @@ fn after_exit_as(
     );
     r.to = format!("{to}({source})");
     let resume = records.transcript_exists(&session) != Some(false);
-    let (riding, hand) = if resume {
-        restart_models(
-            opts,
-            &records,
-            survivor.as_ref(),
-            &snap.start,
-            &session,
-            &snap.argv,
-            true,
-            snap.profile.as_ref(),
-        )
-    } else {
-        (None, None)
-    };
     let mode = resume_mode(
         &records,
         &session,
         tab_mode(opts, &snap.tab),
-        super::upgrade_models::parse_lstart(&snap.start),
+        super::unix_time::parse_lstart(&snap.start),
     );
     let launch = Launch {
         session: &session,
@@ -7943,7 +7585,6 @@ fn after_exit_as(
         agent: snap.pid,
         argv: &snap.argv,
         exe: &exe,
-        model: riding.as_deref().or(hand.as_deref()),
         mode: mode.as_deref(),
         home: snap.home.as_deref(),
         homedir: None,
@@ -7951,11 +7592,6 @@ fn after_exit_as(
         route: snap.route,
         auth_observed: snap.auth_observed,
         launch_env: snap.launch_env.as_ref(),
-        billing: if riding.is_some() {
-            ModelBilling::Move(snap.profile.as_ref())
-        } else {
-            ModelBilling::Keep
-        },
         serve: Serve::Judge,
     };
     let mut st = St {
@@ -7971,9 +7607,7 @@ fn after_exit_as(
         }
         .to_string(),
         salt: now_s(),
-        launch_model: launch_kept(opts, &session, &snap.argv).unwrap_or_default(),
-        model_list: riding.clone().unwrap_or_default(),
-        fallback_from: exit_fallback(opts, &session, riding.as_deref(), hand.as_deref()),
+        launch_model: upgrade::launch_model(&snap.argv).unwrap_or_default(),
         login: snap.login.clone(),
         ..St::default()
     };
@@ -8011,15 +7645,6 @@ fn after_exit_as(
             .map(|p| tail_to_end(&p, TAIL_BYTES));
         (st.model_before, st.mark) = model_and_mark(recent.as_ref());
     }
-    if let Some(intent) = &mut cold {
-        intent.billing = match launch.billing {
-            ModelBilling::Keep => super::native_act::ColdBilling::Keep,
-            ModelBilling::Move(_) if opts.usage_credits => {
-                super::native_act::ColdBilling::UsageCredits
-            }
-            ModelBilling::Move(_) => super::native_act::ColdBilling::PreserveProfile,
-        };
-    }
     let planned =
         home_carried(&opts.home, snap.home.as_deref(), &cwd, &records).and_then(|homedir| {
             let launch = Launch {
@@ -8035,10 +7660,10 @@ fn after_exit_as(
     if opts.dry_run {
         return said(
             r,
-            match (resume, launch.model) {
-                (false, _) => "would-relaunch:fresh".to_string(),
-                (true, Some(m)) => format!("would-relaunch:model={m}"),
-                (true, None) => "would-relaunch".to_string(),
+            if resume {
+                "would-relaunch"
+            } else {
+                "would-relaunch:fresh"
             },
         );
     }
@@ -8394,21 +8019,6 @@ pub(super) fn exit_wait(
     }
 }
 
-/// The fallback origin an exit's relaunch of `session` records ([`fallback_carried`] of the one its last record keeps).
-pub(super) fn exit_fallback(
-    opts: &Opts,
-    session: &str,
-    riding: Option<&str>,
-    hand: Option<&str>,
-) -> Option<String> {
-    let origin = load_record(opts, session)
-        .ok()
-        .flatten()
-        .as_ref()
-        .and_then(fallback_origin);
-    fallback_carried(origin, riding, hand)
-}
-
 fn carry_in_flight(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) -> Report {
     if st.native_retired_unissued && !super::native_restart::cold_retirement_recheck(&st) {
         return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
@@ -8739,55 +8349,44 @@ pub fn standing_limit(opts: &Opts, snap: &Snapshot, tail: &str) -> Option<upgrad
 pub fn moved_off(opts: &Opts, session: &str, at: Option<u64>, live: &Snapshot) -> bool {
     let kept = |st: &St| {
         st.moved_at != 0
+            && st.moved_login.is_some()
             && at.is_none_or(|at| at <= st.moved_at)
-            && runs_moved(
-                live,
-                st.moved_login.as_deref(),
-                st.moved_left_model.as_deref(),
-            )
+            && runs_moved(live, st.moved_login.as_deref())
     };
     let record = load_record(opts, session).ok().flatten().is_some_and(|st| {
-        let (login, left) = own_move_target(&st);
+        let login = own_move_target(&st);
         let own = moves(&st.cause)
             && at.is_none_or(|at| st.relaunched_at == 0 || at <= st.relaunched_at)
-            && runs_moved(live, login.as_deref(), left.as_deref());
+            && runs_moved(live, login.as_deref());
         own || kept(&st)
     });
     record || kept_move(opts, session).is_some_and(|st| kept(&st))
 }
 
-fn runs_moved(live: &Snapshot, login: Option<&str>, left: Option<&str>) -> bool {
+fn runs_moved(live: &Snapshot, login: Option<&str>) -> bool {
     let runs = live.login.as_deref().or(live.home.as_deref()).unwrap_or("");
-    login.is_none_or(|l| runs == l) && left.is_none_or(|m| launch_model_of(&live.argv) != m)
+    login.is_none_or(|l| runs == l)
 }
 
-fn launch_model_of(argv: &[String]) -> String {
-    upgrade::launch_model(argv).unwrap_or_default()
-}
-
-fn own_move_target(st: &St) -> (Option<String>, Option<String>) {
-    if st.cause.starts_with(CAUSE_ACCOUNT) {
-        (st.login.clone(), None)
-    } else if st.cause.starts_with(CAUSE_MODEL) {
-        (None, fallback_origin(st))
-    } else {
-        (None, None)
-    }
+/// The login an account move's record `st` moved onto, `None` for any other record.
+fn own_move_target(st: &St) -> Option<String> {
+    st.cause
+        .starts_with(CAUSE_ACCOUNT)
+        .then(|| st.login.clone())
+        .flatten()
 }
 
 /// The target of the last move record `st` knows of ([`last_move_at`]).
-pub(super) fn last_move_target(st: &St) -> (Option<String>, Option<String>) {
+pub(super) fn last_move_target(st: &St) -> Option<String> {
     if moves(&st.cause) && st.relaunched_at != 0 && st.relaunched_at >= st.moved_at {
         own_move_target(st)
     } else {
-        (st.moved_login.clone(), st.moved_left_model.clone())
+        st.moved_login.clone()
     }
 }
 
 fn moves(cause: &str) -> bool {
-    cause.starts_with(CAUSE_MODEL)
-        || cause.starts_with(CAUSE_MODEL_BACK)
-        || cause.starts_with(CAUSE_ACCOUNT)
+    cause.starts_with(CAUSE_ACCOUNT)
 }
 
 /// The last move record `st` knows of ([`super::upgrade_drive::St::moved_at`]), unix seconds, `0` for none.
@@ -8998,7 +8597,7 @@ pub(in crate::harness) fn agent_resumed_with(
         return false;
     }
     let snap_start = squash(&snap.start);
-    let snap_began = super::upgrade_models::parse_lstart(&snap_start);
+    let snap_began = super::unix_time::parse_lstart(&snap_start);
     let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return false;
     };

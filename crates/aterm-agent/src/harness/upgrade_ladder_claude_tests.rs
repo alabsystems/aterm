@@ -132,8 +132,6 @@ fn opts() -> Opts {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
         press: None,

@@ -518,14 +518,16 @@ fn witnessed_quarantine_conforms_and_unwitnessed_promotion_is_detected() {
     assert!(
         session
             .with_read_batch(f.scope, |batch| {
-                restore(batch, f.receipt, f.wire.clone(), 0)
+                restore(batch, f.receipt, Identified::new(f.wire.clone()), 0)
             })
             .is_err()
     );
     // Negative control: lying about the verified-prefix boundary promotes the
     // exact same unwitnessed tail. The model must reject that unsafe composition.
     let promoted = session
-        .with_read_batch(f.scope, |batch| restore(batch, f.receipt, f.wire, 1))
+        .with_read_batch(f.scope, |batch| {
+            restore(batch, f.receipt, Identified::new(f.wire), 1)
+        })
         .unwrap();
     assert!(promoted.quarantine.is_some());
     let mut bad = initial.clone();

@@ -96,17 +96,38 @@ fn open_started_at(
     absent: Absent,
     started: Instant,
 ) -> Result<Session, LanError> {
-    let stream = match crate::connect::until(path, started + DIAL_HANG) {
+    open_cancelled_at(request, path, ours, absent, started, None)
+}
+
+fn open_cancelled_at(
+    request: Option<&Request>,
+    path: &Path,
+    ours: u32,
+    absent: Absent,
+    started: Instant,
+    cancel: Option<BorrowedFd<'_>>,
+) -> Result<Session, LanError> {
+    let stream = match crate::connect::until_cancelled(path, started + DIAL_HANG, cancel) {
         Ok(stream) => stream,
         // No broker: this process's own server, when the caller makes a LAN use and macOS
         // already allowed this code (`super::direct`); a broker that answers, refuses or speaks
         // another protocol is the broker, and its answer stands.
         Err(error) if not_installed(&error) => {
             return match absent {
-                Absent::Direct => match super::direct::open() {
-                    Ok((stream, allowed)) => exchange(stream, request, ours, Some(allowed)),
-                    Err(_) => Err(Unavailable::NotInstalled.into()),
-                },
+                Absent::Direct => {
+                    crate::ready::check_cancelled(cancel)?;
+                    match super::direct::open() {
+                        Ok((stream, allowed)) => exchange_at(
+                            stream,
+                            request,
+                            ours,
+                            Some(allowed),
+                            Instant::now(),
+                            cancel,
+                        ),
+                        Err(_) => Err(Unavailable::NotInstalled.into()),
+                    }
+                }
                 Absent::NotInstalled => Err(Unavailable::NotInstalled.into()),
             };
         }
@@ -130,18 +151,7 @@ fn open_started_at(
             .into());
         }
     }
-    exchange(stream, request, ours, None)
-}
-
-/// The hellos, and `request`, on a broker's `stream` (`direct`: this process's own server's, under
-/// that allowance).
-fn exchange(
-    stream: CtlStream,
-    request: Option<&Request>,
-    ours: u32,
-    direct: Option<String>,
-) -> Result<Session, LanError> {
-    exchange_at(stream, request, ours, direct, Instant::now())
+    exchange_at(stream, request, ours, None, Instant::now(), cancel)
 }
 
 fn exchange_at(
@@ -150,6 +160,7 @@ fn exchange_at(
     ours: u32,
     direct: Option<String>,
     started: Instant,
+    cancel: Option<BorrowedFd<'_>>,
 ) -> Result<Session, LanError> {
     let mut bytes = wire::encode(&Frame::Hello {
         protocol: ours,
@@ -160,14 +171,15 @@ fn exchange_at(
     }
     // A broker that refuses this process says so and closes before it reads: the write may
     // then fail, and the refusal is still there to read.
-    let wrote = io::Write::write_all(&mut &stream, &bytes);
+    let deadline = started + crate::peer::CHECK_HANG + ANSWER_HANG;
+    let wrote = match cancel {
+        Some(_) => wire::write_cancelled(&stream, &bytes, deadline, cancel),
+        None => io::Write::write_all(&mut &stream, &bytes),
+    };
     let mut reader = Reader::new(1);
     // The broker checks this process's code before it says anything: its hello, or its
     // `Unchecked` for a check that did not finish, can come that check's whole bound late.
-    let first = reader.frame(
-        &stream,
-        Some(started + crate::peer::CHECK_HANG + ANSWER_HANG),
-    );
+    let first = reader.frame_cancelled(&stream, Some(deadline), cancel);
     let first = match (first, wrote) {
         (Ok(Some(Frame::Refused { words })), _) => {
             return Err(Unavailable::Refused(words).into());
@@ -239,7 +251,18 @@ fn millis(within: Duration) -> u32 {
 impl Session {
     /// The one answer to a socket or resolve request, by `deadline`.
     fn answer(&mut self, deadline: Instant) -> Result<Frame, LanError> {
-        match self.reader.frame(&self.stream, Some(deadline))? {
+        self.answer_cancelled(deadline, None)
+    }
+
+    fn answer_cancelled(
+        &mut self,
+        deadline: Instant,
+        cancel: Option<BorrowedFd<'_>>,
+    ) -> Result<Frame, LanError> {
+        match self
+            .reader
+            .frame_cancelled(&self.stream, Some(deadline), cancel)?
+        {
             Some(Frame::Error { code, words }) => Err(failed(code, &words).into()),
             Some(frame) => Ok(frame),
             None => Err(io::Error::new(
@@ -255,8 +278,17 @@ impl Session {
         &mut self,
         deadline: Instant,
     ) -> Result<(std::os::fd::OwnedFd, Option<SocketAddr>), LanError> {
-        match self.answer(deadline)? {
+        self.socket_cancelled(deadline, None)
+    }
+
+    fn socket_cancelled(
+        &mut self,
+        deadline: Instant,
+        cancel: Option<BorrowedFd<'_>>,
+    ) -> Result<(std::os::fd::OwnedFd, Option<SocketAddr>), LanError> {
+        match self.answer_cancelled(deadline, cancel)? {
             Frame::Socket { reached } => {
+                crate::ready::check_cancelled(cancel)?;
                 let fd = self.reader.take_fd().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -265,7 +297,11 @@ impl Session {
                 })?;
                 // The broker holds its copy until it reads this. Once the descriptor is here a
                 // broker that went away has nothing left to hold, so a failed write loses nothing.
-                let _ = wire::took(&self.stream);
+                let _ = match cancel {
+                    Some(_) => wire::took_cancelled(&self.stream, deadline, cancel),
+                    None => wire::took(&self.stream),
+                };
+                crate::ready::check_cancelled(cancel)?;
                 Ok((fd, reached))
             }
             other => Err(unexpected(&other).into()),
@@ -284,6 +320,30 @@ pub fn connect(
     within: Duration,
     options: ConnectOptions,
 ) -> Result<(TcpStream, SocketAddr), LanError> {
+    connect_cancelled(target, port, within, options, None)
+}
+
+/// [`connect`] interrupted by the caller's latched stop, closing its owned control socket.
+/// The broker then observes that closure alongside its pending numeric connect.
+/// # Errors
+/// As [`connect`], or `Interrupted` when the stop is set.
+pub fn connect_stopped(
+    target: &Target,
+    port: u16,
+    within: Duration,
+    options: ConnectOptions,
+    stop: &crate::stop::Stop,
+) -> Result<(TcpStream, SocketAddr), LanError> {
+    connect_cancelled(target, port, within, options, Some(stop.bell()?))
+}
+
+fn connect_cancelled(
+    target: &Target,
+    port: u16,
+    within: Duration,
+    options: ConnectOptions,
+    cancel: Option<BorrowedFd<'_>>,
+) -> Result<(TcpStream, SocketAddr), LanError> {
     let request = Request::Connect {
         target: target.clone(),
         port,
@@ -292,14 +352,22 @@ pub fn connect(
         source: options.source,
         hop_limit: options.hop_limit,
     };
-    let mut session = open(Some(&request))?;
+    let mut session = open_cancelled_at(
+        Some(&request),
+        &super::dialled_socket(),
+        super::protocol(),
+        Absent::Direct,
+        Instant::now(),
+        cancel,
+    )?;
     let deadline = Instant::now() + within.min(super::here::MAX_WITHIN) + ANSWER_HANG;
-    let (fd, reached) = session.socket(deadline)?;
+    let (fd, reached) = session.socket_cancelled(deadline, cancel)?;
     let stream = TcpStream::from(fd);
     let reached = match reached {
         Some(reached) => reached,
         None => stream.peer_addr()?,
     };
+    crate::ready::check_cancelled(cancel)?;
     Ok((stream, reached))
 }
 
@@ -624,8 +692,73 @@ mod tests {
         let ours = super::super::protocol();
         io::Write::write_all(&mut &server, &hello(ours)).unwrap();
         let started = Instant::now() - Duration::from_secs(91);
-        let result = exchange_at(client, None, ours, None, started);
+        let result = exchange_at(client, None, ours, None, started, None);
         assert_eq!(result.unwrap().broker.protocol, ours);
+
+        // A real peer has received the header; cancellation must end the owned connection
+        // while either the broker's hello or its socket answer is still outstanding.
+        for waiting_for_socket in [false, true] {
+            let (client, server) = crate::kept_out(CtlStream::pair).unwrap();
+            let stop = crate::stop::Stop::new();
+            let request = Request::Connect {
+                target: Target::Addr("127.0.0.1:1".parse().unwrap()),
+                port: 1,
+                within_ms: 20_000,
+                bound_if: None,
+                source: None,
+                hop_limit: None,
+            };
+            if waiting_for_socket {
+                wire::send(
+                    &server,
+                    &Frame::Hello {
+                        protocol: ours,
+                        build: "held-answer".into(),
+                    },
+                )
+                .unwrap();
+            }
+            std::thread::scope(|scope| {
+                let caller_stop = &stop;
+                let (entered, observed) = std::sync::mpsc::sync_channel(1);
+                let worker = scope.spawn(move || -> Result<(), LanError> {
+                    let cancel = Some(caller_stop.bell()?);
+                    let mut session = exchange_at(
+                        client,
+                        Some(&request),
+                        ours,
+                        None,
+                        Instant::now() - Duration::from_secs(60),
+                        cancel,
+                    )?;
+                    entered.send(()).unwrap();
+                    let _ = session
+                        .socket_cancelled(Instant::now() + Duration::from_secs(60), cancel)?;
+                    Ok(())
+                });
+                let mut reader = Reader::new(0);
+                let deadline = Some(Instant::now() + Duration::from_secs(60));
+                assert!(matches!(
+                    reader.frame(&server, deadline).unwrap(),
+                    Some(Frame::Hello { .. })
+                ));
+                assert!(matches!(
+                    reader.frame(&server, deadline).unwrap(),
+                    Some(Frame::Request(Request::Connect { .. }))
+                ));
+                if waiting_for_socket {
+                    observed.recv_timeout(Duration::from_secs(60)).unwrap();
+                }
+                assert!(stop.set());
+                assert!(
+                    matches!(worker.join().unwrap(), Err(LanError::Io(error)) if error.kind() == io::ErrorKind::Interrupted)
+                );
+                assert!(
+                    reader.frame(&server, deadline).unwrap().is_none(),
+                    "cancellation closed the owned control socket"
+                );
+            });
+        }
     }
 
     #[test]
@@ -649,7 +782,7 @@ mod tests {
             // The check took its whole minute. Its queued answer wins over the closed
             // write half's error; deleting that precedence is the negative control.
             let started = Instant::now() - Duration::from_secs(61);
-            let result = exchange_at(client, None, super::super::protocol(), None, started);
+            let result = exchange_at(client, None, super::super::protocol(), None, started, None);
             let expected = if refused {
                 Unavailable::Refused(words)
             } else {
@@ -665,7 +798,7 @@ mod tests {
         let ours = super::super::protocol();
         io::Write::write_all(&mut &server, &hello(ours)).unwrap();
         assert!(matches!(
-            exchange_at(client, None, ours, None, Instant::now() - Duration::from_secs(121)),
+            exchange_at(client, None, ours, None, Instant::now() - Duration::from_secs(121), None),
             Err(LanError::Io(error)) if error.kind() == io::ErrorKind::TimedOut
         ));
     }

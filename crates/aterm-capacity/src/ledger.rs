@@ -274,6 +274,9 @@ impl Record {
         if self.need.leads {
             o.insert("leads".to_owned(), Value::from(true));
         }
+        if self.need.critical {
+            o.insert("critical".to_owned(), Value::from(true));
+        }
         if let Some(run) = self.need.run_mem.filter(|run| *run < self.need.mem) {
             o.insert("run_mem".to_owned(), Value::from(run));
         }
@@ -309,6 +312,33 @@ impl Record {
     /// The line a quiet waiter adds when it is first next for the quiet machine ([`Self::next_ms`]).
     pub(crate) fn next_line(ms: u64) -> String {
         format!("{{\"next_ms\":{ms}}}\n")
+    }
+
+    /// The line a waiting critical lead appends once stable Release holders fund its memory
+    /// ([`crate::LeadReservation`]). The evidence is immutable: only the first complete line is
+    /// read.
+    pub(crate) fn lead_reservation_line(reservation: &crate::LeadReservation) -> String {
+        let sponsors = reservation
+            .sponsors
+            .iter()
+            .map(|sponsor| {
+                let mut value = Map::new();
+                value.insert("bytes".into(), Value::from(sponsor.bytes));
+                let (start, pid, seq) = sponsor.order;
+                value.insert(
+                    "order".into(),
+                    Value::Array(vec![Value::from(start), Value::from(pid), Value::from(seq)]),
+                );
+                Value::Object(value)
+            })
+            .collect();
+        let mut proof = Map::new();
+        proof.insert("needed".into(), Value::from(reservation.needed));
+        proof.insert("holdback".into(), Value::from(reservation.holdback));
+        proof.insert("sponsors".into(), Value::Array(sponsors));
+        let mut line = Map::new();
+        line.insert("lead_reservation".into(), Value::Object(proof));
+        line_of(line)
     }
 
     pub(crate) fn timing_line(evidence: crate::TimingEvidence) -> String {
@@ -444,6 +474,8 @@ impl Record {
             covers: head.get("covers").and_then(Value::as_bool) == Some(true),
             scratch: head.get("scratch").and_then(Value::as_bool) == Some(true),
             leads: head.get("leads").and_then(Value::as_bool) == Some(true),
+            critical: head.get("critical").and_then(Value::as_bool) == Some(true),
+            lead_reservation: None,
             run_mem: None,
             stepped: None,
             stuck_ends: None,
@@ -461,6 +493,7 @@ impl Record {
         let mut wrote: Option<u64> = None;
         let mut stepped: Option<u64> = None;
         let mut timing: Option<crate::TimingEvidence> = None;
+        let mut lead_reservation: Option<crate::LeadReservation> = None;
         for l in lines {
             if l.starts_with('@') {
                 if l.as_bytes() == &DETACHED_MEMORY[..DETACHED_MEMORY.len() - 1] && !detached {
@@ -504,6 +537,11 @@ impl Record {
             if let Some(t) = v.get("timing") {
                 timing = Some(crate::TimingEvidence::read(t));
             }
+            if lead_reservation.is_none()
+                && let Some(proof) = v.get("lead_reservation").and_then(read_lead_reservation)
+            {
+                lead_reservation = Some(proof);
+            }
         }
         if bad_detach || detached != poisoned || (detached && (!held || !memory_only(&need))) {
             return None;
@@ -512,11 +550,22 @@ impl Record {
             return None;
         }
         let mut need = need;
+        if need.critical && (!need.leads || need.rank != crate::Rank::Release) {
+            return None;
+        }
+        if need.critical {
+            // Critical sponsorship is bound to this holder's process tree. A later credit line
+            // cannot add a foreign dependency edge that the retained lead cannot recognize.
+            credit.clear();
+        }
         // A run phase's memory is less than the peak or none (CAP3). A step is a held claim's
         // own: a waiter is never stepped, and one stepped below what it was admitted with is held
         // as any other, no longer alone: its reservation is counted beside the other claims'.
         need.run_mem = num(&head, "run_mem").filter(|run| *run < need.mem);
         need.stepped = stepped.filter(|_| held);
+        need.lead_reservation = (!held && need.critical)
+            .then_some(lead_reservation)
+            .flatten();
         let stepped_down = need.mem_now() < need.mem;
         let held = held.then(|| {
             let mut h = explicit_held.unwrap_or(Held {
@@ -618,6 +667,51 @@ fn line_of(o: Map) -> String {
     let mut line = aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| "{}".to_owned());
     line.push('\n');
     line
+}
+
+/// A complete, bounded, irredundant lead-reservation proof. Unknown or malformed evidence is
+/// absent, so it can never make a later claimant wait.
+fn read_lead_reservation(value: &Value) -> Option<crate::LeadReservation> {
+    let needed = value.get("needed")?.as_u64().filter(|needed| *needed > 0)?;
+    let holdback = value.get("holdback")?.as_u64()?;
+    let rows = value.get("sponsors")?.as_array()?;
+    if rows.is_empty() || rows.len() > crate::LEAD_SPONSORS_MAX {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut sponsors = Vec::with_capacity(rows.len());
+    for row in rows {
+        let bytes = row.get("bytes")?.as_u64().filter(|bytes| *bytes > 0)?;
+        let order = row.get("order")?.as_array()?;
+        let [start, pid, seq] = order.as_slice() else {
+            return None;
+        };
+        let order = (
+            start.as_u64()?,
+            u32::try_from(pid.as_u64()?).ok().filter(|pid| *pid > 0)?,
+            seq.as_u64()?,
+        );
+        if !seen.insert(order) {
+            return None;
+        }
+        sponsors.push(crate::LeadSponsor { order, bytes });
+    }
+    let total = sponsors
+        .iter()
+        .map(|sponsor| u128::from(sponsor.bytes))
+        .sum::<u128>();
+    if total < u128::from(needed)
+        || sponsors
+            .iter()
+            .any(|sponsor| total.saturating_sub(u128::from(sponsor.bytes)) >= u128::from(needed))
+    {
+        return None;
+    }
+    Some(crate::LeadReservation {
+        needed,
+        holdback,
+        sponsors,
+    })
 }
 
 /// The next claim of this process: two claims of one process never share a stem.
@@ -1374,6 +1468,10 @@ impl Ledger {
             ));
         }
         let mut need = need.clone();
+        // Critical retention is a Release-only contract. A reservation is runtime evidence
+        // written by this ledger's waiter, never authority a caller can carry into a new claim.
+        need.critical &= need.leads && need.rank == crate::Rank::Release;
+        need.lead_reservation = None;
         let record = Record {
             accounting,
             pid: std::process::id(),

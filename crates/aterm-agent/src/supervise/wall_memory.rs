@@ -5,8 +5,7 @@
 
 use super::super::policy::outlook::ExceptionKind;
 use super::super::policy::turn_end::{
-    Conversation, HostTurn, RULE_MODEL_FALLBACK, ended_under, met_under_another,
-    reads_conversation, screen_alone,
+    Conversation, HostTurn, ended_under, met_under_another, reads_conversation, screen_alone,
 };
 use super::approvals::{self, Outcome, RULE_WALL_WAIT, RULE_WALL_WAIT_END, WALL_LEFT_NO_TASK};
 use super::turn_end_loop::resume_jitter;
@@ -154,7 +153,7 @@ impl<C: Ctl> Session<'_, C> {
         seq: u64,
     ) {
         match reading.wall.clone() {
-            Some(w) if is_kept(&w) && !self.turn_end.left_bucket(w.kind, &w.message) => {
+            Some(w) if is_kept(&w) => {
                 self.remember_wall(&w, reader.program(), seq);
             }
             Some(_) => self.forget_wall(seq),
@@ -189,7 +188,6 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Update wall memory after observing an idle or busy turn-end point.
     pub(super) fn observe_point(&mut self, reading: &TurnEndReading, now: Instant, seq: u64) {
-        let unasked = self.turn_end.fallback_unasked();
         let land = self.turn_end.land_episode().0;
         self.turn_end.observe(reading, now);
         self.book_go_ahead_hour(seq);
@@ -205,7 +203,6 @@ impl<C: Ctl> Session<'_, C> {
             self.wall_login = None;
         }
         self.land_over(land, seq);
-        self.fallback_asked(unasked, seq);
         if self.turn_end.limit_ended() {
             let why = if self.turn_end.limit_ended_elsewhere() {
                 approvals::LIMIT_ENDED_ELSEWHERE
@@ -235,28 +232,13 @@ impl<C: Ctl> Session<'_, C> {
     /// recording build had no break door with guards (`host.at_background_on`) records it as
     /// that build did, as any host turn. Either way it is the harness's own submission, as
     /// Cruise's carry counts them (`CarryWatch::host_typed`).
-    pub(super) fn host_turn(&mut self, kind: HostTurn, seq: u64) {
+    pub(super) fn host_turn(&mut self, kind: HostTurn) {
         self.cruise_carry.host_typed();
         if kind == HostTurn::Fact && !self.fx.replay_lacks_host_door("host.at_background_on") {
             self.turn_end.fact_typed();
             return;
         }
-        let unasked = self.turn_end.fallback_unasked();
         self.turn_end.host_typed(self.fx.mono(), kind);
-        self.fallback_asked(unasked, seq);
-    }
-
-    /// Record an unasked fallback turn against wall memory.
-    pub(super) fn fallback_asked(&mut self, unasked: bool, seq: u64) {
-        if unasked && !self.turn_end.fallback_unasked() {
-            self.ledger_row(
-                RULE_MODEL_FALLBACK,
-                Outcome::Waiting,
-                "",
-                approvals::FALLBACK_ASKED,
-                seq,
-            );
-        }
     }
 
     fn limit_ended_row(&mut self, shown: bool, why: &str, seq: u64) {

@@ -4591,13 +4591,5 @@ fn parked_tabs(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Vec<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::per_min;
-
-    #[test]
-    fn per_min_avoids_premature_saturation_on_large_counts() {
-        let n = u64::MAX / 60_000 + 100;
-        assert_eq!(per_min(n, 60_000), n);
-        assert_eq!(per_min(u64::MAX, 1), u64::MAX);
-    }
-}
+#[path = "units_tests.rs"]
+mod tests;

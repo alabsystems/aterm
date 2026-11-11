@@ -24,7 +24,7 @@ covers.
 ## 1. Specs (TSV)
 
 `difficulty` is the Rust features a proof must handle; `blocking_gaps` are rows of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -126,11 +126,6 @@ J	a_line_waits_for_another_writers_lock_and_a_hold_past_the_wait_refuses_its_cha
 J	writers_that_cross_the_bound_together_rotate_once_and_none_is_refused	FJ-LOCK	FJ-BOUND
 ```
 
-## 3. Coverage
-
-- All 61 live `#[test]` functions across `src/model.rs` (`M`, 10), `src/scope.rs` (`S`, 11),
-  `src/engine.rs` (`E`, 32), and `src/journal.rs` (`J`, 8) map to the 29 specs in §1.
-
 ## 4. Tests that are not spec samples
 
 None.
@@ -146,14 +141,3 @@ None.
   That keeps `left_as_is` (`NotApplicable`, `after` retained) blocking dependants whose unapplied
   prerequisite did not land, whereas `left_to_another` (`NotApplicable`, `after` cleared) lets
   items handed to another run proceed without waiting (`S::an_item_another_run_lays_waits_on_nothing`).
-
-## 6. Proof order (easiest, high value first)
-
-1. CV-FAILURE, CV-ASIDE-EXIT, CV-FAILS-SURFACE: closed tables over enums (gaps 1 and 3).
-2. CV-SELECTS, CV-NAMES: string-prefix predicates.
-3. CV-ORDER, CV-SELECT: the scheduler, loops over index vectors (gap 7).
-4. CV-STEP, CV-READBACK, CV-REFRESH, CV-PLAN-WAITS, CV-STOOD-ASIDE, CV-EXPLAIN: `run_one` as a
-   table from the item's answers to its row.
-5. CV-JOURNAL-FIRST, CV-WAITS, CV-SCOPE-*, CV-WRAPPERS: whole-run properties, which a `ty_model!` of
-   the run could carry first.
-6. FJ-*: the file journal is effectful (gap 8) and FJ-LOCK concurrent (gap 13); they stay tests.

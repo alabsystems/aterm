@@ -248,7 +248,7 @@ pub(crate) fn write_own(
         days,
     };
     let text = aterm_json::to_string(&file).map_err(std::io::Error::other)?;
-    aterm_agent::harness::upgrade_models::write_atomic_mode(&path, &text, Some(MODE))
+    aterm_agent::harness::atomic_write::write_atomic_mode(&path, &text, Some(MODE))
 }
 
 fn is_book_name(name: &str) -> bool {

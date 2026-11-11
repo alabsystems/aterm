@@ -599,8 +599,6 @@ impl Rig {
             background: false,
             aterm_state: None,
             ask: false,
-            several_logins: false,
-            usage_credits: false,
             usage_tap: None,
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
             press: None,
@@ -1447,8 +1445,6 @@ fn prune_opts(dir: &Path) -> Opts {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         press: None,
@@ -1603,8 +1599,8 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
             old,
         ),
     ];
-    let models = state_dir(&opts).join("models.json");
-    std::fs::write(&models, "{}").expect("models");
+    let document = state_dir(&opts).join("other.json");
+    std::fs::write(&document, "{}").expect("document");
     let now = now_s();
 
     let unvouched = ["s-0c0c0c0c0c0c".to_string()];
@@ -1624,7 +1620,7 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
         prune(&quiet, now, registry_life(Some(&graph), &known_live));
     }
     assert!(
-        paths.iter().chain(&strangers).all(|p| p.exists()) && models.exists(),
+        paths.iter().chain(&strangers).all(|p| p.exists()) && document.exists(),
         "nothing proven gone, nothing gone"
     );
     let life = registry_life(Some(&graph), &known_live);
@@ -1681,7 +1677,7 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
         "a Claude record is never the Codex prune's, whatever its name"
     );
     assert!(
-        models.exists(),
+        document.exists(),
         "a file that is no record is not the prune's"
     );
 

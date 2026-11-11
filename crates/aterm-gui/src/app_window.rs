@@ -1065,6 +1065,10 @@ impl App {
             Ok(w) => Arc::new(w),
             Err(e) => {
                 crate::logging::stderr_line!("aterm-gui: OS window creation failed: {e}");
+                aterm_log::warn!(
+                    "OS window creation failed ({})",
+                    aterm_log::words::Len(&e.to_string())
+                );
                 return false;
             }
         };
@@ -1531,6 +1535,10 @@ impl App {
                         .any(|w| matches!(w.present, Some(PresentTarget::Gpu { .. })));
                     if other_gpu {
                         crate::logging::stderr_line!("aterm-gui: GPU surface creation failed: {e}");
+                        aterm_log::warn!(
+                            "GPU surface creation failed ({})",
+                            aterm_log::words::Len(&e)
+                        );
                         drop(window);
                         return false;
                     }
@@ -1538,7 +1546,8 @@ impl App {
                         "aterm-gui: GPU surface creation failed: {e}; falling back to the CPU renderer"
                     );
                     aterm_log::warn!(
-                        "GPU surface creation failed: {e}; falling back to the CPU renderer"
+                        "GPU surface creation failed ({}); falling back to the CPU renderer",
+                        aterm_log::words::Len(&e)
                     );
                     match self
                         .backend
@@ -1556,6 +1565,10 @@ impl App {
                             crate::logging::stderr_line!(
                                 "aterm-gui: resident CPU font fallback failed: {error}"
                             );
+                            aterm_log::warn!(
+                                "resident CPU font fallback failed ({})",
+                                aterm_log::words::Len(&error)
+                            );
                             drop(window);
                             return false;
                         }
@@ -1567,6 +1580,10 @@ impl App {
             Ok(s) => s,
             Err(e) => {
                 crate::logging::stderr_line!("aterm-gui: CPU present surface creation failed: {e}");
+                aterm_log::warn!(
+                    "CPU present surface creation failed ({})",
+                    aterm_log::words::Len(&e.to_string())
+                );
                 drop(window);
                 return false;
             }

@@ -125,14 +125,17 @@ PEOPLE
 ON A HOST
     here plan|apply <baseline.toml> [--json]
                               run a baseline on this Mac directly (apply under sudo)
-    here apply --plain [--root-steps-only] [--name m<N>]
+    here apply --plain [--root-steps-only] [--name m<N> [--nickname <word>]]
                               install Apple's Command Line Tools from aterm's own
                               baseline, reading no file, and with --name give the Mac
-                              its registry label as Computer Name and Local hostname;
+                              its generated computer and network names;
                               --root-steps-only preserves developer-tool installation
                               and selection while applying independent root steps;
                               prints no report and exits with why the tools did not
                               finish (`aterm init`'s root half)
+    here apply --plain --name-rule-only
+                              refresh only the console account's naming permission;
+                              accepts no machine name and changes no OS name
     agent <cmd>               the host agent, which the controller runs over SSH
 
 <host> is a host's name, uuid or address. --parallel N (1 to 64) reaches N hosts at once
@@ -628,8 +631,12 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     let json = args.iter().any(|a| a == "--json");
     let plain = args.iter().any(|a| a == "--plain");
     let steps_only = args.iter().any(|a| a == "--root-steps-only");
+    let name_rule_only = args.iter().any(|a| a == "--name-rule-only");
     if steps_only && !plain {
         return refuse("here: --root-steps-only requires --plain");
+    }
+    if name_rule_only && (!plain || steps_only) {
+        return refuse("here: --name-rule-only requires --plain and no --root-steps-only");
     }
     if json && plain {
         return refuse("here: choose either --json or --plain");
@@ -641,14 +648,15 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     } else {
         commands::HereOutput::Report
     };
-    // `--name <m<N>>` rides the root half alone: the swarm label the Mac is named by under the
-    // one password that installs the tools.
+    // Typed number and optional nickname ride the root half alone. Root derives the
+    // targets without reading any account-writable configuration.
     let mut name = None;
+    let mut nickname = None;
     let mut rest: Vec<&String> = Vec::new();
     let mut words = args.iter();
     while let Some(arg) = words.next() {
         match arg.as_str() {
-            "--json" | "--plain" | "--root-steps-only" => {}
+            "--json" | "--plain" | "--root-steps-only" | "--name-rule-only" => {}
             "--name" => match words
                 .next()
                 .map(String::as_str)
@@ -660,12 +668,38 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
                     return refuse("here: --name takes a machine label: m and a number (m42)");
                 }
             },
+            "--nickname" => {
+                if nickname.is_some() {
+                    return refuse("here: --nickname is given once");
+                }
+                let Some(value) = words.next() else {
+                    return refuse("here: --nickname needs a value");
+                };
+                nickname = match aterm_types::machine_name::Nickname::parse(value) {
+                    Ok(nickname) => Some(nickname),
+                    Err(_) => return refuse("here: --nickname takes a valid machine nickname"),
+                };
+            }
             _ => rest.push(arg),
         }
     }
     if name.is_some() && !plain {
         return refuse("here: --name rides --plain alone");
     }
+    if name_rule_only && (name.is_some() || nickname.is_some()) {
+        return refuse("here: --name-rule-only accepts no name or nickname");
+    }
+    if nickname.is_some() && name.is_none() {
+        return refuse("here: --nickname requires --name");
+    }
+    let name = name.map(|number| {
+        let number = aterm_types::machine_name::Number::parse(&number)
+            .expect("a validated canonical machine number");
+        nickname.as_ref().map_or_else(
+            || aterm_types::machine_name::GeneratedNames::number_only(number),
+            |nickname| aterm_types::machine_name::GeneratedNames::new(number, nickname),
+        )
+    });
     if let Some(flag) = rest.iter().find(|a| a.starts_with('-')) {
         return refuse(&format!("here: unknown option {flag}"));
     }
@@ -674,19 +708,30 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
         Some("apply") => Mode::Apply,
         _ => return refuse("here: takes plan|apply <baseline.toml>"),
     };
-    // `--plain` is `aterm init`'s root half, run as root: it reads no file the person's
-    // account could write, and applies the Command Line Tools' own baseline.
+    // `--plain` applies only compiled root work. The explicit naming tab first waits
+    // for its admitted landing, then invokes the same fixed endpoint as root.
     if plain {
+        if name_rule_only
+            && mode == Mode::Apply
+            && rest.len() == 1
+            && sys.euid() != 0
+            && std::env::var_os(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB)
+                .is_some_and(|value| !value.is_empty())
+        {
+            return ExitCode::from(crate::init_clt::name_rule_tab_entry(sys));
+        }
         return match rest.as_slice() {
             [_] if mode == Mode::Apply => commands::here(
                 sys,
                 mode,
-                commands::HereBaseline::BuiltIn(if steps_only {
+                commands::HereBaseline::BuiltIn(if name_rule_only {
+                    crate::init_clt::RootPlan::NameRuleOnly
+                } else if steps_only {
                     crate::init_clt::RootPlan::StepsOnly
                 } else {
                     crate::init_clt::RootPlan::WithTools
                 }),
-                name.as_deref(),
+                name.as_ref(),
                 output,
             ),
             _ => refuse("here: --plain takes apply alone, with no baseline file"),
@@ -1196,6 +1241,7 @@ mod tests {
             &["--plain", "apply"],
             &["apply", "--plain", "--root-steps-only"],
             &["--root-steps-only", "apply", "--plain"],
+            &["apply", "--plain", "--name-rule-only"],
         ] {
             assert_eq!(here(&user, &args(words)), other, "{words:?}");
         }
@@ -1207,6 +1253,12 @@ mod tests {
             &["apply", "--root-steps-only"],
             &["apply", "--root-steps-only", "/b/clt.toml"],
             &["apply", "--plain", "--root-steps-only", "/b/clt.toml"],
+            &["apply", "--name-rule-only"],
+            &["plan", "--plain", "--name-rule-only"],
+            &["apply", "--plain", "--name-rule-only", "/b/clt.toml"],
+            &["apply", "--plain", "--name-rule-only", "--root-steps-only"],
+            &["apply", "--plain", "--name-rule-only", "--name", "m85"],
+            &["apply", "--plain", "--name-rule-only", "--nickname", "Dog"],
         ] {
             assert_eq!(here(&user, &args(words)), ExitCode::from(2), "{words:?}");
         }
@@ -1229,6 +1281,15 @@ mod tests {
         for words in [
             &["apply", "--plain", "--name", "m42"][..],
             &["--name", "m7", "apply", "--plain"],
+            &["apply", "--plain", "--name", "m85", "--nickname", "Dog"],
+            &[
+                "--nickname",
+                "Blue Heron",
+                "--name",
+                "m85",
+                "apply",
+                "--plain",
+            ],
         ] {
             assert_eq!(here(&user, &args(words)), other, "{words:?}");
         }
@@ -1240,9 +1301,45 @@ mod tests {
             &["apply", "--plain", "--name", "Mac-mini-M4"],
             &["apply", "--plain", "--name", "m4", "--name", "m5"],
             &["apply", "/b/clt.toml", "--name", "m42"],
+            &["apply", "--plain", "--nickname", "Dog"],
+            &["apply", "--plain", "--name", "m85", "--nickname"],
+            &["apply", "--plain", "--name", "m85", "--nickname", "--bad"],
+            &[
+                "apply",
+                "--plain",
+                "--name",
+                "m85",
+                "--nickname",
+                "Dog",
+                "--nickname",
+                "Cat",
+            ],
         ] {
             assert_eq!(here(&user, &args(words)), ExitCode::from(2), "{words:?}");
         }
         assert!(user.calls().is_empty(), "{:?}", user.calls());
+    }
+
+    #[test]
+    fn hostile_root_naming_inputs_are_refused_before_any_operation() {
+        let user = Fake::root();
+        for (flag, value) in [
+            ("--name", "m00".to_owned()),
+            ("--name", "m0 ;".to_owned()),
+            ("--name", "ｍ0".to_owned()),
+            ("--name", "m０".to_owned()),
+            ("--name", "m0\0".to_owned()),
+            ("--nickname", "研".repeat(22)),
+            ("--nickname", "Dog\0".to_owned()),
+            ("--nickname", "Dog\u{202e}".to_owned()),
+        ] {
+            let mut args: Vec<String> = ["apply", "--plain"].map(str::to_owned).into();
+            if flag == "--nickname" {
+                args.extend(["--name".to_owned(), "m0".to_owned()]);
+            }
+            args.extend([flag.to_owned(), value.clone()]);
+            assert_eq!(here(&user, &args), ExitCode::from(2), "{flag} {value:?}");
+            assert!(user.calls().is_empty(), "{:?}", user.calls());
+        }
     }
 }

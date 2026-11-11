@@ -821,3 +821,58 @@ fn a_gated_word_a_build_drops_is_noted() {
         j.noted
     );
 }
+
+#[test]
+fn namespace_drift_follows_consumed_rows_and_cannot_mask_loss() {
+    use crate::measure::{Shows, drift};
+    let message = r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#;
+    let call = r#"{"type":"response_item","payload":{"type":"function_call","call_id":"c","name":"exec_command"}}"#;
+    let baseline = format!("{message}\n{call}\n");
+    let union = Shows::of(&CODEX, &baseline).unwrap();
+    let with_message = baseline.replace("\"role\":", "\"namespace\":\"functions\",\"role\":");
+    let d = drift(&CODEX, "first", &with_message, &union, None).unwrap();
+    assert!(d.new.is_empty(), "{d:?}");
+    assert_eq!(d.pending.len(), 1, "{d:?}");
+    assert_eq!(d.pending[0].kind, "response_item/message");
+    assert_eq!(d.pending[0].key.as_deref(), Some("namespace"));
+    exercised(
+        &CODEX,
+        B,
+        &d.pending,
+        RUN2,
+        &[("first", baseline.clone())],
+        &|_, _, _| String::new(),
+    )
+    .expect_err("ignored new message field still needs run 2");
+    exercised(
+        &CODEX,
+        B,
+        &d.pending,
+        RUN2,
+        &[("first", with_message.clone())],
+        &|_, _, _| String::new(),
+    )
+    .expect("run 2 exercised the ignored field");
+    let ignored_union = Shows::of(&CODEX, &with_message).unwrap();
+    for kind in ["function_call", "custom_tool_call"] {
+        let tool = call
+            .replace("function_call", kind)
+            .replace("\"name\":", "\"namespace\":\"functions\",\"name\":");
+        let consumed = format!("{with_message}{tool}\n");
+        let d = drift(&CODEX, "first", &consumed, &ignored_union, None).unwrap();
+        assert!(d.new.iter().any(|v| v.contains("namespace")), "{d:?}");
+        let all = Shows::of(&CODEX, &consumed).unwrap();
+        let d = drift(
+            &CODEX,
+            "first",
+            &with_message,
+            &all,
+            Some(("previous", &consumed)),
+        )
+        .unwrap();
+        assert!(
+            d.gone.iter().any(|v| v.contains("rollout.namespace")),
+            "message presence must not mask consumed loss: {d:?}"
+        );
+    }
+}

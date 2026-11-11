@@ -2401,6 +2401,7 @@ impl Github {
                 return Err(self.finish_error(door, call, &prepared.as_, None));
             }
         };
+        self.record_exchange(call, &prepared.as_, &answer);
         let mut response = match answer {
             Ok(response) => response,
             Err(wire) => {
@@ -2598,6 +2599,57 @@ impl Github {
         self.run_counted(call, decided, reading, &mut sent)
     }
 
+    /// Retain each API attempt, including retries, transport failures and responses
+    /// without quota headers. Attribution failure leaves write outcomes intact.
+    fn record_exchange(
+        &self,
+        call: &Call,
+        identity: &IdentityRef,
+        exchanged: &std::result::Result<WireResponse, WireError>,
+    ) {
+        if self.replays()
+            || !self.inner.rate_book.enabled()
+            || !matches!(call.origin, OriginRole::Api | OriginRole::Uploads)
+        {
+            return;
+        }
+        let record = || {
+            let now = self.inner.fx.wall_secs()?;
+            let response = exchanged.as_ref().ok();
+            let rate = response.and_then(|response| RateSnapshot::from_headers(&response.headers));
+            let program = std::env::current_exe().ok().and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            });
+            let row = aterm_json::json!({
+                "v": 1,
+                "at": now,
+                "host": aterm_uds::process::kernel_host_name(),
+                "pid": std::process::id(),
+                "parent_pid": i32::try_from(std::process::id()).ok()
+                    .and_then(aterm_uds::process::read_process_parent),
+                "program": program,
+                "caller": self.redactor().apply(&self.inner.caller),
+                "as": identity.label(),
+                "fingerprint": book_key_str(identity),
+                "method": call.method.as_str(),
+                "path": self.redactor().apply(path_only(&call.path)),
+                "status": response.map(|response| response.status),
+                "wire_error": exchanged.as_ref().err().map(|error| error.kind.slug()),
+                "wire_phase": exchanged.as_ref().err().map(|error| match error.phase {
+                    crate::wire::Phase::NotSent => "not_sent",
+                    crate::wire::Phase::Sent => "sent",
+                    crate::wire::Phase::Answered => "answered",
+                }),
+                "rate": rate.as_ref().map(RateSnapshot::to_json),
+            });
+            self.inner.rate_book.record_call(now, &row)
+        };
+        if let Err(error) = record() {
+            let _ = self.inner.fx.note_rate(&self.redactor().apply(&error.why));
+        }
+    }
+
     fn run_counted(
         &self,
         call: &Call,
@@ -2651,7 +2703,9 @@ impl Github {
                 .map_or(0, |resume| resume.begin(&mut prepared));
             requests = requests.saturating_add(1);
             *sent = requests;
-            let failure = match self.send(&prepared)? {
+            let exchanged = self.send(&prepared)?;
+            self.record_exchange(call, &prepared.as_, &exchanged);
+            let failure = match exchanged {
                 Err(wire) => self.finish_error(
                     classify::wire(&wire, call.method, call.idempotency),
                     call,

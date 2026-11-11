@@ -381,11 +381,12 @@ fn a_chain_origin_returning_after_its_middle_link_moved_is_dropped_by_base() {
 }
 
 #[test]
-fn m0_is_never_held() {
+fn an_absent_number_is_distinct_from_zero() {
     let s = settle(&view([(1, Entry::Record(rec(None, Class::Auto, T0)))]));
     assert!(s.holders.is_empty());
     assert_eq!(s.standings.get(&node(1)), Some(&Standing::Unnumbered));
-    assert_eq!(Number::new(0), None);
+    let zero = settle(&view([(1, Entry::Record(rec(Some(0), Class::Chosen, T0)))]));
+    assert_eq!(holder(&zero, 0), Some(node(1)));
 }
 
 #[test]
@@ -726,7 +727,7 @@ fn checks_name_the_holder_and_what_a_rename_would_do() {
     assert_eq!(at("m26"), Verdict::Retired { of: node(9) });
     assert_eq!(at("m28"), Verdict::Planned);
     assert!(matches!(at("m08"), Verdict::Grammar(_)));
-    assert!(matches!(at("m0"), Verdict::Grammar(_)));
+    assert_eq!(at("m0"), Verdict::Free);
 }
 
 /// A number another Mac's vault label names refuses both a rename and a take, whether the label

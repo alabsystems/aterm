@@ -1078,8 +1078,8 @@ fn every_key_fits_the_grammar() {
         keys::random_pk(keys::Random::Phone).unwrap(),
         keys::random_pk(keys::Random::Phone).unwrap()
     );
-    assert!(keys::is_label("m112") && keys::is_label("m40-3fa2"));
-    for bad in ["M109", "m0", "m01", "m40-3FA2", "m40-3fa", "x1"] {
+    assert!(keys::is_label("m112") && keys::is_label("m40-3fa2") && keys::is_label("m0"));
+    for bad in ["M109", "m01", "m40-3FA2", "m40-3fa", "x1"] {
         assert!(!keys::is_label(bad), "{bad}");
     }
 }

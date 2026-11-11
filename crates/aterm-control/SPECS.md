@@ -88,7 +88,7 @@ crates' `SPECS.md`: `json-escape-wire` (aterm-codec; the functions here are re-e
 
 ### Gaps
 
-`blocking_gaps` numbers are rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+`blocking_gaps` numbers are rows of the gap table in `docs/TRUST-LANE.md` (Blocking gaps)
 §7: 0 a seal that publishes Clean-discharged rows (every row), 1 non-scalar carriers (`&str`, `String`,
 `Vec`), 2 certified `&self`/`&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5
 quantified clauses, 6 plain-Rust clause publication, 7 loops, 8 effects, 10 model→code refinement, 11
@@ -136,51 +136,6 @@ conf-sound	contract	conformance::{run_all, run_all_declared, run_read_only, run_
 conf-retention-complete	contract	conformance::{check_select, check_selection}	∀ H, s served. check_select(H,s).passed() ⇒ the selection that cmd_select(…, "0 0 0 4") established is non-empty in the engine that the next with_terminal_mut(s,_) sees, which is (K) at that point. Contrapositive: a host that hands each accessor a fresh Terminal fails check_select, blank screen or not. If, in addition, first_text_row(H,s) = Some(_), such a host fails check_selection: the read-back is "OK 0". A witness-replaying stateless host can therefore pass check_screen_witness and still fail check_select.	-	HARD: reasoning about a sequence of trait calls on an abstract host state (a two-state or relational spec), the selection model	0,1,2,4,5,11,12
 conf-nonintrusive	invariant (frame)	conformance::SelectionRestore::{new, drop}, conformance::{check_select, check_selection, check_copy, run_read_only, run_read_only_witnessed, run_all}	∀ H, s satisfying (K). For check_select, check_selection and check_copy, on every exit path (each early return, a passing return, and unwinding from a panic inside the check), the TextSelection of Term(H,s) afterwards equals the one SelectionRestore::new captured. When s is unserved, nothing is written back. run_read_only and run_read_only_witnessed never call with_terminal_mut, request_redraw or clipboard_set. run_all never calls clipboard_set, because check_copy clears the selection before calling copy, and check_unserved_sid hands with_terminal_mut only a closure that changes nothing. So after run_all the clipboard is unchanged, and cmd_selection answers as before.	-	HARD: a Drop impl on a generic guard struct, Option::take, whole-struct assignment through &mut, unwinding semantics (catch_unwind), an effect footprint (which trait methods are called) over a generic host	0,1,2,4,8,11
 ```
-
-### Distribution by kind (34)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 27 | visible-text-collapse, wait-args, selector-wire-projection, park-slice-loop, verbs-fail-closed-on-unserved-sid, blocks-line-format, blocks-json-format, blocktext-format, wait-completion, select-grammar, selection-and-copy-render, select-line-logical, select-word-contract, word-cells-are-drawn-cells, drift-args-parse, asciicast-structure, cast-until, drift-render, drift-settle-cut, drift-run-grouping, drift-anchor-and-seed, drift-candidates, drift-verdict-and-attribution, drift-undo-law, replay-session-config, conf-sound, conf-retention-complete |
-| refinement | 3 | word-span-window-refines-line, cast-json-reader, drift-replay-fidelity |
-| equivalence | 2 | paint-equals-copy, conf-check-predicates |
-| round-trip | 1 | json-escape-wire |
-| invariant (frame) | 1 | conf-nonintrusive |
-
-### Gap histogram (specs blocked by each gap)
-
-| gap | specs | note |
-|---|---|---|
-| 0 | 34 | every row; closed locally by seal `150efe4a`, channel admission owner-gated |
-| 1 | 33 | non-scalar carriers: every verb takes `&str` and returns `String` (only `drift-settle-cut` escapes it) |
-| 2 | 25 | `&self`/`&mut self` views: the host trait, `&mut Terminal`, `DriftReport` |
-| 3 | 16 | E6 body widening: parsing, `min`, casts, enum matches |
-| 4 | 10 | callee-ensures composition: verbs over the host, the suite over the verbs |
-| 5 | 16 | quantified clauses |
-| 6 | 3 | plain-Rust clause publication: the SMT-shaped parsers (`wait-args`, `drift-args-parse`, `json-escape-wire`) |
-| 7 | 25 | loops |
-| 8 | 3 | effects: `wait-completion` and `park-slice-loop` (clock, condvar), `conf-nonintrusive` (unwinding) |
-| 10 | 1 | model→code refinement: `drift-replay-fidelity` |
-| 11 | 14 | generics: `H: SessionHost`, `D: AsRef<[u8]>`, `Changed<T>` |
-| 12 | 20 | cross-crate citation: aterm-core engine, selection and grid facts; aterm-codec encoders; aterm-types selectors |
-| 13 | 2 | threads and closures: `wait-completion`, `park-slice-loop` |
-
-Gaps 9 and 14-17 block no spec here directly (14 and 17 apply to whatever route each proof takes).
-
-### Proof dependency order
-
-The aterm-codec and aterm-core facts come first, from their own crates: `json-escape-wire`,
-`word-cells-are-drawn-cells`, `paint-equals-copy`, the engine resize law, logical lines and copy. Then:
-
-- the parsers: `wait-args`, `drift-args-parse`, `cast-json-reader` → `asciicast-structure`, `cast-until`;
-- the row text: `visible-text-collapse` (over aterm-core's `push_line_text`), which `blocktext-format` and
-  `drift-replay-fidelity` cite;
-- the verbs: `verbs-fail-closed-on-unserved-sid`, then `blocks-line-format`, `blocks-json-format`,
-  `blocktext-format`, `wait-completion`, `word-span-window-refines-line` → `select-word-contract`,
-  `select-line-logical`, `select-grammar`, `selection-and-copy-render`;
-- the checker: `conf-check-predicates`, then `conf-sound`, `conf-retention-complete` and `conf-nonintrusive`;
-- the drift audit: `drift-replay-fidelity` and `drift-run-grouping`, then `drift-anchor-and-seed`,
-  `drift-candidates`, `drift-verdict-and-attribution`, `drift-undo-law`, `drift-settle-cut` and `drift-render`.
 
 ## 2. Test → spec map (TSV)
 
@@ -265,11 +220,6 @@ src/cast_drift.rs	a_racy_cut_is_answered_by_the_replays	drift-settle-cut	drift-a
 src/cast_drift.rs	offline_drift_sees_the_handoff	drift-render	asciicast-structure
 ```
 
-## 3. Coverage
-
-No test is primary for `select-word-contract`, `paint-equals-copy` or `cast-until`: other tests sample
-them as side checks. The four `conf-*` rows subsume no test.
-
 ## 4. Tests that are not spec samples
 
 None: every test §2 lists samples a spec.
@@ -300,31 +250,3 @@ None: every test §2 lists samples a spec.
 10. **`cmdcol` is not this crate's fact.** `blocks_json_says_the_column_the_input_starts_at` asserts a value
     that comes from aterm-core's OSC 133;B column bookkeeping. This crate owns only the null-or-number
     rendering (`blocks-json-format`). The column needs its own aterm-core spec.
-
-## 6. Proof order (easiest high-value first)
-
-No row is blocked by gap 0 alone. The narrowest go first, each forcing a small Trust widening the
-larger rows reuse:
-
-1. **`drift-settle-cut`** (gaps 0, 2, 3): a `&mut self` update of one field under a `matches!`, with
-   no loop, string or call; the smallest certified `&mut self` view in the crate.
-2. **`wait-args`** (gaps 0, 1, 3, 6): one `str::parse::<u64>` and a `min` over a Clean model of
-   `u64::from_str`, a digit fold once §5.1 is fixed. A premise of `wait-completion` and
-   `conf-check-predicates`.
-3. **`drift-args-parse`** (gaps 0, 1, 3, 6, 7): a token loop over the same parse model.
-4. **`cast-until`** (gaps 0, 1, 7): a `Vec::retain` with an `f64` comparison, the first `Vec` content
-   model, which `asciicast-structure` needs.
-5. **`drift-undo-law`** (gaps 0, 1, 2, 3, 5): a case split over two calls to the seeded audit, its
-   result an opaque record.
-6. **`select-word-contract`** and **`drift-run-grouping`**: the bridge every gesture test crosses, and
-   the base of the drift candidate rows.
-
-Then by dependency: the aterm-codec and aterm-core facts in their crates (`json-escape-wire`,
-`word-cells-are-drawn-cells`, `paint-equals-copy`, the engine resize law); the parsers
-(`cast-json-reader` → `asciicast-structure`); `visible-text-collapse`, which `blocktext-format` and
-`drift-replay-fidelity` cite; the verbs (`verbs-fail-closed-on-unserved-sid`, then
-`blocks-line-format`, `blocks-json-format`, `blocktext-format`, `wait-completion`,
-`word-span-window-refines-line` → `select-line-logical`, `select-grammar`,
-`selection-and-copy-render`); the checker (`conf-check-predicates`, then `conf-sound`,
-`conf-retention-complete`, `conf-nonintrusive`); the drift audit (`drift-replay-fidelity`, then
-`drift-anchor-and-seed`, `drift-candidates`, `drift-verdict-and-attribution`, `drift-render`).

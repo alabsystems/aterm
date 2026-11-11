@@ -4,21 +4,6 @@
 
 # aterm-window: recovered contracts and migration worklist
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 10 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 16 specs below is to be
-> proved (through Trust/Clean, or by rustc for the auto-trait spec), and then the tests it
-> subsumes are deleted. Section 4 records the retired non-spec checks.
->
-> 2026-10-16 (LAG-2): the macOS proxy queue (`src/platform_impl/macos/wake_queue.rs`) added one
-> spec, `macos-proxy-queue`, and its 3 tests (last rows of §1 and §2). The counts below are the
-> recovery's own and leave them out.
->
-> 2026-10-17 (LAG-5): the same spec now covers coalesced wakes (only the send that arms the wake
-> signals; the drain clears the flag before every take), with 2 more tests (§2's last rows).
-
 The package and lib were named `winit` when this was written; since winit-core step 7
 (2026-10-19) they are `aterm-window` and `aterm_window`. The inventory below is historical: the original 36
 entries plus 3 audit regressions. Of those 39, the 9 compile-only auto-trait (`Send`/`Sync`) checks
@@ -60,7 +45,7 @@ Paths are relative to `crates/aterm-window`.
   a 4-byte serial, an `i32` count, then for each setting: type `i8`, pad 1, `name_len i16`, name, pad to 4,
   last-change serial `u32`, then the value (`i32` | `i32` len + bytes + pad to 4 | four `i16`).
 - `blocking_gaps` lists gap numbers from §7 of
-  `docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap 0 (a seal that publishes Clean rows) is
+  `docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (a seal that publishes Clean rows) is
   on every row proved through Clean; `none` marks the auto-trait spec, which rustc's trait solver
   discharges.
 
@@ -95,43 +80,6 @@ macos-proxy-queue	contract (liveness)	macos::wake_queue::{channel, Sender::send,
 
 Test paths in `subsumes` are shortened: `wayland/…`, `common/…`, `x11/…` and `headless.rs` sit under
 `src/platform_impl/linux/`; `event.rs` and `keyboard/…` under `src/`.
-
-### Distribution by kind (20)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 14 | headless-wait-deadline, percent-decode-utf8, event-map-nonuser, pick-text-mime, selection-port-copy, parse-uri-list, copy-verdict, wayland-clipboard-handle, headless-proxy-delivery, windows-drop-ownership, windows-ime-events, windows-key-replay, windows-attention-flash, macos-proxy-queue |
-| round-trip | 2 | smolstr-text-round-trip, xsettings-decode |
-| table-property | 1 | copy-outcome-placed |
-| refinement | 1 | clip-release-before-claim-lands |
-| invariant | 1 | headless-trace-grammar |
-| other | 1 | public-handles-send-sync (auto traits, rustc) |
-
-### Gap histogram (specs blocked by each audit §7 gap)
-
-| gap | specs | notes |
-|---|---|---|
-| none | 1 | public-handles-send-sync (rustc, no Clean) |
-| 0 | 19 | every Clean-proved spec |
-| 1 | 10 | non-scalar carriers: &str, String, Vec, Option, enums |
-| 2 | 9 | &self/&mut self views |
-| 8 | 9 | effects: fs::canonicalize, mpsc, poll(2), pipes, Win32/CFRunLoop FFI |
-| 3 | 8 | E6 body widening: enum matches, calls, casts, shifts |
-| 13 | 8 | closures, threads, channels |
-| 7 | 7 | loops and iterators |
-| 11 | 5 | generics |
-| 5 | 4 | quantified clauses |
-| 4 | 2 | callee-ensures composition |
-| 10 | 2 | model→code refinement |
-| 14 | 1 | Clean elaborator coverage |
-
-### Proof dependency order
-
-`copy-outcome-placed` → `selection-port-copy` → `clip-release-before-claim-lands` (with the `FakeSeat`
-negative control) → `copy-verdict` and `wayland-clipboard-handle`. `percent-decode-utf8` →
-`parse-uri-list`. The proposed pure `headless-wait-deadline` factor → `headless-trace-grammar` →
-`headless-proxy-delivery`. `public-handles-send-sync`, `smolstr-text-round-trip`, `event-map-nonuser`,
-`pick-text-mime` and `xsettings-decode` stand alone.
 
 ## 2. Historical test → spec map (TSV)
 
@@ -173,22 +121,7 @@ src/platform_impl/macos/wake_queue.rs	only_the_send_that_arms_the_wake_owes_a_si
 src/platform_impl/macos/wake_queue.rs	a_drain_that_finds_the_lock_held_still_clears_the_flag	macos-proxy-queue	
 ```
 
-## 3. Coverage
-
-- 36 original tests read. 32 mapped to one of the 16 specs. 4 were not spec samples (§4). 13 of the
-  36 are since deleted: the 9 auto-trait checks, 3 of the 4 non-spec tests and `test_force_normalize`.
-- The biggest collapse was `public-handles-send-sync` (9 tests across two integration files, now
-  deleted; discharged at compile time by the `const _` auto-trait assertion item in `src/lib.rs`). Next: `selection-port-copy`, `parse-uri-list` (3 each).
-- 18 of the 36 tests sit in effectful files (headless event loop, Wayland clipboard, data device). Their
-  pure cores (`copy-outcome-placed`, `selection-port-copy`, `pick-text-mime`, `headless-wait-deadline`,
-  `percent-decode-utf8`) can be proved before Trust's platform lane (gap 8) lands.
-
 ## 4. Tests that are not spec samples
-
-> Status 2026-10-28: all 4 non-spec tests are retired — the 3 derive/prose checks in `src/error.rs`
-> and `src/event.rs` were deleted, and `wayland/clipboard.rs::claiming_before_releasing_loses_every_other_copy_and_leaves_the_text_before_it`
-> was folded into `a_copy_with_no_fresh_input_behind_it_still_reaches_the_system_clipboard` as the
-> `FakeSeat` negative control of `clip-release-before-claim-lands`. No standalone non-spec test remains.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -213,20 +146,3 @@ src/platform_impl/macos/wake_queue.rs	a_drain_that_finds_the_lock_held_still_cle
    live variant to cover.
 6. **Redundant clipboard order assertion removed.** The production wire-trace assertions remain;
    the duplicate CLAIM_ORDER constant assertion no longer substitutes for behavior coverage.
-
-## 6. Proof order
-
-1. **`public-handles-send-sync`** *(discharged)*. No Trust gap at all: the `const _` auto-trait assertion
-   item lives in `src/lib.rs`, and the 9 compile-only `Send`/`Sync` tests it retired are deleted.
-2. **`copy-outcome-placed`**. Blocked only by gap 0 plus enum carriers (gaps 1, 3); decidable by
-   evaluation over 5 values. It is the lemma `copy-verdict` and `selection-port-copy` cite.
-3. **`headless-wait-deadline`** (pure factor). Linear `Duration`/`Option` arithmetic plus a
-   `div_ceil`, an `omega`-class proof once factored, with the due-deadline transition test retained for event ordering.
-4. **`percent-decode-utf8`**, starting with the `hex_val` table half (a range match over `u8`, which seal
-   `150efe4a` already admits for E6 import). The decoder half then unlocks `parse-uri-list` (4 primary tests).
-5. **`selection-port-copy`** then **`clip-release-before-claim-lands`**. These are the Wayland clipboard's
-   real correctness property (release before claim), with the negative control already written as
-   `FakeSeat`. They need `&mut self` views (gap 2) and a `ty_model!` refinement (gap 10).
-6. Then `event-map-nonuser`, `pick-text-mime`, `smolstr-text-round-trip` and `xsettings-decode` (carrier
-   and loop work), and last the effectful shells: `copy-verdict`, `wayland-clipboard-handle`,
-   `headless-trace-grammar` and `headless-proxy-delivery` (gaps 8 and 13).

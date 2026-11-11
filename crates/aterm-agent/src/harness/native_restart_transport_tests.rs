@@ -461,18 +461,19 @@ fn a_completed_cold_predecessor_keeps_the_new_asked_prepare_exact_across_lost_ac
 }
 
 #[test]
-fn a_model_seeded_upgrade_directory_can_persist_before_native_dispatch() {
+fn an_existing_upgrade_directory_can_persist_before_native_dispatch() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     for mode in [0o700, 0o755] {
         let world = aterm_tempfile::tempdir().unwrap();
         let opts = opts(world.path());
         let directory = opts.state.join("upgrade");
-        let models = directory.join("models.json");
-        super::super::upgrade_models::load_or_seed(&models, 1).unwrap();
-        let model_bytes = std::fs::read(&models).unwrap();
-        // The shared model writer permits an existing owned directory. Pin its
-        // historical readable mode independently of this test process's umask.
+        let foreign = directory.join("models.json");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&foreign, b"{}").unwrap();
+        let foreign_bytes = std::fs::read(&foreign).unwrap();
+        // An existing owned directory holding a file of another writer, in a mode pinned
+        // independently of this test process's umask.
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode)).unwrap();
         assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, mode);
         let command = planned();
@@ -515,7 +516,7 @@ fn a_model_seeded_upgrade_directory_can_persist_before_native_dispatch() {
             1
         );
         assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
-        assert_eq!(std::fs::read(&models).unwrap(), model_bytes);
+        assert_eq!(std::fs::read(&foreign).unwrap(), foreign_bytes);
         let mut loaded = upgrade_drive::load(&opts, "conversation").unwrap();
         assert_eq!(loaded.native_prepare, st.native_prepare);
         let expected = Request::parse(&loaded.native_prepare).unwrap();
@@ -1010,8 +1011,6 @@ fn opts(dir: &Path) -> Opts {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),

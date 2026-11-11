@@ -8,7 +8,7 @@ samples; once a row is proved through Trust/Clean, the tests §2 maps to it can 
 notation, §4 lists the mapped tests that sample no spec, §5 the places where the code or a test
 disagrees with a spec, and §6 orders the proofs. The claims come from reading the code. Paths are
 relative to `crates/aterm-keeper`; gap numbers are rows of §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`.
+`docs/TRUST-LANE.md` (Blocking gaps).
 
 No row covers companion (journal-region) custody: `Reach` leaves out `companion` and
 `companion_release`, the rows read as if no companion is claimed (so no `CloseCompanion` or other
@@ -185,21 +185,7 @@ tests/identity_after_swap.rs	a_keeper_whose_app_is_deleted_is_still_that_apps	ke
 tests/trust_unanswered.rs	a_silent_trust_service_refuses_every_code_check_at_once_and_its_answer_lifts_it	identity-trust-gate	client-check-error-mapping
 ```
 
-## 3. Coverage
-
-- 98 tests read. 96 map to one of the 42 specs. 2 are not spec samples (§4).
-- The biggest collapses: `link-worker-delivery` (14), `identity-admission` (7), `core-death-routing` (5),
-  and five specs with 4 each (`core-register`, `core-release-authority`, `core-update-hold`,
-  `core-relaunch-lane`, `server-write-failure-keeps-reading`).
-- `src/core.rs` (30 tests) reduces to 11 specs, every one on the pure lane (no gap 8). Proving them
-  also makes the bodies of the three conformance refinements provable by induction instead of a
-  bounded run.
-- The 14 `tests/kernel_custody.rs` tests are compositions: each is an effect-lane spec (server or
-  marker) over a core spec plus a platform axiom. Their pure core is already stated by the core specs.
-
 ## 4. Tests that are not spec samples
-
-> Status 2026-10-28: `src/conformance_custody.rs::the_custody_anchors_are_live` is deleted.
 
 | test | why | action |
 |---|---|---|
@@ -213,41 +199,5 @@ slow-booting crash loop) is an instance of one of the general specs above.
 ## 5. Implied specs that look wrong, or disagree with the code
 
 1. **(Fixed.) `KeeperCore::release` used two different notions of "the same process".** Both the authority check and the `others_hold` check in `KeeperCore::release` now share one process-identity predicate on `(pid, birth)` (`a_release_keeps_the_claim_of_a_reused_pid`).
-2. **(Fixed 2026-10-28.) `Frame::decode` mislabelled an unknown peer class.** A HELLO with an unknown class byte now returns `WireError::UnknownClass(class_byte)`, asserted directly by `an_unknown_peer_class_is_refused`.
 3. **(Fixed.) `code::owner_of` was not the inverse of `copy_name`.** `owner_of` requires `copy_name(pid, birth) == name` so non-canonical spellings (`+7`, `007`) return `None` (`a_copy_is_named_by_its_keeper`).
-4. **(Fixed 2026-10-28.) `job::the_installed_app_and_dev_builds_never_share_a_keeper` asserted something that is not a theorem.** Dropped the distinct-dev-paths hash assertion; the test now checks `dev != installed` and determinism (`job-place`).
 5. **(Fixed.) `Server::status_text` could panic.** `status_text` truncates at `text.floor_char_boundary(MAX_STATUS)`.
-6. **(Fixed 2026-10-28.) `RelaunchBrake::healthy` reset `streak` without clearing `held`.** `healthy()` now clears `held = false` alongside `streak = 0`, preserving `held ⇒ streak = MAX_STREAK` across all call orders (`the_brake_backs_off_then_holds_until_a_manual_launch`).
-7. **(Fixed 2026-10-28.) `conformance_custody::the_classifier_judges_real_ends` used a transliterated oracle and `std::process::Command`.** Replaced the transliterated if-chain with explicit `(on_zero, on_nonzero)` table verdicts and routed child spawns through `aterm_uds::spawnfd::command`.
-8. **(Fixed 2026-10-28.) `src/core.rs::a_slow_booting_crash_loop_is_still_braked` was weaker than the code.** Tightened the bound from `<= MAX_STREAK + 1` to `<= MAX_STREAK` (`core-relaunch-lane` (f)).
-9. **(Fixed 2026-10-28.) Three cli tests pinned prose.** `start_says_running_only_when_this_builds_keeper_answers`, `stop_says_stopped_only_when_the_keeper_ended` and `status_tells_a_refused_keeper_from_an_absent_one` now assert the `key=value` fields, `ok` decisions, remedy presence, failure reasons and log paths specified by `cli-start-decision`, `cli-stop-lines` and `cli-status-miss-line` without pinning parenthetical prose.
-
-## 6. Proof order (easiest high-value first)
-
-Nearly every row needs gap 1 (each pure function takes or returns an enum, struct, `Option`, slice
-or `String`) and gap 3, so the order is fewest further gaps, then value. Each effect-lane row (gap 8)
-states a pure core that can be proved first.
-
-1. **`classify-death-table`** (gaps 0, 1, 3). Start with its `exited_zero` half, which is pure `i32`
-   bitwise arithmetic and needs only gap 3's shifts and `&` (an `omega`/`bv_decide`-class proof). The
-   if-chain over a `Copy` struct of an `Option<i32>` and two enums is the smallest non-scalar carrier
-   case in the crate. It retires 2 tests and is the callee contract `core-death-routing` and
-   `refines-death-judgement` cite.
-2. **`wire-header-codec`** (gaps 0, 1, 3). A fixed `[u8; 8]` array, a 17-arm `match` on `u8` literals
-   (the seal-150efe4a range-`match` admission is the starting point), big-endian `u16`. It decides
-   every frame the keeper admits and is the base of the three wire round-trip specs.
-3. **`brake-decide`** (gaps 0, 1, 2, 3). A two-field struct, a const array lookup and one
-   `saturating_add`. It needs certified `&mut self` (gap 2), but it is the smallest `&mut self` in the
-   crate, and it makes `refines-relaunch-brake` a short corollary once gap 10 lands.
-4. The string leaves, all gaps 0, 1, 3: **`cli-label-is-ours`**, **`job-own-bundle`**,
-   **`cli-status-miss-line`**, **`cli-start-decision`**. They are first users of the `&str`/`Path`
-   carriers gap 1 adds. Then **`client-check-error-mapping`** and the pure half of
-   **`client-served-policy`** and **`server-holder-verdict`** (`Env::verdict`).
-5. The `KeeperCore` contracts: `core-register`, `core-release-authority`, `core-offer-rule`,
-   `core-eof-and-death-condition` → `core-death-routing` → `core-update-hold`,
-   `core-prune-dead-orphans`, `core-holder-scan-batching` → `core-relaunch-lane` (which cites
-   `brake-decide`). Then the three refinements (gap 10), whose bodies these proofs make provable by
-   induction instead of a bounded run.
-6. The effect-lane rows (gap 8): `frameio-roundtrip`, the `server-*` rows, `read-marker-evidence`,
-   `link-worker-delivery`, `identity-*`, `code-sweep`, `copy-tree-faithful` and
-   `keeper-runs-from-own-copy`, with axioms P1–P5 stated in a `PlatformSpec`.

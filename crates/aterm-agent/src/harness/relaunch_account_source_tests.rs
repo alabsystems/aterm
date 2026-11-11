@@ -198,8 +198,6 @@ fn account_admission_refuses_before_any_filesystem_work() {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         instances: super::super::super::upgrade_drive::Instances::Listed(Vec::new()),
         usage_tap: None,
         agents_off: Vec::new(),

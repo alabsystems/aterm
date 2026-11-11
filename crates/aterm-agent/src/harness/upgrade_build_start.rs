@@ -172,7 +172,7 @@ fn write(opts: &Opts, note: &Note) {
     let Ok(dir) = ensure_upgrade_tree(&opts.state, Some("build-starts")) else {
         return;
     };
-    let _ = crate::harness::upgrade_models::write_atomic(&dir.join(name), &note.to_json());
+    let _ = crate::harness::atomic_write::write_atomic(&dir.join(name), &note.to_json());
 }
 
 /// What `session`'s record, saved at `now` over `before` (the record on disk), says of its build's start: a failure it carries ([`note_failure`]) or a stop it takes back ([`taken_back`]).

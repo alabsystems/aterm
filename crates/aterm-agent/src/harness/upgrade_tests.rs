@@ -204,6 +204,33 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
     }
 }
 
+/// A resume line carries exactly the `--model` words of the session's own launch, in their own
+/// spelling and place, and adds none to a launch that named none.
+#[test]
+fn a_resume_line_carries_exactly_the_launchs_model_flag() {
+    assert_eq!(
+        rewrite_argv(&argv(&["claude", "--verbose"]), ID),
+        Ok(argv(&["--verbose", "--resume", ID]))
+    );
+    assert_eq!(
+        rewrite_argv(
+            &argv(&["claude", "--model", "claude-fable-5-2", "--verbose"]),
+            ID
+        ),
+        Ok(argv(&[
+            "--model",
+            "claude-fable-5-2",
+            "--verbose",
+            "--resume",
+            ID
+        ]))
+    );
+    assert_eq!(
+        rewrite_argv(&argv(&["claude", "--model=fable"]), ID),
+        Ok(argv(&["--model=fable", "--resume", ID]))
+    );
+}
+
 /// A click's line ([`permission_click_argv`]) takes every permission flag off, in every spelling
 /// the table knows and wherever it stood, and then puts on the one its direction asks for: none
 /// toward the settings' mode, one `--dangerously-skip-permissions` toward bypass. The rest keeps its order, a `--`
@@ -2225,49 +2252,20 @@ fn the_wait_word_names_claudes_status_only_for_not_idle() {
 fn the_notices_and_continuations_keep_their_machine_parts() {
     let (from, to) = (v("2.1.282"), v("2.1.283"));
     let marker = ready_marker(ID, &to, 1);
-    assert_eq!(
-        prepare_prompt_with_model(
-            &from,
-            &to,
-            Source::Managed,
-            &marker,
-            None,
-            Some("claude-opus-5")
-        ),
-        prepare_prompt(&from, &to, Source::Managed, &marker),
-        "no model to move to: the plain notice"
+    let notice = prepare_prompt(&from, &to, Source::Managed, &marker);
+    assert!(
+        notice.starts_with(ANNOUNCE_HEAD) && notice.contains(&marker),
+        "{notice}"
     );
-    for want in [None, Some("claude-opus-5-5"), Some("claude-opus-5-5[1m]")] {
-        let notice = prepare_prompt_with_model(
-            &from,
-            &to,
-            Source::Managed,
-            &marker,
-            want,
-            Some("claude-opus-5"),
-        );
-        assert!(
-            notice.starts_with(ANNOUNCE_HEAD) && notice.contains(&marker),
-            "{notice}"
-        );
-        if let Some(model) = want {
-            assert!(notice.contains(model), "{notice}");
-        }
-    }
-    for (before, after) in [
-        (None, None),
-        (Some("claude-opus-5"), None),
-        (None, Some("claude-opus-5-5")),
-        (Some("claude-opus-5"), Some("claude-opus-5-5[1m]")),
-    ] {
-        let text = continue_prompt_with_model(&from, &to, before, after);
+    assert!(!notice.contains("--model"), "{notice}");
+    for before in [None, Some("claude-opus-5")] {
+        let text = continue_prompt(&from, &to, before);
         assert!(!text.starts_with(ANNOUNCE_HEAD), "{text}");
-        for model in [before, after].into_iter().flatten() {
+        if let Some(model) = before {
             assert!(text.contains(model), "{text}");
         }
     }
     let bare = continue_prompt(&from, &to, None);
-    assert_eq!(continue_prompt_with_model(&from, &to, None, None), bare);
     assert!(!bare.contains("claude-"), "no model guessed: {bare}");
 }
 
@@ -2537,9 +2535,7 @@ fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     let (from, to) = (v("2.1.281"), v("2.1.283"));
     for typed in [
         prepare_prompt(&from, &to, Source::Managed, "M"),
-        prepare_prompt_with_model(&from, &to, Source::Managed, "M", Some("opus"), None),
         continue_prompt(&from, &to, Some("haiku")),
-        continue_prompt_with_model(&from, &to, None, Some("opus")),
         super::super::relaunch::resumed_prompt("2.1.283", "exit"),
         super::super::relaunch::resumed_prompt("2.1.283", "memory"),
     ] {
@@ -3944,7 +3940,7 @@ fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() 
 
 #[test]
 fn the_resumed_builds_warning_is_read_by_its_fields() {
-    let at = |t: &str| models::parse_utc(t).expect("a time");
+    let at = |t: &str| crate::harness::unix_time::parse_utc(t).expect("a time");
     let relaunched = at("2026-10-15T15:33:38Z");
     let until = relaunched + 60;
     let row = |subtype: &str, level: &str, version: &str, t: &str, chain: bool| {
@@ -5679,7 +5675,7 @@ fn a_limit_rows_word_on_usage_credits_is_read() {
 
 #[test]
 fn the_newest_answer_is_the_last_response_row() {
-    let at = |ts: &str| crate::harness::upgrade_models::parse_utc(ts).expect("a time");
+    let at = |ts: &str| crate::harness::unix_time::parse_utc(ts).expect("a time");
     let answer = said_row("2026-09-27T15:00:00.000Z", "Fixed.");
     let wall = limit_row("2026-09-27T15:04:28.344Z");
     let sidechain = said_row("2026-09-27T15:06:00.000Z", "Sub.")

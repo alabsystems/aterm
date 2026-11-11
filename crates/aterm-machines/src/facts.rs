@@ -151,6 +151,23 @@ pub fn user(sys: &dyn System, name: &str) -> Result<User, String> {
     read_user(sys, name, &admins)
 }
 
+/// The current console account alone, without host names, hardware, preferences or privacy probes.
+pub(crate) fn console_account(sys: &dyn System) -> Result<User, String> {
+    let accounts = run(sys, &dscl(["-list", "/Users", "UniqueID"]))
+        .filter(Ran::success)
+        .map(|ran| parse_dscl_list(&ran.out()))
+        .ok_or("the console account list could not be read")?;
+    let name = console_user(sys, &accounts).ok_or("no account is at this Mac's console")?;
+    let user = user(sys, &name)?;
+    let console = sys
+        .stat(Path::new("/dev/console"))
+        .map_err(|why| why.to_string())?;
+    if user.uid == 0 || console.uid != user.uid {
+        return Err("the console account changed while it was read".into());
+    }
+    Ok(user)
+}
+
 /// The keyboard-capable services returned by [`hidutil_keyboards`], deduplicated by model.
 #[must_use]
 pub fn parse_hidutil_keyboards(text: &str) -> Vec<Keyboard> {

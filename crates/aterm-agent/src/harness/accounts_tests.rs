@@ -3618,6 +3618,24 @@ fn a_lost_login_signed_back_in_is_where_the_session_is_relaunched() {
     strike(&mut struck, "work-2", "s-one", &Strike::SignedOut, NOW + 30);
     assert_eq!(struck.active.as_deref(), Some("main"), "put back");
     assert_eq!(at(&struck, &lost), wait);
+    let Advice::Wait { until } = wait else {
+        unreachable!("a wait")
+    };
+    // The wait ends in the move it waited for: at the instant it names, the session moves onto
+    // the row that opened, and not a second earlier (m8, 2026-11-07: a session struck off a
+    // lapsed login waited out its walled row).
+    assert_eq!(at_when(&struck, &lost, until - 1), wait, "before it");
+    assert_eq!(
+        at_when(&struck, &lost, until),
+        Advice::Move {
+            to: "pool-a".into(),
+            ahead: false,
+            rotates: true,
+            takes_canary: false,
+            yields: None,
+        },
+        "the instant it names"
+    );
 
     let mut back = struck.clone();
     note_auth(&mut back, "work-2", Auth::Ok, NOW + 50);
@@ -9832,6 +9850,82 @@ fn an_unmeasured_seam_holds_a_due_move_and_a_measured_one_makes_it() {
             Mode::Early,
             NOW
         )
+    );
+}
+
+/// A WORKER'S STARTER IS THE ACCOUNT ITS LOGIN FILE NAMES ([`claude_worker_move`]), never the row
+/// its environment alone suggests: a plain start in a home that holds unicorn's login is judged
+/// as unicorn's row, so the believed row's wall moves nothing and unicorn's own wall does, never
+/// onto the believed row, whose place holds no login of its own; an account no row lists is no
+/// row to judge; and a login file nothing was read of leaves the belief.
+/// NEGATIVE CONTROL: with `claude_worker_move` taking its source from `judged_label(roster,
+/// &login.who)`, the believed row's wall moves the unicorn start: `left: Some(("main",
+/// "work-2")) right: None`.
+#[test]
+fn a_workers_starter_is_the_account_its_login_file_names() {
+    use crate::harness::observe::{Login, Observation, Observed};
+    const BRONTO: &str = "bronto@example.test";
+    const UNICORN: &str = "unicorn@example.test";
+    let mut r = three();
+    for (row, email) in r
+        .rows
+        .iter_mut()
+        .zip([BRONTO, UNICORN, "pool@example.test"])
+    {
+        row.email = Some(email.to_owned());
+    }
+    let enrolled = all(&r);
+    let plain = |seen: Option<&str>| Login {
+        who: ProcessLogin {
+            login: None,
+            default_home: true,
+            route: AuthRoute::Stored,
+        },
+        seen: seen.map_or(Observation::Unread, |email| {
+            Observation::Seen(Observed {
+                cli: crate::harness::journal::ObservedCli::Pool(Cli::Claude),
+                region: None,
+                email: email.to_owned(),
+                key: None,
+                src: crate::harness::journal::ObservedSrc::Profile,
+                path: "/home/someone/.claude.json".into(),
+                mtime: None,
+            })
+        }),
+    };
+    let moved = |s: &State, seen: Option<&str>| {
+        claude_worker_move(&r, s, &enrolled, &plain(seen), Mode::Wall, NOW)
+            .map(|(from, to)| (from.label.as_str(), to.label.as_str()))
+    };
+    let mut main_walled = on_main();
+    limited(&mut main_walled, "main", NOW + 3 * HOUR);
+    assert_eq!(
+        moved(&main_walled, None),
+        Some(("main", "work-2")),
+        "CONTROL: nothing read, the belief"
+    );
+    assert_eq!(
+        moved(&main_walled, Some(BRONTO)),
+        Some(("main", "work-2")),
+        "CONTROL: the file agrees"
+    );
+    assert_eq!(
+        moved(&main_walled, Some(UNICORN)),
+        None,
+        "the wall of `main` is not this start's"
+    );
+    assert_eq!(
+        moved(&main_walled, Some("zed@example.test")),
+        None,
+        "an account no row lists is no row to judge"
+    );
+    let mut work_walled = on_main();
+    limited(&mut work_walled, "work-2", NOW + 3 * HOUR);
+    assert_eq!(moved(&work_walled, None), None, "CONTROL: the belief runs");
+    assert_eq!(
+        moved(&work_walled, Some(UNICORN)),
+        Some(("work-2", "pool-a")),
+        "off its own wall, and never onto `main`, whose place holds unicorn"
     );
 }
 

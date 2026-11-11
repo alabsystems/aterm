@@ -2459,7 +2459,7 @@ pub fn compact_locked(path: &Path, now: i64, tz_at: fn(i64) -> i64) -> std::io::
             text.push_str(&line.text);
             text.push('\n');
         }
-        super::upgrade_models::write_atomic_mode(path, &text, Some(0o600))?;
+        super::atomic_write::write_atomic_mode(path, &text, Some(0o600))?;
     }
     Ok(left)
 }
@@ -2483,11 +2483,7 @@ pub fn compact_due(dir: &Path, now: i64) -> bool {
 
 /// Stamps a pass over `dir` at `now` ([`COMPACTED_FILE`]). The caller holds [`LOCK_FILE`].
 fn stamp_locked(dir: &Path, now: i64) -> std::io::Result<()> {
-    super::upgrade_models::write_atomic_mode(
-        &dir.join(COMPACTED_FILE),
-        &now.to_string(),
-        Some(0o600),
-    )
+    super::atomic_write::write_atomic_mode(&dir.join(COMPACTED_FILE), &now.to_string(), Some(0o600))
 }
 
 /// Claims the pass over `dir` that is due at `now`: under the series lock it finds the pass

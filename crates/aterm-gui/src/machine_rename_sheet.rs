@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One Number/Nickname panel with actual aterm, fleet and macOS naming status. Its explicit
+//! One Numeric ID/Name panel with actual aterm, fleet and macOS naming status. Its explicit
 //! open reads the books and system names on the name writer, after earlier requests, then
 //! delivers them through AppKit's modal loop. An unchanged saved number with pending
 //! publication offers Retry Sync; only a changed number selects another canonical name.
@@ -9,12 +9,12 @@
 //! Each field is the person's only once what it holds differs from what aterm would put there,
 //! the read's text once that lands ([`Field`]): a field they have not touched follows the read on
 //! its own, whatever the other holds, and asks for nothing, so once the read lands a window view
-//! a change pressed before has outdated neither shows a stale number or nickname nor turns into
+//! a change pressed before has outdated neither shows a stale number or name nor turns into
 //! one; while the read is out, or after it failed, the fields stay at the view, still asking for
 //! nothing, and the line says so. A Number left alone or emptied keeps this Mac's number, so a
-//! nickname alone keeps the number, an unnumbered Mac's included
+//! name alone keeps the number, an unnumbered Mac's included
 //! ([`RenameTo`]). A number a migration still waits on holds no claim:
-//! the Number field opens empty, and typing that number claims it. Rename is unavailable while
+//! the Numeric ID field opens empty, and typing that number claims it. Rename is unavailable while
 //! the line refuses what is typed. The set reads again under its locks, so a number the
 //! line passed can still be refused, and that refusal leads the alert at the next press, its
 //! fields holding what that press typed ([`crate::machine_title::NameUnset`]).
@@ -30,11 +30,11 @@ use crate::machine_title::naming::NamingStatus;
 /// the read's, which follows every change pressed before it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Held {
-    /// The NAME: `m8`, or `m0` while unnumbered.
+    /// The NAME: `m8`, or `unnumbered` while unnumbered.
     pub(crate) name: String,
-    /// The nickname as the menu bar shows it.
+    /// The name as the menu bar shows it.
     pub(crate) nick: String,
-    /// The nickname as stored, which the Nickname field holds.
+    /// The display spelling, which the Name field holds.
     pub(crate) word: String,
     /// Whether this is the press's read rather than the window's view, which may be stale.
     pub(crate) read: bool,
@@ -58,20 +58,24 @@ impl Held {
         let name: &MachineName = preview.name();
         Self {
             name: name.name(),
-            nick: name.nick.display(),
-            word: name.nick.as_str().to_owned(),
+            nick: name.display_nick(),
+            word: name.display_nick(),
             read: true,
             waits: preview.waits(),
         }
     }
 
-    /// What an untouched Number field holds: the NAME, or nothing for a number that holds no
+    /// What an untouched Numeric ID field holds: the NAME, or nothing for a number that holds no
     /// claim yet, so typing it is a choice the field can tell from leaving it.
     pub(crate) fn number_text(&self) -> &str {
-        if self.waits { "" } else { &self.name }
+        if self.waits || self.unnumbered() {
+            ""
+        } else {
+            self.name.strip_prefix('m').unwrap_or(&self.name)
+        }
     }
 
-    /// Whether this Mac has no number yet (`m0`).
+    /// Whether this Mac has no number yet (no assigned ID).
     fn unnumbered(&self) -> bool {
         Number::parse(&self.name).is_err()
     }
@@ -193,6 +197,8 @@ impl Snapshot {
         let num = read.preview.name().num?;
         if read.preview.name().class != aterm_types::machine_name::Class::Chosen {
             Some(RenameTo::Name(NameTo { num, nick: None }))
+        } else if read.naming.as_ref().is_some_and(NamingStatus::authorize) {
+            Some(RenameTo::Authorize)
         } else if read.naming.as_ref().is_some_and(NamingStatus::retry) {
             Some(RenameTo::Synchronize(num))
         } else {
@@ -211,37 +217,39 @@ pub(crate) struct Line {
 /// What Rename asks of this Mac's name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RenameTo {
-    /// Nothing the fields changed: neither was typed into, a typed nickname is empty, or what
+    /// Nothing the fields changed: neither was typed into, a typed name is empty, or what
     /// was typed is what the read holds.
     Keep,
-    /// A nickname alone, the number kept
+    /// A name alone, the number kept
     /// ([`aterm_agent::machine_name::set_nick`]), an unnumbered Mac's included.
     Nick(Nickname),
     /// A number explicitly selected by the person, including a displayed seeded number,
-    /// with a typed nickname or keeping the held one
+    /// with a typed name or keeping the held one
     /// ([`aterm_agent::machine_name::set_name`]).
     Name(NameTo),
     /// Publish the already-saved number, without choosing it again.
     Synchronize(Number),
+    /// Explicitly authorize only the naming rule; no captured name crosses that prompt.
+    Authorize,
 }
 
-/// What the Number and Nickname fields ask for, `held` being the name they are judged against
+/// What the Number and Name fields ask for, `held` being the name they are judged against
 /// ([`Held`]). Only what the person typed asks for anything ([`Field::typed`]); an emptied field
 /// keeps what this Mac has. A number is typed as `aterm name set` takes it, `m86` or `86`.
 /// Typed text that equals the read's name keeps it, but for a number that holds no claim yet,
-/// which typing claims; before the read lands, a typed number or nickname is asked for as typed,
+/// which typing claims; before the read lands, a typed number or name is asked for as typed,
 /// since a change pressed before may still move the name the window shows, and the set judges it
 /// from what it finds.
 ///
 /// # Errors
-/// The words the line shows for a typed number or nickname that is none.
+/// The words the line shows for a typed number or name that is none.
 pub(crate) fn rename_to(number: &Field, nick: &Field, held: &Held) -> Result<RenameTo, String> {
     let nick = match nick.typed().map(str::trim) {
         None | Some("") => None,
         Some(word) if held.read && word == held.word => None,
         Some(word) => Some(
             Nickname::parse(word)
-                .map_err(|why| format!("\u{201c}{word}\u{201d} is no nickname: {why}."))?,
+                .map_err(|why| format!("\u{201c}{word}\u{201d} is no name: {why}."))?,
         ),
     };
     let num = match number.typed().map(str::trim) {
@@ -249,9 +257,8 @@ pub(crate) fn rename_to(number: &Field, nick: &Field, held: &Held) -> Result<Ren
         Some(typed) => match Number::parse(typed) {
             Ok(num) if held.read && !held.waits && num.to_string() == held.name => None,
             Ok(num) => Some(num),
-            // An emptied field, and an unnumbered Mac's own `m0` typed back, ask for no number.
+            // An emptied field keeps the current ID, including an unassigned one.
             Err(Refusal::Empty) => None,
-            Err(Refusal::Unnumbered) if held.unnumbered() => None,
             Err(why) => {
                 return Err(format!(
                     "\u{201c}{typed}\u{201d} is no machine number: {why}."
@@ -268,7 +275,7 @@ pub(crate) fn rename_to(number: &Field, nick: &Field, held: &Held) -> Result<Ren
 
 /// The line for the fields `number` and `nick` judged against `held` over `snapshot`: a field's
 /// refusal, the number's verdict as [`RenamePreview::judge`] gives it, and that another Mac
-/// carries the nickname too (information only: two Macs may share one, §5.4). Before the read
+/// carries the name too (information only: two Macs may share one, §5.4). Before the read
 /// lands, when it failed, and for a number whose vault labels it could not read, Rename stays
 /// available, since the set checks the number itself, and the line names nothing of the window's
 /// view, which the read may outdate.
@@ -286,19 +293,44 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
         Snapshot::Read(read) => Some(&read.preview),
         Snapshot::Reading | Snapshot::Unread(_) => None,
     };
-    let also = |nick: &Nickname| {
-        if preview.is_some_and(|preview| preview.shared(nick)) {
-            format!(" Another Mac is called {} too.", nick.as_str())
-        } else {
-            String::new()
+    let expected = preview.and_then(|preview| {
+        use aterm_types::machine_name::GeneratedNames;
+        let name = preview.name();
+        match &to {
+            RenameTo::Name(to) => Some(GeneratedNames::new(
+                to.num,
+                to.nick.as_ref().unwrap_or(&name.nick),
+            )),
+            RenameTo::Nick(nickname) => {
+                name.num.map(|number| GeneratedNames::new(number, nickname))
+            }
+            _ => name
+                .num
+                .map(|number| GeneratedNames::new(number, &name.nick)),
         }
+    });
+    let requested_nick = match &to {
+        RenameTo::Nick(nick) => Some(nick),
+        RenameTo::Name(name) => name.nick.as_ref(),
+        _ => None,
     };
+    if let Some(nick) = requested_nick
+        && preview.is_some_and(|preview| preview.shared(nick))
+    {
+        return Line {
+            text: format!(
+                "The name {} is already used by another machine.",
+                nick.as_str()
+            ),
+            renames: false,
+        };
+    }
     let (text, renames) = match to {
         RenameTo::Keep => (
             match snapshot {
                 Snapshot::Reading => "Reading this Mac's name\u{2026}".to_owned(),
                 Snapshot::Unread(why) => format!(
-                    "This Mac's name could not be read here ({why}). Type a number or nickname; \
+                    "This Mac's name could not be read here ({why}). Type a number or name; \
                      Save checks it."
                 ),
                 Snapshot::Read(_) if held.waits => format!(
@@ -309,22 +341,20 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
                 Snapshot::Read(_) if held.unnumbered() => {
                     "This Mac has no number yet. Type one, such as m8.".to_owned()
                 }
-                Snapshot::Read(_) => "Edit the number or nickname.".to_owned(),
+                Snapshot::Read(_) => "Edit the number or name.".to_owned(),
             },
             true,
         ),
         RenameTo::Nick(nick) => (
             if held.read && held.unnumbered() {
                 format!(
-                    "This Mac has no number yet; Save makes its nickname {}.{}",
+                    "This Mac has no number yet; Save makes its name {}.",
                     nick.as_str(),
-                    also(&nick)
                 )
             } else {
                 format!(
-                    "Save keeps this Mac's number and makes its nickname {}.{}",
+                    "Save keeps this Mac's number and makes its name {}.",
                     nick.as_str(),
-                    also(&nick)
                 )
             },
             true,
@@ -368,18 +398,24 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
                     Err(why) => (sentence(&why), false),
                 },
             };
-            match (&to.nick, renames) {
-                (Some(nick), true) => (format!("{text}{}", also(nick)), true),
-                _ => (text, renames),
-            }
+            (text, renames)
         }
         RenameTo::Synchronize(number) => {
             (format!("Retry name synchronization for {number}."), true)
         }
+        RenameTo::Authorize => (
+            "Authorize naming only. The current saved name is read again after it finishes."
+                .to_owned(),
+            true,
+        ),
     };
     let text = match snapshot {
         Snapshot::Read(read) if let Some(status) = &read.naming => {
-            format!("{}\n\n{text}", status.text(&held.name))
+            let names = match expected.as_ref() {
+                Some(expected) => status.text_for(Some(expected), &held.name),
+                None => status.text(&held.name),
+            };
+            format!("{names}\n\n{text}")
         }
         _ => text,
     };
@@ -426,6 +462,25 @@ fn keep_read(slot: &mut Option<(u64, Snapshot)>, press: u64, snapshot: Snapshot)
     }
 }
 
+/// Discovery updates only status, never the name snapshot or either field's baseline.
+fn keep_discovery(
+    slot: &mut Option<(u64, Snapshot)>,
+    press: u64,
+    available: Result<bool, String>,
+) -> bool {
+    let Some((at, Snapshot::Read(read))) = slot else {
+        return false;
+    };
+    if *at != press {
+        return false;
+    }
+    let Some(naming) = &mut read.naming else {
+        return false;
+    };
+    naming.discovered(available);
+    true
+}
+
 /// End press `press` in `slot`: a later press's snapshot stays.
 fn close(slot: &mut Option<(u64, Snapshot)>, press: u64) {
     if slot.as_ref().is_some_and(|(at, _)| *at == press) {
@@ -433,7 +488,7 @@ fn close(slot: &mut Option<(u64, Snapshot)>, press: u64) {
     }
 }
 
-pub(crate) use macos::{Answer, ask, begin, deliver, end};
+pub(crate) use macos::{Answer, ask, begin, deliver, deliver_discovery, end};
 
 #[cfg(test)]
 mod tests;
@@ -448,11 +503,13 @@ mod macos {
     use crate::machine_title::MachineView;
 
     /// The accessory's width; each field row's height, and the line's.
-    const WIDTH: f64 = 380.0;
+    const WIDTH: f64 = 480.0;
     const LABEL_WIDTH: f64 = 72.0;
     const ROW: f64 = 24.0;
     const GAP: f64 = 8.0;
-    const LINE: f64 = 112.0;
+    const LINE_MIN: f64 = 24.0;
+    const LINE_MAX: f64 = 240.0;
+    const SCROLLER: f64 = 16.0;
 
     /// What the person answered Rename This Mac.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -473,12 +530,18 @@ mod macos {
         press: u64,
         held: Held,
         number: Obj,
-        /// The text aterm last put in the Number field ([`Field`]'s `opened`).
+        /// The text aterm last put in the Numeric ID field ([`Field`]'s `opened`).
         number_opened: Option<String>,
         nick: Obj,
-        /// The text aterm last put in the Nickname field.
+        /// The text aterm last put in the Name field.
         nick_opened: Option<String>,
         line: Obj,
+        scroll: Obj,
+        accessory: Obj,
+        alert: Obj,
+        number_label: Obj,
+        nick_label: Obj,
+        line_height: Cell<f64>,
         rename: Obj,
     }
 
@@ -550,6 +613,12 @@ mod macos {
         refresh();
     }
 
+    pub(crate) fn deliver_discovery(press: u64, available: Result<bool, String>) {
+        if SNAPSHOT.with_borrow_mut(|slot| super::keep_discovery(slot, press, available)) {
+            refresh();
+        }
+    }
+
     /// The name press `press`'s fields are judged against: its read's once that has landed, else
     /// the window's `view`.
     fn held_for(press: u64, view: &MachineView) -> Held {
@@ -605,15 +674,17 @@ mod macos {
             let Some(words) = appkit::nsstring(&words) else {
                 return;
             };
-            let retry = SNAPSHOT.with_borrow(|held| match held {
-                Some((at, snapshot)) if *at == open.press => matches!(
-                    super::request(snapshot, &open.held, &number, &nick),
-                    Ok(super::RenameTo::Synchronize(_))
-                ),
-                _ => false,
+            let primary = SNAPSHOT.with_borrow(|held| match held {
+                Some((at, snapshot)) if *at == open.press => {
+                    match super::request(snapshot, &open.held, &number, &nick) {
+                        Ok(super::RenameTo::Authorize) => "Authorize & Sync",
+                        Ok(super::RenameTo::Synchronize(_)) => "Retry Sync",
+                        _ => BUTTONS[0],
+                    }
+                }
+                _ => BUTTONS[0],
             });
-            let Some(button) = appkit::nsstring(if retry { "Retry Sync" } else { BUTTONS[0] })
-            else {
+            let Some(button) = appkit::nsstring(primary) else {
                 return;
             };
             // SAFETY: `-setStringValue:` is `-(void)(NSString *)` and copies its argument;
@@ -623,12 +694,85 @@ mod macos {
                 appkit::send_v_id(open.line.id(), sel!(setStringValue:), words.id());
                 appkit::send_v_bool(open.rename.id(), sel!(setEnabled:), renames);
                 appkit::send_v_id(open.rename.id(), sel!(setTitle:), button.id());
+                fit_status(open);
             }
         });
     }
 
+    /// Measure the actual wrapping cell, fit ordinary text, and scroll longer documents.
+    /// # Safety
+    /// Main thread; every view is retained by the live alert's Open record.
+    unsafe fn fit_status(open: &Open) {
+        // SAFETY: caller's contract; cellSizeForBounds has the same typed NSSize(NSRect)
+        // signature as the existing developer-tools native text measurement.
+        unsafe {
+            let cell = appkit::send_id(open.line.id(), sel!(cell));
+            if cell.is_null() {
+                return;
+            }
+            let measured = appkit::send_size_rect(
+                cell,
+                sel!(cellSizeForBounds:),
+                rect(0.0, 0.0, WIDTH - SCROLLER, f64::from(u16::MAX)),
+            )
+            .height;
+            if !measured.is_finite() || measured <= 0.0 {
+                return;
+            }
+            let document = (measured.ceil() + 4.0).max(LINE_MIN);
+            let shown = document.min(LINE_MAX);
+            appkit::send_v_rect(
+                open.line.id(),
+                sel!(setFrame:),
+                rect(0.0, 0.0, WIDTH - SCROLLER, document),
+            );
+            appkit::send_v_rect(
+                open.scroll.id(),
+                sel!(setFrame:),
+                rect(0.0, 0.0, WIDTH, shown),
+            );
+            let clip = appkit::send_id(open.scroll.id(), sel!(contentView));
+            if !clip.is_null() {
+                let y = if appkit::send_bool(open.line.id(), sel!(isFlipped)) {
+                    0.0
+                } else {
+                    (document - shown).max(0.0)
+                };
+                appkit::send_v_point(clip, sel!(scrollToPoint:), CGPoint { x: 0.0, y });
+                appkit::send_v_id(open.scroll.id(), sel!(reflectScrolledClipView:), clip);
+            }
+            if (shown - open.line_height.get()).abs() < 0.5 {
+                return;
+            }
+            open.line_height.set(shown);
+            let top = shown + GAP + ROW + GAP;
+            let field_x = LABEL_WIDTH + GAP;
+            let field_width = WIDTH - field_x;
+            for (view, frame) in [
+                (
+                    &open.number_label,
+                    rect(0.0, top + 2.0, LABEL_WIDTH, ROW - 4.0),
+                ),
+                (&open.number, rect(field_x, top, field_width, ROW)),
+                (
+                    &open.nick_label,
+                    rect(0.0, shown + GAP + 2.0, LABEL_WIDTH, ROW - 4.0),
+                ),
+                (&open.nick, rect(field_x, shown + GAP, field_width, ROW)),
+            ] {
+                appkit::send_v_rect(view.id(), sel!(setFrame:), frame);
+            }
+            appkit::send_v_rect(
+                open.accessory.id(),
+                sel!(setFrame:),
+                rect(0.0, 0.0, WIDTH, top + ROW),
+            );
+            appkit::send_v(open.alert.id(), sel!(layout));
+        }
+    }
+
     aterm_objc::declare_class! {
-        /// The Number and Nickname fields' delegate: each edit redraws the line.
+        /// The Number and Name fields' delegate: each edit redraws the line.
         pub(crate) struct RenameSheetTarget: NSObject {
             const NAME: &str = "ATermRenameSheetTarget";
             type Ivars = ();
@@ -662,12 +806,12 @@ mod macos {
     /// Main thread.
     unsafe fn label(words: &str, frame: CGRect) -> Option<Obj> {
         let words = appkit::nsstring(words)?;
-        // SAFETY: `+labelWithString:` is the documented non-raising factory, +0, retained here;
+        // SAFETY: `+wrappingLabelWithString:` is the documented non-raising factory, +0, retained here;
         // `-setFrame:` is `-(void)(NSRect)`; main thread (the caller's contract).
         unsafe {
             let label = Obj::retain(appkit::send_id_id(
                 class(c"NSTextField").as_id(),
-                sel!(labelWithString:),
+                sel!(wrappingLabelWithString:),
                 words.id(),
             ))?;
             appkit::send_v_rect(label.id(), sel!(setFrame:), frame);
@@ -695,9 +839,9 @@ mod macos {
         }
     }
 
-    /// Ask for this Mac's number and nickname: an alert titled `title` over `body`, over the live
+    /// Ask for this Mac's number and name: an alert titled `title` over `body`, over the live
     /// line for press `press` ([`begin`]), with Save/Retry Sync (Return) and Cancel (Escape). The Number
-    /// field holds `number` and the Nickname field `nick`, words the person typed at an earlier
+    /// field holds `number` and the Name field `nick`, words the person typed at an earlier
     /// press, which stay theirs; a field given `None` opens at the name held, `view`'s until the
     /// press's read lands, and follows that read ([`deliver`]). The person's ⌘X, ⌘C, ⌘V and ⌘A
     /// edit the field being edited, Tab moves between the two, and Return does nothing while
@@ -739,28 +883,28 @@ mod macos {
         };
         let target = RenameSheetTarget::alloc_init(mtm, ())?;
         let alert = crate::app_icon::alert(mtm)?;
-        let top = LINE + GAP + ROW + GAP;
+        let top = LINE_MIN + GAP + ROW + GAP;
         let field_x = LABEL_WIDTH + GAP;
         let field_width = WIDTH - field_x;
         // SAFETY: main thread (`mtm` above proves it), for `label` and `field`.
         let (number_label, number_field, nick_label, nick_field, words) = unsafe {
             (
-                label("Number", rect(0.0, top + 2.0, LABEL_WIDTH, ROW - 4.0))?,
+                label("Numeric ID", rect(0.0, top + 2.0, LABEL_WIDTH, ROW - 4.0))?,
                 field(
                     number.text(),
                     rect(field_x, top, field_width, ROW),
                     target.as_id(),
                 )?,
                 label(
-                    "Nickname",
-                    rect(0.0, LINE + GAP + 2.0, LABEL_WIDTH, ROW - 4.0),
+                    "Name",
+                    rect(0.0, LINE_MIN + GAP + 2.0, LABEL_WIDTH, ROW - 4.0),
                 )?,
                 field(
                     nick.text(),
-                    rect(field_x, LINE + GAP, field_width, ROW),
+                    rect(field_x, LINE_MIN + GAP, field_width, ROW),
                     target.as_id(),
                 )?,
-                label("", rect(0.0, 0.0, WIDTH, LINE))?,
+                label("", rect(0.0, 0.0, WIDTH - SCROLLER, LINE_MIN))?,
             )
         };
         // SAFETY: `+[NSView alloc]` then `-initWithFrame:` is +1, adopted into `Obj`, on the main
@@ -772,6 +916,25 @@ mod macos {
                 rect(0.0, 0.0, WIDTH, top + ROW),
             ))
         }?;
+        // A measured status document stays fully readable when long expected/actual names
+        // need more space than a compact alert. Only its viewport is bounded.
+        // SAFETY: main thread; NSScrollView initWithFrame returns +1, adopted into Obj.
+        let scroll = unsafe {
+            Obj::from_owned(appkit::send_id_rect(
+                appkit::alloc(class(c"NSScrollView")),
+                sel!(initWithFrame:),
+                rect(0.0, 0.0, WIDTH, LINE_MIN),
+            ))
+        }?;
+        // SAFETY: the live scroll view owns its document view; BOOL/NSUInteger/id signatures.
+        unsafe {
+            appkit::send_v_bool(scroll.id(), sel!(setDrawsBackground:), false);
+            appkit::send_v_bool(scroll.id(), sel!(setHasVerticalScroller:), true);
+            appkit::send_v_bool(scroll.id(), sel!(setHasHorizontalScroller:), false);
+            appkit::send_v_bool(scroll.id(), sel!(setAutohidesScrollers:), true);
+            appkit::send_v_usize(scroll.id(), sel!(setBorderType:), 0);
+            appkit::send_v_id(scroll.id(), sel!(setDocumentView:), words.id());
+        }
         // SAFETY: standard `NSAlert`, `NSView`, `NSTextField` and `NSButton` messages on the main
         // thread. `-setMessageText:` and `-setInformativeText:` copy their argument, so the +1
         // strings may drop at the end of this frame; `-addSubview:` and `-setAccessoryView:`
@@ -795,7 +958,7 @@ mod macos {
                 &number_field,
                 &nick_label,
                 &nick_field,
-                &words,
+                &scroll,
             ] {
                 appkit::send_v_id(accessory.id(), sel!(addSubview:), view.id());
             }
@@ -830,6 +993,12 @@ mod macos {
                     nick: nick_field.clone_retained(),
                     nick_opened: nick.opened().map(str::to_owned),
                     line: words.clone_retained(),
+                    scroll: scroll.clone_retained(),
+                    accessory: accessory.clone_retained(),
+                    alert: alert.clone_retained(),
+                    number_label: number_label.clone_retained(),
+                    nick_label: nick_label.clone_retained(),
+                    line_height: Cell::new(LINE_MIN),
                     rename: accept.clone_retained(),
                 }));
                 Opened

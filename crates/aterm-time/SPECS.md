@@ -3,13 +3,6 @@
 
 # aterm-time: spec recovery from its 8 unit tests
 
-> Status 2026-10-28: the 2 tests deleted by the tests-and-gates audit and the 4 non-spec tests
-> formerly in §4 are gone from the crate and from §2, leaving 8 live `#[test]` fns.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each spec in §1 is to be proved
-> through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted.
-
 Source: `crates/aterm-time` (read only). Every live `#[test]` (`src/lib.rs` 1 and
 `src/shim.rs` 7, for 8 in all) and the code each one reaches are mapped below.
 
@@ -31,7 +24,7 @@ Result: **9 specs**, covering **8 tests**. **0 remaining non-spec tests** (§4).
   over `Date.now()` on `wasm32-unknown-unknown`. Effect model: each call of `since_epoch` performs
   exactly one `now_w` read, and the accessors are stated per read.
 - **Gap labels.** Numbers are rows of the gap table in
-  `AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
+  `docs/TRUST-LANE.md` (Blocking gaps).
   Gap 0 (a seal that publishes Clean rows) blocks every spec and is not repeated per row. Two
   blockers are not rows of §7:
   - `F`: **an IEEE binary64 model in Trust/Clean.** That means `is_finite`, NaN/−0.0 comparison,
@@ -75,16 +68,6 @@ src/shim.rs	system_time_arithmetic_round_trips	time-systime-shift	time-from-js-m
 src/lib.rs	the_epoch_accessors_read_the_wall_clock	time-epoch-accessors	
 ```
 
-## 3. Coverage
-
-- 8 live tests; all 8 map to one of the 9 specs, and the 4 non-spec tests formerly in §4 are deleted.
-- Every spec but `time-from-js-millis` retires one primary test. `millisecond_conversion_is_total`
-  also checks that a reading beyond `u64::MAX` milliseconds saturates, a clause of `time-conv-exact`.
-  `time-from-js-millis` and `time-conv-exact` are also lemmas that the arithmetic tests use to build
-  their inputs.
-- When the tests that exercise them are gone, the shim specs remain the only statement of the
-  wasm clock's contract. That is the point: on native Trust the shim runs nowhere except tests.
-
 ## 4. Tests that are not spec samples
 
 None.
@@ -96,7 +79,7 @@ None.
    a clock that overflows to `+∞` reads as the time origin. The `!ms.is_finite() || ms <= 0.0` guard
    makes this deliberate. `time-conv-monotone-resolution` therefore quantifies over
    finite inputs only. If saturation is the intent for huge readings, `+∞` should saturate too.
-   That is an owner call, and the spec is written for the code as it is.
+   The spec is written for the code as it is.
 2. **Resolution test tightened (resolved 2026-10-27).** `resolution_survives_an_aged_time_origin`
    now asserts `b - a >= Duration::from_nanos(99_998)` for a `0.1 ms` step at `3.6e6 ms`, matching
    `time-conv-monotone-resolution`'s `< 2 ns` two-reading bound.
@@ -115,24 +98,3 @@ None.
    `[0, 1e6)`" is true only because of rounding. For `f = 1 − 2^-53` the real product rounds to the
    float just below `10^6`, not to `10^6`, because `10^6` is not a power of two and its ulp is `2^-33`.
    The bound is part of `time-conv-exact` and must be proved, not assumed.
-
-## 6. Proof order (easiest high-value first)
-
-Every spec needs gap 1 (newtype, `Option` and `Result` carriers) and gap 3 (calls into core
-`Duration`); `mod shim`'s `trust_verify` `cfg` gate is already active natively (§5.3). The specs
-with no floats and no effects come first:
-
-1. **`time-instant-difference`**. A newtype over `Duration`, `checked_sub`/`saturating_sub` and derived
-   order. Once Duration is modelled as `‖·‖ ∈ ℕ`, it is linear arithmetic. It is the template for the
-   other three arithmetic specs. Blocked by 1, 2, 3, 4, 6 and 12.
-2. **`time-instant-shift`** and **`time-systime-shift`** together. They have the same proof, and they
-   add the `&mut self` two-state form (gap 2) and the panic-as-precondition form of `+`/`−`.
-3. **`time-systime-duration-since`**. The same arithmetic, plus a `Result` and the `Display`
-   message (gap 1).
-4. **`time-from-js-millis`**. Trivial once conv has a contract to compose on.
-5. **`time-conv-total-floor`**, then **`time-conv-exact`**, then **`time-conv-monotone-resolution`**.
-   All three wait on the float model `F`. Proposing `F` as a new §7 row is the highest-leverage Trust
-   change this crate surfaces, since 3 of its 9 specs depend on it.
-6. **`time-epoch-accessors`** last for the wall-clock effect (gap 8); its pure
-   `duration_to_millis_saturating` and `*_at(w)` helpers are already factored out (§5.4) and can be
-   proved alongside items 1–3.

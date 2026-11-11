@@ -648,6 +648,17 @@ pub trait Ports: Sync {
     /// # Errors
     /// The label could not be resolved or `aterm.toml` could not be updated.
     fn sync_identity(&self) -> Result<String, String>;
+    /// Ordinary explicit setup's OS-only projection after its root work returned.
+    /// No target crosses that wait. `current` fences Stop and setup-record changes,
+    /// including immediately before each setter. `None` claims no saved target.
+    /// # Errors
+    /// The saved source, policy, current intent or existing permission is unavailable.
+    fn init_name(
+        &self,
+        _current: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     /// `sync.fleet`'s read.
     ///
     /// # Errors
@@ -799,6 +810,19 @@ pub trait Ports: Sync {
         Ok(crate::init::OwedClone::Nothing(
             "aterm init owes no clone".into(),
         ))
+    }
+    /// Fresh Off/Held admission before starting a clone. Native ports read control
+    /// policy without scanning checkouts; other ports retain their ordinary reading.
+    /// This grants no credential, source or checkout authority to the apply.
+    ///
+    /// # Errors
+    /// The applicable current controls cannot be read safely.
+    fn owed_clone_control(&self) -> Result<Option<String>, String> {
+        self.owed_clone(None, aterm_secrets::converge::RepositoryWork::Repair)
+            .map(|owed| match owed {
+                crate::init::OwedClone::Off(why) | crate::init::OwedClone::Held(why) => Some(why),
+                _ => None,
+            })
     }
     /// `sync.clone`'s apply: that step, run once ([`crate::init::clone_owed`]). The keychain
     /// row's retry is `sync.github`'s.
@@ -1005,6 +1029,15 @@ impl<'a> Synced<'a> {
         *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = Some(aside);
     }
 
+    /// Whether the engine still runs this row's refresh after the probe now reading: an
+    /// applying Refresh pass, before its apply said anything or stood aside.
+    fn refresh_ahead(&self) -> bool {
+        self.mode == Mode::Apply
+            && self.refresh_changes()
+            && self.detail().is_none()
+            && self.stood_aside().is_none()
+    }
+
     /// `sync.clone`'s row where its step was turned off (`why`): an apply forgets the clone
     /// `aterm init` owed, so turning the step on later clones nothing by itself; a plan only
     /// says so.
@@ -1022,14 +1055,11 @@ impl<'a> Synced<'a> {
     /// System State holds the vault (a Stop pressed while the row read what is owed), or holds
     /// GitHub repositories, or init.toml turned the step off, since. A clone can take half an
     /// hour, so the probe's reading is too old to start one over.
-    fn owed_clone_held(&self) -> Option<String> {
+    fn owed_clone_held(&self) -> Result<Option<String>, String> {
         if let Some(why) = self.ports.vault_held() {
-            return Some(why);
+            return Ok(Some(why));
         }
-        match self.read_owed_clone(aterm_secrets::converge::RepositoryWork::Repair) {
-            Ok(crate::init::OwedClone::Off(why) | crate::init::OwedClone::Held(why)) => Some(why),
-            _ => None,
-        }
+        self.ports.owed_clone_control()
     }
 
     fn read_owed_clone(
@@ -1259,6 +1289,31 @@ impl Item for Synced<'_> {
                         now: format!(
                             "{present}/{total} vault repositories verified on this machine"
                         ),
+                    },
+                    // This row's refresh reads those remotes anyway, so they are no clone owed
+                    // before it; its read-back must then verify them, or the row fails.
+                    crate::init::OwedClone::Unobserved {
+                        present,
+                        unborn,
+                        total,
+                    } if self.refresh_ahead() => Probe::Ok {
+                        now: format!(
+                            "{present}/{total} vault repositories verified on this machine, \
+                             {unborn} more checked out without a commit: this pass reads their \
+                             remotes"
+                        ),
+                    },
+                    crate::init::OwedClone::Unobserved {
+                        present,
+                        unborn,
+                        total,
+                    } => Probe::Change {
+                        from: format!(
+                            "{present}/{total} vault repositories verified on this machine, \
+                             {unborn} more checked out without a commit: their remotes are not \
+                             read yet"
+                        ),
+                        to: "their remotes read, as aterm init reads them".to_owned(),
                     },
                     crate::init::OwedClone::Off(why) | crate::init::OwedClone::Held(why) => {
                         not_applicable(why)
@@ -1505,7 +1560,7 @@ impl Item for Synced<'_> {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 said
             }
-            Kind::OwedClone => match self.owed_clone_held() {
+            Kind::OwedClone => match self.owed_clone_held()? {
                 // A Stop pressed, or the group turned off, since the row read what is owed holds
                 // the clone it has not begun (principle 4): the row reads it was not cloned.
                 Some(why) => {

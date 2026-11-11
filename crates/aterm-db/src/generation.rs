@@ -25,6 +25,9 @@ use aterm_secrets::{
     transport::Source,
 };
 use aterm_uds::private_file::{self, PrivateLock};
+
+mod retained;
+pub(crate) use retained::{ReadValidation, with_retained_session};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},

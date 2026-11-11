@@ -87,9 +87,9 @@ pub(crate) const fn is_chooser_kind(kind: usize) -> bool {
     is_key_kind(kind) || matches!(kind, 1..=4 | 25 | 26)
 }
 
-/// One native key or mouse event, as the main thread can tell a burst's or another process's
-/// apart from a person's in `-[NSApp currentEvent]`: its `NSEventType`, virtual keycode (0 for a
-/// mouse event) and timestamp (seconds since boot), and the process it came from
+/// One native key, modifier-change or mouse event, as the main thread can tell a burst's or
+/// another process's apart from a person's in `-[NSApp currentEvent]`: its `NSEventType`, virtual
+/// keycode (0 for a mouse event) and timestamp (seconds since boot), and the process it came from
 /// (`kCGEventSourceUnixProcessID`, read by `aterm_cg::event_source_pid`; [`HID_SYSTEM`] for a
 /// keyboard's key or a mouse's click).
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
@@ -309,11 +309,11 @@ pub(crate) fn current_event_origin() -> InputOrigin {
     current_input().map_or(InputOrigin::Person, classify)
 }
 
-/// Where this window callback came from ([`classify`]). The native source classifies a key, a
-/// click or a scroll before queueing a callback, including text an input method composes or
-/// commits. A retained person's verdict also masks an unrelated current event. Outside a
-/// retained window callback, a native reader can still classify the event AppKit is dispatching
-/// now.
+/// Where this window callback came from ([`classify`]). The native source classifies a key,
+/// modifier change, click or scroll before queueing a callback, including text an input method
+/// composes or commits. A retained person's verdict also masks an unrelated current event.
+/// Outside a retained window callback, a native reader can still classify the event AppKit is
+/// dispatching now.
 pub(crate) fn window_callback_origin() -> InputOrigin {
     #[cfg(test)]
     let retained = WINDOW_EVENT_ORIGIN_STUB.with(std::cell::Cell::get);

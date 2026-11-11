@@ -441,6 +441,31 @@ impl Journal {
         })
     }
 
+    /// Authenticate an existing read-only prefix while excluding local writers.
+    /// Retain the returned guard through the bounded local action that depends
+    /// on this view. Neither opening nor dropping it repairs or creates storage.
+    /// The journal remains read-only; lock custody grants no mutation authority.
+    ///
+    /// # Errors
+    /// Missing or non-private custody, changed lock identity, invalid retained
+    /// history, or a local writer still active at `deadline` (`JournalBusy`).
+    pub fn read_retained_until(
+        dir: &Path,
+        trust: Trust,
+        deadline: std::time::Instant,
+    ) -> Result<(aterm_journal::ReadGuard, Self)> {
+        let guard = aterm_journal::ReadGuard::take(dir, NAME, deadline).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                Error::of_kind(crate::ErrorKind::JournalBusy, error.to_string())
+            } else {
+                Error::from(error)
+            }
+        })?;
+        let journal = Self::read_existing(dir, trust)?;
+        guard.check()?;
+        Ok((guard, journal))
+    }
+
     /// Whether this handle holds the exclusive writer, not a read-only view.
     pub const fn is_writer(&self) -> bool {
         self.log.is_some()

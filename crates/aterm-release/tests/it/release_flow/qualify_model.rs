@@ -10,7 +10,7 @@
 //! match the world's. The negative controls replay the defects the model's laws exist for and
 //! must be refused.
 
-use super::{BTreeSet, BUMP, Branch, Half, World, bump, mac};
+use super::{BTreeSet, Branch, Half, World, bump, mac};
 
 use aterm_models_release::release_qualify_model;
 use aterm_spec::derive::Model;
@@ -203,7 +203,6 @@ fn every_qualify_run_the_release_makes_is_a_path_of_the_model() {
             "build red before the tree starts",
             |w| {
                 w.build_claims_late = true;
-                w.records.insert((BUMP.into(), None, "lint".into()), "ok");
             },
             None,
         ),
@@ -286,7 +285,6 @@ fn every_qualify_run_the_release_makes_is_a_path_of_the_model() {
             agrees(&r, &w, case);
         }
     }
-    let _ = BUMP;
 }
 
 /// NEGATIVE CONTROLS: the defects the model's laws are for, replayed, are each refused — the

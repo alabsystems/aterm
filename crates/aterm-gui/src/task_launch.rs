@@ -2545,8 +2545,8 @@ pub(crate) fn claude_starter_in(
     }
 }
 
-/// The starter's row and the login [`claude_starter_in`] moves a worker to, or `None` where it
-/// keeps the starter's.
+/// The name of the account the starter runs on and the login [`claude_starter_in`] moves a
+/// worker to, or `None` where it keeps the starter's.
 fn claude_pick(
     starter: &aterm_agent::harness::worker::Starter,
     seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
@@ -2562,18 +2562,36 @@ fn claude_pick(
         return Ok(None);
     }
     let roster = seat.bound_roster(cli)?;
-    if !roster.several() || accounts::judged_label(&roster, &who).is_none() {
+    let login = starter_login(starter, seat, &roster);
+    if !roster.several() || login.reconciled(&roster).row().is_none() {
         return Ok(None);
     }
     let (state, _) = seat.store(cli).load_judged(seat.now, &roster)?;
     let enrolled = accounts::enrolled_for(cli, &roster);
     let Some((from, row)) =
-        accounts::claude_worker_move(&roster, &state, &enrolled, &who, mode, seat.now)
+        accounts::claude_worker_move(&roster, &state, &enrolled, &login, mode, seat.now)
     else {
         return Ok(None);
     };
     let env = accounts_pool::login_env(cli, row, seat.home).map_err(|why| why.to_string())?;
-    Ok(Some((from.to_owned(), env)))
+    Ok(Some((from.shown_name().to_owned(), env)))
+}
+
+/// The login a Claude Code worker of `starter` would run on in `seat`'s home: what the starter's
+/// carried environment makes the roster believe beside what the login file it selects says
+/// ([`aterm_agent::harness::observe::Login::claude`]). A plain starter carries none, which is
+/// the default home's login, whichever account that file names.
+fn starter_login(
+    starter: &aterm_agent::harness::worker::Starter,
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    roster: &aterm_agent::harness::accounts::Roster,
+) -> aterm_agent::harness::observe::Login {
+    let env: Vec<String> = starter
+        .env
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    aterm_agent::harness::observe::Login::claude(&env, Some(seat.home), roster)
 }
 
 /// Until when (unix seconds) the Claude Code login a worker of `starter` would start on
@@ -2592,14 +2610,11 @@ pub(crate) fn claude_worker_wall(
         return None;
     }
     let cli = accounts::Cli::Claude;
-    let who = accounts::ProcessLogin::of_env_for(
-        cli,
-        starter.env.iter().map(|(n, v)| (n.as_str(), v.as_str())),
-    );
     let roster = seat.bound_roster(cli).ok()?;
-    let row = roster.row(accounts::judged_label(&roster, &who)?)?;
+    let login = starter_login(starter, seat, &roster);
+    let row = login.reconciled(&roster).row()?;
     let (state, _) = seat.store(cli).load(seat.now).ok()?;
-    let enrolled = accounts::enrolled_for(cli, &roster);
+    let enrolled = login.enrolled(&roster, &accounts::enrolled_for(cli, &roster));
     match accounts::condition(row, &state, enrolled.contains(&row.label), seat.now) {
         accounts::Condition::Limited { until } => Some(until),
         accounts::Condition::NotEnrolled

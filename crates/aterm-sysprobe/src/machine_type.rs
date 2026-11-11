@@ -55,10 +55,17 @@ const PLACEHOLDERS: &[&str] = &[
 /// and digits (an underscore between them allowed, as HP's `103C_5336AN`) with at least six
 /// digits; or with a configure-to-order `CTO` or a world-wide `WW` in it, as Lenovo writes its
 /// machine type (`21K9CTO1WW`); or set in capitals throughout, eight characters or more with
-/// three digits or more, as Lenovo's other machine types (`81YK00EUUS`).
+/// three digits or more, as Lenovo's other machine types (`81YK00EUUS`); or MSI's board model,
+/// `MS-` and four letters or digits (`MS-7D25`).
 #[must_use]
 pub fn is_code(field: &str) -> bool {
     let t = field.trim();
+    let msi_board = t
+        .strip_prefix("MS-")
+        .is_some_and(|id| id.len() == 4 && id.bytes().all(|b| b.is_ascii_alphanumeric()));
+    if msi_board {
+        return true;
+    }
     if t.is_empty() || !t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return false;
     }

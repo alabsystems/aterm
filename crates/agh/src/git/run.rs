@@ -94,6 +94,10 @@ pub enum GitOp {
         into: String,
         /// Read without any credential, including for a release-tier owner.
         anonymous: bool,
+        /// Retain full commit/tree ancestry and only the selected tree's blobs.
+        checkout_closure: bool,
+        /// A screened source of already-held immutable blobs, with no ref authority.
+        checkout_cache: Option<PathBuf>,
     },
     /// Fetch an admitted exact snapshot with one network transfer. Ref batches atomically
     /// publish their private cache refs after every OID matches; object imports publish none.
@@ -312,8 +316,25 @@ impl GitRun {
                 reference: reference.to_string(),
                 into: into.to_string(),
                 anonymous,
+                checkout_closure: false,
+                checkout_cache: None,
             },
         )
+    }
+
+    /// Limit an exact immutable fetch to ancestry and the selected checkout.
+    #[must_use]
+    pub fn with_checkout_closure(mut self, cache: Option<&Path>) -> GitRun {
+        if let GitOp::FetchRef {
+            checkout_closure,
+            checkout_cache,
+            ..
+        } = &mut self.op
+        {
+            *checkout_closure = true;
+            *checkout_cache = cache.map(Path::to_path_buf);
+        }
+        self
     }
 
     /// Fetch an entire admitted snapshot without moving caller branches, tags,
@@ -692,8 +713,16 @@ mod unix {
                 )))
             }
             GitOp::FetchRef {
-                reference, into, ..
+                reference,
+                into,
+                checkout_closure,
+                ..
             } => {
+                if *checkout_closure && !crate::path::is_sha(reference) {
+                    return Err(Error::usage(
+                        "checkout closure requires an exact immutable commit",
+                    ));
+                }
                 if !(crate::path::is_sha(reference)
                     || (reference.starts_with("refs/") && crate::path::ref_name_ok(reference)))
                 {
@@ -2423,16 +2452,115 @@ mod unix {
         )
     }
 
-    /// Keep promisor configuration private. Import only a newly generated metadata pack;
-    /// the caller receives neither a remote nor authority to lazily fetch missing blobs.
-    fn fetch_main_blobless(
+    fn checkout_blob_ids(
+        commit: &str,
+        mut list: impl FnMut(&str, bool) -> Result<ChildOut>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        use std::collections::BTreeSet;
+        let mut trees = vec![commit.to_owned()];
+        let mut visited = BTreeSet::new();
+        let mut blobs = BTreeSet::new();
+        while let Some(tree) = trees.pop() {
+            if !visited.insert(tree.clone()) {
+                continue;
+            }
+            let mut recursive = true;
+            let mut rows = list(&tree, recursive)?;
+            if rows.stdout_may_be_truncated() {
+                recursive = false;
+                rows = list(&tree, recursive)?;
+            }
+            if rows.stdout_may_be_truncated()
+                || (!rows.stdout.is_empty() && rows.stdout.last() != Some(&0))
+            {
+                return Err(Error::protocol(
+                    "checkout tree exceeds the complete inventory bound",
+                ));
+            }
+            for row in rows
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|row| !row.is_empty())
+            {
+                let text = std::str::from_utf8(row)
+                    .map_err(|_| Error::protocol("invalid checkout tree object row"))?;
+                let (kind, oid) = text
+                    .split_once(' ')
+                    .filter(|(_, oid)| crate::path::is_sha(oid))
+                    .ok_or_else(|| Error::protocol("invalid checkout tree object identity"))?;
+                match kind {
+                    "blob" => {
+                        blobs.insert(oid.to_owned());
+                    }
+                    "tree" if !recursive => trees.push(oid.to_owned()),
+                    // Gitlinks belong to their independent indexed source owner.
+                    "commit" => {}
+                    _ => return Err(Error::protocol("unexpected checkout tree object kind")),
+                }
+            }
+        }
+        Ok(blobs)
+    }
+
+    fn checkout_missing_blobs(
+        children: &Children<'_>,
+        scratch: Option<&Path>,
+        key: &[u8],
+        batch: &[String],
+        input: &[u8],
+    ) -> Result<String> {
+        let key = [key, b"\ninspect cached blob types"].concat();
+        let result = children.git_input(
+            &[
+                os("cat-file"),
+                os("--batch-check=%(objectname) %(objecttype)"),
+            ],
+            scratch,
+            &key,
+            input,
+        )?;
+        if result.code != Some(0) || result.stdout_may_be_truncated() {
+            return Err(Error::protocol(
+                "could not inspect the complete checkout cache batch",
+            ));
+        }
+        let text = std::str::from_utf8(&result.stdout)
+            .map_err(|_| Error::protocol("invalid checkout cache object response"))?;
+        let mut rows = text.lines();
+        let mut missing = String::new();
+        for oid in batch {
+            match rows.next().and_then(|row| row.split_once(' ')) {
+                Some((observed, "blob")) if observed == oid => {}
+                Some((observed, "missing")) if observed == oid => {
+                    missing.push_str(oid);
+                    missing.push('\n');
+                }
+                _ => {
+                    return Err(Error::protocol(
+                        "checkout cache object identity or type differs",
+                    ));
+                }
+            }
+        }
+        if rows.next().is_some() {
+            return Err(Error::protocol("unexpected checkout cache object response"));
+        }
+        Ok(missing)
+    }
+
+    /// Keep promisor configuration private. Import complete commit/tree ancestry and,
+    /// for checkout closure, only the immutable selected tree's blob bodies.
+    fn fetch_tree_scope(
         children: &Children<'_>,
         run: &GitRun,
         remote: &Remote,
         dir: &Path,
         into: &str,
+        checkout: Option<(&str, Option<&Path>)>,
     ) -> Result<ChildOut> {
-        let dir = screened(children, run, dir)?;
+        let mut children = children.clone();
+        children.env.push((os("GIT_NO_LAZY_FETCH"), os("1")));
+        let dir = screened(&children, run, dir)?;
         let canonical = crate::fx::canon::git_request(run);
         let scratch = children.scratch_git.as_deref();
         let step = |name: &str, args: Vec<OsString>, cwd: Option<&Path>| -> Result<ChildOut> {
@@ -2469,7 +2597,10 @@ mod unix {
                 os("--recurse-submodules=no"),
                 os("--filter=blob:none"),
                 os(remote.url()),
-                os("+refs/heads/main:refs/agh/source"),
+                os(format!(
+                    "+{}:refs/agh/source",
+                    checkout.map_or("refs/heads/main", |(commit, _)| commit)
+                )),
             ],
             scratch,
         )?;
@@ -2487,7 +2618,35 @@ mod unix {
             .and_then(|s| s.strip_suffix('\n'))
             .filter(|s| crate::path::is_sha(s))
             .ok_or_else(|| Error::protocol("invalid metadata commit"))?;
-        let prefix = Path::new(common).join("objects/pack/pack");
+        if checkout.is_some_and(|(expected, _)| expected != oid) {
+            return Err(Error::protocol(
+                "checkout closure returned a different commit",
+            ));
+        }
+        let object_directory = Path::new(common).join("objects");
+        let pack_directory = object_directory.join("pack");
+        let quarantine = if checkout.is_some() {
+            for directory in [&object_directory, &pack_directory] {
+                let metadata = std::fs::symlink_metadata(directory)
+                    .map_err(|error| Error::local(format!("checkout pack directory: {error}")))?;
+                if !metadata.is_dir() {
+                    return Err(Error::refused("checkout pack directory must be physical"));
+                }
+            }
+            Some(
+                aterm_tempfile::Builder::new()
+                    .prefix(".agh-checkout-")
+                    .suffix(".noindex")
+                    .tempdir_in(&pack_directory)
+                    .map_err(|error| Error::local(format!("checkout pack quarantine: {error}")))?,
+            )
+        } else {
+            None
+        };
+        let prefix = quarantine
+            .as_ref()
+            .map_or(pack_directory.as_path(), aterm_tempfile::TempDir::path)
+            .join("pack");
         let key = [canonical.as_slice(), b"\nstep metadata-pack"].concat();
         let packed = children
             .git_input(
@@ -2536,7 +2695,128 @@ mod unix {
             ],
             scratch,
         )?;
+        let mut verified_packs = vec![hash.to_owned()];
+        if let Some((_, cache)) = checkout {
+            if let Some(cache) = cache {
+                let cache = screened(&children, run, cache)?;
+                let view = step("checkout-cache", source_view_args(&cache), None)?;
+                let (common, shallow) = source_view(&view.stdout)?;
+                if shallow {
+                    return Err(Error::refused(
+                        "checkout cache must have complete commit ancestry",
+                    ));
+                }
+                lend_objects(scratch, common, false)?;
+            }
+            let blobs = checkout_blob_ids(oid, |tree, recursive| {
+                let mut args = vec![
+                    os("ls-tree"),
+                    os("-z"),
+                    os("--format=%(objecttype) %(objectname)"),
+                ];
+                if recursive {
+                    args.push(os("-r"));
+                }
+                args.push(os(tree));
+                step("checkout-tree", args, scratch)
+            })?;
+            let blobs: Vec<_> = blobs.into_iter().collect();
+            for (index, batch) in blobs.chunks(16_384).enumerate() {
+                let mut input = batch.join("\n");
+                input.push('\n');
+                let fetch_key = [
+                    canonical.as_slice(),
+                    format!("\nstep checkout-fetch {index}").as_bytes(),
+                ]
+                .concat();
+                let pack_key = [
+                    canonical.as_slice(),
+                    format!("\nstep checkout-pack {index}").as_bytes(),
+                ]
+                .concat();
+                let missing = if cache.is_some() {
+                    checkout_missing_blobs(&children, scratch, &fetch_key, batch, input.as_bytes())?
+                } else {
+                    input.clone()
+                };
+                if !missing.is_empty() {
+                    let fetched = children
+                        .remote_read(
+                            run,
+                            &[
+                                os("fetch"),
+                                os("--quiet"),
+                                os("--no-tags"),
+                                os("--no-write-fetch-head"),
+                                os("--recurse-submodules=no"),
+                                os("--stdin"),
+                                os(remote.url()),
+                            ],
+                            scratch,
+                            &fetch_key,
+                            Some(missing.as_bytes()),
+                        )
+                        .map_err(unsent)?;
+                    if fetched.code != Some(0) {
+                        return Err(failed(
+                            &run.op,
+                            &fetched,
+                            children.gh.redactor(),
+                            &run.slug,
+                            false,
+                        ));
+                    }
+                }
+                let packed = children
+                    .git_input(
+                        &[
+                            os("-c"),
+                            os("protocol.allow=never"),
+                            os("pack-objects"),
+                            os("--quiet"),
+                            os("--threads=1"),
+                            prefix.as_os_str().to_owned(),
+                        ],
+                        scratch,
+                        &pack_key,
+                        input.as_bytes(),
+                    )
+                    .map_err(unsent)?;
+                let hash = std::str::from_utf8(&packed.stdout)
+                    .ok()
+                    .and_then(|value| value.strip_suffix('\n'))
+                    .filter(|value| packed.code == Some(0) && crate::path::is_sha(value))
+                    .ok_or_else(|| {
+                        Error::protocol("could not pack the complete checkout blob batch")
+                    })?;
+                step(
+                    "checkout-verify",
+                    vec![
+                        os("-c"),
+                        os("protocol.allow=never"),
+                        os("index-pack"),
+                        os("--verify"),
+                        prefix
+                            .with_file_name(format!("pack-{hash}.pack"))
+                            .into_os_string(),
+                    ],
+                    scratch,
+                )?;
+                verified_packs.push(hash.to_owned());
+            }
+        }
         cache_parents(Path::new(common), into)?;
+        if let Some(quarantine) = &quarantine {
+            for hash in &verified_packs {
+                for extension in ["pack", "idx"] {
+                    let name = format!("pack-{hash}.{extension}");
+                    std::fs::hard_link(quarantine.path().join(&name), pack_directory.join(&name))
+                        .map_err(|error| {
+                        Error::local(format!("install verified checkout pack: {error}"))
+                    })?;
+                }
+            }
+        }
         step(
             "update",
             vec![
@@ -2998,6 +3278,36 @@ mod unix {
             }
             Ok(out)
         };
+        let forward_main = |before: &str, after: &str| -> Result<()> {
+            if before == after {
+                return Ok(());
+            }
+            // A release clone need not contain a concurrent land. Fetch exact
+            // remote objects into the private view, never into the source.
+            checked(
+                "retry-main-fetch",
+                vec![
+                    os("fetch"),
+                    os("--quiet"),
+                    os("--no-tags"),
+                    os("--no-write-fetch-head"),
+                    os("--recurse-submodules=no"),
+                    os("--filter=blob:none"),
+                    os(remote.url()),
+                    os(before),
+                    os(after),
+                ],
+                children.scratch_git.as_deref(),
+            )?;
+            // Hash original commit bodies and walk their actual parents. A
+            // source alternate or an accelerator must not invent ancestry.
+            if !ancestry::witnessed_local_path(children, run, &dir, before, after)? {
+                return Err(Error::could_not_run(
+                    "remote main did not provably advance fast-forward during push preparation",
+                ));
+            }
+            Ok(())
+        };
         if batch.control().is_some() {
             let origin = checked(
                 "control-source-origin",
@@ -3061,6 +3371,11 @@ mod unix {
         let mut list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
         list.extend(guards.iter().map(|reference| os(*reference)));
         let listed = checked("remote", list, scratch)?;
+        if listed.stdout_may_be_truncated() {
+            return Err(Error::protocol(
+                "remote refs exceed the complete output bound",
+            ));
+        }
         let text = std::str::from_utf8(&listed.stdout)
             .map_err(|_| Error::protocol("git returned non-UTF-8 refs"))?;
         let mut found = BTreeMap::new();
@@ -3089,6 +3404,18 @@ mod unix {
                 found.get(crate::git::RELEASE_LEASE_REF).copied(),
                 found.get(crate::git::PUBLISHER_FENCE_REF).copied(),
             )?;
+        }
+        if let NativeRefBatch::Ordinary(batch) = &batch
+            && let Some(expected) = batch.observed_main()
+            && found.get("refs/heads/main").copied() != Some(expected)
+        {
+            let main = found.get("refs/heads/main").ok_or_else(|| {
+                Error::could_not_run("remote main disappeared during push preparation")
+            })?;
+            forward_main(expected, main)?;
+            return Err(Error::could_not_run(
+                "the remote inventory changed outside the requested refs; their expected values are unchanged",
+            ).with_sub(Sub::GitInventoryChanged { main: (*main).into() }));
         }
         // Only freshly observed remote objects can exclude an old object
         // closure. Source refs, grafts, replacement objects and accelerator
@@ -3526,10 +3853,41 @@ mod unix {
         let mut final_list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
         final_list.extend(guards.iter().map(|reference| os(*reference)));
         let final_refs = checked("remote-final", final_list, scratch)?;
+        if final_refs.stdout_may_be_truncated() {
+            return Err(Error::protocol(
+                "remote refs exceed the complete output bound",
+            ));
+        }
+        let final_text = std::str::from_utf8(&final_refs.stdout)
+            .map_err(|_| Error::protocol("git returned non-UTF-8 refs"))?;
+        let mut final_found = BTreeMap::new();
+        for line in final_text.lines() {
+            let (oid, reference) = line
+                .split_once('\t')
+                .ok_or_else(|| Error::protocol("git returned malformed refs"))?;
+            if !crate::path::is_sha(oid)
+                || !guards.contains(&reference)
+                || final_found.insert(reference, oid).is_some()
+            {
+                return Err(Error::protocol("git returned unexpected or duplicate refs"));
+            }
+        }
         if final_refs.stdout != listed.stdout {
             // The inventory also guards main and sibling control refs, so a
             // changed inventory does not prove an expected-old mismatch.
-            return Err(inventory_change(batch.updates(), &final_refs.stdout));
+            let mut error = inventory_change(batch.updates(), &final_refs.stdout);
+            if error.kind == Kind::CouldNotRun {
+                let main = final_found.get("refs/heads/main").copied();
+                if let (Some(before), Some(after)) = (found.get("refs/heads/main"), main) {
+                    forward_main(before, after)?;
+                    // Only the caller can re-evaluate its policy against main.
+                    // Uncertain-receive recovery never emits this marker.
+                    error = error.with_sub(Sub::GitInventoryChanged {
+                        main: after.to_owned(),
+                    });
+                }
+            }
+            return Err(error);
         }
         let mut args = vec![
             os("-c"),
@@ -3619,6 +3977,15 @@ mod unix {
                     stdout: b"remote re-read confirmed all requested refs\n".to_vec(),
                     stderr: Vec::new(),
                 });
+            }
+            // A main-bound claim may restart selection only before receive.
+            // A read of BEFORE cannot exclude a delayed commit or an ABA, and
+            // a different holder cannot turn our uncertain send into an unsent
+            // conflict. Keep its intent open unless every requested AFTER was
+            // confirmed above; never repeat receive behind the caller's policy.
+            if matches!(&batch, NativeRefBatch::Ordinary(batch) if batch.observed_main().is_some())
+            {
+                return Err(error);
             }
             if observed != found {
                 let partial = batch.updates().iter().any(|u| {
@@ -3805,7 +4172,7 @@ mod unix {
                 blobless,
             } => {
                 if *blobless {
-                    let out = fetch_main_blobless(children, run, remote, dir, into)?;
+                    let out = fetch_tree_scope(children, run, remote, dir, into, None)?;
                     return Ok(GitOut {
                         stdout: kept(&out.stdout, redactor),
                         stderr: kept(&out.stderr, redactor),
@@ -3832,9 +4199,22 @@ mod unix {
                 dir,
                 reference,
                 into,
+                checkout_closure,
+                checkout_cache,
                 ..
             } => {
-                let out = fetch_exact(children, run, remote, dir, reference, into)?;
+                let out = if *checkout_closure {
+                    fetch_tree_scope(
+                        children,
+                        run,
+                        remote,
+                        dir,
+                        into,
+                        Some((reference, checkout_cache.as_deref())),
+                    )?
+                } else {
+                    fetch_exact(children, run, remote, dir, reference, into)?
+                };
                 return Ok(GitOut {
                     stdout: kept(&out.stdout, redactor),
                     stderr: kept(&out.stderr, redactor),

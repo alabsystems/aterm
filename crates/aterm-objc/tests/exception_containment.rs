@@ -9,7 +9,7 @@
     reason = "aterm-objc's own runtime tests drive the bare `msg` cast; everything else uses checked_msg"
 )]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use aterm_objc::{
@@ -207,6 +207,46 @@ fn a_raise_inside_a_declared_method_is_contained_and_every_drop_runs() {
     assert!(
         mine.ordinal > before,
         "the record carries the count after this containment"
+    );
+}
+
+#[test]
+fn an_objective_c_unwind_runs_drops_without_marking_a_rust_panic() {
+    struct PanicState {
+        dropped: Arc<AtomicBool>,
+        panicking: Arc<AtomicBool>,
+    }
+    impl Drop for PanicState {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+            self.panicking
+                .store(std::thread::panicking(), Ordering::SeqCst);
+        }
+    }
+
+    install_sink();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let panicking = Arc::new(AtomicBool::new(false));
+    let result = autoreleasepool(|_| {
+        aterm_objc::exception::contain("foreign unwind panic state", || {
+            let _state = PanicState {
+                dropped: Arc::clone(&dropped),
+                panicking: Arc::clone(&panicking),
+            };
+            raise(
+                "ATermForeignUnwindPanicState",
+                "the drop must not see a Rust panic",
+            );
+        })
+    });
+    assert!(result.is_err(), "the Objective-C exception was contained");
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the foreign unwind ran Rust Drop"
+    );
+    assert!(
+        !panicking.load(Ordering::SeqCst),
+        "an Objective-C unwind must not make thread::panicking true"
     );
 }
 

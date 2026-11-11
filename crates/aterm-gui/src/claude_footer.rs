@@ -3292,7 +3292,6 @@ fn resolve_facts_at_with_cwd(
                 tail,
                 fold,
                 clock,
-                crate::harness_host::harness_state().as_deref(),
                 (asks.home)().as_deref(),
             )
         });

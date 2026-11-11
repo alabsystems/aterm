@@ -69,6 +69,7 @@ aterm-messages = { workspace = true }
 aterm-netplace = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 aterm-journal.workspace = true
 aterm-dirfd.workspace = true
 # O_NOFOLLOW / O_NONBLOCK for admitted reads.

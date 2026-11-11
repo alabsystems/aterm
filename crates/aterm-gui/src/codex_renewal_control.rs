@@ -1530,7 +1530,7 @@ mod tests {
             "native_coordination": true,
             "native_completed_prepare": root.native_prepare,
         });
-        aterm_agent::harness::upgrade_models::write_atomic_mode(
+        aterm_agent::harness::atomic_write::write_atomic_mode(
             &native_dir.join(&file),
             &retained.to_string(),
             Some(0o600),
@@ -1550,7 +1550,7 @@ mod tests {
             "native_noexec_prepare".into(),
             aterm_json::Value::from(root.native_prepare.clone()),
         );
-        aterm_agent::harness::upgrade_models::write_atomic_mode(
+        aterm_agent::harness::atomic_write::write_atomic_mode(
             &native_dir.join(&file),
             &retained.to_string(),
             Some(0o600),

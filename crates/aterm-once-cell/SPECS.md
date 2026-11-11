@@ -35,7 +35,7 @@ a spec**: the 8 §4 checks that sampled no spec are deleted.
 - `Hist` is any linearizable history of calls, from any number of threads, on one
   `sync::OnceCell` or on a `sync::Lazy` or `race::OnceBox` built on it.
 - `blocking_gaps` numbers are rows of the gap table in
-  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes Clean
+  `docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (a seal that publishes Clean
   rows) blocks every row.
 
 ## 1. Specs (TSV)
@@ -130,29 +130,3 @@ stepping stone but retires no test.
    with a runtime sample, `lazy_new_is_unbounded_in_f_the_way_wasm_bindgen_needs` and
    `lazy_is_sync_when_upstream_says_it_is`, are deleted: their derefs are what
    `lazy_does_not_run_its_initialiser_until_forced` and `unsync_lazy_forces_once_and_derefs` check.
-
-## 6. Proof order (easiest high-value first)
-
-No spec here is blocked by gap 0 alone. Every function is generic (gap 11) and almost every one takes
-a closure (gap 13). So the first step is the Trust work on those two gaps. Until it lands, a
-monomorphic instance (`T = u32`, a concrete closure type) can serve as a stepping stone, but it does
-not retire a test.
-
-1. **`unsync-oncecell-refines-cellmodel`**: sequential, no threads and no `Mutex`. It is a thin
-   wrapper over `core::cell::OnceCell` (gaps 1, 2, 4, 11, 12, 13). It establishes CellModel and the
-   ghost `Calls(f)` pattern that every other spec reuses.
-2. **`sync-oncecell-refines-cellmodel`**: the same CellModel over `OnceLock` plus the gate. Stated
-   sequentially, it needs only a library model of `Mutex` lock/unlock (gap 8). It retires 3 tests and
-   is the contract wgpu-core depends on.
-3. **`oncebox-refines-cellmodel`** and **`lazy-refines-lazymodel`**: compositions over steps 1 and 2
-   (gap 4). Together they retire 4 tests.
-4. **`cell-debug-eq-clone-shapes`**: it needs no closures and no threads, but it does need models of
-   `core::fmt` (gaps 1, 3, 12). It is cheap once the carriers exist.
-5. **`unsync-reentrant-init-panics`**, then **`sync-panic-leaves-cell-empty-and-unpoisoned`**: these
-   need panic and unwind edges (gap 8).
-6. **`sync-init-exactly-once-concurrent`**: `OnceCellGateProtocol` (`ty_model!` in
-   `crates/aterm-models-core/src/models_kernels.rs`) and its conformance + ungated-`OnceLock`
-   negative-control test (`sync_once_cell_gate_conformance_and_ungated_negative_control` in
-   `tests/behaviour.rs`) are now authored and checked ahead of Trust's concurrency lane (gaps 10,
-   13). Do not delete the three contention tests until the proof about the compiled code is
-   Certified.

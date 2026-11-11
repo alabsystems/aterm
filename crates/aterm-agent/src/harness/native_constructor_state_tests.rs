@@ -22,8 +22,6 @@ fn completed_predecessor_and_positive_noexec_survive_target_rotation_and_reload(
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -124,7 +122,6 @@ fn completed_predecessor_and_positive_noexec_survive_target_rotation_and_reload(
         Some(prior),
         &Version::parse("2.1.318").unwrap(),
         &candidate,
-        None,
         Proc::default(),
         900,
     );
@@ -233,7 +230,6 @@ fn retarget_and_restart_preserve_the_entire_unresolved_native_operation() {
             Some(prior.clone()),
             &Version::parse("2.0.0").unwrap(),
             &candidate,
-            None,
             Proc::default(),
             900,
         );

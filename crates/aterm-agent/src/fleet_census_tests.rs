@@ -736,7 +736,9 @@ fn reported(pool: &str, id: &str, condition: &str, walled_until: Option<i64>) ->
 /// THE CENSUS SAYS WHETHER ROTATION CAN AND DOES HAPPEN, from what the Macs report, so it needs no
 /// pool file: with none, it used to print "short by 0 accounts" and "0h lost" of a fleet at its
 /// walls. A wall with nothing to move to is short by one; a wall with a second signed-in account,
-/// an account nobody signed in to, a Mac with no sessions and one not heard for a day are not.
+/// an account nobody signed in to, a Mac with no sessions and one not heard for a day are not. A
+/// Mac the vault heard today whose facts are older than a day is named as unknown, never counted
+/// (m8 on 2026-11-10 held the fleet's only rotation, and the census said 0 of 44).
 #[test]
 fn the_census_reads_rotation_from_what_macs_report_with_no_pool_file() {
     let now: u64 = 1_800_000_000;
@@ -773,6 +775,14 @@ fn the_census_reads_rotation_from_what_macs_report_with_no_pool_file() {
     });
     let mut unread = mac("m8", 1, 60, vec![reported("kimi", "l", "usable", None)]);
     unread.facts.accounts_unread = vec!["claude".to_owned()];
+    // Facts two days old say nothing newer of the Mac: only the vault heard it today.
+    let mut stale = mac(
+        "m6",
+        1,
+        2 * HEARD_24H_S,
+        vec![reported("claude", "y", "limited", wall)],
+    );
+    stale.facts.window_last = Some(now - 2 * HEARD_24H_S);
     inputs.heartbeats = vec![
         mac(
             "m2",
@@ -789,13 +799,14 @@ fn the_census_reads_rotation_from_what_macs_report_with_no_pool_file() {
         failed,
         unread,
         mac("m5", 0, 60, vec![reported("claude", "x", "limited", wall)]),
-        mac(
-            "m6",
-            1,
-            2 * HEARD_24H_S,
-            vec![reported("claude", "y", "limited", wall)],
-        ),
+        stale,
     ];
+
+    inputs.server_heard.push(ServerHeardFact {
+        vault: "alab".to_owned(),
+        subject: "m6".to_owned(),
+        at: now - 60,
+    });
 
     let census = SwarmCensus::compute(&inputs);
     let summary = &census.summary;
@@ -803,6 +814,7 @@ fn the_census_reads_rotation_from_what_macs_report_with_no_pool_file() {
     assert_eq!(summary.shortfall_accounts, 1);
     let rotation = summary.rotation.as_ref().expect("a rotation summary");
     assert_eq!((rotation.macs, rotation.unread), (5, 1));
+    assert_eq!(rotation.silent, ["m6"], "heard today, facts two days old");
     assert_eq!(rotation.two_logins, ["m3"]);
     assert_eq!(
         (rotation.reporting, rotation.moved_7d, rotation.unproven_7d),
@@ -820,8 +832,9 @@ fn the_census_reads_rotation_from_what_macs_report_with_no_pool_file() {
     assert!(
         human.contains(
             "rotation: 1 of 5 Macs with sessions hold two signed-in accounts of one CLI (m3), 1 of \
-             them could not read a pool; 1 of the 3 that report moves moved in 7 days (1 tried with \
-             no proof it worked), last 2027-01-15T07:58:20Z"
+             them could not read a pool, and 1 more heard within a day sent no facts newer than a \
+             day (m6), so what they hold is unknown; 1 of the 3 that report moves moved in 7 days \
+             (1 tried with no proof it worked), last 2027-01-15T07:58:20Z"
         ),
         "{human}"
     );

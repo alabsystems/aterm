@@ -47,6 +47,8 @@ pub(crate) use marks::{paint_mark, paint_surface};
 pub(crate) enum Chip {
     /// Read as wanted.
     InPlace,
+    /// The prior useful reading was in place; this is explicitly not current evidence.
+    LastKnown,
     /// Managed and differs; `busy` while its step runs.
     WillChange { busy: bool },
     /// A step waits for aterm to try it again, or for Check again (a stage aterm parked): calm,
@@ -65,6 +67,7 @@ impl Chip {
     pub(crate) fn spoken(self) -> &'static str {
         match self {
             Self::InPlace => "in place",
+            Self::LastKnown => "in place as last read",
             Self::WillChange { busy: false } => "will change",
             Self::WillChange { busy: true } => "changing now",
             Self::Waiting => "waiting",
@@ -94,6 +97,13 @@ pub struct SetupStatus {
     /// The latest read-only reading of each row, keyed by subject (at most one
     /// per subject). Rows with no reading yet are absent.
     pub observed: Vec<aterm_types::macos_setup::Observation>,
+    /// Presentation history only. Never used as current readiness or admission.
+    pub last_known: Vec<aterm_types::macos_setup::Observation>,
+    /// Subjects whose latest attempted reading supplied no current evidence.
+    pub unconfirmed_observations: Vec<Subject>,
+    /// The subjects being read or retained for an accepted read.
+    /// Each entry carries its vault source, and whether it is queued rather than reading.
+    pub observing: Vec<(Subject, Option<String>, bool)>,
     /// The vault source the Secrets and Repositories readings describe.
     /// Unknown sources never supply those rows to a review.
     pub observed_vault_url: Option<String>,
@@ -338,6 +348,30 @@ impl SetupStatus {
         self.observed
             .iter()
             .filter(move |observation| !observation.subject.uses_vault_source() || source_matches)
+    }
+
+    fn last_known_for(&self, vault_url: Option<&str>, subject: Subject) -> Option<&Observation> {
+        let source_matches = vault_url.map(str::trim).is_some_and(|source| {
+            !source.is_empty() && self.observed_vault_url.as_deref().map(str::trim) == Some(source)
+        });
+        self.last_known
+            .iter()
+            .find(|row| row.subject == subject && (!subject.uses_vault_source() || source_matches))
+    }
+
+    fn observation_progress(&self, subject: Subject, vault_url: Option<&str>) -> Option<bool> {
+        self.observing
+            .iter()
+            .filter(|(reading, source, _)| {
+                *reading == subject
+                    && (!subject.uses_vault_source()
+                        || source
+                            .as_deref()
+                            .zip(vault_url.map(str::trim))
+                            .is_some_and(|(source, shown)| !shown.is_empty() && source == shown))
+            })
+            .map(|(_, _, queued)| *queued)
+            .reduce(|a, b| a && b)
     }
 
     /// Whether a reading that failed is a signal now (§3.6): never while the run still
@@ -1706,6 +1740,8 @@ pub(crate) enum RowValue {
     Change { now: String, wanted: String },
     /// One value: read as wanted, or nothing to compare it with.
     One(String),
+    /// A useful previous reading, displayed without supplying current authority.
+    LastKnown(String),
     /// The read value of a row aterm leaves as is, in muted ink.
     Muted(String),
 }
@@ -1820,10 +1856,109 @@ fn row_view_as(
     vault_url: Option<&str>,
     review: bool,
 ) -> RowView {
-    let name = subject.name();
+    let mut row = row_view_current(subject, status, selection, vault_url, review, None);
+    // History is a display value only: Off/hold/not-needed rules above it stay
+    // current, and no old reading supplies a button or settled standing below.
+    if !row.managed || matches!(row.value, RowValue::Muted(_)) || status.newer() {
+        return row;
+    }
+    let progress = status.observation_progress(subject, vault_url);
+    let checking = progress.is_some();
+    let unconfirmed = status.unconfirmed_observations.contains(&subject);
     let reading = status
         .observations_for(vault_url)
-        .find(|observation| observation.subject == subject);
+        .find(|seen| seen.subject == subject);
+    let missing = unconfirmed || reading.is_none_or(|seen| seen.standing == Standing::Unknown);
+    let previous = status.last_known_for(vault_url, subject);
+    let progress = if progress == Some(true) {
+        "A new reading is queued."
+    } else {
+        "Checking again…"
+    };
+    if missing && let Some(previous) = previous {
+        let value = if previous.standing == Standing::AtLogin {
+            previous.wanted.clone()
+        } else {
+            previous.now.clone().unwrap_or_else(|| "—".into())
+        };
+        row.value = RowValue::LastKnown(value.clone());
+        let current_error = !unconfirmed
+            && matches!(
+                row.chip,
+                Some(Chip::Failed | Chip::NeedsYou | Chip::Waiting)
+            );
+        if !current_error {
+            row.chip = previous.standing.settled().then_some(Chip::LastKnown);
+            row.standing = Some(Standing::Unknown);
+        }
+        // The value cell and reserved page caption carry history/checking;
+        // adding a note to every open row would move the page during a Check.
+        row.note = row.note.or_else(|| {
+            row_view_current(
+                subject,
+                status,
+                selection,
+                vault_url,
+                review,
+                Some(previous),
+            )
+            .note
+        });
+        let current = if current_error {
+            row.label
+        } else {
+            format!("{}: no current reading", subject.name())
+        };
+        let latest = if checking {
+            progress
+        } else {
+            "No current reading is available."
+        };
+        row.label = format!("{current}. Last read: {value}. {latest}");
+        if !current_error {
+            row.open = None;
+            row.turn_on_sync = false;
+            row.install_tools = false;
+            row.copy_command = false;
+        }
+    } else if checking {
+        if row.chip == Some(Chip::InPlace) {
+            row.chip = Some(Chip::LastKnown);
+            row.standing = Some(Standing::Unknown);
+            if let RowValue::One(value) = &row.value {
+                row.value = RowValue::LastKnown(value.clone());
+            }
+        }
+        row.label.push_str(&format!(", as last read. {progress}"));
+    }
+    if matches!(
+        row.standing,
+        Some(Standing::Failed | Standing::Waiting | Standing::NeedsYou | Standing::Differs)
+    ) && let Some(previous) = previous
+        && let Some(value) = previous.now.as_deref()
+    {
+        if reading.is_none_or(|seen| seen.now.is_none()) {
+            row.value = RowValue::LastKnown(value.to_owned());
+        }
+        row.label.push_str(&format!(". Previously read: {value}."));
+    }
+    row
+}
+
+fn row_view_current(
+    subject: Subject,
+    status: &SetupStatus,
+    selection: Selection,
+    vault_url: Option<&str>,
+    review: bool,
+    previous: Option<&Observation>,
+) -> RowView {
+    let name = subject.name();
+    let reading = previous.or_else(|| {
+        status
+            .observations_for(vault_url)
+            .find(|observation| observation.subject == subject)
+    });
     let wanted = reading.map_or_else(|| subject.wanted().to_owned(), |o| o.wanted.clone());
     let now = reading
         .and_then(|o| o.now.clone())
@@ -2755,9 +2890,33 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
         }
         return Headline::waiting_on(status, &waiting);
     }
+    let progress = rows
+        .iter()
+        .filter_map(|row| {
+            status.observation_progress(row.subject, plan.map(|plan| plan.vault_url.as_str()))
+        })
+        .reduce(|a, b| a && b);
+    if let Some(queued) = progress {
+        return Headline::line(if queued {
+            "Waiting to read this Mac…"
+        } else {
+            CHECKING
+        });
+    }
+    let past_unread = rows.iter().any(|row| {
+        row.managed
+            && row.standing == Some(Standing::Unknown)
+            && matches!(row.value, RowValue::LastKnown(_))
+    });
     // Readings still to come, or a saved setup aterm reads again by itself, whose calm line
     // says so: nothing is claimed of a plan the worker could not read just now.
-    if status.observed.is_empty() || status.plan_unread() {
+    if (status.observed.is_empty()
+        && !past_unread
+        && !rows
+            .iter()
+            .any(|row| row.managed && status.unconfirmed_observations.contains(&row.subject)))
+        || status.plan_unread()
+    {
         return Headline::line(CHECKING);
     }
     // Past a person and a failure, a row not yet as wanted differs or waits.
@@ -2796,7 +2955,19 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     // shows it, where its note says to Check again.
     let unread: Vec<Subject> = rows
         .iter()
-        .filter(|row| row.managed && row.standing == Some(Standing::Unknown) && row.note.is_some())
+        .filter(|row| {
+            row.managed
+                && row.standing == Some(Standing::Unknown)
+                && (status.unconfirmed_observations.contains(&row.subject)
+                    || (row.note.is_some()
+                        && (!matches!(row.value, RowValue::LastKnown(_))
+                            || status
+                                .observations_for(plan.map(|plan| plan.vault_url.as_str()))
+                                .any(|seen| {
+                                    seen.subject == row.subject
+                                        && (seen.note.is_some() || seen.detail.is_some())
+                                }))))
+        })
         .map(|row| row.subject)
         .collect();
     if let Some(first) = unread.first() {
@@ -2805,6 +2976,9 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             show: Some(*first),
             ..Headline::line(format!("Could not read: {}", names.join(", ")))
         };
+    }
+    if past_unread {
+        return Headline::line("Current reading unavailable");
     }
     // A source change can leave just its managed rows unread. Known changes
     // and waits above stay useful, but unread rows cannot establish success.
@@ -4697,8 +4871,12 @@ pub(crate) const GITHUB_TOKEN_REFUSED: &str = aterm_types::macos_setup::GITHUB_T
 /// test that sweeps the scenarios sweeps it. `older-cancel` is a Cancel an older aterm recorded.
 /// Debug and dev-seam builds only.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
-pub(crate) const FIXTURES: [&str; 66] = [
+pub(crate) const FIXTURES: [&str; 70] = [
     "checking",
+    "check-last-known",
+    "check-last-known@mac",
+    "check-last-known-idle@mac",
+    "check-last-known-failed@mac",
     "account-provisioning",
     "plan-unread",
     "vault-source-mismatch",
@@ -4863,6 +5041,30 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
     }
     match name {
         "checking" => {}
+        "check-last-known" | "check-last-known-idle" | "check-last-known-failed" => {
+            // A Check retires current readings while retaining useful presentation history.
+            status.last_known = in_place();
+            if name == "check-last-known" {
+                status.observing = status
+                    .last_known
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.subject,
+                            row.subject
+                                .uses_vault_source()
+                                .then(|| all.vault_url.clone()),
+                            false,
+                        )
+                    })
+                    .collect();
+            } else if name == "check-last-known-failed" {
+                status.observed = vec![Observation {
+                    note: Some("The latest keyboard settings could not be read".into()),
+                    ..setting(Setting::CapsLock, Failed, None)
+                }];
+            }
+        }
         "plan-unread" => {
             status.plan = None;
             status.observed_vault_url = None;

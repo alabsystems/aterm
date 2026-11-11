@@ -66,75 +66,11 @@ pub(super) trait AgyKernel: Kernel {
     fn prompts_since(&self, st: &St, since: u64) -> Option<Vec<String>> {
         live::prompts_look(Path::new(&st.agy_config), &st.thread, since)
     }
-    /// What the reading on record makes of a running agy's `model` (its `--model`; `None`: agy's
-    /// default) as `exe` under the relaunch's `env` and config `flags`, asking agy nothing
-    /// ([`crate::harness::agy_quota_store::rotate_worker_on_record`]); `None` in a kernel that
-    /// reads no quota.
-    fn quota_pick(
-        &self,
-        _model: Option<&str>,
-        _exe: &Path,
-        _env: &[(String, String)],
-        _flags: &[String],
-    ) -> Option<crate::harness::agy_quota::Pick> {
-        None
-    }
-
-    /// [`Self::quota_pick`], or with `at_wall` (`agy` is stopped at a quota wall on screen) the
-    /// wall's read ([`crate::harness::agy_quota_store::rotate_worker_at_wall`]).
-    fn quota_pick_at(
-        &self,
-        model: Option<&str>,
-        exe: &Path,
-        env: &[(String, String)],
-        flags: &[String],
-        _at_wall: bool,
-    ) -> Option<crate::harness::agy_quota::Pick> {
-        self.quota_pick(model, exe, env, flags)
-    }
 }
 
 impl AgyKernel for Live {
     fn alive(&self, pid: u32) -> bool {
         alive(pid)
-    }
-
-    fn quota_pick(
-        &self,
-        model: Option<&str>,
-        exe: &Path,
-        env: &[(String, String)],
-        flags: &[String],
-    ) -> Option<crate::harness::agy_quota::Pick> {
-        let _ = exe;
-        crate::harness::agy_quota_store::rotate_worker_on_record(
-            model,
-            env,
-            flags,
-            crate::supervise::limit::unix_now(),
-        )
-        .map(|l| l.pick)
-    }
-
-    fn quota_pick_at(
-        &self,
-        model: Option<&str>,
-        exe: &Path,
-        env: &[(String, String)],
-        flags: &[String],
-        at_wall: bool,
-    ) -> Option<crate::harness::agy_quota::Pick> {
-        if !at_wall {
-            return self.quota_pick(model, exe, env, flags);
-        }
-        crate::harness::agy_quota_store::rotate_worker_at_wall(
-            model,
-            exe,
-            env,
-            flags,
-            crate::supervise::limit::unix_now(),
-        )
-        .map(|l| l.pick)
     }
 
     fn args(&self, pid: u32) -> Option<atpkg::caller_shell::ProcArgs> {
@@ -1331,19 +1267,6 @@ fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) ->
     turn_verdict(&head)
 }
 
-/// The outcome line of a relaunch agy's quota moved onto another model.
-fn rotated_outcome(st: &St, tail: &str) -> Option<String> {
-    st.cause
-        .strip_prefix(super::super::relaunch::CAUSE_MODEL)
-        .filter(|m| !m.is_empty())
-        .map(|model| {
-            format!(
-                "agy moved onto {model} by its quota (on {}) · the same conversation resumed{tail}",
-                st.to
-            )
-        })
-}
-
 /// Carry the relaunched TUI `new`, or record a quiet upgrade without typing. Under Cruise and Land
 /// alike the prompt goes once the current composer, custody, settling, person-hold, foreground and
 /// who-spoke-first checks pass, with Cruise's done check under Cruise alone; a reply that defends
@@ -1507,14 +1430,7 @@ fn carry_on(
     st.resumed_pid = new;
     st.resumed_on.clone_from(&st.to);
     st.done_at = now_s();
-    let rotated_tail = if st.quiet && !typed {
-        ", nothing typed"
-    } else {
-        ""
-    };
-    st.outcome = if let Some(rotated) = rotated_outcome(st, rotated_tail) {
-        rotated
-    } else if st.quiet {
+    st.outcome = if st.quiet {
         format!(
             "agy upgraded to {} (from {}) · the same conversation resumed, nothing typed",
             st.to, st.from

@@ -94,17 +94,12 @@ impl Fixture {
 }
 
 #[test]
-fn upgrades_recover_cardinality_before_reading_model_and_tap_policy() {
+fn upgrades_recover_cardinality_before_reading_tap_policy() {
     for (before, after) in [(1, 2), (2, 1), (0, 2), (2, 0)] {
         for tap in [false, true] {
             let f = Fixture::new(before);
             f.pending(after);
             let opts = f.opts(tap);
-            assert_eq!(
-                opts.several_logins,
-                after > 1,
-                "{before} -> {after}, tap={tap}"
-            );
             if let Some(armed) = opts.usage_tap {
                 assert_eq!(armed.listed.len(), if after > 1 { after } else { 0 });
                 assert_eq!(armed.lone_login.is_some(), after == 1);
@@ -117,30 +112,16 @@ fn upgrades_recover_cardinality_before_reading_model_and_tap_policy() {
 }
 
 #[test]
-fn unreadable_upgrade_policy_cannot_enable_home_evidence_or_a_default_tap() {
+fn an_unreadable_upgrade_policy_cannot_arm_a_default_tap() {
     for tap in [false, true] {
         let f = Fixture::new(1);
         std::fs::write(&f.path, "[[account]").unwrap();
         let opts = f.opts(tap);
-        assert!(opts.several_logins, "unknown is restrictive");
         assert!(
             opts.usage_tap.is_none(),
             "unknown cannot name the default login"
         );
     }
-}
-
-#[test]
-fn model_reporting_recovers_even_without_a_usage_tap() {
-    let f = Fixture::new(1);
-    f.pending(2);
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    assert_eq!(
-        run_upgrade_models(&f.env, None, &mut out, &mut err),
-        ExitCode::SUCCESS
-    );
-    assert_eq!(std::fs::read_to_string(&f.path).unwrap(), f.roster(2));
-    assert!(!out.is_empty());
 }
 
 #[test]
@@ -368,7 +349,7 @@ fn a_launch_policy_is_retained_and_absent_records_create_no_storage() {
     assert!(policy.several_logins);
     assert_eq!(policy.usage_tap.as_ref().unwrap().listed, directories);
     assert!(
-        !f.opts(true).several_logins,
+        f.opts(true).usage_tap.unwrap().lone_login.is_some(),
         "a new decision observes the changed roster"
     );
     assert!(!f.store.dir.exists());

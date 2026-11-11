@@ -270,7 +270,11 @@ impl NameRecord {
         let nick = if has(6) {
             let len = usize::from(r.u8()?);
             let text = std::str::from_utf8(r.take(len)?).map_err(|_| Malformed::Field("nick"))?;
-            Some(Nickname::parse(text).map_err(|_| Malformed::Field("nick"))?)
+            let nick = Nickname::parse(text).map_err(|_| Malformed::Field("nick"))?;
+            if nick.as_str() != text {
+                return Err(Malformed::Field("nick"));
+            }
+            Some(nick)
         } else {
             None
         };

@@ -27,6 +27,7 @@ use crate::common;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod abrupt_stop_tests;
 mod commit_ancestry_tests;
+mod inventory_retry_tests;
 
 /// Exercise the real CLI entry and its signal-to-collector handoff. The fake Git waits for
 /// a release file, so even the old orphaning CLI can be cleaned without signalling a guessed
@@ -344,6 +345,129 @@ fn push_batch(rows: &[(&str, &str, &str)]) -> agh::github::refs::AtomicRefBatch 
 }
 
 const ABSENT: &str = "0000000000000000000000000000000000000000";
+
+#[test]
+fn native_writes_survive_exhausted_core_and_still_require_git_write_authority() {
+    use agh::git::{ControlRefChange, ControlRefTransaction, RELEASE_LEASE_REF};
+    use agh::policy::{RouteRequest, RouteTarget};
+    use agh::rate::{RateBook, RateSnapshot};
+    use agh_fake::git_backend::GitHttpBackend;
+    use agh_fake::{Fault, Match};
+
+    for authorized in [true, false] {
+        let world = reader_world("native-core-exhausted");
+        let source = bare_repo(world.path(), "source");
+        host_git(
+            &source,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/fixture-dev/app.git",
+            ],
+        );
+        let sha = host_git(&source, &["rev-parse", "main"]);
+        let writer = if authorized { "dev" } else { "another-writer" };
+        let backend = GitHttpBackend::start(
+            "fixture-dev/app",
+            &source,
+            &agh_fake::token("reader"),
+            &agh_fake::token(writer),
+        )
+        .unwrap();
+        let now = live_start();
+        let book = RateBook::at(world.dirs.rate());
+        book.record(
+            &agh::identity::fingerprint(agh_fake::token("dev").as_bytes()),
+            &RateSnapshot {
+                resource: "core".into(),
+                limit: 5000,
+                remaining: 0,
+                reset: now + 3600,
+                used: 5000,
+            },
+        );
+        world.fake.fault_always(
+            Match::api("/"),
+            Fault::Status {
+                status: 403,
+                body: r#"{"message":"API rate limit exceeded"}"#.into(),
+                headers: vec![("x-ratelimit-remaining".into(), "0".into())],
+            },
+        );
+        let ports = world.fake.ports();
+        let gh = git_builder(
+            world.router.clone(),
+            Endpoints::loopback(ports.api, ports.uploads, backend.port(), ports.cdn),
+            &world.dirs,
+            git_env(),
+            now,
+        )
+        .rate_book(book)
+        .build();
+        let slug = common::slug("fixture-dev/app");
+        let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+        let journal = gh.journal(&slug).unwrap();
+        let batch = push_batch(&[("refs/tags/release", ABSENT, &sha)]);
+        let claim = ControlRefTransaction::new(
+            &sha,
+            vec![ControlRefChange {
+                reference: RELEASE_LEASE_REF.into(),
+                before: None,
+                after: Some(sha.clone()),
+            }],
+        )
+        .unwrap();
+        let before = host_git(backend.repository(), &["show-ref"]);
+        let checked = gh.refs(&slug).check_push(&permit, &source, &batch);
+        let control_checked =
+            gh.refs(&slug)
+                .check_control(&permit, &source, &claim, Duration::from_secs(60));
+        let pushed = gh
+            .refs(&slug)
+            .push_atomic(&permit, &source, &batch, &journal)
+            .and_then(agh::write::Outcome::into_result);
+        let claimed = gh
+            .refs(&slug)
+            .push_control(&permit, &source, &claim, &journal, Duration::from_secs(60))
+            .and_then(agh::write::Outcome::into_result);
+        eprintln!(
+            "native quota regression authorized={authorized} operations=4 rest_calls={}",
+            gh.meter().requests,
+        );
+        if authorized {
+            checked.unwrap();
+            control_checked.unwrap();
+            pushed.unwrap();
+            claimed.unwrap();
+            assert_eq!(
+                host_git(backend.repository(), &["rev-parse", "refs/tags/release"]),
+                sha
+            );
+            assert_eq!(
+                host_git(backend.repository(), &["rev-parse", RELEASE_LEASE_REF]),
+                sha
+            );
+        } else {
+            // Negative control: core independence cannot grant Git authority.
+            for error in [
+                checked.unwrap_err(),
+                control_checked.unwrap_err(),
+                pushed.unwrap_err(),
+                claimed.unwrap_err(),
+            ] {
+                assert_eq!(error.kind, Kind::Unauthenticated, "{error:?}");
+                assert_eq!(error.side_effect, SideEffect::None);
+            }
+            assert_eq!(host_git(backend.repository(), &["show-ref"]), before);
+        }
+        assert!(
+            world.fake.seen().is_empty(),
+            "native writes issued REST calls"
+        );
+        assert_eq!(gh.meter().requests, 0);
+    }
+}
 
 #[test]
 fn native_push_preserves_exact_objects_to_an_empty_remote_and_changes_no_local_state() {
@@ -3086,6 +3210,84 @@ fn exact_object_import_checks_the_remote_and_creates_no_caller_refs() {
     ))
     .unwrap();
     assert_eq!(host_git(&receiver, &["rev-parse", "refs/agh/control"]), oid);
+}
+
+/// `repo fetch --objects` imports an exact blob (a partial clone's missing file) and publishes
+/// no ref; combined with `--input` it is refused before anything runs.
+#[test]
+fn cli_object_import_brings_an_exact_blob_and_no_ref() {
+    let world = World::canonical("git-cli-object-import");
+    common::canonical_repos(&world.fake);
+    let work = world.path().join("app-work");
+    std::fs::create_dir_all(&work).unwrap();
+    host_git(&work, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(work.join("version.rs"), "pub const V: u32 = 3;\n").unwrap();
+    host_git(&work, &["add", "version.rs"]);
+    host_git(&work, &["commit", "--quiet", "-m", "one"]);
+    let blob = host_git(&work, &["rev-parse", "main:version.rs"]);
+    let remote = world.path().join("app.git");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            "app-work",
+            &remote.to_string_lossy(),
+        ],
+    );
+    let receiver = world.path().join("receiver.git");
+    host_git(
+        world.path(),
+        &["init", "--quiet", "--bare", &receiver.to_string_lossy()],
+    );
+    let objects = world.path().join("objects.json");
+    std::fs::write(&objects, aterm_json::json!([blob]).to_string()).unwrap();
+    let rows = world.path().join("rows.json");
+    std::fs::write(&rows, "[]").unwrap();
+    let run = |extra: &[&str]| {
+        let (ctx, captured) = common::ctx(world.path(), &world.fake, git_env());
+        let mut ctx = ctx
+            .with_git_helper(common::helper())
+            .with_git_remote("fixture-dev/app", &remote);
+        ctx.fx = Arc::new(Fx::simulated(live_start()));
+        let mut args = vec![
+            "repo",
+            "fetch",
+            "fixture-dev/app",
+            receiver.to_str().unwrap(),
+            "--objects",
+            objects.to_str().unwrap(),
+        ];
+        args.extend(extra);
+        (common::run_cli(&mut ctx, &args), captured)
+    };
+    let has_blob = || {
+        let out = aterm_uds::spawnfd::command(host_git_path())
+            .args([
+                "--git-dir",
+                &receiver.to_string_lossy(),
+                "cat-file",
+                "-e",
+                &blob,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output()
+            .unwrap();
+        out.status.success()
+    };
+    // NEGATIVE CONTROL: the mixed form is a usage refusal and imports nothing.
+    let (exit, captured) = run(&["--input", rows.to_str().unwrap()]);
+    assert_ne!(exit, 0, "{}", captured.stderr_text());
+    assert!(!has_blob());
+    let (exit, captured) = run(&[]);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert!(has_blob(), "the exact blob was imported");
+    assert_eq!(
+        host_git(&receiver, &["for-each-ref"]),
+        "",
+        "an object import publishes no ref"
+    );
 }
 
 #[test]

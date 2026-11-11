@@ -559,15 +559,5 @@ impl Drop for VoidCookie<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::Error;
-
-    #[test]
-    fn only_the_stream_error_is_the_transport_failing() {
-        assert!(Error::Connection(1).is_transport_failure());
-        for code in 2..=7 {
-            assert!(!Error::Connection(code).is_transport_failure(), "{code}");
-        }
-        assert!(!Error::RequestTooLarge.is_transport_failure());
-    }
-}
+#[path = "conn_tests.rs"]
+mod tests;

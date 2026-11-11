@@ -11,10 +11,10 @@ Source: `crates/aterm-winsign/src/lib.rs`, which holds all 22 `#[test]` function
 Result: **19 specs**, covering **22 tests**. **No test is outside a spec** (§4).
 
 Gap numbers are the rows of the table in
-`AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
+`docs/TRUST-LANE.md` (Blocking gaps).
 Gap 0 (a seal that publishes Clean rows) is a prerequisite for every row, so the
 `blocking_gaps` column leaves it out. Seal `150efe4a` closes it for local work
-(`PLAN-tests-to-specs-2026-10-15.md` (historical internal plan)), but
+(`docs/TRUST-LANE.md`), but
 it has not been admitted to the machine's `trust` channel. **No spec here is blocked by gap 0
 alone.** Every one needs gap 1 (non-scalar carriers), because the crate works on `&str`,
 `String`, `Vec`, `PathBuf`, `Option` and enums throughout.
@@ -117,17 +117,6 @@ src/lib.rs	a_trusted_signing_sign_passes_dotnet_root_for_a_user_local_runtime	wi
 src/lib.rs	verify_reports_an_untrusted_chain_with_exit_one_even_when_inactive	winsign-run-verify-verdict	winsign-run-exit-classes, winsign-verify-flags
 ```
 
-## 3. Coverage
-
-- 22 tests read: 22 map to one of the 19 specs.
-- The biggest collapses are `winsign-verify-leaf` (1 primary test, 4 in all) and
-  `winsign-verify-flags` (2 primary, 4 in all). The run specs share 5 tests among 3 specs.
-- `winsign-default-timestamp` and `winsign-config-lane` have no primary test. Each is sampled only
-  as a side assertion of another test, but both are needed before that test can be deleted:
-  `sign_args_per_lane_…` checks the default URLs, and `precedence_…` checks lane inference.
-- Once `winsign-run-*` are proved, the test-only `Fake` host and its `win_path` canonicaliser
-  have no remaining user and are deleted too.
-
 ## 4. Tests that are not spec samples
 
 None left. `the_fake_spells_paths_the_way_the_windows_machine_it_models_would` tested `win_path`, a
@@ -151,26 +140,3 @@ Count by action: delete 0.
    `the_active_tier_refuses_…` assert exact `RefusalReason` variants rather than error prose substrings.
 6. **Fixed (2026-10-28): metadata file removal and PID are routed through `Host` (`Host::remove_file`,
    `Host::pid`).** `run_with_tier` performs zero filesystem or process queries outside `&dyn Host`.
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone. Every one needs gap 1, so the order is chosen by what else
-each one needs.
-
-1. **`winsign-default-timestamp`** (gap 1 only). An enum match returning a `&'static str`. It is
-   the smallest gap-1 carrier probe in the repo (an enum in, a string literal out), and it frees
-   half of `sign_args_per_lane_…`.
-2. **`winsign-judge`** (gaps 1, 3). A pure function over a 4-bool + `Option<String>` record, with
-   an enum match and early returns. It is the security core of Tier WINDOWS: it retires
-   `the_active_tier_refuses_…` and is the last link of `winsign-pin-is-leaf`.
-3. **`winsign-tier-from`** (gaps 1, 3, 12). Trivial once `&str` emptiness is a carrier fact. Cite
-   `anchor_active` across crates, or inline its `a.is_empty()` test to drop gap 12.
-4. **`winsign-verify-flags`** (gaps 1, 3). Four substring facts and one `Option<i32>` compare, with
-   no loops. Retires two tests and is a lemma of `winsign-pin-is-leaf`.
-5. **`winsign-sign-verify-args`** (gaps 1, 3, 7). Straight-line `Vec<String>` construction plus
-   one `extend` over a map. It pins the SHA-256 and timestamp flags that Code Integrity requires.
-
-Then `winsign-verify-leaf` → `winsign-pin-is-leaf`; this pair is the highest-value property in the
-crate, since it ensures a pin can only ever match the leaf. Then `winsign-win-join` and
-`winsign-versions-newest-first`, the finders, and the config specs. The three `winsign-run-*`
-specs come last. They wait on gap 8 (§5.1 and §5.6 are already in place).

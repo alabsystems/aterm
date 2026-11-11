@@ -237,15 +237,5 @@ pub(super) fn build(request: &Request, inputs: &Inputs, work: &Path) -> Result<P
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gnu_builder_does_not_claim_an_older_runtime_than_its_headers() {
-        assert!(admitted_glibc("glibc 2.39\n"));
-        assert!(admitted_glibc("glibc 2.38"));
-        assert!(!admitted_glibc("glibc 2.40"));
-        assert!(!admitted_glibc("musl 1.2.5"));
-        assert!(!admitted_glibc("glibc 2.39.injected"));
-    }
-}
+#[path = "source_tests.rs"]
+mod tests;

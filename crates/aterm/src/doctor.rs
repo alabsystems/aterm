@@ -1840,10 +1840,10 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
 /// `base.clt` ([`aterm_machines::init_clt`]): its probe is atpkg's C toolchain probe over
 /// the standard system tool path, which raises no Apple dialog ([`base_clt_probe`]), beside
 /// whether init has a Git provider (managed Git or Apple's developer tools). Its root half
-/// runs from this executable and names the Mac by the swarm label its vault's roster gave it
-/// where that is known by the time the root half
-/// runs ([`crate::converge::mac_name_label`]), so the one password also aligns the Mac's
-/// own names. On a Mac that has the tools it still asks for that password where the
+/// runs from this executable and installs the permission for later guarded naming.
+/// No saved naming target crosses the password wait: the unprivileged publisher
+/// reads the current choice after setup returns. On a Mac that has the tools it
+/// still asks for that password where the
 /// elevation's other root steps are owed ([`aterm_machines::root_steps::owed_here`]: developer
 /// mode, the rule that names the Mac after admission, the LAN broker).
 /// `None` when this executable cannot name itself.
@@ -1862,7 +1862,6 @@ fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
             }),
             aterm,
         )
-        .with_name(Box::new(crate::converge::mac_name_label))
         .with_owed(Box::new(aterm_machines::root_steps::owed_here)),
     )
 }

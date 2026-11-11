@@ -127,12 +127,28 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ),
 ];
 
+/// Every thread on the machine, the set's `thread_count` (where positive), and its run queue,
+/// [`crate::runq::of_pset`] of its `load_average` and `mach_factor` over `cores` logical cores
+/// ([`RunQueue::Failed`] where the cores are unread), from one load-info read.
+#[cfg(target_os = "macos")]
+fn of_load_info(info: PsetLoadInfo, cores: Option<u64>) -> (Option<u64>, RunQueue) {
+    let threads = u64::try_from(info.thread_count).ok().filter(|n| *n > 0);
+    let queue = cores.map_or(RunQueue::Failed, |cores| {
+        crate::runq::of_pset(
+            i64::from(info.load_average),
+            i64::from(info.mach_factor),
+            cores,
+        )
+    });
+    (threads, queue)
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use std::ffi::{CStr, c_int};
     use std::sync::OnceLock;
 
-    use super::{PROCESSOR_SET_LOAD_INFO, PsetLoadInfo, RunQueue, TaskRoom};
+    use super::{PROCESSOR_SET_LOAD_INFO, PsetLoadInfo, RunQueue, TaskRoom, of_load_info};
 
     unsafe extern "C" {
         fn processor_set_default(
@@ -190,21 +206,13 @@ mod imp {
         })
     }
 
-    /// Every thread on the machine, the set's `thread_count`, and its run queue
-    /// ([`crate::runq::of_pset`]), from one read.
+    /// Every thread on the machine and its run queue ([`of_load_info`]), from one read; both
+    /// unread where the read fails.
     fn threads_and_queue() -> (Option<u64>, RunQueue) {
         let Some(info) = pset_load() else {
             return (None, RunQueue::Failed);
         };
-        let threads = u64::try_from(info.thread_count).ok().filter(|n| *n > 0);
-        let queue = cores().map_or(RunQueue::Failed, |cores| {
-            crate::runq::of_pset(
-                i64::from(info.load_average),
-                i64::from(info.mach_factor),
-                cores,
-            )
-        });
-        (threads, queue)
+        of_load_info(info, cores())
     }
 
     pub(super) fn task_room(uid: u32) -> TaskRoom {

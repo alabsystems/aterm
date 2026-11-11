@@ -24,7 +24,7 @@ struct Network<'a> {
 trait ClaimStore: GitRunner {
     fn ref_oid(&self, name: &str) -> Result<Option<String>, String>;
     fn import(&self, oid: &str) -> Result<(), String>;
-    fn compare_and_swap(&self, name: &str, before: &str, after: &str) -> Write;
+    fn compare_and_swap(&self, name: &str, before: &str, after: &str, main: Option<&str>) -> Write;
 }
 
 impl<'a> Network<'a> {
@@ -91,19 +91,20 @@ impl ClaimStore for Network<'_> {
         self.remote.fetch_exact(oid)
     }
 
-    fn compare_and_swap(&self, name: &str, before: &str, after: &str) -> Write {
+    fn compare_and_swap(&self, name: &str, before: &str, after: &str, main: Option<&str>) -> Write {
         if let Err(error) = self.running() {
             return Write::Offline(error);
         }
         match self
             .remote
-            .write_ref(name, (!before.is_empty()).then_some(before), after)
+            .write_claim_ref(name, (!before.is_empty()).then_some(before), after, main)
         {
-            Ok(crate::github_remote::RefWrite::Written) => Write::Written(after.into()),
-            Ok(crate::github_remote::RefWrite::Conflict) => Write::Race,
-            Err(error) | Ok(crate::github_remote::RefWrite::Transient(error)) => {
-                Write::Offline(error)
+            Ok(crate::github_remote::ClaimWrite::Written) => Write::Written(after.into()),
+            Ok(crate::github_remote::ClaimWrite::Conflict) => Write::Race,
+            Ok(crate::github_remote::ClaimWrite::InventoryChanged { main, why }) => {
+                Write::InventoryChanged { main, why }
             }
+            Err(error) => Write::Offline(error),
         }
     }
 }
@@ -196,7 +197,17 @@ fn reference(version: &str) -> Result<String, String> {
 }
 
 fn remote(git: &dyn ClaimStore, name: &str) -> Result<Option<(String, State)>, String> {
-    let Some(sha) = git.ref_oid(name)? else {
+    remote_expected(git, name, None)
+}
+
+fn remote_expected(
+    git: &dyn ClaimStore,
+    name: &str,
+    expected: Option<&str>,
+) -> Result<Option<(String, State)>, String> {
+    let observed = git.ref_oid(name)?;
+    claim_ref_unchanged(expected, observed.as_deref().unwrap_or(""))?;
+    let Some(sha) = observed else {
         return Ok(None);
     };
     git.import(&sha)?;
@@ -253,14 +264,81 @@ enum Write {
     Written(String),
     Race,
     Offline(String),
+    InventoryChanged { main: String, why: String },
+}
+
+enum ClaimAttempt<T> {
+    Done(T),
+    InventoryChanged { main: String, why: String },
+}
+
+/// Only an unsent inventory race restarts the complete claim selection. The
+/// callback must refresh main after this floor and recheck supersession and
+/// holder evidence. A receive failure never enters this loop.
+fn inventory_retry<T>(
+    mut attempt: impl FnMut(Option<&str>) -> Result<ClaimAttempt<T>, String>,
+) -> Result<T, String> {
+    let mut floor = None;
+    for index in 0..3 {
+        match attempt(floor.as_deref())? {
+            ClaimAttempt::Done(value) => return Ok(value),
+            ClaimAttempt::InventoryChanged { main, why } => {
+                if index == 2 {
+                    return Err(why);
+                }
+                floor = Some(main);
+            }
+        }
+    }
+    unreachable!("the third attempt returns")
+}
+
+fn claim_main(
+    remote: &crate::github_remote::Remote,
+    repo: &Path,
+    line: &crate::line::Line,
+    floor: Option<&str>,
+) -> Result<(String, Option<crate::line::Supersession>), String> {
+    let main = remote.refresh_main_after(floor)?;
+    let current = crate::line::supersession(&GitCli::new(repo), &line.version)?;
+    if current
+        .as_ref()
+        .is_some_and(|r| r.replacement.base != line.base)
+    {
+        return Err(
+            "this line was superseded on main; discard the retired journal and resume".into(),
+        );
+    }
+    Ok((main, current))
+}
+
+fn claim_ref_unchanged(expected: Option<&str>, observed: &str) -> Result<(), String> {
+    if expected.is_some_and(|expected| expected != observed) {
+        return Err(claim_ref_conflict());
+    }
+    Ok(())
+}
+
+fn claim_ref_conflict() -> String {
+    "could not claim fleet line: requested ref changed during an inventory retry (conflict; side_effect=none)".into()
 }
 
 fn replace(git: &dyn ClaimStore, name: &str, previous: &str, state: &State) -> Write {
+    replace_at_main(git, name, previous, state, None)
+}
+
+fn replace_at_main(
+    git: &dyn ClaimStore,
+    name: &str,
+    previous: &str,
+    state: &State,
+    main: Option<&str>,
+) -> Write {
     let sha = match commit(git, previous, state) {
         Ok(sha) => sha,
         Err(e) => return Write::Offline(e),
     };
-    git.compare_and_swap(name, previous, &sha)
+    git.compare_and_swap(name, previous, &sha, main)
 }
 
 fn local_observation(state: &State, directory: &Path) -> Observation {
@@ -487,94 +565,100 @@ impl Lease {
         let name = reference(&line.version)?;
         let stopped = AtomicBool::new(false);
         let git = Network::new(repo, &stopped)?;
-        loop {
-            crate::github_remote::Remote::origin(repo)?.refresh_main()?;
-            let current = crate::line::supersession(&GitCli::new(repo), &line.version)?;
-            if current
-                .as_ref()
-                .is_some_and(|r| r.replacement.base != line.base)
-            {
-                return Err(
-                    "this line was superseded on main; discard the retired journal and resume"
-                        .into(),
-                );
-            }
-            let old = remote(&git, &name)?;
-            if let Some((_, state)) = &old {
-                let observed = observe(state, &holder, &env.state);
-                let continued = continues_holder(continued, &state.holder, &holder);
-                if !continued && !adoptable(state, &observed, now()) {
-                    if matches!(observed, Observation::Unknown)
-                        || matches!(&observed, Observation::Live(live) if live.holder != state.holder)
-                    {
+        let mut expected_ref = None;
+        inventory_retry(|floor| {
+            loop {
+                let (main, current) = claim_main(
+                    &crate::github_remote::Remote::origin(repo)?,
+                    repo,
+                    line,
+                    floor,
+                )?;
+                let old = remote_expected(&git, &name, expected_ref.as_deref())?;
+                if let Some((_, state)) = &old {
+                    let observed = observe(state, &holder, &env.state);
+                    let continued = continues_holder(continued, &state.holder, &holder);
+                    if !continued && !adoptable(state, &observed, now()) {
+                        if matches!(observed, Observation::Unknown)
+                            || matches!(&observed, Observation::Live(live) if live.holder != state.holder)
+                        {
+                            return Err(format!(
+                                "COULD NOT RUN: cannot establish fleet line holder {}'s process and progress; the existing cut continues",
+                                state.holder.host
+                            ));
+                        }
                         return Err(format!(
-                            "COULD NOT RUN: cannot establish fleet line holder {}'s process and progress; the existing cut continues",
-                            state.holder.host
+                            "CUTTING ELSEWHERE: v{} by {} at {} head {}; red: {}; help: land a fix with verify land; the holder carries it with ship release --fix",
+                            line.version,
+                            state.holder.host,
+                            state.step,
+                            state.line.head(),
+                            red_items(state)
                         ));
                     }
-                    return Err(format!(
-                        "CUTTING ELSEWHERE: v{} by {} at {} head {}; red: {}; help: land a fix with verify land; the holder carries it with ship release --fix",
-                        line.version,
-                        state.holder.host,
-                        state.step,
-                        state.line.head(),
-                        red_items(state)
+                }
+                let selected = old.as_ref().map_or_else(
+                    || line.clone(),
+                    |(_, state)| {
+                        // A carried fix extends this exact line. A different base selected on a
+                        // moving main is discarded when adopting the fleet's existing line.
+                        if let Some(record) = &current {
+                            preferred(line, &preferred(&state.line, &record.replacement))
+                        } else {
+                            preferred(line, &state.line)
+                        }
+                    },
+                );
+                let previous_holder = old
+                    .as_ref()
+                    .filter(|(_, state)| state.line.head() == selected.head())
+                    .map(|(_, state)| holder_words(&state.holder));
+                let state = State {
+                    line: selected,
+                    holder: holder.clone(),
+                    step: "commit".into(),
+                    boundary: "claimed".into(),
+                    at: now(),
+                    p95_s: 0,
+                    rows: Vec::new(),
+                };
+                let previous = old.as_ref().map_or("", |(sha, _)| sha.as_str());
+                let local = env
+                    .state
+                    .join(aterm_agent::release_progress::DIRECTORY)
+                    .join(format!(
+                        "{}-{}-{}.json",
+                        line.version, holder.pid, holder.start
                     ));
-                }
-            }
-            let selected = old.as_ref().map_or_else(
-                || line.clone(),
-                |(_, state)| {
-                    // A carried fix extends this exact line. A different base selected on a
-                    // moving main is discarded when adopting the fleet's existing line.
-                    if let Some(record) = &current {
-                        preferred(line, &preferred(&state.line, &record.replacement))
-                    } else {
-                        preferred(line, &state.line)
+                let mut claim = Self {
+                    repo: repo.into(),
+                    name: name.clone(),
+                    sha: previous.into(),
+                    state,
+                    local,
+                    previous_holder,
+                };
+                // Make the identity observable before publishing it. A failure here can never
+                // strand a remote lease with no host record from which to prove its death.
+                claim.keep_local()?;
+                match replace_at_main(&git, &name, previous, &claim.state, Some(&main)) {
+                    Write::Race if expected_ref.is_some() => return Err(claim_ref_conflict()),
+                    Write::Race => continue,
+                    Write::Offline(e) => return Err(format!("could not claim fleet line: {e}")),
+                    Write::InventoryChanged { main, why } => {
+                        expected_ref = Some(previous.to_owned());
+                        return Ok(ClaimAttempt::InventoryChanged {
+                            main,
+                            why: format!("could not claim fleet line: {why}"),
+                        });
                     }
-                },
-            );
-            let previous_holder = old
-                .as_ref()
-                .filter(|(_, state)| state.line.head() == selected.head())
-                .map(|(_, state)| holder_words(&state.holder));
-            let state = State {
-                line: selected,
-                holder: holder.clone(),
-                step: "commit".into(),
-                boundary: "claimed".into(),
-                at: now(),
-                p95_s: 0,
-                rows: Vec::new(),
-            };
-            let previous = old.as_ref().map_or("", |(sha, _)| sha.as_str());
-            let local = env
-                .state
-                .join(aterm_agent::release_progress::DIRECTORY)
-                .join(format!(
-                    "{}-{}-{}.json",
-                    line.version, holder.pid, holder.start
-                ));
-            let mut claim = Self {
-                repo: repo.into(),
-                name: name.clone(),
-                sha: previous.into(),
-                state,
-                local,
-                previous_holder,
-            };
-            // Make the identity observable before publishing it. A failure here can never
-            // strand a remote lease with no host record from which to prove its death.
-            claim.keep_local()?;
-            match replace(&git, &name, previous, &claim.state) {
-                Write::Race => continue,
-                Write::Offline(e) => return Err(format!("could not claim fleet line: {e}")),
-                Write::Written(sha) => {
-                    claim.sha = sha;
-                    return Ok(claim);
+                    Write::Written(sha) => {
+                        claim.sha = sha;
+                        return Ok(ClaimAttempt::Done(claim));
+                    }
                 }
             }
-        }
+        })
     }
 
     fn keep_local(&self) -> Result<(), String> {
@@ -596,7 +680,7 @@ impl Lease {
                 self.sha = sha;
                 Ok(true)
             }
-            Write::Offline(_) => Ok(false),
+            Write::Offline(_) | Write::InventoryChanged { .. } => Ok(false),
             Write::Race => match remote(git, &self.name) {
                 Ok(Some((sha, state))) if state.holder == self.state.holder => {
                     self.sha = sha;
@@ -1636,6 +1720,230 @@ mod tests {
             remote: crate::github_remote::claim_fixture(&path, origin),
             repo: path,
             stopped: &RUNNING,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_line_claim_retries_inventory_with_fresh_policy_and_a_bound() {
+        use std::sync::{OnceLock, Weak};
+        for mode in [
+            "forward",
+            "twice",
+            "early",
+            "conflict",
+            "rewind",
+            "diverge",
+            "bound",
+            "every",
+            "between",
+            "between-ref",
+            "policy",
+        ] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let origin = dir.path().join("origin.git");
+            std::fs::create_dir(&origin).unwrap();
+            git_ok(&GitCli::new(&origin), &["init", "--bare"]).unwrap();
+            git_ok(
+                &GitCli::new(&origin),
+                &["config", "user.name", "Andrew Yates"],
+            )
+            .unwrap();
+            git_ok(
+                &GitCli::new(&origin),
+                &["config", "user.email", "test@example.invalid"],
+            )
+            .unwrap();
+            let mut writer = repository(dir.path(), "writer", &origin);
+            let source = GitCli::new(&writer.repo);
+            git_ok(&source, &["checkout", "-b", "main"]).unwrap();
+            git_ok(&source, &["commit", "--allow-empty", "-m", "base"]).unwrap();
+            let base = git_ok(&source, &["rev-parse", "HEAD"])
+                .unwrap()
+                .stdout_utf8()
+                .trim()
+                .to_owned();
+            git_ok(&source, &["commit", "--allow-empty", "-m", "tip"]).unwrap();
+            let initial = git_ok(&source, &["rev-parse", "HEAD"])
+                .unwrap()
+                .stdout_utf8()
+                .trim()
+                .to_owned();
+            git_ok(&source, &["push", origin.to_str().unwrap(), "main"]).unwrap();
+            let name = reference("0.156.0").unwrap();
+            let rival = commit(&writer, "", &state("other", 124)).unwrap();
+            git_ok(
+                &GitCli::new(&origin),
+                &[
+                    "fetch",
+                    "--no-write-fetch-head",
+                    writer.repo.to_str().unwrap(),
+                    &rival,
+                ],
+            )
+            .unwrap();
+            let slot = Arc::new(OnceLock::<Weak<agh::Fx>>::new());
+            let observed_slot = slot.clone();
+            let reads = Arc::new(Mutex::new(0_usize));
+            let observed_reads = reads.clone();
+            let bare = origin.clone();
+            let observed_name = name.clone();
+            let early = AtomicBool::new(false);
+            let fx = Arc::new(
+                agh::Fx::simulated(1_760_000_000).with_git_child_observer_for_tests(move |span| {
+                    let specs = observed_slot
+                        .get()
+                        .unwrap()
+                        .upgrade()
+                        .unwrap()
+                        .children_run();
+                    let args = &specs[span.ordinal].args;
+                    let early_move = mode == "early"
+                        && args.iter().any(|arg| arg == "--is-shallow-repository")
+                        && !early.swap(true, Ordering::SeqCst);
+                    if !early_move
+                        && (!args.iter().any(|arg| arg == "ls-remote")
+                            || !args.iter().any(|arg| arg == observed_name.as_str())
+                            || !args.iter().any(|arg| arg == "refs/heads/main"))
+                    {
+                        return;
+                    }
+                    let mut reads = observed_reads.lock().unwrap();
+                    if !early_move {
+                        *reads += 1;
+                    }
+                    let git = GitCli::new(&bare);
+                    if mode == "between-ref" && *reads == 2 {
+                        git_ok(&git, &["update-ref", &observed_name, &rival]).unwrap();
+                        return;
+                    }
+                    if mode == "between" && *reads == 2 {
+                        git_ok(&git, &["update-ref", "refs/heads/main", &initial]).unwrap();
+                        return;
+                    }
+                    if mode == "early" && !early_move {
+                        return;
+                    }
+                    if !early_move
+                        && *reads != 1
+                        && mode != "every"
+                        && !(mode == "twice" && *reads == 2)
+                        && !(mode == "bound" && *reads % 2 == 1)
+                    {
+                        return;
+                    }
+                    let current = git_ok(&git, &["rev-parse", "main"])
+                        .unwrap()
+                        .stdout_utf8()
+                        .trim()
+                        .to_owned();
+                    let tree = git_ok(&git, &["rev-parse", "main^{tree}"])
+                        .unwrap()
+                        .stdout_utf8()
+                        .trim()
+                        .to_owned();
+                    let message = if mode == "policy" {
+                        let record = crate::line::Supersession {
+                            previous: state("holder", 123).line,
+                            replacement: crate::line::Line::start("0.156.0", &current, 2),
+                            reason: "concurrent retirement".into(),
+                        };
+                        format!(
+                            "land\n\nAterm-Line-Supersession: {}",
+                            aterm_json::to_string(&record).unwrap()
+                        )
+                    } else {
+                        "land".into()
+                    };
+                    let args = if matches!(mode, "rewind" | "diverge") {
+                        vec!["commit-tree", tree.as_str(), "-m", "unrelated"]
+                    } else {
+                        vec![
+                            "commit-tree",
+                            tree.as_str(),
+                            "-p",
+                            current.as_str(),
+                            "-m",
+                            message.as_str(),
+                        ]
+                    };
+                    let next = if mode == "rewind" {
+                        base.clone()
+                    } else {
+                        git_ok(&git, &args).unwrap().stdout_utf8().trim().to_owned()
+                    };
+                    let reference = if mode == "conflict" {
+                        observed_name.as_str()
+                    } else {
+                        "refs/heads/main"
+                    };
+                    git_ok(&git, &["update-ref", reference, &next]).unwrap();
+                }),
+            );
+            assert!(slot.set(Arc::downgrade(&fx)).is_ok());
+            writer.remote =
+                crate::github_remote::claim_fixture_with_fx(&writer.repo, &origin, fx.clone());
+            let mut attempts = 0;
+            let mut expected_ref = None;
+            let result = inventory_retry(|floor| {
+                attempts += 1;
+                let (main, _) = claim_main(
+                    &writer.remote,
+                    &writer.repo,
+                    &state("holder", 123).line,
+                    floor,
+                )?;
+                remote_expected(&writer, &name, expected_ref.as_deref())?;
+                match replace_at_main(&writer, &name, "", &state("holder", 123), Some(&main)) {
+                    Write::Written(sha) => Ok(ClaimAttempt::Done(sha)),
+                    Write::InventoryChanged { main, why } => {
+                        expected_ref = Some(String::new());
+                        Ok(ClaimAttempt::InventoryChanged { main, why })
+                    }
+                    Write::Race => Err("conflict".into()),
+                    Write::Offline(why) => Err(why),
+                }
+            });
+            if matches!(mode, "forward" | "early" | "twice") {
+                let sha = result.unwrap();
+                assert_eq!(
+                    git_ok(&GitCli::new(&origin), &["rev-parse", &name])
+                        .unwrap()
+                        .stdout_utf8()
+                        .trim(),
+                    sha
+                );
+                assert_eq!(attempts, 2);
+                assert_eq!(*reads.lock().unwrap(), if mode == "early" { 3 } else { 4 });
+            } else {
+                let why = result.unwrap_err();
+                assert_eq!(
+                    attempts,
+                    match mode {
+                        "bound" | "every" => 3,
+                        "between" | "between-ref" | "policy" => 2,
+                        _ => 1,
+                    },
+                    "{mode}: {why}"
+                );
+                if matches!(mode, "bound" | "every") {
+                    assert!(why.contains("outside the requested refs"));
+                }
+                if mode == "policy" {
+                    assert!(why.contains("superseded on main"));
+                }
+                if mode == "between-ref" {
+                    assert!(why.contains("conflict; side_effect=none"));
+                }
+                if mode == "between" {
+                    assert!(why.contains("did not advance fast-forward"), "{why}");
+                }
+                assert!(
+                    !fx.children_run()
+                        .iter()
+                        .any(|s| s.args.iter().any(|a| a == "push"))
+                );
+            }
         }
     }
 

@@ -23,7 +23,7 @@ the tests in its `mod tests`. A test is deleted once Trust/Clean proves its prim
   - `LlvmRc` ⇒ `["/I", I, "/FO", O, R]`
   - `Windres` ⇒ `["-I", I, "-i", R, "-o", O, "-O", "coff"]`
 - `EXT(d)`: `Rc | LlvmRc` ⇒ `"res"`; `Windres` ⇒ `"o"`.
-- `blocking_gaps`: rows of §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap 0 (the
+- `blocking_gaps`: rows of `docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (the
   installed seal publishes no Lean-discharged row) is on every row.
 
 ## 1. Specs (TSV)
@@ -57,11 +57,6 @@ src/lib.rs	outcome_display_names_the_state	WR6	WR5
 src/lib.rs	winres_version_le_round_trips_and_lays_out_four_u32_words	WR7	
 ```
 
-## 3. Coverage
-
-- 7 tests: all 7 are retired by a spec (WR1 retires 2; WR2, WR3, WR4, WR6 and WR7 retire 1 each,
-  with WR5 sampled alongside WR6).
-
 ## 4. Tests that are not spec samples
 
 None.
@@ -84,19 +79,3 @@ None.
    file names defaulting to `Rc`.
 4. **Resolved — `arguments()` doc comment no longer cites the unit test.** `arguments()` is documented
    as `"The argument vector for one dialect."`.
-
-## 6. Proof order
-
-The specs are independent; WR3 and WR6 share only `disp`, which can stay an uninterpreted function
-of the path.
-
-1. **WR7**: fixed-width `u32`↔`[u8; 16]` bitvector round-trip with no branches, loops or heap
-   (needs only gaps 0 and 1).
-2. **WR4**: a three-arm match with literal results, the smallest test of enum carriers.
-3. **WR5**: `matches!` predicates on `&self`; adds gap 2.
-4. **WR2**: needs a string content model, `to_ascii_lowercase`, substring search and gap 5.
-5. **WR3**: a fixed `vec!` per arm, once `Vec<String>` contents are modelled; with WR4 it gives
-   WR4's companion invariant.
-6. **WR6**: the `Formatter`/`write!` model (gaps 2, 8); prove the payload suffix first.
-7. **WR1**: a loop, a generic `IntoIterator`, a sort and a sorted-permutation postcondition (gaps 5,
-   7, 11, 13), stated with §5.2's tie order.

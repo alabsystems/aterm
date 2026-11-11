@@ -154,25 +154,31 @@ fn a_pressure_state_past_sleeping_is_no_level() {
 
 /// `heat_scores_nothing_without_a_cut` (A4 §15): Moderate and Heavy with the Super clock at its
 /// usual score 0 and light the ladder (and at Heavy the well) alone: 10:10:09, a 10-thread spin at
-/// Moderate with the Super clock at 4114 against its usual 4113. CONTROL: the first draft's 0.8 for
-/// Moderate scores there.
+/// Moderate with the Super clock at 4114 against its usual 4113. So does a clock under its usual by
+/// less than [`CUT_SHARE`] (4 % here): the cut is more than 5 % under, never any dip. CONTROL: the
+/// first draft's 0.8 for Moderate scores there.
 #[test]
 fn heat_scores_nothing_without_a_cut() {
     let first_draft = |p: ThermalPressure| if p.judges_cut() { 0.8 } else { 0.0 };
     for level in [ThermalPressure::Moderate, ThermalPressure::Heavy] {
-        let mut e = learned(4113.0, PASSED);
-        let cores = fracs(1.0, 1.0);
-        let v = e.absorb(&input(
-            level,
-            moved(second(4.0, 4114.0, 6.0, 2900.0)),
-            PASSED,
-            &cores,
-        ));
-        let chain = v.chain.expect("judged");
-        assert!(matches!(chain.cut, Cut::Within(_)), "{level:?}: {chain:?}");
-        assert_eq!(v.score(), 0.0, "{level:?}");
-        assert_eq!(v.steps(), level.level());
-        assert_ne!(first_draft(level), v.score(), "control: {level:?}");
+        for clock in [4114.0, 4113.0 * 0.96] {
+            let mut e = learned(4113.0, PASSED);
+            let cores = fracs(1.0, 1.0);
+            let v = e.absorb(&input(
+                level,
+                moved(second(4.0, clock, 6.0, 2900.0)),
+                PASSED,
+                &cores,
+            ));
+            let chain = v.chain.expect("judged");
+            assert!(
+                matches!(chain.cut, Cut::Within(_)),
+                "{level:?} at {clock}: {chain:?}"
+            );
+            assert_eq!(v.score(), 0.0, "{level:?} at {clock}");
+            assert_eq!(v.steps(), level.level());
+            assert_ne!(first_draft(level), v.score(), "control: {level:?}");
+        }
     }
 }
 
@@ -261,7 +267,9 @@ fn the_usual_clock_learns_only_at_nominal_or_moderate() {
 }
 
 /// After [`USUAL_SPAN_S`] of readings a decile's usual moves as an exponential mean, so it follows
-/// a lasting change instead of holding the first hour forever.
+/// a lasting change instead of holding the first hour forever. A reading whose decile is past 9, or
+/// whose clock or window is not a positive number, teaches nothing: a zero window on a decile that
+/// has learned nothing would make its usual 0/0, a NaN no later reading undoes.
 #[test]
 fn a_learned_usual_follows_a_lasting_change() {
     let mut u = UsualClocks::default();
@@ -274,13 +282,35 @@ fn a_learned_usual_follows_a_lasting_change() {
     let usual = u.usual(9).expect("learned");
     assert!(usual < 3990.0, "{usual}");
     u.note(10, 1.0, 1.0);
-    u.note(9, f64::NAN, 1.0);
-    assert_eq!(u.usual(9), Some(usual), "nothing taught by a bad reading");
+    for (mhz, window_s) in [
+        (f64::NAN, 1.0),
+        (0.0, 1.0),
+        (-3900.0, 1.0),
+        (3900.0, -1.0),
+        (3900.0, f64::INFINITY),
+    ] {
+        u.note(9, mhz, window_s);
+        assert_eq!(
+            u.usual(9),
+            Some(usual),
+            "nothing taught by {mhz} MHz over {window_s} s"
+        );
+    }
+    u.note(3, 3900.0, 0.0);
+    for _ in 0..(USUAL_LEARN_S as usize) {
+        u.note(3, 4000.0, 1.0);
+    }
+    assert_eq!(
+        u.usual(3),
+        Some(4000.0),
+        "a zero window taught an unlearned decile"
+    );
 }
 
 /// `the_e_clock_is_hollow_until_its_bound_holds` (A4 §15): with M-ECLK failed (the M5 as N1
-/// measured it) the Efficiency clock is read and drawn hollow. CONTROL: a chip whose M-ECLK passed
-/// draws it filled.
+/// measured it) the Efficiency clock is read and drawn hollow, and so it is under every verdict
+/// short of a pass (unmeasured, as on every other chip; marginal; Heavy only). CONTROL: a chip
+/// whose M-ECLK passed draws it filled.
 #[test]
 fn the_e_clock_is_hollow_until_its_bound_holds() {
     let cores = fracs(0.5, 0.5);
@@ -297,13 +327,21 @@ fn the_e_clock_is_hollow_until_its_bound_holds() {
         "{chain:?}"
     );
     assert_eq!(chain.e_drawn(), None);
+    for e in [Verdict::Unmeasured, Verdict::Marginal, Verdict::HeavyOnly] {
+        let gate = ClockGate { e, ..PASSED };
+        let v = Engine::default().absorb(&input(ThermalPressure::Nominal, reading, gate, &cores));
+        assert_eq!(v.chain.expect("judged").e_drawn(), None, "{e:?}");
+    }
     let v = Engine::default().absorb(&input(ThermalPressure::Nominal, reading, PASSED, &cores));
     assert!(v.chain.expect("judged").e_drawn().is_some(), "control");
 }
 
 /// `a_clock_above_the_tables_top_is_refused` (A4 §15): the recorded 6.03 GHz Efficiency clock
 /// (`rec/heat-clocks.jsonl` i=6) is refused alone, past the table's top: the Super clock and the
-/// reading stand. CONTROL: within the table it is given.
+/// reading stand. Each kind is held to its own table: an Efficiency clock past the Efficiency top is
+/// refused though the Super table reaches it (3.5 GHz), and a Super clock past the Super top
+/// (4.7 GHz), or under its own bottom where the Efficiency table's would hold it (600 MHz), is no
+/// clock, so the reading is refused. CONTROL: within the table it is given.
 #[test]
 fn a_clock_above_the_tables_top_is_refused() {
     let m = Counters {
@@ -330,6 +368,34 @@ fn a_clock_above_the_tables_top_is_refused() {
     };
     let j = judge(&within, SECOND, TB, Some(&M5), Some(busy)).expect("stands");
     assert!(!j.e_refused && j.e_mhz.is_some(), "control: {j:?}");
+    // 3 325 M cycles over the 0.95 s of Efficiency time: 3500 MHz, under the Super top's 4553.
+    let past_e_top = Counters {
+        cycles: 13_436_000_000 + 3_325_000_000,
+        ..m
+    };
+    let j = judge(&past_e_top, SECOND, TB, Some(&M5), Some(busy)).expect("the reading stands");
+    assert!(j.e_refused && j.e_mhz.is_none(), "{j:?}");
+    // 17 202 M Super cycles over 3.66 s: 4700 MHz; the whole clock (4274 MHz) stays in range.
+    let past_p_top = Counters {
+        p_cycles: 17_202_000_000,
+        cycles: 17_202_000_000 + 2_500_000_000,
+        ..m
+    };
+    assert_eq!(
+        judge(&past_p_top, SECOND, TB, Some(&M5), Some(busy)),
+        Err("p_clock_range")
+    );
+    // 2196 M Super cycles over 3.66 s: 600 MHz, under the Super bottom's 654 though over the
+    // whole range's 486; the whole clock (1019 MHz) stays in range.
+    let under_p_bottom = Counters {
+        p_cycles: 2_196_000_000,
+        cycles: 2_196_000_000 + 2_500_000_000,
+        ..m
+    };
+    assert_eq!(
+        judge(&under_p_bottom, SECOND, TB, Some(&M5), Some(busy)),
+        Err("p_clock_range")
+    );
 }
 
 /// The whole clock reads the QoS time: a cool machine's Super cores near their top, with
@@ -462,16 +528,27 @@ fn no_decile_without_the_super_cores_over_the_window() {
     );
 }
 
-/// Work per joule and the Super shares come from the same change.
+/// Work per joule and the Super shares come from the same change: the time share over the QoS
+/// time, never `cpu_time` (here at 0.926 of it, N1's p50), and the instruction share over the
+/// instructions, never the cycles (here the Super cores retire 3 a cycle, the Efficiency cores 2).
 #[test]
 fn work_per_joule_and_the_super_shares() {
-    let c = second(2.0, 4000.0, 2.0, 2000.0);
+    let even = second(2.0, 4000.0, 2.0, 2000.0);
+    let c = Counters {
+        cpu_ticks: ticks(3_704_000_000),
+        instructions: 3 * even.p_cycles + 2 * (even.cycles - even.p_cycles),
+        p_instructions: 3 * even.p_cycles,
+        ..even
+    };
     let j = judge(&c, SECOND, TB, Some(&M5), None).expect("judges");
     let want_ipj = c.instructions as f64 / (c.energy_nj as f64 / 1e9);
     assert!(j.ipj.is_some_and(|v| (v - want_ipj).abs() < 1.0), "{j:?}");
-    assert!(j.p_time_share.is_some_and(|v| (v - 0.5).abs() < 1e-9));
+    assert!(
+        j.p_time_share.is_some_and(|v| (v - 0.5).abs() < 1e-9),
+        "{j:?}"
+    );
     let p_share = j.p_instruction_share.expect("timed");
-    assert!((p_share - 8.0 / 12.0).abs() < 1e-9, "{p_share}");
+    assert!((p_share - 24.0 / 32.0).abs() < 1e-9, "{p_share}");
     assert!((j.cpu_w - 4.0).abs() < 1e-9);
     let idle = Counters::default();
     let j = judge(&idle, SECOND, TB, Some(&M5), None).expect("an idle machine judges");
@@ -523,8 +600,8 @@ fn the_change_takes_the_gone_off_the_earlier_total() {
     assert_eq!(change(&then, &now, &[11]), Err("gone_unread"));
 }
 
-/// Either read's refusal, another timebase or a window that does not run forward refuses the
-/// change.
+/// Either read's refusal, another timebase or a window that does not run forward (backwards, or no
+/// time at all: two reads at one instant) refuses the change.
 #[test]
 fn a_refused_read_refuses_the_change() {
     let a = second(1.0, 3000.0, 1.0, 2000.0);
@@ -543,6 +620,11 @@ fn a_refused_read_refuses_the_change() {
     };
     assert_eq!(change(&then, &other, &[]), Err("timebase"));
     assert_eq!(change(&now, &then, &[]), Err("window"));
+    let same_instant = HeatBook {
+        at_ns: then.at_ns,
+        ..now.clone()
+    };
+    assert_eq!(change(&then, &same_instant, &[]), Err("window"));
 }
 
 /// Compute watts is the CPU's, the GPU's and the Neural Engine's; a part this system has no reader

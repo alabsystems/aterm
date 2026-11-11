@@ -2059,9 +2059,10 @@ pub fn launch_now<'a>(
 
 /// The row a worker with no starter of its kind would run on here, as the records stand: what a
 /// survey says of this Mac ([`super::cli::survey_accounts`]), so a placement weighs that row and no
-/// other. It reads no usage, records no claim and prepares no login. Claude Code's is the row on
-/// this machine's own login, unless [`accounts::claude_worker_move`], the task launcher's own rule,
-/// moves the worker. Every other CLI's is [`launch_now`]'s pick, or the row on this machine's own login where that takes no
+/// other. It reads no usage, records no claim and prepares no login. Claude Code's is the row of
+/// the account `home`'s login file names (a plain start's [`super::observe::Login`], reconciled:
+/// the row with no directory only while nothing was read of the file or it agrees), unless
+/// [`accounts::claude_worker_move`], the task launcher's own rule, moves the worker. Every other CLI's is [`launch_now`]'s pick, or the row on this machine's own login where that takes no
 /// row, and for Codex only if a wall on it can show ([`codex_row_can_show_a_wall`]). `None` where
 /// the launch is refused, runs on a login no row lists, or is Codex's on one no read here can show a
 /// wall on. A launch also reads the row it picks and may leave it for a wall that read finds, which
@@ -2077,9 +2078,9 @@ pub fn unstarted_launch_row<'a>(
     now: i64,
 ) -> Option<&'a Row> {
     if cli == Cli::Claude {
-        let own_login = accounts::ProcessLogin::of_env(std::iter::empty());
-        let from = roster.row(accounts::judged_label(roster, &own_login)?)?;
-        let moved = accounts::claude_worker_move(roster, state, enrolled, &own_login, mode, now);
+        let plain = super::observe::Login::claude(&[], home, roster);
+        let from = plain.reconciled(roster).row()?;
+        let moved = accounts::claude_worker_move(roster, state, enrolled, &plain, mode, now);
         return Some(moved.map_or(from, |(_, row)| row));
     }
     let row = match launch_now((cli, keyring, mode), roster, state, enrolled, program, now).ok()? {

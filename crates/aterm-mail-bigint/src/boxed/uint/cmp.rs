@@ -35,18 +35,5 @@ impl PartialEq for BoxedUint {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::BoxedUint;
-    use subtle::ConstantTimeEq;
-
-    #[test]
-    fn ct_eq() {
-        let a = BoxedUint::zero();
-        let b = BoxedUint::one();
-
-        assert!(bool::from(a.ct_eq(&a)));
-        assert!(!bool::from(a.ct_eq(&b)));
-        assert!(!bool::from(b.ct_eq(&a)));
-        assert!(bool::from(b.ct_eq(&b)));
-    }
-}
+#[path = "cmp_tests.rs"]
+mod tests;

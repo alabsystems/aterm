@@ -1948,19 +1948,15 @@ fn fleet_sign(doc: &Path, key: &Path, out: &mut dyn Write) -> Result<(), String>
     scrub_vec(secret);
     let (sig, public) = signed?;
     let to = sig_path(doc);
-    crate::harness::upgrade_models::write_atomic_ordered_mode(
-        &to,
-        &format!("{sig}\n"),
-        Some(0o644),
-    )
-    .map_err(|e| {
-        if e.kind() == std::io::ErrorKind::InvalidFilename {
-            "the document's name is too long to write its signature beside it: shorten it"
-                .to_string()
-        } else {
-            crate::harness::one_line(&e.to_string(), 120)
-        }
-    })?;
+    crate::harness::atomic_write::write_atomic_ordered_mode(&to, &format!("{sig}\n"), Some(0o644))
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidFilename {
+                "the document's name is too long to write its signature beside it: shorten it"
+                    .to_string()
+            } else {
+                crate::harness::one_line(&e.to_string(), 120)
+            }
+        })?;
     let _ = writeln!(
         out,
         "signed {} → {} (signer {}…)",

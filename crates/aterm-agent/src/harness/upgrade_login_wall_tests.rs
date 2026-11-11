@@ -259,7 +259,7 @@ struct Visited {
     ledger: Vec<String>,
 }
 
-/// One real visit ([`visit_with_claim`]) of a stand-in agent in [`TAB`]
+/// One real visit ([`visit_build`]) of a stand-in agent in [`TAB`]
 /// holding `session`: its session file registered, its transcript
 /// `transcript`, its state what `st` makes of the stand-in's session file, its
 /// tab showing `screen` (`text --json`), `targets` the builds on offer, and the
@@ -301,7 +301,7 @@ fn visit_at(
     let args = atpkg::caller_shell::process_args(agent.id()).expect("argv");
     let files = session_files(&opts.home);
     let script = Script::new(shell, fg, None);
-    let r = visit_with_claim(
+    let r = visit_build(
         &opts,
         &sf,
         files.as_deref(),
@@ -413,7 +413,7 @@ fn ts(epoch: u64) -> String {
 }
 
 fn at(stamp: &str) -> u64 {
-    crate::harness::upgrade_models::parse_utc(stamp).expect("a stamp")
+    crate::harness::unix_time::parse_utc(stamp).expect("a stamp")
 }
 
 fn idle() -> Facts {

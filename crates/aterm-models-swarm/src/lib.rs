@@ -32,6 +32,7 @@ mod models_gap_heal;
 mod models_join_phrase;
 mod models_journal_append;
 mod models_journal_open;
+mod models_journal_read_guard;
 mod models_keyed_epochs;
 mod models_ledger_publish;
 mod models_machine_number;
@@ -61,6 +62,7 @@ pub use models_gap_heal::gap_heal_model;
 pub use models_join_phrase::join_phrase_model;
 pub use models_journal_append::journal_append_model;
 pub use models_journal_open::journal_open_model;
+pub use models_journal_read_guard::journal_read_guard_model;
 pub use models_keyed_epochs::keyed_epochs_model;
 pub use models_ledger_publish::ledger_publish_model;
 pub use models_machine_number::{

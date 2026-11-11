@@ -830,20 +830,17 @@ impl App {
                 let mut tab_order = Vec::with_capacity(ws.tab_set.len());
                 let mut restored_tabs = Vec::with_capacity(ws.tab_set.len());
                 let mut active_item = None;
-                for tab in ws.tab_set.tabs() {
-                    let Some(restored) = self.tab_restore_descriptor_carrying(tab, handoff) else {
-                        continue;
-                    };
-                    if ws.tab_set.active_id() == Some(tab.id) {
-                        active_item = Some(restored_tabs.len());
-                    }
-                    if filling_window == Some(wid) {
-                        filling_tabs.push(tab.id);
-                    }
-                    restored_tabs.push(restored);
-                }
                 let mut terminal_index = 0usize;
                 for tab in ws.tab_set.tabs() {
+                    if let Some(restored) = self.tab_restore_descriptor_carrying(tab, handoff) {
+                        if ws.tab_set.active_id() == Some(tab.id) {
+                            active_item = Some(restored_tabs.len());
+                        }
+                        if filling_window == Some(wid) {
+                            filling_tabs.push(tab.id);
+                        }
+                        restored_tabs.push(restored);
+                    }
                     let entry = if !tab.root.any_leaf(&mut |view| {
                         !matches!(
                             self.view_store.get(*view),
@@ -974,8 +971,7 @@ impl App {
         tab: &crate::tab_model::Tab,
         carry_drafts: bool,
     ) -> Option<restore::RestoredTab> {
-        /// One captured subtree: described (boxed, as a split holds it), or wholly private and
-        /// left out.
+        /// One captured subtree: described, or wholly private and left out.
         enum Captured {
             Kept(Box<restore::RestoredSplitTree>),
             Private,
@@ -998,14 +994,7 @@ impl App {
                     if *view == focus {
                         *focused_path = Some(path.clone());
                     }
-                    let mut view = app.view_restore_descriptor_carrying(*view, carry_drafts)?;
-                    // A worker's tab, parked or not, carries each leaf's task record.
-                    if worker && let restore::RestoredView::Terminal(leaf) = &mut view {
-                        leaf.task = leaf
-                            .local_id
-                            .and_then(|session| app.pool.get(session))
-                            .and_then(|session| crate::task_record::restore_row(&session.ctx));
-                    }
+                    let view = app.view_restore_descriptor_carrying(*view, carry_drafts, worker)?;
                     Some(Captured::Kept(Box::new(restore::RestoredSplitTree::leaf(
                         view,
                     ))))
@@ -1099,55 +1088,79 @@ impl App {
         &self,
         view: crate::tab_model::ViewId,
     ) -> Option<restore::RestoredView> {
-        self.view_restore_descriptor_carrying(view, false)
+        self.view_restore_descriptor_carrying(view, false, false)
     }
 
     fn view_restore_descriptor_carrying(
         &self,
         view: crate::tab_model::ViewId,
         carry_drafts: bool,
+        worker: bool,
     ) -> Option<restore::RestoredView> {
         if self.view_is_private(view) {
             return None;
         }
         match self.view_store.get(view).copied()? {
             crate::tab_model::View::Terminal(terminal) => {
-                let (cwd, title) = self.restore_session_meta(terminal.session);
-                let (user_meta, (sid, lineage, log_ep), claim) = self
-                    .pool
-                    .get(terminal.session)
-                    .map(|s| {
-                        let user_meta = s
-                            .ctx
-                            .meta
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .sanitized();
-                        let (lineage, log_ep) = {
-                            let tl = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                            (tl.slog().lineage(), tl.slog().log().ep())
-                        };
-                        let sid = s.ctx.self_id.as_str();
-                        let ids = (
-                            restore::carried_sid(sid).then(|| sid.to_string()),
-                            lineage
-                                .filter(|l| l.as_str() != sid && restore::carried_sid(l.as_str()))
-                                .map(|l| l.as_str().to_string()),
-                            Some(log_ep),
-                        );
-                        let claim = crate::harness_host::credit_claim::claim_worker(&s.ctx);
-                        (user_meta, ids, claim)
-                    })
-                    .unwrap_or_default();
-                let owed = if carry_drafts {
-                    self.pending_restored_agent(terminal.session, true)
+                let ((cwd, title), user_meta, (sid, lineage, log_ep), claim, task, session_held) =
+                    self.pool
+                        .get(terminal.session)
+                        .map(|s| {
+                            let cwd_and_title = Self::session_cwd_and_title(s);
+                            let user_meta = s
+                                .ctx
+                                .meta
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .sanitized();
+                            let (lineage, log_ep) = {
+                                let tl = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                                (tl.slog().lineage(), tl.slog().log().ep())
+                            };
+                            let sid = s.ctx.self_id.as_str();
+                            let ids = (
+                                restore::carried_sid(sid).then(|| sid.to_string()),
+                                lineage
+                                    .filter(|l| {
+                                        l.as_str() != sid && restore::carried_sid(l.as_str())
+                                    })
+                                    .map(|l| l.as_str().to_string()),
+                                Some(log_ep),
+                            );
+                            let claim = crate::harness_host::credit_claim::claim_worker(&s.ctx);
+                            let task = worker
+                                .then(|| crate::task_record::restore_row(&s.ctx))
+                                .flatten();
+                            let session_held = cfg!(unix) && !carry_drafts && Self::session_held(s);
+                            (cwd_and_title, user_meta, ids, claim, task, session_held)
+                        })
+                        .unwrap_or_default();
+                let store_sid = (carry_drafts || session_held)
+                    .then(|| self.session_sid(terminal.session))
+                    .flatten();
+                let (owed, supervised, lost, held) = if carry_drafts {
+                    let owed = store_sid
+                        .as_deref()
+                        .and_then(|sid| self.pending_restored_agent_by_sid(sid, true));
+                    let supervised = if owed.is_none() {
+                        store_sid
+                            .as_deref()
+                            .and_then(crate::harness_host::followed_snapshot)
+                            .map(|snap| Box::new(restore::AgentRestore::of(snap)))
+                    } else {
+                        None
+                    };
+                    let lost = store_sid
+                        .as_deref()
+                        .and_then(|sid| self.harness.as_ref()?.lost_word(sid))
+                        .map(Box::new);
+                    (owed, supervised, lost, false)
                 } else {
-                    None
-                };
-                let supervised = if carry_drafts && owed.is_none() {
-                    self.hosted_agent(terminal.session).map(Box::new)
-                } else {
-                    None
+                    let held = session_held
+                        && !store_sid.as_deref().is_some_and(|sid| {
+                            crate::harness_host::published_snapshot(sid).is_some()
+                        });
+                    (None, None, None, held)
                 };
                 // Marked from the agent the leaf carries here (a handoff's owed one), and again
                 // once a desk's agents are filled in (`fill_desk_agents`).
@@ -1170,12 +1183,8 @@ impl App {
                         .map(|theme| theme.selector.clone()),
                     agent: owed,
                     supervised,
-                    lost: if carry_drafts {
-                        self.hosted_lost_word(terminal.session).map(Box::new)
-                    } else {
-                        None
-                    },
-                    held: !carry_drafts && self.restore_session_held(terminal.session),
+                    lost,
+                    held,
                     sid,
                     lineage,
                     log_ep,
@@ -1183,7 +1192,7 @@ impl App {
                     claim_ended: claim.as_ref().is_some_and(|&(_, ended)| ended),
                     not_claim_worker: false,
                     claim_worker: claim.map(|(folder, _)| folder),
-                    task: None,
+                    task,
                 };
                 leaf.mark_claim_bystander();
                 Some(restore::RestoredView::Terminal(leaf))
@@ -1417,24 +1426,15 @@ impl App {
             })
     }
 
-    fn pending_restored_agent(&self, id: u64, handoff: bool) -> Option<Box<restore::AgentRestore>> {
+    fn pending_restored_agent_by_sid(
+        &self,
+        sid: &str,
+        handoff: bool,
+    ) -> Option<Box<restore::AgentRestore>> {
         let host = self.harness.as_ref()?;
-        let sid = {
-            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-            g.by_local(id)?.sid.as_str().to_string()
-        };
-        let owed = host.pending_restored_for(&sid)?;
+        let owed = host.pending_restored_for(sid)?;
         let asked = owed.asked.filter(|_| handoff);
         Some(Box::new(restore::AgentRestore::owed(owed.snap, asked)))
-    }
-
-    fn hosted_agent(&self, id: u64) -> Option<restore::AgentRestore> {
-        crate::harness_host::followed_snapshot(&self.session_sid(id)?)
-            .map(restore::AgentRestore::of)
-    }
-
-    fn hosted_lost_word(&self, id: u64) -> Option<restore::LostRestore> {
-        self.harness.as_ref()?.lost_word(&self.session_sid(id)?)
     }
 
     fn unhanded_restored_agent(&self, id: u64) -> Option<restore::AgentRestore> {
@@ -1461,17 +1461,20 @@ impl App {
             .map_or(&[][..], |(.., rows)| rows.as_slice())
     }
 
-    fn hosts_agent(&self, id: u64) -> bool {
-        self.session_sid(id)
-            .is_some_and(|sid| crate::harness_host::published_snapshot(&sid).is_some())
-    }
-
     /// Populates running agent metadata onto terminal leaves of `manifest` for an unexpected exit.
     pub(crate) fn fill_desk_agents(&mut self, manifest: &mut restore::RestoreManifest) {
         manifest.fill_agents(&|id| {
-            self.hosted_agent(id)
-                .or_else(|| self.pending_restored_agent(id, false).map(|agent| *agent))
-                .or_else(|| self.unhanded_restored_agent(id))
+            if let Some(sid) = self.session_sid(id)
+                && let Some(agent) = crate::harness_host::followed_snapshot(&sid)
+                    .map(restore::AgentRestore::of)
+                    .or_else(|| {
+                        self.pending_restored_agent_by_sid(&sid, false)
+                            .map(|agent| *agent)
+                    })
+            {
+                return Some(agent);
+            }
+            self.unhanded_restored_agent(id)
         });
         manifest.fill_holds(&|id| self.desk_holds(id));
         let pool = &self.pool;
@@ -1585,25 +1588,25 @@ impl App {
         })
     }
 
-    fn restore_session_meta(&self, id: u64) -> (Option<String>, String) {
+    fn session_cwd_and_title(s: &Session) -> (Option<String>, String) {
         use crate::cwd_native::ReportedCwd as _;
-        self.pool.get(id).map_or((None, String::new()), |s| {
-            let t = match s.term.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    return (None, String::new());
-                }
-            };
-            (
-                t.native_working_directory().map(|cwd| cwd.into_owned()),
-                t.title().to_string(),
-            )
-        })
+        let t = match s.term.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return (None, String::new());
+            }
+        };
+        (
+            t.native_working_directory().map(|cwd| cwd.into_owned()),
+            t.title().to_string(),
+        )
     }
 
-    fn restore_session_held(&self, id: u64) -> bool {
-        cfg!(unix) && self.pool.get(id).is_some_and(Self::session_held) && !self.hosts_agent(id)
+    fn restore_session_meta(&self, id: u64) -> (Option<String>, String) {
+        self.pool
+            .get(id)
+            .map_or((None, String::new()), Self::session_cwd_and_title)
     }
 
     /// Flushes a due crash-journal snapshot before the event loop parks.
@@ -2648,7 +2651,7 @@ impl App {
                 return std::ops::ControlFlow::Continue(());
             }
             if !self.headless && !self.attach_os_window(el, wid) {
-                self.close_window_logical(wid);
+                self.retire_unattached_restored_window(wid);
                 return std::ops::ControlFlow::Continue(());
             }
             placed.shown.push((wid, show));
@@ -2747,6 +2750,15 @@ impl App {
             Some(slot) => *slot = self.begin_sliced_fill(wid, wl),
             None => self.restore_into_window(wid, wl),
         }
+    }
+
+    pub(crate) fn retire_unattached_restored_window(&mut self, wid: WindowId) {
+        // A native-only window adds no PTY to the adoption set; losing it must still
+        // prevent a proof of the complete restored layout.
+        if self.handoff_ready.is_some() {
+            self.handoff_degraded = true;
+        }
+        self.close_window_logical(wid);
     }
 
     fn create_native_restore_window(&mut self, rows: u16, cols: u16) -> WindowId {

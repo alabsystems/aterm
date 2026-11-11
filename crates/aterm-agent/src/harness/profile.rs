@@ -423,10 +423,6 @@ pub struct Profile {
     pub usage_of_another_at: Option<i64>,
     /// [`FablePlan`].
     pub fable: FablePlan,
-    /// The model families a stored consent bills to usage credits with no dialog, lowercased (`fable` by `fableOverageConsentV2`, a family of `usageCreditsOnlyModelConsent`).
-    pub consented: Vec<String>,
-    /// The model families billed to usage credits only, lowercased (`tengu_calm_seal`); `None`: the flag absent or of another shape.
-    pub credits_only: Option<Vec<String>>,
 }
 
 /// Why no profile was read, one closed word each ([`NoProfile::word`]).
@@ -545,7 +541,7 @@ impl Selection {
     }
 }
 
-/// The process's captured profile identity for a billing decision.
+/// The process's captured profile identity, which a cold relaunch compares with its helper's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
     /// The exact plain profile path resolved from the process's HOME/config.
@@ -627,105 +623,6 @@ impl Context {
             config: vars.config.map(str::to_owned),
             login: exec_var(env, super::accounts::LOGIN_ENV)?.map(str::to_owned),
         })
-    }
-
-    /// A Standard model move's complete profile environment.
-    pub(super) fn for_launch(
-        &self,
-        user_home: &Path,
-        cwd: &str,
-        required: &[(&'static str, &str)],
-    ) -> Option<LaunchEnv> {
-        if self.selection != Selection::Standard {
-            return None;
-        }
-        let mut values = Vec::new();
-        let mut unset = Vec::new();
-        for (name, captured) in [
-            (super::accounts::HOMEDIR_ENV, self.home.as_deref()),
-            (super::accounts::HOME_ENV, self.config.as_deref()),
-            (super::accounts::LOGIN_ENV, self.login.as_deref()),
-        ] {
-            let value = required
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map_or(captured, |(_, value)| Some(*value));
-            if let Some(value) = value {
-                values.push((name, value.to_string()));
-            } else {
-                unset.push(name);
-            }
-        }
-        if required.iter().any(|(name, _)| {
-            *name != super::accounts::HOMEDIR_ENV
-                && *name != super::accounts::HOME_ENV
-                && *name != super::accounts::LOGIN_ENV
-        }) {
-            return None;
-        }
-        values.push(("CLAUDE_CODE_CUSTOM_OAUTH_URL", String::new()));
-        let env: Vec<String> = values
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect();
-        let vars = HomeVars {
-            config: exec_var(&env, super::accounts::HOME_ENV)?,
-            home: exec_var(&env, super::accounts::HOMEDIR_ENV)?,
-        };
-        let records = Records::at(user_home, vars, || {
-            Path::new(cwd).is_absolute().then(|| PathBuf::from(cwd))
-        });
-        let context = Self::of_exec_env(user_home, records.dir()?, &env)?;
-        Some(LaunchEnv {
-            values,
-            unset,
-            context,
-        })
-    }
-}
-
-/// Required values and removals, plus the context resolved only from those words.
-pub(super) struct LaunchEnv {
-    pub values: Vec<(&'static str, String)>,
-    pub unset: Vec<&'static str>,
-    pub context: Context,
-}
-
-/// The effective profile, with selection uncertainty preserved for a billing decision.
-///
-/// # Errors
-///
-/// An unknown selector or records directory, a legacy `.config.json` or plain profile whose
-/// metadata cannot be read, or a legacy `.config.json` whose selection cannot be told.
-pub(super) fn effective_for_billing(
-    plain: &Path,
-    records: Option<&Path>,
-    selection: Selection,
-) -> std::io::Result<PathBuf> {
-    let plain = match selection {
-        Selection::Unknown => return Err(std::io::Error::other("profile selector unknown")),
-        Selection::Standard => plain.to_path_buf(),
-        Selection::CustomOauth => plain.with_file_name(".claude-custom-oauth.json"),
-    };
-    let records = records.ok_or_else(|| std::io::Error::other("records directory unknown"))?;
-    let legacy = records.join(".config.json");
-    let meta = match std::fs::metadata(&legacy) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(plain),
-        Err(e) => return Err(e),
-    };
-    if !meta.is_file() || (meta.len() == 0 && meta.permissions().readonly()) {
-        return Ok(plain);
-    }
-    if meta.len() > 0 {
-        return Err(std::io::Error::other("legacy profile selection unknown"));
-    }
-    match std::fs::metadata(&plain) {
-        Ok(_) => Ok(plain),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(std::io::Error::other("legacy profile selection unknown"))
-        }
-        Err(e) => Err(e),
     }
 }
 
@@ -2042,7 +1939,7 @@ pub fn parse_agy_usage_json(bytes: &[u8], third_party: bool, now: i64) -> Option
     let reset_str = bucket
         .get("reset_time")
         .and_then(aterm_json::Value::as_str)?;
-    let resets_at = i64::try_from(super::upgrade_models::parse_utc(reset_str)?).ok()?;
+    let resets_at = i64::try_from(super::unix_time::parse_utc(reset_str)?).ok()?;
     Some(WeeklyFigure {
         used_x10,
         resets_at,
@@ -3436,16 +3333,7 @@ fn profile_of(raw: RawFile) -> Profile {
     };
     let usage_of_another_at = another.and_then(|cache| cache.fetched_ms.num().and_then(ms_to_s));
     let features = raw.features.0.unwrap_or_default();
-    let credits_only = features
-        .calm_seal
-        .0
-        .as_ref()
-        .map(|words| words.iter().filter_map(|w| family(w.as_str())).collect());
     let fable = fable_plan(&plan, features);
-    let mut consented: Vec<String> = raw.model_consent.0;
-    if raw.fable_consent.0 && !consented.iter().any(|f| f == "fable") {
-        consented.insert(0, "fable".to_string());
-    }
     Profile {
         key,
         plan,
@@ -3453,8 +3341,6 @@ fn profile_of(raw: RawFile) -> Profile {
         usage,
         usage_of_another_at,
         fable,
-        consented,
-        credits_only,
     }
 }
 
@@ -3660,19 +3546,10 @@ pub fn instant(text: &str) -> Option<i64> {
     Some(at - sign * (hours * 3600 + minutes * 60))
 }
 
-fn family(name: &str) -> Option<String> {
-    (!name.is_empty() && name.len() <= 32 && name.bytes().all(|b| b.is_ascii_alphabetic()))
-        .then(|| name.to_ascii_lowercase())
-}
-
-/// The file: the six keys read; every other key skipped.
+/// The file: the four keys read; every other key skipped.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawFile {
-    #[serde(rename = "fableOverageConsentV2")]
-    fable_consent: Consent,
-    #[serde(rename = "usageCreditsOnlyModelConsent")]
-    model_consent: Consents,
     #[serde(rename = "oauthAccount")]
     oauth: Obj<RawOauth>,
     #[serde(rename = "cachedExtraUsageDisabledReason")]
@@ -3786,8 +3663,6 @@ struct RawFeatures {
     tiers: Words,
     #[serde(rename = "tengu_saffron_lattice")]
     lattice: Obj<RawLattice>,
-    #[serde(rename = "tengu_calm_seal")]
-    calm_seal: Words,
 }
 
 #[derive(Default, Deserialize)]
@@ -4216,86 +4091,6 @@ impl<'de> Deserialize<'de> for FableEntries {
             }
         }
         d.deserialize_any(V)
-    }
-}
-
-/// A stored consent (`{ "<org or acct:id>": true }`): whether any entry holds `true`.
-#[derive(Default)]
-struct Consent(bool);
-
-impl<'de> Deserialize<'de> for Consent {
-    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Consent;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("any value")
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Consent, A::Error> {
-                let mut given = false;
-                while map.next_key::<IgnoredAny>()?.is_some() {
-                    given |= matches!(map.next_value::<Leaf>()?, Leaf::Flag(true));
-                }
-                Ok(Consent(given))
-            }
-            lenient_scalars!(Consent(false));
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Consent, A::Error> {
-                drain_seq(seq).map(|()| Consent(false))
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
-
-/// The stored consents per model family ([`family`], [`Consent`]).
-#[derive(Default)]
-struct Consents(Vec<String>);
-
-impl<'de> Deserialize<'de> for Consents {
-    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Consents;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("any value")
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Consents, A::Error> {
-                let mut families = Vec::new();
-                while let Some(Family(name)) = map.next_key::<Family>()? {
-                    let Consent(given) = map.next_value::<Consent>()?;
-                    if let Some(name) = name.filter(|_| given)
-                        && !families.contains(&name)
-                    {
-                        families.push(name);
-                    }
-                }
-                Ok(Consents(families))
-            }
-            lenient_scalars!(Consents(Vec::new()));
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Consents, A::Error> {
-                drain_seq(seq).map(|()| Consents(Vec::new()))
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
-
-/// An object key, kept only where it names a model family ([`family`]).
-struct Family(Option<String>);
-
-impl<'de> Deserialize<'de> for Family {
-    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl Visitor<'_> for V {
-            type Value = Family;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a key")
-            }
-            fn visit_str<E: de::Error>(self, s: &str) -> Result<Family, E> {
-                Ok(Family(family(s)))
-            }
-        }
-        d.deserialize_str(V)
     }
 }
 

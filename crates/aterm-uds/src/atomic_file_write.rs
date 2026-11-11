@@ -558,7 +558,24 @@ pub(super) fn create_temp_salted(
         #[cfg(windows)]
         let _ = mode;
         match options.open(&tmp) {
-            Ok(f) => return Ok((tmp, f)),
+            Ok(f) => {
+                // A mode of 0600 does not suppress inherited macOS ACL grants.
+                // Refuse before handing the descriptor to a payload producer.
+                #[cfg(unix)]
+                if mode & 0o077 == 0 {
+                    let private = astream_sys::owner_private(&f).and_then(|verdict| {
+                        verdict.map(|_| ()).map_err(|why| {
+                            io::Error::new(io::ErrorKind::PermissionDenied, why.to_string())
+                        })
+                    });
+                    if let Err(error) = private {
+                        drop(f);
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(error);
+                    }
+                }
+                return Ok((tmp, f));
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }

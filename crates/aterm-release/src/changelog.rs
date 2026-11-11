@@ -42,44 +42,61 @@ pub fn real_body(text: &str, section: &str) -> Vec<String> {
         if raw.starts_with("## ") {
             break;
         }
-        let rest = if in_comment {
-            match raw.find("-->") {
-                Some(p) => {
-                    in_comment = false;
-                    &raw[p + 3..]
-                }
-                None => continue,
-            }
-        } else {
-            raw
-        };
-        if !rest.contains("<!--") {
-            if rest.trim_start().starts_with("###") || rest.trim().is_empty() {
-                continue;
-            }
-            out.push(rest.to_string());
-            continue;
-        }
-        let mut line = rest.to_string();
-        while let Some(start) = line.find("<!--") {
-            match line.rfind("-->").filter(|&end| end >= start + 4) {
-                Some(end) => line.replace_range(start..end + 3, ""),
-                None => break,
-            }
-        }
-        if let Some(start) = line.find("<!--") {
-            line.truncate(start);
-            in_comment = true;
-        }
-        if line.trim_start().starts_with("###") {
-            continue;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        out.push(line);
+        out.extend(body_line(raw, &mut in_comment));
     }
     out
+}
+
+/// One raw line of a section, as [`real_body`] keeps it: `None` for a line inside an HTML
+/// comment, a `###` scaffold heading or a blank line. `in_comment` carries a comment that
+/// one line opens and a later one closes.
+fn body_line(raw: &str, in_comment: &mut bool) -> Option<String> {
+    let rest = if *in_comment {
+        let end = raw.find("-->")?;
+        *in_comment = false;
+        &raw[end + 3..]
+    } else {
+        raw
+    };
+    let mut line = rest.to_string();
+    while let Some(start) = line.find("<!--") {
+        match line.rfind("-->").filter(|&end| end >= start + 4) {
+            Some(end) => line.replace_range(start..end + 3, ""),
+            None => break,
+        }
+    }
+    if let Some(start) = line.find("<!--") {
+        line.truncate(start);
+        *in_comment = true;
+    }
+    (!line.trim_start().starts_with("###") && !line.trim().is_empty()).then_some(line)
+}
+
+/// Every [`note_keys`] key of every `## [<name>]` section of `text` but `skip`, read in one
+/// pass: whether an entry is anywhere in the changelog, whichever section holds it.
+pub(crate) fn every_note_key(text: &str, skip: Option<&str>) -> std::collections::BTreeSet<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    let mut body: Option<Vec<String>> = None;
+    let mut in_comment = false;
+    for raw in text.lines() {
+        if raw.starts_with("## ") {
+            if let Some(lines) = body.take() {
+                keys.extend(keys_of(&lines));
+            }
+            body = (raw.starts_with("## [")
+                && !skip.is_some_and(|name| is_section_header(raw, name)))
+            .then(Vec::new);
+            in_comment = false;
+            continue;
+        }
+        if let Some(lines) = body.as_mut() {
+            lines.extend(body_line(raw, &mut in_comment));
+        }
+    }
+    if let Some(lines) = body {
+        keys.extend(keys_of(&lines));
+    }
+    keys
 }
 
 /// Whether the changelog already carries a `## [<version>]` section: the roll's double-roll guard and the claim's "cut elsewhere" abort (ledger.rs) share it.
@@ -394,7 +411,12 @@ enum Unit<'a> {
 /// entry matters: a follow-up may reuse a bold title while describing a new fix.
 /// Harness versions have their own release-window rule in `harness_versions`.
 pub(crate) fn note_keys(text: &str, section: &str) -> Vec<String> {
-    note_entries(text, section)
+    keys_of(&real_body(text, section))
+}
+
+/// [`note_keys`] of one section's real body.
+fn keys_of(body: &[String]) -> Vec<String> {
+    entries_of(body)
         .into_iter()
         .filter(|entry| !entry.starts_with(HARNESS_ENTRY_HEAD))
         .map(|entry| {
@@ -409,7 +431,11 @@ pub(crate) fn note_keys(text: &str, section: &str) -> Vec<String> {
 
 /// Whole entries with whitespace folded, including harness announcements.
 pub(crate) fn note_entries(text: &str, section: &str) -> Vec<String> {
-    let body = real_body(text, section);
+    entries_of(&real_body(text, section))
+}
+
+/// [`note_entries`] of one section's real body.
+fn entries_of(body: &[String]) -> Vec<String> {
     let lines: Vec<&str> = body.iter().map(String::as_str).collect();
     units(&lines)
         .into_iter()
@@ -793,7 +819,9 @@ mod tests {
         let doc = "## [Unreleased]\n\n### Changed\n\n- a new fix\n\n- **Harness versions since v0.193.0: `alab claude harness 0.31`.**\n\n## [0.194.0] - date\n\n- `alab claude harness 0.31` records the upgrade changes.\n\n## [0.193.0] - date\n\n- older change\n";
         let err = gate_unreleased(doc).unwrap_err().to_string();
         assert!(
-            err.contains("immediately preceding") && err.contains("0.194.0"),
+            err.contains("immediately preceding")
+                && err.contains("0.194.0")
+                && err.contains("fix: run `targo --unverified ship harness-bump`"),
             "{err}"
         );
     }
@@ -804,7 +832,9 @@ mod tests {
         let dated = doc.replacen("since v0.193.0", "since v0.194.0", 1);
         let err = gate_unreleased(&dated).unwrap_err().to_string();
         assert!(
-            err.contains("already announced") && err.contains("0.31"),
+            err.contains("already announced")
+                && err.contains("0.31")
+                && err.contains("fix: run `targo --unverified ship harness-bump`"),
             "{err}"
         );
         let fresh = dated.replacen("harness 0.31", "harness 0.32", 1);

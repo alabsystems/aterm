@@ -3,11 +3,6 @@
 
 # aterm-toml: spec recovery from its 52 unit tests
 
-> Status 2026-10-28: this is the crate's migration worklist across its 28 specs and 52 live
-> `#[test]` fns (`tests/`). Each spec below is proved through Trust/Clean about the compiled Rust
-> function, and then the tests each one subsumes are deleted. The one test that samples no spec
-> (§4) moves to a bench.
-
 Source: `crates/aterm-toml` (read only). Every live `#[test]` in `tests/`
 (cost.rs 1, depth.rs 4, edit.rs 15, fuzz.rs 5, roundtrip.rs 2, spec.rs 10, typed.rs 15 = 52)
 and the code each one reaches are mapped below. `src/` has no `#[test]` and no `#[cfg(test)]`.
@@ -48,7 +43,7 @@ Result: **28 specs**, covering **51 tests**. **1 test is not a spec sample** (§
 
 `subsumes` lists the primary tests (secondary ones are in §2). `difficulty` names the Rust
 features a proof must handle. `blocking_gaps` are rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes Clean rows)
+`docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (a seal that publishes Clean rows)
 blocks every row and is left out. Every row also needs gap 1 (non-scalar carriers), since even
 the scalar cores take `&str`, `Option` or `Result`.
 
@@ -83,27 +78,6 @@ schema-error-location	invariant	de::Deserializer::{locate,mismatch}, Error::with
 value-index	contract	<aterm_toml::Value as Index<I>>::index, aterm_toml::Value::{get,as_str,as_integer,as_float,as_table}, <str as value::Index>::index_into, <usize as value::Index>::index_into, <Map<String, Value> as Index<&str>>::index	∀ v: Value, i: I with I: value::Index: v.get(i) == i.index_into(v). index_into by str/String = Some(t[k]) if v = Table(t) ∧ k ∈ t, else None. index_into by usize = Some(a[n]) if v = Array(a) ∧ n < len, else None. v[i] = i.index_into(v).unwrap() when Some, and panics with a message containing "index not found" ⇔ it is None. Each as_X returns Some exactly on its variant.	typed::the_untyped_table_and_index_surface	EASY-MEDIUM: a sealed generic trait, enum match, BTreeMap lookup, Vec indexing, panic as a specified outcome (#[should_panic] becomes a panics-iff clause)	1,2,3,11
 error-log-words	contract	Error::log_words, <LogWords as Display>::fmt	What an app log may keep of an error (DESIGN-session-log §3.6, unit E7). ∀ e: Error: e.log_words() displays as "TOML error at line L, column C" when e has a position (L, C its 1-based line_col, the one Display prints), else "TOML error"; it depends on e only through that position, so it prints neither the offending line (Display's snippet) nor the message, which a serde error fills with the value it quotes.	spec::log_words_keeps_the_position_and_never_the_line	TRIVIAL: an Option<(usize, usize)> copy and one match in a Display impl	1,2,3
 ```
-
-### Distribution by kind (28)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 13 | depth-bound, char-boundary, unicode-escape, eof-empty-span, error-display, number-literal, parsed-tree-shape, edit-byte-locality, canonical-encoding, seq-drained, unit-variant-empty, value-index, error-log-words |
-| round-trip | 4 | roundtrip, key-parse-spelling, standalone-value, serde-roundtrip |
-| refinement | 4 | accept-domain, value-semantics, edit-semantics, deser-refines-model |
-| invariant | 3 | span-aligned, parsed-spans, schema-error-location |
-| table-property | 2 | days-in-month, item-kind-predicates |
-| equivalence | 1 | entry-points-agree |
-| no-panic/bounds | 1 | no-panic-bounded-stack |
-
-### Proof dependency order
-
-`char-boundary` → `span-aligned`, `error-display` → `eof-empty-span`, `schema-error-location`, `error-log-words`.
-`days-in-month`, `number-literal`, `unicode-escape`, `key-parse-spelling` are lemmas of
-`accept-domain` and `value-semantics`. `roundtrip` → `edit-byte-locality`.
-`value-semantics` → `edit-semantics`. `canonical-encoding` + `deser-refines-model` →
-`serde-roundtrip`. `entry-points-agree` (b) is definitional; (a) needs `deser-refines-model` on the
-`Value` instance.
 
 ## 2. Test → spec map (TSV)
 
@@ -165,17 +139,6 @@ tests/typed.rs	a_none_field_is_left_out_and_a_none_map_value_refused	canonical-e
 tests/spec.rs	log_words_keeps_the_position_and_never_the_line	error-log-words	schema-error-location
 ```
 
-## 3. Coverage
-
-- 52 live tests in the suite; all 52 are mapped above, 51 of them to one of the 28 specs, and 1 is
-  not a spec sample (§4).
-- The biggest collapses: `edit-byte-locality` (8 primary), `roundtrip` (4 primary, plus 5
-  shared), `deser-refines-model` (4), `serde-roundtrip` (4), `depth-bound` (3), and `canonical-encoding` (3).
-- Three specs have no primary test: `entry-points-agree` (sampled by 8 tests as a side check),
-  `char-boundary` (a lemma no test isolates) and `days-in-month` (sampled inside the grammar and
-  datetime tests). Each is still needed: the first is how one parser proof covers six entry points,
-  the other two are the scalar cores the bigger proofs are built on.
-
 ## 4. Tests that are not spec samples
 
 | test | why | action |
@@ -215,29 +178,3 @@ tests/spec.rs	log_words_keeps_the_position_and_never_the_line	error-log-words	sc
    audit §7 covers stack-depth reasoning; the gaps listed (1, 3, 7, 16) are necessary but not
    sufficient. A new §7 row is needed, or the parser and `Drop` must be made iterative so that the
    bound is a loop variant.
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone: gap 1 (non-scalar carriers) is the floor for all 28. So the order
-below starts with specs whose only other blocker is gap 3 (calls, matches, loops in reflected bodies)
-and gap 7 (loops), on scalar or near-scalar cores.
-
-1. **`seq-drained` (a)**, **`days-in-month` (a)**, **`char-boundary`** (gaps 1, 3; 7 for
-   `char-boundary`): a comparison and `saturating_sub`; a match on integer literals with
-   `is_multiple_of`; two `usize` loops over `is_char_boundary`. They retire no test alone but are
-   the lemmas under `span-aligned`, `error-display`, `accept-domain` and `seq-drained` (b).
-2. **`item-kind-predicates`**, **`unit-variant-empty`**, **`unicode-escape`** (gaps 1, 2, 3; 7 for
-   the escape window): enum matches and `&self`/`&mut self` views, the first users of gap 2.
-3. **`error-display`**, **`number-literal`**, **`key-parse-spelling`** (gaps 1, 3, 7; 11 for the
-   `Formatter`, 5 for keys): string-scanning contracts. `number-literal`'s round-to-nearest
-   clause needs a float-parse model; its range half (None on overflow) can land first.
-4. **`span-aligned`**, **`eof-empty-span`**, **`depth-bound`**, **`value-index`**: invariants over
-   every error site, and the depth guard.
-5. The whole-parser specs: `roundtrip`, `accept-domain`, `value-semantics`,
-   `entry-points-agree`, `standalone-value`, `parsed-spans`, `parsed-tree-shape` and
-   `no-panic-bounded-stack`. They need a Lean model of TOML 1.0 (gaps 10, 14) and the stack-depth
-   row of §5.9.
-6. The edit specs (`edit-byte-locality`, `edit-semantics`), then the serde specs
-   (`canonical-encoding`, `deser-refines-model`, `schema-error-location`, `seq-drained` (b),
-   `serde-roundtrip`), which need gap 9 (serde derives across the proc-macro boundary) and gap 11
-   (generic `T`).

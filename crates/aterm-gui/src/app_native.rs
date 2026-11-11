@@ -421,6 +421,16 @@ pub(crate) struct NativeUpdateReconcileFacts {
     pub(crate) installable: Option<bool>,
 }
 
+/// A read that produced no facts; never evidence that an update is absent.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeUpdateReadFailure {
+    ticket: NativeUpdateReconcileTicket,
+    observation_sequence: u64,
+}
+
+pub(crate) type NativeUpdateReadResult =
+    Result<NativeUpdateReconcileFacts, NativeUpdateReadFailure>;
+
 /// One retire of a latched installed activation for a newer verified release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ActivationSupersedeJob {
@@ -448,7 +458,7 @@ enum NativeUpdateFactDestination {
         proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
     },
     #[cfg(any(unix, test))]
-    Reply(std::sync::mpsc::SyncSender<NativeUpdateReconcileFacts>),
+    Reply(std::sync::mpsc::SyncSender<NativeUpdateReadResult>),
 }
 
 pub(crate) struct NativeUpdateReconcileRequest {
@@ -560,6 +570,13 @@ pub(crate) fn spawn_native_update_reconcile_worker(
             run_native_update_worker(
                 receiver,
                 read_native_update_reconcile_facts,
+                |build, witness| {
+                    aterm_update::confirm_boot_health_exact(
+                        build,
+                        crate::build_info::git_commit(),
+                        witness,
+                    )
+                },
                 move |confirmed| {
                     let _ = health_proxy
                         .send_event(Wake::NativeBootHealthConfirmationFinished { confirmed });
@@ -577,6 +594,7 @@ pub(crate) fn spawn_native_update_reconcile_worker(
 fn run_native_update_worker(
     receiver: std::sync::mpsc::Receiver<NativeUpdateWorkerRequest>,
     mut read: impl FnMut(NativeUpdateReconcileTicket, u64, u64) -> NativeUpdateReconcileFacts,
+    mut confirm: impl FnMut(u64, aterm_update::TrialWitness) -> bool,
     mut health_finished: impl FnMut(bool),
     mut drained: impl FnMut(),
 ) {
@@ -588,11 +606,16 @@ fn run_native_update_worker(
                 current_build,
                 witness,
             } => {
-                let confirmed = aterm_update::confirm_boot_health_exact(
-                    current_build,
-                    crate::build_info::git_commit(),
-                    witness,
-                );
+                let confirmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    confirm(current_build, witness)
+                }))
+                .unwrap_or_else(|payload| {
+                    aterm_log::warn!(
+                        "boot-health confirmation panicked ({})",
+                        aterm_log::words::Panic::of(payload.as_ref())
+                    );
+                    false
+                });
                 health_finished(confirmed);
                 drained();
                 continue;
@@ -603,7 +626,19 @@ fn run_native_update_worker(
             break;
         };
         next_observation_sequence = next;
-        let facts = read(request.ticket, observation_sequence, request.current_build);
+        let facts = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read(request.ticket, observation_sequence, request.current_build)
+        }))
+        .map_err(|payload| {
+            aterm_log::warn!(
+                "updater facts read panicked ({})",
+                aterm_log::words::Panic::of(payload.as_ref())
+            );
+            NativeUpdateReadFailure {
+                ticket: request.ticket,
+                observation_sequence,
+            }
+        });
         match request.destination {
             NativeUpdateFactDestination::Wake { purpose, proxy } => {
                 let _ = proxy.send_event(Wake::NativeUpdateReconcileFinished { purpose, facts });
@@ -634,7 +669,7 @@ pub(crate) fn collect_native_update_reconcile_facts(
             },
         ))
         .ok()?;
-    result.recv().ok()
+    result.recv().ok()?.ok()
 }
 
 const MAX_AUTOMATIC_UPDATE_CYCLES: u8 = 3;
@@ -1225,6 +1260,23 @@ const fn failed_update_status(build: u64, message: String) -> DurableUpdateStatu
         installable: None,
         channel_unreadable: false,
         checked_at: None,
+    }
+}
+
+/// Every returning check worker completes its ticket, including after an unwind.
+fn run_update_check(
+    build: u64,
+    check: impl FnOnce() -> DurableUpdateStatus,
+) -> DurableUpdateStatus {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)) {
+        Ok(status) => status,
+        Err(payload) => {
+            aterm_log::warn!(
+                "manual update check worker panicked ({})",
+                aterm_log::words::Panic::of(payload.as_ref())
+            );
+            failed_update_status(build, "update check worker panicked".to_string())
+        }
     }
 }
 
@@ -1868,22 +1920,34 @@ impl App {
         purpose: NativeUpdateReconcilePurpose,
         destination: impl FnOnce(NativeUpdateReconcilePurpose) -> NativeUpdateFactDestination,
     ) -> bool {
-        if !self.native_updater_service.snapshot().enabled {
-            self.pending_native_update_reconcile_purpose = None;
-            return false;
-        }
         let effective = self
             .pending_native_update_reconcile_purpose
             .take()
             .map_or(purpose, |pending| merge_reconcile_purpose(pending, purpose));
-        match self.try_dispatch_native_update_reconcile(effective, destination) {
+        let outcome = if self.native_updater_service.snapshot().enabled {
+            self.try_dispatch_native_update_reconcile(effective, destination)
+        } else {
+            NativeUpdateDispatch::Unavailable
+        };
+        self.finish_native_update_dispatch(effective, outcome)
+    }
+
+    fn finish_native_update_dispatch(
+        &mut self,
+        purpose: NativeUpdateReconcilePurpose,
+        outcome: NativeUpdateDispatch,
+    ) -> bool {
+        match outcome {
             NativeUpdateDispatch::Queued => true,
             NativeUpdateDispatch::Saturated => {
-                self.pending_native_update_reconcile_purpose = Some(effective);
+                self.pending_native_update_reconcile_purpose = Some(purpose);
                 true
             }
             NativeUpdateDispatch::Unavailable => {
                 self.pending_native_update_reconcile_purpose = None;
+                if purpose == NativeUpdateReconcilePurpose::ApplyControl {
+                    self.refuse_control_apply_without_facts();
+                }
                 false
             }
         }
@@ -1894,13 +1958,13 @@ impl App {
         &mut self,
         purpose: NativeUpdateReconcilePurpose,
     ) -> bool {
-        if !self.native_updater_service.snapshot().enabled {
-            self.pending_native_update_reconcile_purpose = None;
-            return false;
-        }
         let Some(proxy) = self.proxy.clone() else {
-            self.pending_native_update_reconcile_purpose = None;
-            return false;
+            let effective = self
+                .pending_native_update_reconcile_purpose
+                .take()
+                .map_or(purpose, |pending| merge_reconcile_purpose(pending, purpose));
+            return self
+                .finish_native_update_dispatch(effective, NativeUpdateDispatch::Unavailable);
         };
         self.request_native_update_reconcile_with(purpose, move |effective| {
             NativeUpdateFactDestination::Wake {
@@ -1917,15 +1981,12 @@ impl App {
         let Some(purpose) = self.pending_native_update_reconcile_purpose.take() else {
             return NativeUpdateDispatch::Queued;
         };
-        if !self.native_updater_service.snapshot().enabled {
-            return NativeUpdateDispatch::Unavailable;
-        }
-        let outcome = self.try_dispatch_native_update_reconcile(purpose, destination);
-        if outcome == NativeUpdateDispatch::Saturated {
-            self.pending_native_update_reconcile_purpose = Some(purpose);
-        } else if outcome == NativeUpdateDispatch::Unavailable {
-            self.pending_native_update_reconcile_purpose = None;
-        }
+        let outcome = if self.native_updater_service.snapshot().enabled {
+            self.try_dispatch_native_update_reconcile(purpose, destination)
+        } else {
+            NativeUpdateDispatch::Unavailable
+        };
+        self.finish_native_update_dispatch(purpose, outcome);
         outcome
     }
 
@@ -1973,11 +2034,8 @@ impl App {
     }
 
     fn refuse_control_apply_without_facts(&mut self) {
+        self.control_apply_stale_retries = 0;
         let reason = "Updater facts could not be collected safely";
-        aterm_update::record_apply_refusal(
-            self.native_updater_service.snapshot().current_build,
-            reason,
-        );
         self.surface_update_apply_outcome(
             "control request",
             UpdateOutcome::Blocked {
@@ -1993,13 +2051,35 @@ impl App {
         now: std::time::Instant,
     ) {
         if confirmed {
-            self.boot_health_confirmation_dispatched = true;
+            self.boot_health_confirmation = crate::BootHealthConfirmation::Confirmed;
             self.boot_health_confirmation_retry_at = None;
             self.boot_health_confirmation_backoff = crate::BOOT_HEALTH_RETRY_MIN;
             self.try_pending_native_auto_apply(false);
         } else {
-            self.boot_health_confirmation_dispatched = false;
+            self.boot_health_confirmation = crate::BootHealthConfirmation::Pending;
             self.arm_boot_health_retry(now);
+        }
+    }
+
+    /// Failed reads leave verified state intact and cannot authorize an apply.
+    pub(crate) fn finish_native_update_observation(
+        &mut self,
+        purpose: NativeUpdateReconcilePurpose,
+        result: NativeUpdateReadResult,
+    ) {
+        match result {
+            Ok(facts) => self.finish_native_update_reconcile(purpose, facts),
+            Err(failure) => {
+                aterm_log::debug!(
+                    "updater facts request {} observation {} failed",
+                    failure.ticket.request_sequence,
+                    failure.observation_sequence
+                );
+                if purpose == NativeUpdateReconcilePurpose::ApplyControl {
+                    self.control_apply_stale_retries = 0;
+                    self.refuse_control_apply_without_facts();
+                }
+            }
         }
     }
 
@@ -2025,14 +2105,13 @@ impl App {
         match self.reconcile_native_update_facts(facts) {
             NativeUpdateFactsResult::IgnoredStale => {
                 const MAX_CONTROL_APPLY_STALE_RETRIES: u8 = 3;
-                if purpose == NativeUpdateReconcilePurpose::ApplyControl
-                    && (self.control_apply_stale_retries >= MAX_CONTROL_APPLY_STALE_RETRIES || {
+                if purpose == NativeUpdateReconcilePurpose::ApplyControl {
+                    if self.control_apply_stale_retries >= MAX_CONTROL_APPLY_STALE_RETRIES {
+                        self.refuse_control_apply_without_facts();
+                    } else {
                         self.control_apply_stale_retries += 1;
-                        !self.request_native_update_reconcile(purpose)
-                    })
-                {
-                    self.control_apply_stale_retries = 0;
-                    self.refuse_control_apply_without_facts();
+                        self.request_native_update_reconcile(purpose);
+                    }
                 }
             }
             NativeUpdateFactsResult::Deferred(facts) => {
@@ -6905,11 +6984,12 @@ impl App {
                     "aterm-native-update-check",
                     crate::qos::Role::Background,
                     move || {
-                        let status = aterm_update::check_now_with_settings(build, &provider);
-                        let _ = proxy.send_event(Wake::NativeUpdateFinished {
-                            ticket,
-                            status: durable_update_status(status),
+                        let status = run_update_check(build, || {
+                            durable_update_status(aterm_update::check_now_with_settings(
+                                build, &provider,
+                            ))
                         });
+                        let _ = proxy.send_event(Wake::NativeUpdateFinished { ticket, status });
                     },
                 );
                 match spawn {
@@ -6944,14 +7024,11 @@ impl App {
 
         if let Some((purpose, _stale)) = self.deferred_native_update_reconcile.take()
             && !self.request_native_update_reconcile(purpose)
+            && purpose != NativeUpdateReconcilePurpose::ApplyControl
         {
-            if purpose == NativeUpdateReconcilePurpose::ApplyControl {
-                self.refuse_control_apply_without_facts();
-            } else {
-                aterm_log::debug!(
-                    "update check: could not re-request the reconcile a parked {purpose:?} asked for"
-                );
-            }
+            aterm_log::debug!(
+                "update check: could not re-request the reconcile a parked {purpose:?} asked for"
+            );
         }
         if self.native_updater_service.snapshot().phase == UpdaterPhase::Applying {
             return;
@@ -6992,6 +7069,17 @@ impl App {
                 at
             }
         };
+        if let Some(intent) = self.auto_apply_intent.as_mut() {
+            intent.retry_at = forward(intent.retry_at);
+        }
+        self.boot_health_confirmation_retry_at =
+            self.boot_health_confirmation_retry_at.map(forward);
+        if let Some(ladder) = self.auto_apply_ladder.as_mut() {
+            ladder.armed_at = ladder
+                .armed_at
+                .checked_sub(slept.min(crate::native_update_auto_intent::LANDS_WITHIN))
+                .unwrap_or(ladder.armed_at);
+        }
         if let Some(latch) = self.auto_apply_manual_only.as_mut() {
             latch.retry_at = latch.retry_at.map(forward);
             if let Some(replacement) = latch.replacement.as_mut()
@@ -8545,7 +8633,7 @@ impl App {
         };
         // An installed build must prove its own health before it can chain another update.
         // Confirmation releases this intent through finish_native_boot_health_confirmation.
-        if !self.boot_health_confirmation_dispatched {
+        if self.boot_health_confirmation != crate::BootHealthConfirmation::Confirmed {
             return;
         }
         let now = std::time::Instant::now();

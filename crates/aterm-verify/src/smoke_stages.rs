@@ -21,7 +21,7 @@ fn ok_reply(reply: &str) -> bool {
 
 /// The `aterm.toml` lines the smoke's instance runs with (top-level keys, ahead of the sandbox's
 /// first `[table]`).
-pub const SMOKE_CONFIG: &str = "cursor_trail_style = \"rainbow kitty pet\"\ncursor_momentum_glow = true\ntrail_sounds = true\n";
+pub const SMOKE_CONFIG: &str = "motion = \"full\"\ncursor_trail_style = \"rainbow kitty pet\"\ncursor_momentum_glow = true\ntrail_sounds = true\n";
 
 const CURSOR_EFFECT_LATE_MAX: u64 = 4;
 const CURSOR_EFFECT_LATE_SHARE_DEN: u64 = 50;
@@ -800,9 +800,7 @@ fn guarded_burst<G>(
     }
     let effects = effects_verdict(&readings.summary);
     let hardware = hardware_key_verdict(readings.posted, &readings.summary, &readings.percentiles);
-    if effects.is_ok() && hardware.is_ok() {
-        retain_burst_readings(r, &readings);
-    }
+    retain_burst_readings(r, &readings);
     for verdict in [effects, hardware] {
         match verdict {
             Ok(line) => r.pass(format!("{line}{stated}")),
@@ -1387,6 +1385,33 @@ pub(crate) mod tests {
                         |e| matches!(e, crate::ladder::Entry::Raw(text) if text.ends_with(raw.trim_end_matches('\n')))
                     )
                     .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn burst_failure_retains_bounded_summary_and_percentiles() {
+        let mut readings = burst_readings();
+        readings.summary = readings
+            .summary
+            .replace("fx_under_frames=20", "fx_under_frames=0");
+        let expected = [readings.summary.clone(), readings.percentiles.clone()];
+        let mut r = Report::new("burst");
+        guarded_burst(
+            &mut r,
+            || Ok(((), String::new())),
+            |_| Ok(readings),
+            |_| Ok(Vec::new()),
+        );
+        assert!(r.outcomes().any(|(outcome, _)| {
+            outcome == crate::ladder::Outcome::Fail(crate::ladder::Severity::GateFailed)
+        }));
+        for raw in expected {
+            assert_eq!(
+                r.entries.iter().filter(|entry| {
+                    matches!(entry, crate::ladder::Entry::Raw(text) if text.ends_with(raw.trim_end_matches('\n')))
+                }).count(),
                 1
             );
         }

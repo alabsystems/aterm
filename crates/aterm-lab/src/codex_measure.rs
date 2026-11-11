@@ -73,6 +73,7 @@ pub(crate) const CODEX: Family = Family {
     verb: "codex-measure",
     source: "rollout",
     read: ROLLOUT_KEYS,
+    read_scope: rollout_read_scope,
     inert: no_kind_is_inert,
     words: &aterm_agent::harness::codex_steps::GATED_WORDS,
     holds: is_reduction,
@@ -84,6 +85,16 @@ pub(crate) const CODEX: Family = Family {
     filters: &FILTERS,
     standing: &STANDING,
 };
+
+/// Namespace is read only by the function/custom-call arm of CodexStepFold.
+/// Keep every other anchored key conservative until its decoder scope is established.
+fn rollout_read_scope(key: &str, kind: &str) -> bool {
+    key != "namespace"
+        || matches!(
+            kind,
+            "response_item/function_call" | "response_item/custom_tool_call"
+        )
+}
 
 /// No rollout record kind is inert: while the Codex step fold reads a fork's copy
 /// (`CodexStepFold::past_copy`) it reads every row's `type` and stamp, whatever its kind, so a row

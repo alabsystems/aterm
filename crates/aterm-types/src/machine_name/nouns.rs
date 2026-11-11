@@ -17,7 +17,7 @@
 //! are a judgement, so every word added gets an agent's hostile review against those
 //! senses before it lands, and a word any review flags is dropped, not argued.
 
-/// The most draws a machine makes to find a noun no machine in view already uses.
+/// The most random draws before a bounded search of the remaining noun pool.
 pub const DRAWS: usize = 8;
 
 /// The default nicknames: every word that passed review, so their number is whatever
@@ -78,18 +78,22 @@ pub const NOUNS: &[&str] = &[
 
 /// A default nickname: up to [`DRAWS`] nouns drawn with `next` (uniform `u32`s from the
 /// OS's CSPRNG), the first one `in_use` says no machine in view uses as a nickname or
-/// nickname alias (compared without case), else the last one drawn.
+/// nickname alias (compared without case). After occupied random draws, walk the pool
+/// from the last draw so an available noun is never missed. `None` means every noun is in use.
 ///
 /// The index is `next() % NOUNS.len()`: with a few hundred nouns its bias is below 2^-22,
 /// which no person can see.
 #[must_use]
-pub fn draw(mut next: impl FnMut() -> u32, in_use: impl Fn(&str) -> bool) -> &'static str {
-    let mut noun = NOUNS[0];
+pub fn draw(mut next: impl FnMut() -> u32, in_use: impl Fn(&str) -> bool) -> Option<&'static str> {
+    let mut last = 0;
     for _ in 0..DRAWS {
-        noun = NOUNS[next() as usize % NOUNS.len()];
+        last = next() as usize % NOUNS.len();
+        let noun = NOUNS[last];
         if !in_use(noun) {
-            break;
+            return Some(noun);
         }
     }
-    noun
+    (1..NOUNS.len())
+        .map(|offset| NOUNS[(last + offset) % NOUNS.len()])
+        .find(|noun| !in_use(noun))
 }

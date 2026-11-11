@@ -153,7 +153,11 @@ pub fn cut_removed_writer(
             save(paths, scope, member, store.last_of(*member));
         }
     };
-    let session = match crate::table::Session::open(&bootstrap) {
+    let admitted = match pass {
+        CutPass::BeforeRemove => crate::table::Session::try_open(&bootstrap),
+        CutPass::Repair | CutPass::Share => crate::table::Session::open(&bootstrap),
+    };
+    let session = match admitted {
         Ok(session) => session,
         Err(_) => {
             // Another local writer holds the journal: read each table's frontier beside it and

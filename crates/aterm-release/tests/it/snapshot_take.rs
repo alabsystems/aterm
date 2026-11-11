@@ -496,7 +496,12 @@ fn the_cache_is_one_noindex_directory_beside_the_clone() {
     let (repo, _) = fixture(dir.path());
     let canonical = std::fs::canonicalize(dir.path()).unwrap();
     let cache = CacheRoot::for_repo(&repo).unwrap();
-    assert_eq!(cache.path(), canonical.join("repo-release.noindex"));
+    let quiet_parent = if aterm_tempfile::is_quiet(&canonical) {
+        canonical
+    } else {
+        canonical.join(aterm_tempfile::QUIET)
+    };
+    assert_eq!(cache.path(), quiet_parent.join("repo-release.noindex"));
     assert_eq!(
         std::fs::metadata(cache.path())
             .unwrap()

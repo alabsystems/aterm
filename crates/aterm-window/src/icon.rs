@@ -120,29 +120,5 @@ impl Icon {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rgba_icon_rejects_overflowing_or_mismatched_dimensions() {
-        assert!(matches!(
-            RgbaIcon::from_rgba(Vec::new(), 65_536, 65_536),
-            Err(BadIcon::DimensionsVsPixelCount {
-                width: 65_536,
-                height: 65_536,
-                pixel_count: 0,
-                ..
-            })
-        ));
-        assert!(matches!(
-            RgbaIcon::from_rgba(vec![0; 4], u32::MAX, u32::MAX),
-            Err(BadIcon::DimensionsVsPixelCount {
-                width: u32::MAX,
-                height: u32::MAX,
-                pixel_count: 1,
-                ..
-            })
-        ));
-        assert!(RgbaIcon::from_rgba(vec![0; 16], 2, 2).is_ok());
-    }
-}
+#[path = "icon_tests.rs"]
+mod tests;

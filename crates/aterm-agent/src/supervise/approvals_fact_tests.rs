@@ -8,7 +8,7 @@ use super::*;
 use crate::supervise::facts::FactKind;
 use crate::supervise::policy::turn_end::{
     AccountAt, RULE_ACCOUNT, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LEFT,
-    RULE_LIMIT_RESUME, RULE_LOGIN, RULE_MODEL_FALLBACK,
+    RULE_LIMIT_RESUME, RULE_LOGIN,
 };
 
 const SID: &str = "@s-1";
@@ -265,20 +265,6 @@ fn a_fact_line_is_no_read_after_a_usage_try() {
     let answered = row_at(10_000, RULE_TRY_ANSWERED, Outcome::Waiting, "", "-");
     invisible_at(&[resume, answered], 1, |b| {
         usage_attempt_taken_in(b, Some(SID), &|_, _| false).map(|a| a.read_ms)
-    });
-}
-
-#[test]
-fn a_fact_line_asks_nothing_on_a_model_switch() {
-    let switch = row_at(
-        1_000,
-        RULE_MODEL_FALLBACK,
-        Outcome::Typed,
-        "relaunch --model sonnet",
-        &model_switch_reason(Some("opus"), None, 1),
-    );
-    invisible(&[switch], |b| {
-        open_model_switch_in(b, Some(SID)).map(|o| o.asked)
     });
 }
 

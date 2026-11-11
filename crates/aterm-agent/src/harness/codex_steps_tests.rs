@@ -1759,7 +1759,23 @@ fn a_turn_naming_no_trigger_is_nobodys() {
             continue;
         }
         let text = std::fs::read_to_string(e.path()).expect("a reduction");
-        assert_eq!(harnessed(&fold_ungated(&text)), 0, "{name}");
+        let without_triggers = rows(&text)
+            .map(|row| {
+                let mut value: Value = aterm_json::from_str(row).expect("a reduction row");
+                if let Some(attribution) = value
+                    .as_object_mut()
+                    .and_then(|row| row.get_mut("payload"))
+                    .and_then(Value::as_object_mut)
+                    .and_then(|payload| payload.get_mut("turn_attribution"))
+                    .and_then(Value::as_object_mut)
+                {
+                    attribution.remove("turn_trigger");
+                }
+                aterm_json::to_string(&value).expect("a reduction row")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(harnessed(&fold_ungated(&without_triggers)), 0, "{name}");
         read += 1;
     }
     assert!(read > 40, "every committed codex reduction ({read})");
@@ -1950,5 +1966,24 @@ fn codex_shown_is_what_each_measured_builds_reductions_hold() {
             exit: true,
             autopilot: true
         }
+    );
+}
+
+#[test]
+fn message_namespace_is_ignored_but_tool_namespace_changes_classification() {
+    let plain =
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}"#;
+    let tagged = plain.replace("\"role\":", "\"namespace\":\"collaboration\",\"role\":");
+    let context = meta(T0, PARENT, PARENT, None);
+    assert_eq!(
+        saids(&fold(&format!("{context}{plain}\n"))),
+        saids(&fold(&format!("{context}{tagged}\n")))
+    );
+    let ordinary = call(T0 + 1, "c", "functions", "spawn_agent");
+    let delegated = ordinary.replace("functions", "collaboration");
+    assert_ne!(
+        saids(&fold(&format!("{context}{ordinary}"))),
+        saids(&fold(&format!("{context}{delegated}"))),
+        "namespace remains a consumed tool classifier"
     );
 }

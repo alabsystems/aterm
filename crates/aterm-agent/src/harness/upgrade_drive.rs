@@ -11,14 +11,11 @@ use aterm_types::control_verbs::ScreenGen;
 
 use super::relaunch::{
     Launch, NoPlan, Plan, PromptLook, PromptMark, Relaunch, RelaunchLineError, STALE_S, TAB_TAKEN,
-    WAIT_HAND_LIFTS, await_new, carry_on, confirm, expired, fallback_carried, fallback_origin,
-    hand_waits_out, launched, overtaken_by, overtaken_line, pause, plan, recorded, relaunch,
-    relaunch_of, resume_mode, screen_mode, tab_front, type_relaunch_line_with, unplanned, wait_now,
-    wait_until,
+    WAIT_HAND_LIFTS, await_new, carry_on, confirm, expired, hand_waits_out, launched, overtaken_by,
+    overtaken_line, pause, plan, recorded, relaunch, relaunch_of, resume_mode, screen_mode,
+    tab_front, type_relaunch_line_with, unplanned, wait_now, wait_until,
 };
 use super::upgrade::{self, Candidate, Facts, Phase, Request, SessionFile, Source, Step, Version};
-use super::upgrade_catalog::{self as catalog, Baked};
-use super::upgrade_models::{self as models, ModelRecord, ModelVerdict, Priority};
 use crate::RelayClient;
 use crate::supervise::approvals;
 use crate::supervise::policy::git_config::claude_dir_at;
@@ -620,9 +617,6 @@ pub struct Opts {
     pub background: bool,
     pub aterm_state: Option<PathBuf>,
     pub ask: bool,
-    /// Exclude model and billing file evidence for a multi-account or unreadable pool.
-    pub several_logins: bool,
-    pub usage_credits: bool,
     pub usage_tap: Option<super::tap::Armed>,
     pub instances: Instances,
     pub agents_off: Vec<aterm_phase::Program>,
@@ -663,61 +657,6 @@ pub const PRESS_LAPSED: &str = "skip:no-press";
 pub enum Instances {
     Machine,
     Listed(Vec<String>),
-}
-
-fn model_evidence(opts: &Opts, records: &Records) -> models::Evidence {
-    let profile = records
-        .profile(&opts.home)
-        .zip(records.dir())
-        .map(|(plain, dir)| super::profile::Context {
-            plain,
-            records: dir.to_path_buf(),
-            selection: super::profile::Selection::Standard,
-            home: None,
-            config: None,
-            login: None,
-        });
-    let credits_billed = credits_billed_for(opts, profile.as_ref()).unwrap_or_else(|| {
-        models::CREDITS_BILLED_UNREAD
-            .iter()
-            .map(|f| (*f).to_string())
-            .collect()
-    });
-    model_evidence_with_billing(opts, records, credits_billed)
-}
-
-fn model_evidence_with_billing(
-    opts: &Opts,
-    records: &Records,
-    credits_billed: Vec<String>,
-) -> models::Evidence {
-    match (records.dir(), records.profile(&opts.home)) {
-        (Some(dir), Some(profile)) if !opts.several_logins => models::Evidence {
-            credits_billed,
-            ..models::read_evidence(dir, &profile)
-        },
-        _ => models::Evidence {
-            credits_billed,
-            ..models::Evidence::default()
-        },
-    }
-}
-
-pub(super) fn credits_billed_for(
-    opts: &Opts,
-    profile: Option<&super::profile::Context>,
-) -> Option<Vec<String>> {
-    if opts.usage_credits {
-        return Some(Vec::new());
-    }
-    if opts.several_logins {
-        return None;
-    }
-    let profile = profile?;
-    super::profile::effective_for_billing(&profile.plain, Some(&profile.records), profile.selection)
-        .ok()
-        .and_then(|path| super::profile::read(&path).ok())
-        .map(|p| models::credits_billed(&p, i64::try_from(now_s()).unwrap_or(i64::MAX)))
 }
 
 fn claude_profile(user_home: &Path, claude_dir: &Path) -> PathBuf {
@@ -1725,14 +1664,14 @@ pub(super) fn names_program(exe: &Path, program: &str) -> bool {
         .is_some_and(|tool| exe.file_name() == Some(std::ffi::OsStr::new(&tool.exe_file())))
 }
 
-/// The build a managed twin `twin` of `program` execs ([`catalog::twin_binary`]: a `sh` twin's
+/// The build a managed twin `twin` of `program` execs ([`super::twin::twin_binary`]: a `sh` twin's
 /// body, or on Windows a `.cmd` twin's), named by its executable's name ([`names_program`]) and a
 /// file.
 pub(super) fn twin_build(twin: &Path, program: &str) -> Option<PathBuf> {
     let text = crate::harness::accounts::read_bounded(twin, 64 * 1024)
         .ok()
         .flatten()?;
-    let exe = catalog::twin_binary(&text)?;
+    let exe = super::twin::twin_binary(&text)?;
     (names_program(&exe, program) && exe.is_file()).then_some(exe)
 }
 
@@ -1782,7 +1721,7 @@ pub(super) fn twin_version(twin: &Path) -> Option<String> {
     let text = crate::harness::accounts::read_bounded(twin, 64 * 1024)
         .ok()
         .flatten()?;
-    let exe = catalog::twin_binary(&text)?;
+    let exe = super::twin::twin_binary(&text)?;
     store_version(&exe)
 }
 
@@ -1926,7 +1865,7 @@ pub(super) fn native_root(home: &Path) -> PathBuf {
 /// `program`'s managed twin under `layout`, where atpkg lays it
 /// (`atpkg::store::Layout::agent_shim`: `agents/<program>`, `agents\<program>.cmd` on Windows):
 /// the twin itself where `program` is not dev-linked, else only while the build it execs
-/// ([`catalog::twin_binary`]) is in the store. The native half ([`Targets::read_with`]) reads the
+/// ([`super::twin::twin_binary`]) is in the store. The native half ([`Targets::read_with`]) reads the
 /// `~/.local/bin/claude` link alone, not Windows' `claude.exe`.
 fn managed_twin(layout: &atpkg::store::Layout, program: &str) -> Option<PathBuf> {
     let twin = layout.agent_shim(&atpkg::store::ToolName::new(program)?);
@@ -1936,7 +1875,7 @@ fn managed_twin(layout: &atpkg::store::Layout, program: &str) -> Option<PathBuf>
     let text = crate::harness::accounts::read_bounded(&twin, 64 * 1024)
         .ok()
         .flatten()?;
-    let exe = super::upgrade_catalog::twin_binary(&text)?;
+    let exe = super::twin::twin_binary(&text)?;
     exe.starts_with(layout.prefix.join("store")).then_some(twin)
 }
 
@@ -1947,6 +1886,27 @@ pub(super) struct Targets {
 }
 
 impl Targets {
+    /// Cache the catalog baked into each target build under `<state>/upgrade/builds`
+    /// ([`super::switch_top::baked_cached`], one scan per build), where a person's click on a
+    /// session's model fact reads it ([`super::switch_top::switch_top`]). A dry run writes
+    /// nothing; a cache that cannot be written is left for the next sweep.
+    fn cache_catalogs(&self, opts: &Opts) {
+        if opts.dry_run {
+            return;
+        }
+        let Ok(dir) = ensure_upgrade_tree(&opts.state, Some("builds")) else {
+            return;
+        };
+        let managed = self
+            .managed
+            .as_ref()
+            .and_then(|m| twin_build(&m.exe, "claude"));
+        let native = self.native.as_ref().map(|n| n.exe.clone());
+        for build in managed.into_iter().chain(native) {
+            let _ = super::switch_top::baked_cached(&build, &dir);
+        }
+    }
+
     /// The targets under `opts.home`, each program a version is asked of held until it exited
     /// with a code of its own ([`super::first_exec`]).
     pub(super) fn read(opts: &Opts) -> Targets {
@@ -3058,255 +3018,6 @@ fn turn_verdict(head: &str) -> Result<(), Typed> {
     Ok(())
 }
 
-#[derive(Clone)]
-pub(super) struct ModelCtx {
-    list: Priority,
-    baked: Option<Baked>,
-    offered: Vec<String>,
-    default_model: Option<String>,
-    native: Option<(Option<Baked>, Vec<String>)>,
-    versions: (String, String),
-}
-
-impl ModelCtx {
-    fn view(&self, native: bool) -> (Option<&Baked>, &[String]) {
-        match (&self.native, native) {
-            (Some((baked, offered)), true) => (baked.as_ref(), offered),
-            _ => (self.baked.as_ref(), &self.offered),
-        }
-    }
-
-    pub(super) fn none() -> ModelCtx {
-        ModelCtx {
-            list: Priority::seed(0),
-            baked: None,
-            offered: Vec::new(),
-            default_model: None,
-            native: None,
-            versions: Default::default(),
-        }
-    }
-
-    fn read(opts: &Opts, targets: &Targets) -> ModelCtx {
-        let now = i64::try_from(now_s()).unwrap_or(0);
-        let upgrade_dir = if opts.dry_run {
-            match check_upgrade_tree(&opts.state, None) {
-                Ok(dir) => dir,
-                Err(_) => return ModelCtx::none(),
-            }
-        } else {
-            match ensure_upgrade_tree(&opts.state, None) {
-                Ok(dir) => Some(dir),
-                Err(_) => return ModelCtx::none(),
-            }
-        };
-        let path = upgrade_dir
-            .as_deref()
-            .map_or_else(|| state_dir(opts), Path::to_path_buf)
-            .join("models.json");
-        let Ok(list) = (if opts.dry_run {
-            match upgrade_dir.as_ref() {
-                Some(_) => crate::harness::accounts::read_bounded(&path, 1024 * 1024)
-                    .ok()
-                    .flatten()
-                    .map_or_else(
-                        || Ok(Priority::seed(now)),
-                        |t| Priority::parse(&t).ok_or_else(String::new),
-                    ),
-                None => Ok(Priority::seed(now)),
-            }
-        } else {
-            models::load_or_seed(&path, now)
-        }) else {
-            return ModelCtx::none();
-        };
-        let builds_dir = if opts.dry_run {
-            check_upgrade_tree(&opts.state, Some("builds"))
-        } else {
-            ensure_upgrade_tree(&opts.state, Some("builds")).map(Some)
-        };
-        let baked_of = |bin: &Path| match &builds_dir {
-            Ok(Some(dir)) if !opts.dry_run => catalog::baked_cached(bin, dir),
-            Ok(Some(_)) | Ok(None) => catalog::scan_baked(bin),
-            Err(_) => None,
-        };
-        let managed = targets.managed.as_ref();
-        let baked = managed
-            .and_then(|m| {
-                crate::harness::accounts::read_bounded(&m.exe, 64 * 1024)
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|twin| catalog::twin_binary(&twin))
-            .and_then(|bin| baked_of(&bin));
-        let label = managed.map(|m| m.version.to_string()).unwrap_or_default();
-        let ev = model_evidence(opts, &Records::of(&opts.home, None));
-        let native = targets
-            .native
-            .as_ref()
-            .map(|n| (n.version.to_string(), baked_of(&n.exe)));
-        let mut ctx = ModelCtx {
-            list,
-            baked,
-            offered: Vec::new(),
-            default_model: None,
-            versions: (
-                label,
-                native.as_ref().map(|(v, _)| v.clone()).unwrap_or_default(),
-            ),
-            native: native.map(|(_, nb)| (nb, Vec::new())),
-        };
-        let changes = ctx.grow(&ev);
-        if !changes.is_empty() && !opts.dry_run {
-            let _ = models::write_atomic_ordered(&path, &ctx.list.render());
-            for ch in &changes {
-                let r = Report {
-                    pid: 0,
-                    tab: "-".to_string(),
-                    session: "-".to_string(),
-                    from: "-".to_string(),
-                    to: ch.id.clone(),
-                    step: "models-changed".to_string(),
-                };
-                ledger(opts, &r, &format!("{} ({})", ch.placed, ch.source));
-            }
-        }
-        ctx.offer(&ev);
-        ctx
-    }
-
-    fn grow(&mut self, ev: &models::Evidence) -> Vec<models::Change> {
-        let now = i64::try_from(now_s()).unwrap_or(0);
-        let recs = models::recommendations(ev, self.baked.as_ref(), &self.versions.0);
-        models::ingest(&mut self.list, &recs, self.baked.as_ref(), now)
-    }
-
-    fn at(&self, opts: &Opts, sf: &SessionFile) -> std::borrow::Cow<'_, ModelCtx> {
-        let records = Records::of_file(&opts.home, sf);
-        let mut ctx = self.clone();
-        if records.home_word(&opts.home).is_some() {
-            let ev = model_evidence(opts, &records);
-            ctx.grow(&ev);
-            ctx.offer(&ev);
-        }
-        let settings = records.dir().and_then(|dir| agent_settings(opts, sf, dir));
-        ctx.settle(settings);
-        std::borrow::Cow::Owned(ctx)
-    }
-
-    fn for_profile(
-        &self,
-        opts: &Opts,
-        records: &Records,
-        profile: Option<&super::profile::Context>,
-    ) -> ModelCtx {
-        let mut ctx = self.clone();
-        let Some(credits_billed) = credits_billed_for(opts, profile) else {
-            ctx.offered.clear();
-            if let Some((_, offered)) = &mut ctx.native {
-                offered.clear();
-            }
-            return ctx;
-        };
-        let ev = model_evidence_with_billing(opts, records, credits_billed);
-        if records.home_word(&opts.home).is_some() {
-            ctx.grow(&ev);
-        }
-        ctx.offer(&ev);
-        ctx
-    }
-
-    fn at_for_profile(
-        &self,
-        opts: &Opts,
-        sf: &SessionFile,
-        profile: Option<&super::profile::Context>,
-    ) -> ModelCtx {
-        let records = Records::of_file(&opts.home, sf);
-        let mut ctx = self.for_profile(opts, &records, profile);
-        ctx.settle(records.dir().and_then(|dir| agent_settings(opts, sf, dir)));
-        ctx
-    }
-
-    fn offer(&mut self, ev: &models::Evidence) {
-        self.offered = models::offered(&self.list, &self.versions.0, ev, self.baked.as_ref(), None);
-        if let Some((nb, no)) = &mut self.native {
-            *no = models::offered(&self.list, &self.versions.1, ev, nb.as_ref(), None);
-        }
-    }
-
-    fn settle(&mut self, settings: Option<models::UserModelSettings>) {
-        let Some(user) = settings else {
-            self.offered.clear();
-            if let Some((_, no)) = &mut self.native {
-                no.clear();
-            }
-            self.default_model = None;
-            return;
-        };
-        let allowed = user.allowed.as_deref();
-        self.offered.retain(|id| models::allowed_by(allowed, id));
-        if let Some((_, no)) = &mut self.native {
-            no.retain(|id| models::allowed_by(allowed, id));
-        }
-        self.default_model = user.default;
-    }
-}
-
-fn agent_settings(
-    opts: &Opts,
-    sf: &SessionFile,
-    claude_dir: &Path,
-) -> Option<models::UserModelSettings> {
-    use crate::supervise::policy::claude_settings;
-    use crate::supervise::policy::git_config::WorkerEnv;
-    let own = kernel_start(sf.pid).as_deref() == Some(squash(&sf.proc_start).as_str());
-    let mut process = own
-        .then(|| atpkg::caller_shell::process_args(sf.pid))
-        .flatten()
-        .unwrap_or_default();
-    process.env.insert(
-        0,
-        format!("{}={}", super::accounts::HOME_ENV, claude_dir.display()),
-    );
-    let worker = WorkerEnv::new(process);
-    let managed = managed_settings_dir();
-    let sources = claude_settings::sources_under(
-        &worker,
-        Path::new(&sf.cwd),
-        managed.as_deref(),
-        Some(&opts.home),
-    );
-    let in_managed = |name: &str| {
-        managed
-            .as_deref()
-            .is_some_and(|dir| Path::new(name).starts_with(dir))
-    };
-    const KEYS: [&str; 2] = ["model", "availableModels"];
-    let mut managed_said = Map::new();
-    let mut said_below = Map::new();
-    for source in sources {
-        let Some(text) = source.text.ok()? else {
-            continue;
-        };
-        let doc = claude_settings::parse(&text).ok()?;
-        for key in KEYS {
-            let Some(value) = doc.get(key) else {
-                continue;
-            };
-            if in_managed(&source.name) {
-                managed_said.insert(key.to_string(), value.clone());
-            } else if !said_below.contains_key(key) {
-                said_below.insert(key.to_string(), value.clone());
-            }
-        }
-    }
-    for (key, value) in managed_said {
-        said_below.insert(key, value);
-    }
-    Some(models::model_settings_of(&Value::Object(said_below)))
-}
-
 /// Every settings document a relaunch line of `argv` in `cwd` would have Claude Code read
 /// for the tap's [`super::tap::gate`]: under the host's home, the user's `settings.json` and
 /// `cowork_settings.json` alike (the line sets no cowork flag of its own, and the shell it is
@@ -3475,473 +3186,15 @@ fn managed_preferences_dir() -> Option<PathBuf> {
     MANAGED_PREFERENCES.with(|dir| dir.borrow().clone())
 }
 
-fn checked_model_record_in(state: &Path, session: &str) -> Option<PathBuf> {
-    check_upgrade_tree(state, Some("models"))
-        .ok()
-        .flatten()
-        .map(|dir| dir.join(format!("{session}.json")))
-}
-
-/// The resume line a person is told to run, under the relaunch's own model rule.
+/// The resume line a person is told to run for the conversation `session` of the launch `argv`:
+/// the launch's own flags, its `--model` among them, rewritten for `--resume`
+/// ([`super::resume::command`]).
 #[must_use]
-pub fn resume_command_kept(state: Option<&Path>, argv: &[String], session: &str) -> Option<String> {
+pub fn resume_command_kept(argv: &[String], session: &str) -> Option<String> {
     if !upgrade::is_session_id(session) {
         return None;
     }
-    let launch = upgrade::launch_model(argv);
-    let dropped = launch.as_deref().zip(state).is_some_and(|(m, state)| {
-        let record = checked_model_record_in(state, session)
-            .and_then(|path| {
-                super::accounts::read_bounded(&path, 64 * 1024)
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|t| ModelRecord::parse(&t))
-            .unwrap_or_default();
-        models::launch_model_kept(Some(m), &record).is_none()
-    });
-    if dropped {
-        super::resume::command(
-            &super::relaunch::with_model(argv.to_vec(), Some("")),
-            session,
-        )
-    } else {
-        super::resume::command(argv, session)
-    }
-}
-
-fn load_model_record(opts: &Opts, session: &str) -> ModelRecord {
-    if !upgrade::is_session_id(session) {
-        return ModelRecord::default();
-    }
-    checked_model_record_in(&opts.state, session)
-        .and_then(|path| {
-            super::accounts::read_bounded(&path, 64 * 1024)
-                .ok()
-                .flatten()
-        })
-        .and_then(|t| ModelRecord::parse(&t))
-        .unwrap_or_default()
-}
-
-fn save_model_record(opts: &Opts, session: &str, rec: &ModelRecord) {
-    if opts.dry_run || !upgrade::is_session_id(session) {
-        return;
-    }
-    let Ok(dir) = ensure_upgrade_tree(&opts.state, Some("models")) else {
-        return;
-    };
-    let _ = models::write_atomic(&dir.join(format!("{session}.json")), &rec.render());
-}
-
-struct ModelRead {
-    verdict: ModelVerdict,
-    cold: bool,
-    due_for_s: u64,
-    ride_barred: Option<&'static str>,
-}
-
-#[cfg(all(test, unix))]
-fn model_read(opts: &Opts, sf: &SessionFile, launch: Option<&str>, mctx: &ModelCtx) -> ModelRead {
-    model_read_for(opts, sf, launch, mctx, false, None, None)
-}
-
-fn model_read_for(
-    opts: &Opts,
-    sf: &SessionFile,
-    launch: Option<&str>,
-    mctx: &ModelCtx,
-    native: bool,
-    carried: Option<&str>,
-    process_view: Option<&ModelCtx>,
-) -> ModelRead {
-    let before = load_model_record(opts, &sf.session_id);
-    let mut record = before.clone();
-    let tail = std::cell::OnceCell::new();
-    let mctx = match process_view {
-        Some(view) => std::borrow::Cow::Borrowed(view),
-        None => mctx.at(opts, sf),
-    };
-    let (read, rows) = model_judge(
-        opts,
-        sf,
-        &mut record,
-        &tail,
-        launch,
-        &mctx,
-        native,
-        now_s(),
-        carried,
-    );
-    model_read_kept(opts, sf, &before, &record, &rows);
-    read
-}
-
-type ModelRow = (&'static str, String, &'static str);
-
-fn model_read_kept(
-    opts: &Opts,
-    sf: &SessionFile,
-    before: &ModelRecord,
-    record: &ModelRecord,
-    rows: &[ModelRow],
-) {
-    if record != before {
-        save_model_record(opts, &sf.session_id, record);
-    }
-    for (step, model, detail) in rows {
-        let mut r = blank(sf);
-        r.to = format!("model:{model}");
-        ledger(opts, &said(r, *step), detail);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn model_judge(
-    opts: &Opts,
-    sf: &SessionFile,
-    record: &mut ModelRecord,
-    tail: &std::cell::OnceCell<String>,
-    launch: Option<&str>,
-    mctx: &ModelCtx,
-    native: bool,
-    now: u64,
-    carried: Option<&str>,
-) -> (ModelRead, Vec<ModelRow>) {
-    let (baked, offered) = mctx.view(native);
-    let view = models::ModelView {
-        list: &mctx.list,
-        baked,
-        offered,
-        launch,
-        default_model: mctx.default_model.as_deref(),
-        started_s: models::parse_lstart(&sf.proc_start),
-        now,
-        carried,
-    };
-    let step = models::model_read_step(record, &view, || {
-        tail.get_or_init(|| {
-            Records::of_file(&opts.home, sf)
-                .transcript(&sf.session_id)
-                .map(|p| tail_to_end(&p, TAIL_BYTES).0)
-                .unwrap_or_default()
-        })
-        .as_str()
-    });
-    let mut rows = Vec::new();
-    if let Some(model) = step.settled.verified {
-        rows.push(("model-verified", model, "the conversation runs it"));
-    }
-    if let Some(model) = step.settled.failed {
-        rows.push((
-            "model-failed",
-            model,
-            "asked for on a relaunch and not what runs",
-        ));
-    }
-    let read = ModelRead {
-        verdict: step.verdict,
-        cold: step.cold,
-        due_for_s: step.due_for_s,
-        ride_barred: step.ride_barred,
-    };
-    (read, rows)
-}
-
-pub(super) fn riding_model_in(
-    opts: &Opts,
-    sf: &SessionFile,
-    argv: &[String],
-    mctx: &ModelCtx,
-    process_view: Option<&ModelCtx>,
-) -> Option<String> {
-    let launch = upgrade::launch_model(argv);
-    let native = runs_native(opts, Some(sf.pid), argv);
-    let mread = model_read_for(
-        opts,
-        sf,
-        launch.as_deref(),
-        mctx,
-        native,
-        None,
-        process_view,
-    );
-    models::model_to(None, &mread.verdict, mread.cold, true, mread.due_for_s)
-}
-
-fn runs_native(opts: &Opts, pid: Option<u32>, argv: &[String]) -> bool {
-    pid.and_then(exe_of)
-        .or_else(|| argv.first().map(PathBuf::from))
-        .is_some_and(|e| e.starts_with(native_root(&opts.home)))
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the restart's captured process profile selector"
-)]
-pub(super) fn restart_models(
-    opts: &Opts,
-    records: &Records,
-    sf: Option<&SessionFile>,
-    start: &str,
-    session: &str,
-    argv: &[String],
-    ride: bool,
-    profile: Option<&super::profile::Context>,
-) -> (Option<String>, Option<String>) {
-    let ride = ride && sf.is_some();
-    if !ride && upgrade::launch_model(argv).is_none() {
-        return (None, None);
-    }
-    let mctx = ModelCtx::read(opts, &Targets::read(opts));
-    let riding = sf.filter(|_| ride).and_then(|sf| {
-        let view = mctx.at_for_profile(opts, sf, profile);
-        riding_model_in(opts, sf, argv, &mctx, Some(&view))
-    });
-    let native = runs_native(opts, sf.map(|sf| sf.pid), argv);
-    let started = sf
-        .and_then(|sf| models::parse_lstart(&sf.proc_start))
-        .or_else(|| models::parse_lstart(start));
-    let hand = hand_model_in(opts, records, session, argv, started, &mctx, native);
-    (riding, hand)
-}
-
-pub(super) fn hand_model_in(
-    opts: &Opts,
-    records: &Records,
-    session: &str,
-    argv: &[String],
-    started_s: Option<u64>,
-    mctx: &ModelCtx,
-    native: bool,
-) -> Option<String> {
-    let launch = upgrade::launch_model(argv)?;
-    let (tail, _) = tail_to_end(&records.transcript(session)?, TAIL_BYTES);
-    let (baked, _) = mctx.view(native);
-    let human = load_model_record(opts, session).human;
-    models::hand_model(&tail, baked, &human, &launch, started_s)
-}
-
-pub(super) fn launch_kept(opts: &Opts, session: &str, argv: &[String]) -> Option<String> {
-    let launch = upgrade::launch_model(argv)?;
-    models::launch_model_kept(Some(&launch), &load_model_record(opts, session)).map(str::to_owned)
-}
-
-pub(super) fn line_model_of<'a>(
-    opts: &Opts,
-    session: &str,
-    argv: &[String],
-    asks: Option<&'a str>,
-) -> Option<&'a str> {
-    if asks.is_some() {
-        return asks;
-    }
-    let launch = upgrade::launch_model(argv)?;
-    models::line_model(None, Some(&launch), &load_model_record(opts, session))
-}
-
-pub(super) fn record_asked(opts: &Opts, session: &str, model: &str) -> Option<models::Asked> {
-    if opts.dry_run || model.is_empty() {
-        return None;
-    }
-    let mut rec = load_model_record(opts, session);
-    let asked = rec.asked(model, now_s());
-    save_model_record(opts, session, &rec);
-    Some(asked)
-}
-
-fn same_build(
-    targets: &Targets,
-    exe: &Path,
-    running: &Version,
-    running_native: bool,
-) -> Option<Candidate> {
-    let pick = if running_native {
-        targets.native.as_ref()
-    } else {
-        targets.managed.as_ref()
-    };
-    if let Some(c) = pick.filter(|c| c.version == *running) {
-        return Some(c.clone());
-    }
-    (!exe.as_os_str().is_empty()).then(|| Candidate {
-        exe: exe.to_path_buf(),
-        version: running.clone(),
-        source: if running_native {
-            Source::Native
-        } else {
-            Source::Managed
-        },
-    })
-}
-
-fn model_wants_a_look(opts: &Opts, sf: &SessionFile, mctx: &ModelCtx) -> bool {
-    let mctx = &*mctx.at(opts, sf);
-    let views: Vec<bool> = std::iter::once(false)
-        .chain(mctx.native.is_some().then_some(true))
-        .filter(|&native| !mctx.view(native).1.is_empty())
-        .collect();
-    let before = load_model_record(opts, &sf.session_id);
-    let tail = std::cell::OnceCell::new();
-    let now = now_s();
-    let reads: Vec<(ModelRecord, ModelRead, Vec<ModelRow>)> = views
-        .iter()
-        .map(|&native| {
-            let mut judged = before.clone();
-            let (read, rows) =
-                model_judge(opts, sf, &mut judged, &tail, None, mctx, native, now, None);
-            (judged, read, rows)
-        })
-        .collect();
-    if let Some((first, _, rows)) = reads.first()
-        && reads.iter().all(|(judged, _, _)| judged == first)
-    {
-        model_read_kept(opts, sf, &before, first, rows);
-    }
-    reads
-        .iter()
-        .any(|(_, read, _)| matches!(read.verdict, ModelVerdict::Due { .. }))
-}
-
-/// The user's own model settings (`<home>/.claude/settings.json`), read bounded like every
-/// other settings read (the tap's mebibyte): missing, not a regular file, oversized or
-/// unreadable reads as no settings, never a wait on whatever stands at the path.
-fn user_settings(home: &Path) -> models::UserModelSettings {
-    crate::harness::accounts::read_bounded(&home.join(".claude/settings.json"), 1024 * 1024)
-        .ok()
-        .flatten()
-        .map(|t| models::parse_user_settings(&t))
-        .unwrap_or_default()
-}
-
-/// Where a person's switch "to the top" goes for a session on Claude Code `version`
-/// ([`models::top`]): of the priority list under `state` (the seed where none is written) and
-/// that build's cached catalog (`None` where no sweep has read the build, or `version` is not
-/// known). It reads, and writes nothing.
-#[must_use]
-pub fn switch_top(state: &Path, version: Option<&str>) -> models::Top {
-    let list = check_upgrade_tree(state, None)
-        .ok()
-        .flatten()
-        .and_then(|dir| {
-            crate::harness::accounts::read_bounded(&dir.join("models.json"), 1024 * 1024)
-                .ok()
-                .flatten()
-        })
-        .and_then(|text| Priority::parse(&text))
-        .unwrap_or_else(|| Priority::seed(i64::try_from(now_s()).unwrap_or(0)));
-    let baked = version.and_then(|version| {
-        check_upgrade_tree(state, Some("builds"))
-            .ok()
-            .flatten()
-            .and_then(|dir| catalog::cached_for_version(&dir, version))
-    });
-    models::top(&list, version.unwrap_or_default(), baked)
-}
-
-/// `aterm harness upgrade models`.
-#[must_use]
-pub fn models_report(opts: &Opts) -> String {
-    use std::fmt::Write as _;
-    let targets = Targets::read(opts);
-    let mut ctx = ModelCtx::read(opts, &targets);
-    ctx.settle(Some(user_settings(&opts.home)));
-    let label = targets
-        .managed
-        .as_ref()
-        .map_or_else(|| "?".to_string(), |m| m.version.to_string());
-    let ev = model_evidence(opts, &Records::of(&opts.home, None));
-    let (_, verdicts) = models::target(&ctx.list, &label, &ev, ctx.baked.as_ref());
-    let mut out = format!("Claude Code (managed): {label}\n");
-    for (i, (id, a)) in verdicts.iter().enumerate() {
-        let name = ctx
-            .baked
-            .as_ref()
-            .and_then(|b| b.model(id))
-            .map_or(String::new(), |m| format!(" ({})", m.display_name));
-        let verdict = match a {
-            models::Availability::Yes(why) => format!("available — {why}"),
-            models::Availability::No(why) => format!("NOT available — {why}"),
-        };
-        let _ = writeln!(out, "  {}. {id}{name}: {verdict}", i + 1);
-    }
-    let _ = writeln!(
-        out,
-        "on offer (a session moves to the newest of its own family first): {}",
-        if ctx.offered.is_empty() {
-            "none".to_string()
-        } else {
-            ctx.offered.join(", ")
-        }
-    );
-    let _ = writeln!(
-        out,
-        "target (then, for a model nobody chose, up this list): {}",
-        models::list_target(&ctx.list, &ctx.offered).unwrap_or("none available")
-    );
-    if let (Some(n), Some((_, offered))) = (targets.native.as_ref(), ctx.native.as_ref()) {
-        let _ = writeln!(
-            out,
-            "native Claude Code {} (a session on it is judged by its own catalog): on offer {}; target {}",
-            n.version,
-            if offered.is_empty() {
-                "none".to_string()
-            } else {
-                offered.join(", ")
-            },
-            models::list_target(&ctx.list, offered).unwrap_or("none available")
-        );
-    }
-    for (id, source) in models::recommendations(&ev, ctx.baked.as_ref(), &label) {
-        let _ = writeln!(out, "  recommended by Claude Code: {id} ({source})");
-    }
-    out
-}
-
-/// `aterm harness upgrade models set <id>,<id>,...`.
-pub fn set_models(opts: &Opts, list: &str) -> Result<Vec<String>, String> {
-    let now = i64::try_from(now_s()).unwrap_or(0);
-    let ids: Vec<String> = list
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut p = check_upgrade_tree(&opts.state, None)
-        .ok()
-        .flatten()
-        .and_then(|dir| models::load_or_seed(&dir.join("models.json"), now).ok())
-        .unwrap_or_else(|| Priority::seed(now));
-    let candidate = Priority {
-        ids: ids.clone(),
-        history: p.history.clone(),
-    };
-    if ids.is_empty() || Priority::parse(&candidate.render()).is_none() {
-        return Err(
-            "every entry must be a Claude model id (claude-<family>-<n>[-<n>]), no repeats"
-                .to_string(),
-        );
-    }
-    p.ids.clone_from(&ids);
-    p.history.push(models::Change {
-        id: list.to_string(),
-        placed: "set".into(),
-        source: "owner".into(),
-        at: now,
-    });
-    let path = ensure_upgrade_tree(&opts.state, None)
-        .map_err(|e| format!("{}: {e}", state_dir(opts).join("models.json").display()))?
-        .join("models.json");
-    models::write_atomic(&path, &p.render()).map_err(|e| format!("{}: {e}", path.display()))?;
-    let r = Report {
-        pid: 0,
-        tab: "-".to_string(),
-        session: "-".to_string(),
-        from: "-".to_string(),
-        to: ids.join(","),
-        step: "models-set".to_string(),
-    };
-    ledger(opts, &r, "the priority list was set by hand");
-    Ok(ids)
+    super::resume::command(argv, session)
 }
 
 pub(super) enum Terminated {
@@ -4012,10 +3265,7 @@ pub(super) struct Unsent {
     release: String,
     marker: String,
     markers: Vec<String>,
-    fallback_from: Option<String>,
 }
-
-const FALLBACK_NO_MODEL: &str = "-";
 
 pub(super) const SAME_PROGRAM: &str = "same";
 
@@ -4091,8 +3341,6 @@ pub(super) struct St {
     pub(super) model_before: String,
     pub(super) mark: u64,
     pub(super) launch_model: String,
-    pub(super) model_list: String,
-    pub(super) fallback_from: Option<String>,
     pub(super) login: Option<String>,
     /// Exact forward account attribution. Missing legacy attribution never grants execution.
     pub(super) account_intent: Option<super::accounts_pool::ExecutionIntent>,
@@ -4110,7 +3358,6 @@ pub(super) struct St {
     pub(super) relaunched_at: u64,
     pub(super) moved_at: u64,
     pub(super) moved_login: Option<String>,
-    pub(super) moved_left_model: Option<String>,
     pub(super) hold_since_s: u64,
     pub(super) hold_seen_s: u64,
     pub(super) ready_since: u64,
@@ -4419,25 +3666,15 @@ impl St {
         }
     }
 
-    pub(super) fn promised_model(&self) -> Option<&str> {
-        (matches!(self.phase, Phase::Announced { .. }) && !self.model_list.is_empty())
-            .then_some(self.model_list.as_str())
-    }
-
-    pub(super) fn carried_model(&self) -> Option<&str> {
-        let restarts = match &self.phase {
-            Phase::Announced { .. } => true,
-            Phase::Failed(why) => why == upgrade::GAVE_UP,
-            _ => false,
-        };
-        (restarts && !self.model_list.is_empty()).then_some(self.model_list.as_str())
-    }
-
-    fn release_unridden(&mut self, now: u64) -> bool {
-        if !matches!(self.phase, Phase::Announced { .. }) {
+    /// Release an announced round no build is ahead to restart onto: its build this session
+    /// already runs or has passed, or, where every target probe was `answered`, one no target
+    /// offers any more.
+    fn release_untargeted(&mut self, running: &Version, answered: bool, now: u64) -> bool {
+        let reached = Version::parse(&self.to).is_some_and(|to| to <= *running);
+        if !(reached || answered) || !matches!(self.phase, Phase::Announced { .. }) {
             return false;
         }
-        self.owe_release("model-dropped");
+        self.owe_release("no-target");
         self.new_round(now);
         self.phase = Phase::Pending;
         self.forget_markers();
@@ -4527,7 +3764,6 @@ impl St {
         self.account_intent = self.back_account_intent.take();
         self.native_rollback = self.native.is_some() || !self.native_prepare.is_empty();
         self.line_grace_s = Some(grace_s);
-        self.model_list.clear();
         self.prompt = None;
         self.phase = Phase::Exiting { at_s: now };
         true
@@ -4569,18 +3805,16 @@ impl St {
         prior: Option<St>,
         from: &Version,
         to: &Candidate,
-        model: Option<&str>,
         who: Proc<'_>,
         now: u64,
     ) -> St {
-        Self::retarget(prior, from, to, model, who, now).0
+        Self::retarget(prior, from, to, who, now).0
     }
 
     fn retarget(
         prior: Option<St>,
         from: &Version,
         to: &Candidate,
-        model: Option<&str>,
         who: Proc<'_>,
         now: u64,
     ) -> (St, Retarget) {
@@ -4617,8 +3851,6 @@ impl St {
         let (mut st, how) = match prior {
             Some(mut st)
                 if st.to == to.version.to_string()
-                    && (matches!(st.phase, Phase::Pending | Phase::Failed(_))
-                        || st.model_list == model.unwrap_or_default())
                     && !(matches!(st.phase, Phase::Failed(_)) && !st.same_process(from, who)) =>
             {
                 // Managed and native builds can share a version, and which one
@@ -4670,7 +3902,6 @@ impl St {
             }
             Some(mut st)
                 if matches!(st.phase, Phase::Pending | Phase::Announced { .. })
-                    && st.model_list == model.unwrap_or_default()
                     && Version::parse(&st.from).as_ref() == Some(from)
                     && st.same_process(from, who) =>
             {
@@ -4689,7 +3920,6 @@ impl St {
                 let same = old.same_process(from, who);
                 let pending_since = if same { old.behind_since() } else { now };
                 let history = same.then(|| old.history());
-                let fallback_from = fallback_origin(&old);
                 let (request, request_tab, request_at) = old.word_onto(to, now, same);
                 let (noticed_at, last_stop) = if same {
                     (old.noticed_at, old.stop_kept_onto())
@@ -4701,7 +3931,6 @@ impl St {
                     request,
                     request_tab,
                     request_at,
-                    fallback_from,
                     tab: old.tab,
                     release: old.release,
                     asked: old.asked,
@@ -4721,7 +3950,6 @@ impl St {
                 let rested = old.failed_start().filter(|f| f.of(to));
                 let history = same.then(|| old.history());
                 let pending_since = if same { old.behind_since() } else { now };
-                let fallback_from = fallback_origin(&old);
                 let (request, request_tab, request_at) = old.word_onto(to, now, same);
                 let (noticed_at, last_stop) = if same {
                     (old.noticed_at, old.stop_kept_onto())
@@ -4733,7 +3961,6 @@ impl St {
                     request,
                     request_tab,
                     request_at,
-                    fallback_from,
                     release: old.release,
                     asked: old.asked,
                     tab: old.tab,
@@ -4763,7 +3990,6 @@ impl St {
                 .then(|| (old.request.clone(), old.request_tab.clone(), old.request_at));
                 let rested = old.failed_start().filter(|f| f.of(to));
                 let mut st = St {
-                    fallback_from: fallback_origin(&old),
                     release: old.release,
                     asked: old.asked,
                     tab: old.tab,
@@ -4817,7 +4043,7 @@ impl St {
 
     /// A saved word holding this actual managed move, before a quiet worker claims it. The
     /// agent, tab, conversation, source and both validated versions must still be its own;
-    /// recovery after a signal and quota model rotations do not enter this path.
+    /// recovery after a signal does not enter this path.
     pub(super) fn held_managed_move(
         &self,
         agent: upgrade::Agent,
@@ -5218,15 +4444,6 @@ impl St {
             ("ask", &self.ask),
             ("model_before", &self.model_before),
             ("launch_model", &self.launch_model),
-            ("model_list", &self.model_list),
-            (
-                "fallback_from",
-                match self.fallback_from.as_deref() {
-                    None => "",
-                    Some("") => FALLBACK_NO_MODEL,
-                    Some(m) => m,
-                },
-            ),
             ("resumed_on", &self.resumed_on),
             ("wait", &self.wait),
             ("request", &self.request.word()),
@@ -5349,14 +4566,6 @@ impl St {
         }
         if let Some(login) = &self.moved_login {
             o.insert("moved_login".into(), Value::from(login.as_str()));
-        }
-        if let Some(model) = &self.moved_left_model {
-            let model = if model.is_empty() {
-                FALLBACK_NO_MODEL
-            } else {
-                model.as_str()
-            };
-            o.insert("moved_left_model".into(), Value::from(model));
         }
         if !self.look_word.is_empty() {
             o.insert("look_word".into(), Value::from(self.look_word.as_str()));
@@ -5605,12 +4814,6 @@ impl St {
             model_before: s("model_before"),
             mark: n("mark"),
             launch_model: s("launch_model"),
-            model_list: s("model_list"),
-            fallback_from: match s("fallback_from") {
-                m if m.is_empty() => None,
-                m if m == FALLBACK_NO_MODEL => Some(String::new()),
-                m => Some(m),
-            },
             login: v.get("login").and_then(Value::as_str).map(str::to_owned),
             account_intent: v
                 .get("account_intent")
@@ -5639,13 +4842,6 @@ impl St {
                 .get("moved_login")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            moved_left_model: v.get("moved_left_model").and_then(Value::as_str).map(|m| {
-                if m == FALLBACK_NO_MODEL {
-                    String::new()
-                } else {
-                    m.to_owned()
-                }
-            }),
             tabs: list("tabs"),
             tabs_until: list("tabs_until")
                 .iter()
@@ -5897,7 +5093,7 @@ impl St {
     fn started_by_line(&self, sf: &SessionFile) -> bool {
         let stop = self.stopped_at();
         stop != 0
-            && models::parse_lstart(&sf.proc_start).is_some_and(|start| start <= stop)
+            && super::unix_time::parse_lstart(&sf.proc_start).is_some_and(|start| start <= stop)
             && (self.to.is_empty() || self.to == "-" || sf.version == self.to)
     }
 
@@ -6068,7 +5264,6 @@ impl St {
         self.relaunched_pid = 0;
         self.relaunched_start.clear();
         self.noted.clear();
-        self.fallback_from = fallback_origin(self);
         self.cause.clear();
         self.hold_since_s = 0;
         self.hold_seen_s = 0;
@@ -6095,7 +5290,6 @@ impl St {
             release: std::mem::take(&mut self.release),
             marker: std::mem::take(&mut self.marker),
             markers: std::mem::take(&mut self.markers),
-            fallback_from: self.fallback_from.clone(),
         };
         self.bind(pid, start);
         self.shell = shell;
@@ -6120,7 +5314,6 @@ impl St {
         self.release = back.release;
         self.marker = back.marker;
         self.markers = back.markers;
-        self.fallback_from = back.fallback_from;
         self.back_line.clear();
         self.back_account_intent = None;
     }
@@ -6318,27 +5511,6 @@ fn create_owned_plain_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Ensures `dir` exists as a plain directory owned by this user.
-pub(super) fn ensure_owned_plain_dir(dir: &Path) -> std::io::Result<()> {
-    if check_owned_plain_dir_existing(dir)? {
-        return Ok(());
-    }
-    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty())
-        && !check_owned_plain_dir_existing(parent)?
-    {
-        if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty())
-            && !check_owned_plain_dir_existing(grand)?
-        {
-            if let Some(great) = grand.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(great)?;
-            }
-            create_owned_plain_dir(grand)?;
-        }
-        create_owned_plain_dir(parent)?;
-    }
-    create_owned_plain_dir(dir)
-}
-
 /// Validates `<state>`, `<state>/upgrade`, and optional child `sub` without creating missing components.
 pub(super) fn check_upgrade_tree(
     state: &Path,
@@ -6405,7 +5577,6 @@ fn forget_settled_pending(
     prior: Option<&St>,
     running: &Version,
 ) -> Option<St> {
-    let model_only = |st: &St| st.from == running.to_string() && st.to == running.to_string();
     let reached = |st: &St| Version::parse(&st.to).is_some_and(|to| to <= *running);
     let now = now_s();
     let word_in_force = |st: &St| matches!(st.request, Request::DeferUntil(t) if t > now);
@@ -6414,7 +5585,7 @@ fn forget_settled_pending(
             !st.native_retired_unissued && st.phase == Phase::Pending && st.release.is_empty()
         })
         .filter(|st| !word_in_force(st))
-        .filter(|st| model_only(st) || reached(st))?;
+        .filter(|st| reached(st))?;
     if opts.dry_run {
         return None;
     }
@@ -6432,7 +5603,7 @@ fn forget_settled_pending(
     } else {
         remove(opts, session);
     }
-    (!model_only(st)).then(|| st.clone())
+    Some(st.clone())
 }
 
 pub(super) const STATE_KEEP_S: u64 = 7 * 24 * 60 * 60;
@@ -6737,7 +5908,7 @@ mod record {
         }
         #[cfg(not(unix))]
         {
-            crate::harness::upgrade_models::write_atomic(path, text)
+            crate::harness::atomic_write::write_atomic(path, text)
         }
     }
 
@@ -6755,13 +5926,12 @@ mod record {
         let Ok(dir) = super::ensure_upgrade_tree(&opts.state, None) else {
             return;
         };
-        let (moved_login, moved_left_model) = super::super::relaunch::last_move_target(disk);
+        let moved_login = super::super::relaunch::last_move_target(disk);
         let kept = St {
             phase: super::Phase::Done,
             agent: disk.agent,
             moved_at: moved,
             moved_login,
-            moved_left_model,
             ..St::default()
         };
         let path = dir.join(format!("{session}.move"));
@@ -6943,8 +6113,7 @@ mod record {
         for disk in on_disk.iter().chain(kept.iter()) {
             let moved = super::super::relaunch::last_move_at(disk);
             if moved != 0 && moved >= out.moved_at {
-                (out.moved_login, out.moved_left_model) =
-                    super::super::relaunch::last_move_target(disk);
+                out.moved_login = super::super::relaunch::last_move_target(disk);
             }
             out.moved_at = out.moved_at.max(moved);
         }
@@ -7033,7 +6202,7 @@ mod record {
         {
             // Keep the existing portable replacement route, returning its
             // failure to the checked caller instead of hiding it.
-            crate::harness::upgrade_models::write_atomic(&dir.join(name), &text)
+            crate::harness::atomic_write::write_atomic(&dir.join(name), &text)
         }
     }
 
@@ -7476,14 +6645,13 @@ fn host_candidates<'a>(
 
 fn needs_upgrade_inspection(sf: &SessionFile, targets: &Targets, prior: Option<&St>) -> bool {
     // A restart in flight, a release owed whatever build the agent runs now
-    // ([`release_visit`]), and an announced round whose notice carried a model
-    // ([`St::promised_model`]): the ride is the round's own state, so its READY
-    // must still be acted on or a barred ride dropped ([`ride_dropped`]). A
-    // gave-up round's late READY acts only while its release is owed, which
-    // this lets through.
-    if prior
-        .is_some_and(|st| st.in_flight() || !st.release.is_empty() || st.promised_model().is_some())
-    {
+    // ([`release_visit`]), and an announced round: its READY must still be acted on, or the
+    // round released once no build is ahead of the one it runs
+    // ([`St::release_untargeted`]). A gave-up round's late READY acts only while its release is
+    // owed, which this lets through.
+    if prior.is_some_and(|st| {
+        st.in_flight() || !st.release.is_empty() || matches!(st.phase, Phase::Announced { .. })
+    }) {
         return true;
     }
     if prior.is_some_and(|st| st.landed_after_stop(sf, &Live)) {
@@ -8154,7 +7322,7 @@ pub(crate) fn note_earlier_tab_under(root: &Path, tab: &str, was: &str) {
     let Some(body) = earlier_tab_note(tab, was, noted_earlier_tabs(root, tab)) else {
         return;
     };
-    let _ = models::write_atomic_ordered(&earlier_tabs_path(root, tab), &body);
+    let _ = super::atomic_write::write_atomic_ordered(&earlier_tabs_path(root, tab), &body);
 }
 
 fn earlier_tab_note(tab: &str, was: &str, mut noted: Vec<String>) -> Option<String> {
@@ -8437,7 +7605,7 @@ pub fn note_writes(opts: &Opts, snap: &super::relaunch::Snapshot, dir: &Path) {
     let Ok(upgrade_dir) = ensure_upgrade_tree(&opts.state, None) else {
         return;
     };
-    let _ = models::write_atomic(
+    let _ = super::atomic_write::write_atomic(
         &upgrade_dir.join(format!("{session}.writes")),
         &format!("{text}\n"),
     );
@@ -8571,7 +7739,7 @@ fn newest_row_at(path: &Path) -> Option<u64> {
     let (tail, _) = tail_to_end(path, TAIL_BYTES);
     tail.lines().rev().find_map(|line| {
         let v: Value = aterm_json::from_str(line).ok()?;
-        models::parse_utc(v.get("timestamp")?.as_str()?)
+        super::unix_time::parse_utc(v.get("timestamp")?.as_str()?)
     })
 }
 
@@ -8899,7 +8067,7 @@ fn process_transcript_end(
     let filed = Records::of_process(&user_home, vars, pid, || cwd.clone(), started_in);
     let writes = Records::at(&user_home, vars, || cwd.clone());
     let (filed, writes) = (filed.dir()?.to_path_buf(), writes.dir()?.to_path_buf());
-    let started = models::parse_lstart(start)?;
+    let started = super::unix_time::parse_lstart(start)?;
     let entry = super::footer::session_of_pid(&filed, pid, Some(started))?;
     let entry = super::footer::SessionEntry {
         cwd: cwd.unwrap_or(entry.cwd),
@@ -9435,7 +8603,6 @@ fn due_among(
         return Due::No;
     };
     let targets = std::cell::OnceCell::new();
-    let mctx = std::cell::OnceCell::new();
     let unanswered = std::cell::Cell::new(false);
     let unread_record = std::cell::Cell::new(false);
     let wants = |sf: &SessionFile| {
@@ -9450,8 +8617,7 @@ fn due_among(
             return false;
         }
         let tg = targets.get_or_init(&read_targets);
-        let wanted = needs_upgrade_inspection(sf, tg, prior.as_ref())
-            || model_wants_a_look(opts, sf, mctx.get_or_init(|| ModelCtx::read(opts, tg)));
+        let wanted = needs_upgrade_inspection(sf, tg, prior.as_ref());
         unanswered.set(!wanted && tg.unanswered);
         wanted
     };
@@ -9537,7 +8703,7 @@ fn no_record(
 }
 
 pub(super) fn started_s(pid: u32) -> Option<u64> {
-    models::parse_lstart(&kernel_start(pid)?)
+    super::unix_time::parse_lstart(&kernel_start(pid)?)
 }
 
 /// What [`due`] read of a tab.
@@ -9685,9 +8851,9 @@ fn mint_behind(
     let who = squash(&sf.proc_start);
     let who = Proc {
         start: &who,
-        started_s: models::parse_lstart(&sf.proc_start).unwrap_or(0),
+        started_s: super::unix_time::parse_lstart(&sf.proc_start).unwrap_or(0),
     };
-    let mut st = St::for_target(prior, &running, &target, None, who, now_s());
+    let mut st = St::for_target(prior, &running, &target, who, now_s());
     st.pending_since = st.pending_since.min(since);
     st.tab = tab.to_string();
     st.keep_home(&Records::of_file(&opts.home, sf), &opts.home);
@@ -9713,10 +8879,10 @@ fn retab(
     let who = squash(&sf.proc_start);
     let who = Proc {
         start: &who,
-        started_s: models::parse_lstart(&sf.proc_start).unwrap_or(0),
+        started_s: super::unix_time::parse_lstart(&sf.proc_start).unwrap_or(0),
     };
     let now = now_s();
-    let (mut st, how) = St::retarget(prior, running, target, None, who, now);
+    let (mut st, how) = St::retarget(prior, running, target, who, now);
     if matches!(st.phase, Phase::Pending | Phase::Failed(_)) {
         tab.clone_into(&mut st.tab);
     }
@@ -10383,7 +9549,6 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
     let mut reports = Vec::new();
     reports.extend(if let Some(tabs) = live_tabs {
         let targets = std::cell::OnceCell::new();
-        let mctx = std::cell::OnceCell::new();
         let candidates = host_candidates(
             &files,
             tabs,
@@ -10394,14 +9559,7 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
                 }
                 match load_record(opts, &sf.session_id) {
                     Err(_) => true,
-                    Ok(prior) => {
-                        needs_upgrade_inspection(sf, tg, prior.as_ref())
-                            || model_wants_a_look(
-                                opts,
-                                sf,
-                                mctx.get_or_init(|| ModelCtx::read(opts, tg)),
-                            )
-                    }
+                    Ok(prior) => needs_upgrade_inspection(sf, tg, prior.as_ref()),
                 }
             },
             atpkg::caller_shell::process_args,
@@ -10418,9 +9576,9 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
         if !claimed.is_empty() {
             let t = table();
             let targets = targets.get_or_init(|| Targets::read(opts));
-            let mctx = mctx.get_or_init(|| ModelCtx::read(opts, targets));
+            targets.cache_catalogs(opts);
             waits.extend(claimed.into_iter().map(|(sf, args, claim)| {
-                visit_models(
+                visit_build(
                     opts,
                     sf,
                     Some(&files),
@@ -10429,7 +9587,6 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
                     &Live,
                     Some(&args),
                     Some(&claim),
-                    mctx,
                 )
             }));
         }
@@ -10439,22 +9596,10 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
     } else {
         let t = table();
         let targets = Targets::read(opts);
-        let mctx = ModelCtx::read(opts, &targets);
+        targets.cache_catalogs(opts);
         files
             .iter()
-            .map(|sf| {
-                visit_models(
-                    opts,
-                    sf,
-                    Some(&files),
-                    &t,
-                    &targets,
-                    &Live,
-                    None,
-                    None,
-                    &mctx,
-                )
-            })
+            .map(|sf| visit_build(opts, sf, Some(&files), &t, &targets, &Live, None, None))
             .collect()
     });
     for sid in &homes.unnamed {
@@ -10546,7 +9691,7 @@ pub fn retarget_pending_for_test(
         start: proc_start,
         started_s: 0,
     };
-    let (st, _) = St::retarget(Some(prior), &running, &target, None, who, now_s());
+    let (st, _) = St::retarget(Some(prior), &running, &target, who, now_s());
     save(opts, session, &st);
     Ok(())
 }
@@ -10640,86 +9785,7 @@ fn visit(
     k: &dyn Kernel,
 ) -> Report {
     let files = Records::of_file(&opts.home, sf).session_files();
-    visit_with_claim(opts, sf, files.as_deref(), t, targets, k, None, None)
-}
-
-#[cfg(all(test, unix))]
-#[allow(clippy::too_many_arguments)]
-fn visit_with_claim(
-    opts: &Opts,
-    sf: &SessionFile,
-    initial_files: Option<&[SessionFile]>,
-    t: &[ProcRow],
-    targets: &Targets,
-    k: &dyn Kernel,
-    prefetched_args: Option<&atpkg::caller_shell::ProcArgs>,
-    host_claim: Option<&HostClaim>,
-) -> Report {
-    visit_models(
-        opts,
-        sf,
-        initial_files,
-        t,
-        targets,
-        k,
-        prefetched_args,
-        host_claim,
-        &ModelCtx::none(),
-    )
-}
-
-fn ride_dropped(
-    opts: &Opts,
-    session: &str,
-    st: &mut St,
-    why: &'static str,
-    idle: bool,
-    now: u64,
-) -> DroppedRide {
-    let model = std::mem::take(&mut st.model_list);
-    let released = idle && st.release_unridden(now);
-    if !opts.dry_run {
-        save(opts, session, st);
-    }
-    DroppedRide {
-        why,
-        model,
-        released,
-    }
-}
-
-struct DroppedRide {
-    why: &'static str,
-    model: String,
-    released: bool,
-}
-
-impl DroppedRide {
-    fn say(&self, opts: &Opts, r: &Report, round: &St, how: Retarget) {
-        if opts.dry_run {
-            return;
-        }
-        let row = Report {
-            to: format!("model:{}", self.model),
-            ..said(r.clone(), "model-ride-dropped")
-        };
-        let then = if self.released {
-            "with the build current and nothing else due, nothing is left to restart for: the \
-             agent the notice asked to wind down is released, and the upgrade is pending again"
-                .to_string()
-        } else {
-            format!("the round goes on without it, {}", retarget_how(how, round))
-        };
-        ledger(
-            opts,
-            &row,
-            &format!(
-                "{}: the model the notice carried is not one the model rule may move this \
-                 conversation to now, so it no longer rides the restart; {then}",
-                self.why
-            ),
-        );
-    }
+    visit_build(opts, sf, files.as_deref(), t, targets, k, None, None)
 }
 
 fn notice_process_gone(st: &St) -> Option<&'static str> {
@@ -10735,7 +9801,7 @@ fn notice_process_gone(st: &St) -> Option<&'static str> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn visit_models(
+fn visit_build(
     opts: &Opts,
     sf: &SessionFile,
     initial_files: Option<&[SessionFile]>,
@@ -10744,7 +9810,6 @@ fn visit_models(
     k: &dyn Kernel,
     prefetched_args: Option<&atpkg::caller_shell::ProcArgs>,
     host_claim: Option<&HostClaim>,
-    mctx: &ModelCtx,
 ) -> Report {
     let mut r = blank(sf);
     if !alive(sf.pid) || kernel_start(sf.pid).as_deref() != Some(squash(&sf.proc_start).as_str()) {
@@ -10917,98 +9982,34 @@ fn visit_models(
     };
     let exe = exe_of(sf.pid).unwrap_or_default();
     let running_native = exe.starts_with(native_root(&opts.home));
-    let launch = upgrade::launch_model(&args.argv);
-    let carried = prior.as_ref().and_then(St::carried_model);
-    let profile = sf
-        .claude_dir
-        .as_ref()
-        .and_then(|_| Records::of_file(&opts.home, sf).billing_context(&opts.home, args));
-    let view = mctx.at_for_profile(opts, sf, profile.as_ref());
-    let mread = model_read_for(
-        opts,
-        sf,
-        launch.as_deref(),
-        mctx,
-        running_native,
-        carried,
-        Some(&view),
-    );
-    let hand_model = || {
-        hand_model_in(
-            opts,
-            &Records::of_file(&opts.home, sf),
-            &sf.session_id,
-            &args.argv,
-            models::parse_lstart(&sf.proc_start),
-            mctx,
-            running_native,
-        )
-    };
-    let build_target = upgrade::choose_target(&running, &targets.for_session(running_native));
-    let announced_model = prior
-        .as_ref()
-        .and_then(St::promised_model)
-        .filter(|_| mread.ride_barred.is_none());
-    let model_to = models::model_to(
-        announced_model,
-        &mread.verdict,
-        mread.cold,
-        build_target.is_some(),
-        mread.due_for_s,
-    );
-    let target = build_target.or_else(|| {
-        model_to
-            .as_ref()
-            .and_then(|_| same_build(targets, &exe, &running, running_native))
-    });
-    let dropped = match (mread.ride_barred, prior.as_mut()) {
-        (Some(why), Some(st)) => Some(ride_dropped(
-            opts,
-            &sf.session_id,
-            st,
-            why,
-            target.is_none(),
-            now_s(),
-        )),
-        _ => None,
-    };
-    let running_model = match &mread.verdict {
-        ModelVerdict::Due { from, .. } => Some(from.as_str()),
-        ModelVerdict::Keep(_) => None,
-    };
+    let target = upgrade::choose_target(&running, &targets.for_session(running_native));
     let Some(target) = target else {
-        // A dropped ride's round, as the drop left it: released, or a gave-up
-        // round kept as it stopped (no retarget follows).
-        if let (Some(dropped), Some(st)) = (&dropped, prior.as_ref()) {
-            dropped.say(opts, &r, st, Retarget::Kept);
+        if let Some(st) = prior.as_mut()
+            && st.release_untargeted(&running, !targets.unanswered, now_s())
+            && !opts.dry_run
+        {
+            save(opts, &sf.session_id, st);
         }
         if let Some(st) = prior.clone().filter(|st| !st.release.is_empty()) {
             return release_visit(opts, r, sf, st, &tab, t, k, host_claim);
         }
-        return match &mread.verdict {
-            ModelVerdict::Due { .. } => said(r, "wait:model-cache-warm"),
-            ModelVerdict::Keep(_) => {
-                if let Some(gone) =
-                    forget_settled_pending(opts, &sf.session_id, prior.as_ref(), &running)
-                {
-                    let reached = Report {
-                        to: gone.to.clone(),
-                        ..said(r.clone(), "reached:by-hand")
-                    };
-                    ledger(
-                        opts,
-                        &reached,
-                        &format!(
-                            "the session runs {running}, the build this upgrade was moving it to \
-                             ({} at its worst): it got there by another route, so the record is \
-                             closed and nothing ages toward the next build",
-                            gone.to
-                        ),
-                    );
-                }
-                said(r, "current")
-            }
-        };
+        if let Some(gone) = forget_settled_pending(opts, &sf.session_id, prior.as_ref(), &running) {
+            let reached = Report {
+                to: gone.to.clone(),
+                ..said(r.clone(), "reached:by-hand")
+            };
+            ledger(
+                opts,
+                &reached,
+                &format!(
+                    "the session runs {running}, the build this upgrade was moving it to \
+                     ({} at its worst): it got there by another route, so the record is \
+                     closed and nothing ages toward the next build",
+                    gone.to
+                ),
+            );
+        }
+        return said(r, "current");
     };
     r.to = format!("{}({})", target.version, target.source.as_str());
     if Records::of_file(&opts.home, sf).left_by(
@@ -11025,7 +10026,7 @@ fn visit_models(
     let who = squash(&sf.proc_start);
     let who = Proc {
         start: &who,
-        started_s: models::parse_lstart(&sf.proc_start).unwrap_or(0),
+        started_s: super::unix_time::parse_lstart(&sf.proc_start).unwrap_or(0),
     };
     let retargeted_from = prior
         .as_ref()
@@ -11036,12 +10037,9 @@ fn visit_models(
             ) && Version::parse(&p.to).as_ref() != Some(&target.version)
         })
         .map(|p| p.to.clone());
-    let (mut st, how) = St::retarget(prior, &running, &target, model_to.as_deref(), who, now);
+    let (mut st, how) = St::retarget(prior, &running, &target, who, now);
     if st.keep_home(&Records::of_file(&opts.home, sf), &opts.home) {
         save(opts, &sf.session_id, &st);
-    }
-    if let Some(dropped) = &dropped {
-        dropped.say(opts, &r, &st, how);
     }
     if how == Retarget::Rested {
         rested_said(opts, &r, &st, now);
@@ -11152,25 +10150,18 @@ fn visit_models(
             &records,
             &sf.session_id,
             shown_mode.clone(),
-            models::parse_lstart(&sf.proc_start),
+            super::unix_time::parse_lstart(&sf.proc_start),
         );
-        let model = model_to.clone().or_else(hand_model);
         let launch_record = super::accounts::LaunchEnv::of_exec_env(&args.env);
         plan_move(
             opts,
             &Launch {
                 homedir: homedir.as_deref(),
                 launch_env: launch_record.as_ref(),
-                billing: if model_to.is_some() {
-                    super::relaunch::ModelBilling::Move(profile.as_ref())
-                } else {
-                    super::relaunch::ModelBilling::Keep
-                },
                 ..launch_of(
                     sf,
                     &args.argv,
                     &target,
-                    model.as_deref(),
                     mode.as_deref(),
                     true,
                     home,
@@ -11184,16 +10175,13 @@ fn visit_models(
         )
     };
     // A tell names the newer build waiting and promises aterm's move onto it, so it waits its own
-    // work's word on a model's move alone (the target is the build the agent runs, which the line
-    // cannot name) and where the relaunch the move would type cannot be planned now (its shell,
-    // the HOME it carries, its model's billing), before the build's start is probed for a line it
-    // will not type.
+    // work's word where the relaunch the move would type cannot be planned now (its shell, the
+    // HOME it carries), before the build's start is probed for a line it will not type.
     if let Step::Tell(why) = step
-        && (target.version == running
-            || foreground_shell(k.job(sf.pid))
-                .ok()
-                .map_or(Err(NoPlan::Wait("ids")), move_plan)
-                .is_err())
+        && foreground_shell(k.job(sf.pid))
+            .ok()
+            .map_or(Err(NoPlan::Wait("ids")), move_plan)
+            .is_err()
     {
         step = Step::Wait(why);
     }
@@ -11210,8 +10198,7 @@ fn visit_models(
         step,
         Step::Announce | Step::Terminate | Step::Fresh | Step::Tell(_)
     );
-    if target.version != running
-        && (upgrade::asked_for_a_move(&asked_about, ready) || moving)
+    if (upgrade::asked_for_a_move(&asked_about, ready) || moving)
         && build_starts(opts, &r, &target, now, request == Request::Now, moving).is_err()
     {
         step = upgrade::build_hold(step, &asked_about, ready);
@@ -11291,14 +10278,7 @@ fn visit_models(
                     salt.wrapping_add(u64::from(asks)),
                 );
                 let text = upgrade::with_running(
-                    &upgrade::prepare_prompt_with_model(
-                        &running,
-                        &target.version,
-                        target.source,
-                        &marker,
-                        model_to.as_deref(),
-                        running_model,
-                    ),
+                    &upgrade::prepare_prompt(&running, &target.version, target.source, &marker),
                     &upgrade::running_clause(&k.describe(sf.pid, &background_procs(sf.pid, t))),
                 );
                 require_unique_owner(&opts.home, sf).map_err(str::to_string)?;
@@ -11331,7 +10311,6 @@ fn visit_models(
                 if facts.work_ended {
                     st.spend_work_end(now);
                 }
-                st.model_list = model_to.clone().unwrap_or_default();
                 st.line = planned_line.unwrap_or_default();
                 st.login = args.env_var(super::accounts::LOGIN_ENV).map(str::to_owned);
                 st.tab.clone_from(&tab);
@@ -11381,14 +10360,10 @@ fn visit_models(
                 pressed && !facts.background.is_empty() && !opts.press.is_some_and(|p| p.off);
             let quiet = unasked && !owed_here;
             st.quiet = quiet && !ended_work;
-            if fresh || unasked {
-                st.model_list = model_to.clone().unwrap_or_default();
-            }
             if !fresh {
                 (st.model_before, st.mark) = model_and_mark(recent.as_ref());
             }
-            st.launch_model = launch_kept(opts, &sf.session_id, &args.argv).unwrap_or_default();
-            let hand = st.model_list.is_empty().then(hand_model).flatten();
+            st.launch_model = upgrade::launch_model(&args.argv).unwrap_or_default();
             let launch_record = super::accounts::LaunchEnv::of_exec_env(&args.env);
             let restarting = Restarting {
                 argv: &args.argv,
@@ -11410,12 +10385,10 @@ fn visit_models(
                     && request == Request::Now
                     && upgrade::status_lags(&facts),
                 mode: shown_mode.as_deref(),
-                model: hand.as_deref(),
                 login: args.env_var(super::accounts::LOGIN_ENV),
                 home: args.env_var(super::accounts::HOME_ENV),
                 route: route_of(&args.env),
                 auth_observed: !args.env.is_empty(),
-                profile: profile.as_ref(),
                 launch_env: launch_record.as_ref(),
             };
             restart(opts, r, &mut st, &mut c, &tab, sf, t, k, &restarting)
@@ -12658,7 +11631,6 @@ fn launch_of<'a>(
     sf: &'a SessionFile,
     argv: &'a [String],
     target: &'a Candidate,
-    model: Option<&'a str>,
     mode: Option<&'a str>,
     resume: bool,
     home: Option<&'a str>,
@@ -12673,7 +11645,6 @@ fn launch_of<'a>(
         agent: sf.pid,
         argv,
         exe: &target.exe,
-        model,
         mode,
         home,
         homedir: None,
@@ -12681,7 +11652,6 @@ fn launch_of<'a>(
         route,
         auth_observed,
         launch_env: None,
-        billing: crate::harness::relaunch::ModelBilling::Keep,
         serve: crate::harness::relaunch::Serve::Judge,
     }
 }
@@ -13049,12 +12019,10 @@ struct Restarting<'a> {
     pressed: bool,
     lagging: bool,
     mode: Option<&'a str>,
-    model: Option<&'a str>,
     login: Option<&'a str>,
     home: Option<&'a str>,
     route: super::accounts::AuthRoute,
     auth_observed: bool,
-    profile: Option<&'a super::profile::Context>,
     /// What the agent's own exec environment records of its shell's
     /// ([`super::accounts::LaunchEnv`]).
     launch_env: Option<&'a super::accounts::LaunchEnv>,
@@ -13092,12 +12060,10 @@ fn restart(
         pressed,
         lagging,
         mode: shown_mode,
-        model: hand_model,
         login,
         home,
         route,
         auth_observed,
-        profile,
         launch_env,
     } = *how;
     let records = Records::of_file(&opts.home, sf);
@@ -13151,25 +12117,18 @@ fn restart(
         Ok(shell) => shell,
         Err(why) => return said(r, format!("wait:{why}")),
     };
-    let model = recorded(&st.model_list).or(hand_model);
     let mode = resume_mode(
         &records,
         &sf.session_id,
         shown_mode.map(str::to_owned),
-        models::parse_lstart(&sf.proc_start),
+        super::unix_time::parse_lstart(&sf.proc_start),
     );
     let launch = Launch {
         launch_env,
-        billing: if !st.model_list.is_empty() {
-            super::relaunch::ModelBilling::Move(profile)
-        } else {
-            super::relaunch::ModelBilling::Keep
-        },
         ..launch_of(
             sf,
             argv,
             target,
-            model,
             mode.as_deref(),
             !fresh,
             home,
@@ -13211,8 +12170,6 @@ fn restart(
             // to: it is typed on the row's stored login, never through the token wrapper.
             let back = Launch {
                 exe: &program,
-                model: hand_model,
-                billing: super::relaunch::ModelBilling::Keep,
                 serve: super::relaunch::Serve::Never,
                 ..launch
             };
@@ -13268,8 +12225,6 @@ fn restart(
         if fresh {
             super::relaunch::CAUSE_UPGRADE_FRESH.clone_into(&mut st.cause);
         }
-        st.fallback_from =
-            fallback_carried(fallback_origin(st), recorded(&st.model_list), hand_model);
         if save_checked(opts, &sf.session_id, st).is_err() {
             st.unsent(back);
             st.cause.clear();
@@ -13459,14 +12414,6 @@ fn restart(
     );
     super::relaunch::note_dropped(opts, &r, tap_dropped.as_deref(), token_dropped.as_deref());
     relaunch(opts, r, st, c, &sf.session_id, k)
-}
-
-pub(super) fn take_back_ask(opts: &Opts, session: &str, asked: Option<models::Asked>) {
-    if let Some(asked) = asked {
-        let mut rec = load_model_record(opts, session);
-        rec.take_back(asked);
-        save_model_record(opts, session, &rec);
-    }
 }
 
 fn confirmations(opts: &Opts) -> Vec<Report> {

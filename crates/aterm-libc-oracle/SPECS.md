@@ -41,7 +41,7 @@ formatting that no spec should keep (§4).
   with a size of "`. `BODY_MARKER` = `"type fd_word = "`, the start of the first line of code `regen::shim::bodies` writes (from the constant), never a comment.
 - `up(x,a)` = `Some(ceil(x/a)·a)` for `a ≥ 1` when `ceil(x/a)·a ≤ 2^64−1`, and `None` when `a = 0` or the product overflows `u64`.
 - F: the filesystem state. A spec that names F is effectful (gap 8).
-- **Gaps** are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Every spec lists gap 0
+- **Gaps** are the rows of `docs/TRUST-LANE.md` (Blocking gaps). Every spec lists gap 0
   (an installed seal that publishes Lean-discharged rows). Gap 6 (publishing plain-Rust clauses) applies
   to any spec discharged on the SMT lane instead of in Lean; the column leaves it out because the lane is
   chosen per proof.
@@ -108,42 +108,6 @@ union-json-roundtrip	round-trip	union::Union::parse, union::Union::render, union
 report-exit-code-precedence	table-property	verdict::Report::exit_code	∀ r: exit_code(r) = EXIT_FINDING (1) if r.findings≠[]; else EXIT_COULD_NOT_RUN (3) if r.could_not_run is Some; else EXIT_PASS (0). Pure (&self), so a stop alongside a finding is still reported.	src/verdict.rs::findings_outrank_a_stop_and_a_stop_alone_could_not_run	Vec::is_empty and Option::is_some on &self fields, a u8 match on consts	0,1,2
 binary-exit-codes	contract	main::main, main::parse, main::print_text, run::run, verdict::Report::exit_code	∀ argv a, F: parse(a)=Err ⇒ the process exits 2 (EXIT_USAGE) and prints the usage to stderr. A help parse exits 0. For the Gate verb, stdout prints print_text(r) with r = run(the options from a), and the exit code is exit_code(r). Composed with run-precondition-could-not-run: for a root without the oracle the gate exits 3 and prints a "COULD NOT RUN: ..." line with a fix string.	tests/exit_codes.rs::no_oracle_could_not_run_and_a_stray_flag_is_usage	a process entry point (env args, current_dir, stdout, ExitCode), composition of the parse/run/verdict specs, fs and process effects	0,1,4,8,9,12
 ```
-
-### Distribution by kind (53)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 43 | every id not listed below |
-| table-property | 6 | locked-failure-classification, cell-lookup, control-expect-judge, behaviour-sweeps-closed, shim-arg-name, report-exit-code-precedence |
-| invariant | 2 | harvest-scan-filtered-by-reference, probe-line-key-correspondence |
-| refinement | 1 | shim-struct-layout-reproduces-measurement |
-| round-trip | 1 | union-json-roundtrip |
-
-### Blocking-gap histogram (specs blocked by each gap)
-
-| gap | specs | | gap | specs |
-|---|---|---|---|---|
-| 0 | 53 | | 7 | 35 |
-| 1 | 53 | | 8 | 6 |
-| 2 | 17 | | 9 | 1 |
-| 3 | 40 | | 11 | 2 |
-| 4 | 13 | | 12 | 14 |
-| 5 | 40 | | 13 | 13 |
-
-Gaps 6, 10, 14, 15, 16 and 17 block no spec directly. Gap 6 still applies to any SMT-lane discharge
-(§0), and 17 applies whenever a proof is run from `/private/tmp`.
-
-### Proof dependency order
-
-Data lemmas first: `cell-lookup` (distinct triples, keys and sources), `sibling-pairs`, the `ErrList`
-lemma, `tail`, and `up`. Then `repr-c-layout` → `layout-validate` → `shim-struct-layout-reproduces-measurement`.
-`render-type` + `named-identifiers` → `closure-least-fixpoint` → `decls-read-partition`,
-`expected-shape-is-closure-plus-prims`. `outcome-parse` + `diagnostic-names-whole-identifier` +
-`outcome-detail-and-tail` → `control-expect-judge`. `apply-edits-anchor-count` + `sibling-compare` →
-`sibling-controls`. `harvest-missing-names` + `harvest-crate-of` → `harvest-scan-filtered-by-reference`.
-`shim-const-expr` → `probe-line-key-correspondence` → `probe-readback`. `rustdoc-public-surface` →
-`shape-records` → `shape-diff-symmetric-difference`. `cli-parse` + `run-precondition-could-not-run` +
-`report-exit-code-precedence` → `binary-exit-codes`.
 
 ## 2. Test to spec map (TSV)
 
@@ -217,27 +181,6 @@ src/verdict.rs	findings_outrank_a_stop_and_a_stop_alone_could_not_run	report-exi
 tests/exit_codes.rs	no_oracle_could_not_run_and_a_stray_flag_is_usage	binary-exit-codes	cli-parse, run-precondition-could-not-run, report-exit-code-precedence
 ```
 
-## 3. Coverage
-
-- 63 live tests, and all 63 map to one of the 53 specs. 0 tests are not spec samples.
-- The specs are fine-grained, because each test here already names one property. The largest
-  collapses are `sibling-compare` (4 primary tests), `rustdoc-public-surface` (3) and `shape-records` (3).
-- Composition hubs: `repr-c-layout` is reused by `layout-validate` and
-  `shim-struct-layout-reproduces-measurement` (4 more tests). `closure-least-fixpoint` is reused by
-  `decls-read-partition` and `expected-shape-is-closure-plus-prims`. `outcome-parse` is reused by
-  `control-expect-judge` and `probe-readback`. All three wait on gap 4 (callee ensures into caller).
-
-- `repr-c-layout` → `layout-validate` → `shim-struct-layout-reproduces-measurement`.
-- `render-type` + `named-identifiers` → `closure-least-fixpoint` → `decls-read-partition`,
-  `expected-shape-is-closure-plus-prims`.
-- `outcome-parse` + `diagnostic-names-whole-identifier` + `outcome-detail-and-tail` →
-  `control-expect-judge`.
-- `apply-edits-anchor-count` + `sibling-compare` → `sibling-controls`.
-- `harvest-missing-names` + `harvest-crate-of` → `harvest-scan-filtered-by-reference`.
-- `shim-const-expr` → `probe-line-key-correspondence` → `probe-readback`.
-- `rustdoc-public-surface` → `shape-records` → `shape-diff-symmetric-difference`.
-- `cli-parse` + `run-precondition-could-not-run` + `report-exit-code-precedence` → `binary-exit-codes`.
-
 ## 4. Test residue no spec keeps
 
 `src/regen/shim.rs::a_cell_module_writes_each_kind_in_its_section` and
@@ -268,27 +211,3 @@ keep only the structure; delete the golden fragments when those specs are proved
 12. **Golden-text residue.** `src/regen/shim.rs::a_cell_module_writes_each_kind_in_its_section`
     and `src/regen/oracle.rs::each_kind_is_pinned_in_its_strongest_form` pin exact emitted lines,
     including comment, header and whitespace lines. The specs keep only the structure (§4).
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone, because every one also needs gap 1 (string, Vec and enum
-carriers). So the order takes the specs whose only other blocker is gap 1, then gap 1 plus one more.
-
-1. **`regen-outputs`** (gaps 0, 1). Pure path construction, with distinctness following from the
-   `cell-lookup` table facts. It is the smallest carrier exercise for `Path`/`format!`.
-2. **`report-exit-code-precedence`** and **`locked-failure-classification`** (gaps 0, 1, 2). Branch
-   tables over `&self` fields. The exit-code spec is what `binary-exit-codes` and every caller of the
-   gate depend on.
-3. **`native-primitive-mutation`** (gaps 0, 1, 3) and **`cell-cfg-and-probe-root`** (gaps 0, 1, 2, 3).
-   String-concatenation equalities with no loop beyond a map/collect.
-4. **`rustdoc-parse-format-errors`** (gaps 0, 1, 12). The first spec that cites aterm_json's model; it
-   is the test bed for gap 12, which 14 specs here need.
-5. **`cell-lookup`** and **`sibling-pairs`** (gaps 0, 1, 3, 5, 7, but over a 4-row const table, so they
-   can be decided by evaluation). Every cell-indexed spec cites their distinctness and pairing facts.
-6. **`repr-c-layout`** (gaps 0, 1, 3, 5, 7). The crate's arithmetic core: u64 `up`, prefix sums and a
-   max, with the §5.6 preconditions. It is an `omega`-class proof once the slice loop is admitted, and
-   it feeds `layout-validate` and `shim-struct-layout-reproduces-measurement` (4 more tests).
-7. **`outcome-out-of-space`**, **`shim-arg-name`** and **`handwritten-gaps`**: small, quantified
-   (gap 5), and loop-free or set algebra only.
-
-After these, take the composition hubs in §1's dependency order once gap 4 lands.

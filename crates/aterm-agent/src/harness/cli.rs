@@ -143,13 +143,11 @@ USAGE:
                                                  route each AI email to the mailbox login its codes
                                                  arrive in, from the accounts CSV (no secret changed)
     aterm harness upgrade [<sid>] [--dry-run] [--json]
-                                                 move live Claude Code sessions onto a newer build/model
+                                                 move live Claude Code sessions onto a newer build
     aterm harness upgrade [<sid>] --status [--json]
                                                  show pending upgrades and what each waits on
     aterm harness upgrade <sid> --now | --defer <dur> | --skip [--json]
                                                  hurry, defer, or skip one tab's upgrade
-    aterm harness upgrade models [set <id>,<id>,...]
-                                                 show or set the upgrade model priority list
     aterm harness signin --cli grok [--wait] [--json]
                                                  sign this machine in to Grok Build once: sandboxed, one
                                                  sign-in and one need however many sessions ask
@@ -170,7 +168,7 @@ OPTIONS:
                         `atpkg-gc` and `claude-purge` are report-only and name the owning command)
     --dry-run           upgrade: print each session's next step without typing or signalling;
                         disk free: say what would go and why not, removing nothing
-                        (`disk --apply` and `upgrade models set` ignore it and still act)
+                        (`disk --apply` ignores it and still acts)
     --status            upgrade: print recorded upgrades without sweeping
     --now               upgrade <sid>: move at first pause (still requires idle, empty draft,
                         no box/hold/child, and no keystroke in the last 20 s)
@@ -261,9 +259,9 @@ limit's burn per hour and the moment it runs out at that rate are reckoned.
     spent pool rotates any launch to the first `[harness.agy] order` model in an open pool,
     else in the low pool with the most left, else it waits (exit 3) until the earliest refill;
     a low pool rotates agy's default, and keeps a named model. `aterm ctl spawn agent=agy`
-    workers launch on this pick (waiting for the earliest refill when every pool is spent), and
-    a live supervised `agy` session stopped at a quota wall rotates across pools on `--model`
-    or resumes in place once its pool refills.
+    workers launch on this pick (waiting for the earliest refill when every pool is spent). A
+    live supervised `agy` session stopped at a quota wall keeps its model and resumes in place
+    once its own pool refills.
   - `[harness.agy]` in aterm.toml: `rotate = false` turns rotation off; `low = 0.1` (or `10`);
     `order = [\"claude-opus-5-5-medium\", \"gemini-4-argon-high\", ...]`.
 ";
@@ -930,7 +928,7 @@ FLEET ACCOUNTS (fetched where a source is named, signed in wherever a roster sta
 ";
 
 const HELP_UPGRADE: &str = "\
-`upgrade` moves live supervised sessions onto a newer build (and newer model) in place,
+`upgrade` moves live supervised sessions onto a newer build in place,
 keeping the conversation and running work.
 
 MODES:
@@ -972,8 +970,8 @@ THE LADDER (activity delays, never disables):
 SCOPE & EXIT CODES:
   - Moves only foreground jobs on an aterm tab's own PTY (tmux/screen/ssh panes wait as
     `held-back:<owner>`; wrapper scripts refuse).
-  - Model upgrades (`aterm harness upgrade models`) ride the relaunch line as `--model`:
-    the newest model of the same family, or the next one up the priority list.
+  - A Claude Code relaunch is the session's own launch line rewritten for `--resume`: aterm
+    never adds, replaces or drops its `--model`.
   - Muse Code (`muse resume <uuid>`) and agy (`agy --conversation=<uuid>`) are moved by the
     window in quiet mode only; Codex is never moved live.
   - Hand-run sweeps exit 0, 1 (`[harness] enabled` off without `--dry-run`, or the sweep
@@ -996,7 +994,7 @@ const HELP_UPGRADE_STATUS: &str = "\
     look), or `overdue` (>6h behind, >1h past a usage-limit reset, or a notice refused for 90m).
   - `held_by=`: child processes (`<pid>(<name>:<age>),...` or `-`).
   - `release=`: release line owed after an abandoned notice (`gave-up`, `void`, `skipped`,
-    `deferred`, `retargeted`, `model-dropped`, the reason a round stopped after its notice,
+    `deferred`, `retargeted`, `no-target`, the reason a round stopped after its notice,
     or `-`).
   - `rung=`: ladder rung (`prefer`, `settled`, `keys-only`, `land`, or `-`).
   - `looked=`, `by=`, `point=`, `guard=`, `watch_at=`: last host look, build, idle point,
@@ -1588,11 +1586,6 @@ pub enum Cmd {
         /// The JSON form.
         json: bool,
     },
-    /// The model priority list of the live upgrade: print it, with each model's availability on the managed build, the target, and Claude Code's own recommendations; or `set` it (best first).
-    UpgradeModels {
-        /// `Some(list)`: replace the list with this comma-separated one.
-        set: Option<String>,
-    },
     /// The Claude Code accounts: the report, and the roster's verbs.
     Accounts(AccountsCmd),
     /// `accounts … --cli <id>`: another CLI's pool ([`AccountsOf`]).
@@ -2142,17 +2135,6 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             }
             Cmd::Ledger { file, count, json }
         }
-        "upgrade" if rest.get(1) == Some(&"models") => match (rest.get(2), rest.get(3)) {
-            (None, None) => Cmd::UpgradeModels { set: None },
-            (Some(&"set"), Some(list)) if rest.len() == 4 => Cmd::UpgradeModels {
-                set: Some((*list).to_string()),
-            },
-            _ => {
-                return Err(
-                    "upgrade models takes nothing, or `set <id>,<id>,...` (best first)".to_string(),
-                );
-            }
-        },
         "upgrade" => {
             let sid = rest.get(1).map_or(String::new(), |s| (*s).to_string());
             if !sid.is_empty() && !sid.starts_with("s-") {
@@ -6620,7 +6602,7 @@ fn replace_ledger_rows(
         body.push_str(row);
         body.push('\n');
     }
-    super::upgrade_models::write_atomic_ordered(path, &body)
+    super::atomic_write::write_atomic_ordered(path, &body)
 }
 
 fn ledger_path(env: &Env, file: &LedgerFile) -> Result<PathBuf, String> {
@@ -6859,69 +6841,6 @@ fn window_off(policy: &SupervisorConfig, agent: super::upgrade::Agent) -> Option
     }
 }
 
-fn run_upgrade_models(
-    env: &Env,
-    set: Option<&str>,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> ExitCode {
-    let Some(home) = env.home.clone() else {
-        let _ = writeln!(
-            err,
-            "aterm harness: upgrade models needs the home directory"
-        );
-        return ExitCode::from(2);
-    };
-    let accounts = super::tap::LaunchPolicy::read(
-        false,
-        || None,
-        env.accounts_roster().as_deref(),
-        &env.accounts_store(),
-        Some(env.now),
-    );
-    let opts = super::upgrade_drive::Opts {
-        home,
-        state: env.state.clone(),
-        account_roster: env.accounts_roster(),
-        sock: None,
-        token: None,
-        only_sid: None,
-        dry_run: set.is_none(),
-        human_grace_s: 0,
-        hand_back: false,
-        background: false,
-        aterm_state: None,
-        ask: false,
-        several_logins: accounts.several_logins,
-        usage_credits: SupervisorConfig::from_path(env.config.as_deref())
-            .0
-            .usage_credits,
-        usage_tap: None,
-        instances: crate::harness::upgrade_drive::Instances::Machine,
-        agents_off: Vec::new(),
-        land: false,
-        press: None,
-        timings: super::Timings::for_build(),
-        tell: crate::harness::upgrade_drive::Tell::Off,
-    };
-    match set {
-        Some(list) => match super::upgrade_drive::set_models(&opts, list) {
-            Ok(ids) => {
-                let _ = writeln!(out, "models (best first): {}", ids.join(", "));
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                let _ = writeln!(err, "aterm harness: {e}");
-                ExitCode::from(2)
-            }
-        },
-        None => {
-            let _ = write!(out, "{}", super::upgrade_drive::models_report(&opts));
-            ExitCode::SUCCESS
-        }
-    }
-}
-
 fn run_upgrade(
     env: &Env,
     sid: &str,
@@ -6976,8 +6895,6 @@ fn upgrade_opts(
         background: false,
         aterm_state: env.aterm_state.clone(),
         ask: policy.upgrade_ask,
-        several_logins: accounts.several_logins,
-        usage_credits: policy.usage_credits,
         usage_tap: accounts.usage_tap,
         instances: crate::harness::upgrade_drive::Instances::Machine,
         agents_off: policy.off.clone(),
@@ -8047,7 +7964,7 @@ impl AccountsHost for LiveAccounts {
     fn setup_token_program(&self) -> Option<(super::setup_token::Program, String)> {
         let twin = super::upgrade_drive::managed_agent_twin("claude")?;
         let text = super::accounts::read_bounded(&twin, 64 * 1024).ok()??;
-        let exe = super::upgrade_catalog::twin_binary(&text)?;
+        let exe = super::twin::twin_binary(&text)?;
         let version = super::upgrade_drive::twin_version(&twin).unwrap_or_default();
         Some((super::setup_token::Program::setup_token(exe), version))
     }
@@ -10291,7 +10208,12 @@ fn accounts_next(
         next.wait_until = None;
         next.none = Some(not_installed_words(cli));
     } else if cli == Cli::Claude {
-        next.worker = Some(claude_worker_words(rotation.mode, roster, state, now));
+        next.worker = Some(claude_worker_words(
+            (rotation.mode, rotation.home.as_deref()),
+            roster,
+            state,
+            now,
+        ));
     }
     next.wall_moves = wall_moves((cli, launch), rotation, roster, state, enrolled, now);
     let login = rotation.default_login.as_deref();
@@ -10428,7 +10350,7 @@ fn next_on(
             none: Some(no_row_words(
                 cli,
                 rotation.keyring,
-                &own_login_words(roster),
+                &own_login_words(roster, None),
                 true,
             )),
             ..AccountsNext::default()
@@ -10475,7 +10397,13 @@ fn next_on(
             .as_deref()
             .filter(|label| roster.row(label).is_some())
             .or_else(|| sole_listed_running(roster, state))
-            .or_else(|| roster.row_for_login(None).map(|row| row.label.as_str()))
+            // Else the row a plain start runs on: the account this home's login file names,
+            // and no row where no row lists it.
+            .or_else(|| {
+                plain_login(cli, rotation.home.as_deref(), roster)
+                    .and_then(|plain| plain.reconciled(roster).row())
+                    .map(|row| row.label.as_str())
+            })
     });
     let point = accounts::Point::Wall {
         window: String::new(),
@@ -10614,22 +10542,68 @@ fn own_condition(
     }
 }
 
+/// The login a plain start of `cli` runs on in `home`, where an observer reads it: Claude
+/// Code's ([`super::observe::Login::claude`] of no environment). Another CLI's has no observer
+/// yet, and the report says the roster's belief of it.
+fn plain_login(cli: Cli, home: Option<&Path>, roster: &Roster) -> Option<super::observe::Login> {
+    (cli == Cli::Claude).then(|| super::observe::Login::claude(&[], home, roster))
+}
+
 /// The login a launch that takes no row runs on when started plainly, in the report's words:
-/// this machine's own, named by the roster's row on it where it lists one.
-fn own_login_words(roster: &Roster) -> String {
-    match roster.row_for_login(None) {
-        Some(row) => format!("this machine's own (`{}`'s)", row.label),
-        None => "this machine's own, which no row of the roster lists".to_string(),
+/// this machine's own, named by the account its login file names where `plain` read one (with
+/// the row that lists it, where one does), else by the roster's row on it where it lists one.
+fn own_login_words(roster: &Roster, plain: Option<&super::observe::Login>) -> String {
+    let believed = roster.row_for_login(None);
+    let Some((plain, email)) = plain.and_then(|plain| Some((plain, plain.seen.email()?))) else {
+        return match believed {
+            Some(row) => format!("this machine's own (`{}`'s)", row.label),
+            None => "this machine's own, which no row of the roster lists".to_string(),
+        };
+    };
+    match plain.reconciled(roster) {
+        accounts::Reconciled::Agrees(row) | accounts::Reconciled::Other(row) => {
+            format!("this machine's own ({email}, `{}`'s)", row.label)
+        }
+        accounts::Reconciled::Unread(Some(row)) => format!(
+            "this machine's own ({email}; `{}` is the row with no directory, and the roster              cannot check that address against it)",
+            row.label
+        ),
+        accounts::Reconciled::Unlisted(_) | accounts::Reconciled::Unread(None) => {
+            format!("this machine's own ({email}), which no row of the roster lists")
+        }
+    }
+}
+
+/// The row a plain start's login is, in the report's words, for the row `row` it reconciled to:
+/// the account its login file names with the row that lists it, the believed row beside it where
+/// the file contradicts the belief, and the belief said as one where nothing checked it.
+fn plain_row_words(roster: &Roster, plain: &super::observe::Login, row: &accounts::Row) -> String {
+    let label = &row.label;
+    let believed = accounts::judged_label(roster, &plain.who).filter(|believed| believed != label);
+    match (plain.reconciled(roster), plain.seen.email()) {
+        (accounts::Reconciled::Agrees(_) | accounts::Reconciled::Other(_), Some(email)) => {
+            let not = believed.map_or_else(String::new, |believed| {
+                format!(" (not `{believed}`, whose place that is in the roster)")
+            });
+            format!("`{label}`, the row of {email}, the login this machine's home holds{not}")
+        }
+        (_, Some(email)) => format!(
+            "`{label}`, the row this machine's own login counts as (its login file names              {email}, which the roster cannot check against that row)"
+        ),
+        (_, None) => format!("`{label}`, the row this machine's own login counts as"),
     }
 }
 
 /// What a Claude Code worker started plainly takes, in the report's words: what a survey says as
 /// `launch=` ([`super::accounts_pool::unstarted_launch_row`]), judged on the rows such a launch
 /// counts as enrolled ([`accounts::enrolled_for`]), which are not the report's
-/// ([`reported_enrolled`]). `next:` cannot say this: for Claude Code it names the row a rotation
-/// moves a session to. A launch of Claude Code is never refused for its pool.
+/// ([`reported_enrolled`]). The row is the one of the account `home`'s login file names
+/// ([`plain_login`], reconciled), never the row with no directory by assumption: where that file
+/// names an account no row lists, the worker takes no row and the line names the account.
+/// `next:` cannot say this: for Claude Code it names the row a rotation moves a session to. A
+/// launch of Claude Code is never refused for its pool.
 fn claude_worker_words(
-    mode: accounts::Mode,
+    (mode, home): (accounts::Mode, Option<&Path>),
     roster: &Roster,
     state: &accounts::State,
     now: i64,
@@ -10637,29 +10611,29 @@ fn claude_worker_words(
     let cli = Cli::Claude;
     let a_launch = launch_words(cli);
     let enrolled = accounts::enrolled_for(cli, roster);
-    let own_login = accounts::ProcessLogin::of_env(std::iter::empty());
-    let own = accounts::judged_label(roster, &own_login);
+    let plain = super::observe::Login::claude(&[], home, roster);
+    let own = plain.reconciled(roster).row();
     let row = super::accounts_pool::unstarted_launch_row(
         (cli, false, mode),
         roster,
         state,
         &enrolled,
-        (None, None),
+        (None, home),
         now,
     );
     match (row, own) {
-        (Some(row), Some(own)) if row.label != own => format!(
-            "{a_launch} takes `{}` for a plain start: rotation moves it off `{own}`, the row this \
-             machine's own login counts as",
-            row.label
+        (Some(row), Some(own)) if row.label != own.label => format!(
+            "{a_launch} takes `{}` for a plain start: rotation moves it off {}",
+            row.label,
+            plain_row_words(roster, &plain, own)
         ),
         (Some(row), _) => format!(
-            "{a_launch} takes `{}`, the row this machine's own login counts as, for a plain start",
-            row.label
+            "{a_launch} takes {}, for a plain start",
+            plain_row_words(roster, &plain, row)
         ),
         (None, _) => format!(
             "{a_launch} takes no row: it runs on the login its starter carries, {} for a plain one",
-            own_login_words(roster)
+            own_login_words(roster, Some(&plain))
         ),
     }
 }
@@ -10741,7 +10715,10 @@ fn use_recorded(
         );
     }
     let a_launch = launch_words(cli);
-    let own = own_login_words(roster);
+    let own = own_login_words(
+        roster,
+        plain_login(cli, rotation.home.as_deref(), roster).as_ref(),
+    );
     let picked = rotation.launch_now((cli, launch.program), roster, state, enrolled, now);
     let takes = match &picked {
         Ok(Some(row)) => UseTakes::Row(row.label.clone()),
@@ -11012,7 +10989,10 @@ fn off_next(
     now: i64,
 ) -> AccountsNext {
     let product = cli.connector().product;
-    let own = own_login_words(roster);
+    let own = own_login_words(
+        roster,
+        plain_login(cli, rotation.home.as_deref(), roster).as_ref(),
+    );
     let (by, back) = off_by_words(&rotation.off_by);
     let (to, none, off) = if cli == Cli::Claude {
         let pin = state
@@ -15633,6 +15613,7 @@ fn drove_words(outcome: &super::login_drive::Outcome) -> String {
         Outcome::NotRun(why) | Outcome::PageNotOpened(why) => {
             format!("it did not run: {}", super::one_line(why, why.len()))
         }
+        Outcome::PreparationFailed(stage) => format!("it did not run: {}", stage.reason()),
         Outcome::Unverified(why) => format!(
             "sign-in result was not verified: {}",
             super::one_line(why, why.len())
@@ -15787,7 +15768,7 @@ impl SignInPlan {
         store: &accounts::Store,
         native: Option<&super::codex_enrollment::NativeContext<'_>>,
     ) -> super::login_drive::Drove {
-        use super::login_drive::{Drove, Outcome};
+        use super::login_drive::{Drove, NativePreparationStage, Outcome};
         let request = super::login_drive::Request {
             publication: Some(&self.publication),
             enrollment: self.artifact.as_ref(),
@@ -15814,51 +15795,69 @@ impl SignInPlan {
                 let roster = native
                     .env
                     .accounts_roster_for(cli)
-                    .ok_or("account roster unavailable")?;
+                    .ok_or(NativePreparationStage::RowPolicy)?;
                 let held = store
                     .acquire_within(&accounts::LOCK_LADDER)
-                    .map_err(|_| "native row writer unavailable")?
-                    .ok_or("native row writer busy")?;
+                    .map_err(|_| NativePreparationStage::RowPolicy)?
+                    .ok_or(NativePreparationStage::RowPolicy)?;
                 let admission = self
                     .native_row_admission
                     .as_ref()
-                    .ok_or("native row occurrence unavailable")?;
-                let live = admission.inspect_current(
-                    native.env,
-                    store.native_row_snapshot_held(&held, &roster, host.now())?,
-                )?;
+                    .ok_or(NativePreparationStage::RowPolicy)?;
+                let snapshot = NativePreparationStage::RowPolicy
+                    .checked(store.native_row_snapshot_held(&held, &roster, host.now()))?;
+                let live = NativePreparationStage::RowPolicy
+                    .checked(admission.inspect_current(native.env, snapshot))?;
                 let fence = live.policy();
-                super::codex_grant_owner::prepare(
-                    native.env,
-                    operation,
-                    &super::codex_app_login::auth_path_in_home(&self.staging),
-                    fence,
+                NativePreparationStage::GrantCustody.checked(
+                    super::codex_grant_owner::prepare_held(
+                        native.env,
+                        operation,
+                        &super::codex_app_login::auth_path_in_home(&self.staging),
+                        fence,
+                        store,
+                        &held,
+                    ),
                 )
             })();
             let prepared = prepared.and_then(|prepared| {
-                let prepared =
-                    prepared.with_native_scope(native.env, self._begun.native_scope().cloned())?;
+                let prepared = NativePreparationStage::NativeScope.checked(
+                    prepared.with_native_scope(native.env, self._begun.native_scope().cloned()),
+                )?;
                 let admission = self
                     .native_row_admission
                     .take()
-                    .ok_or("native row occurrence unavailable")?;
-                prepared.with_row_admission(admission)
+                    .ok_or(NativePreparationStage::RowAdmission)?;
+                NativePreparationStage::RowAdmission.checked(prepared.with_row_admission(admission))
             });
             let prepared = match prepared {
                 Ok(prepared) => prepared,
-                Err(_) => {
+                Err(stage) => {
                     return Drove {
-                        outcome: Outcome::NotRun("native grant custody unavailable".into()),
+                        outcome: Outcome::PreparationFailed(stage),
                         host: None,
                     };
                 }
             };
+            #[cfg(test)]
+            if native_preparation_fixture::stop() {
+                return Drove {
+                    outcome: Outcome::NotRun(
+                        "isolated fixture reached actual native preparation".into(),
+                    ),
+                    host: None,
+                };
+            }
             let Some(home) = native.env.home.as_deref() else {
                 return Drove {
                     outcome: Outcome::NotRun("native account home unavailable".into()),
                     host: None,
                 };
             };
+            #[cfg(test)]
+            let (mut drove, outcome) =
+                native_preparation_fixture::drive(&request, home, native, prepared);
+            #[cfg(not(test))]
             let (mut drove, outcome) = super::login_drive::sign_in_live_scoped_custody(
                 &request,
                 home,
@@ -17335,6 +17334,60 @@ pub(super) fn renew_one_for(
     )
 }
 
+#[cfg(test)]
+mod native_preparation_fixture {
+    std::thread_local! {
+        pub(super) static STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static REACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static LOOPBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static EXCHANGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    pub(super) fn stop() -> bool {
+        REACHED.with(|reached| reached.set(true));
+        STOP.with(std::cell::Cell::get)
+    }
+
+    pub(super) fn drive(
+        request: &super::super::login_drive::Request<'_>,
+        home: &std::path::Path,
+        native: &super::super::codex_enrollment::NativeContext<'_>,
+        prepared: super::super::codex_grant_owner::PreparedGrant,
+    ) -> (
+        super::super::login_drive::Drove,
+        Option<super::super::codex_grant_owner::CaptureOutcome>,
+    ) {
+        #[cfg(unix)]
+        if LOOPBACK.with(std::cell::Cell::get) {
+            let (drove, outcome) =
+                super::super::codex_app_login::tests::current_global_login_fixture(
+                    request.enrollment.expect("actual native artifact"),
+                    prepared,
+                    native.scope,
+                    None,
+                    true,
+                    false,
+                    native.env,
+                );
+            EXCHANGES.with(|count| count.set(count.get() + 1));
+            return (drove, Some(outcome));
+        }
+        super::super::login_drive::sign_in_live_scoped_custody(
+            request,
+            home,
+            &|name| std::env::var_os(name),
+            Some(native.scope.clone()),
+            prepared,
+        )
+        .into_parts()
+    }
+}
+
+#[derive(Default)]
+struct EnrollmentAttempt {
+    provider_attempted: std::cell::Cell<bool>,
+    preparation_stage: std::cell::Cell<Option<super::login_drive::NativePreparationStage>>,
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the existing renewal policy and optional durable operation stay explicit"
@@ -17347,7 +17400,7 @@ fn renew_one_for_operation(
     (row, roster_path, captured_logins): (&accounts::Row, &Path, &accounts::Logins),
     (own_dir, sign_in): (Option<&str>, SignIn),
     enrollment: Option<&super::codex_enrollment::Request>,
-    provider_attempted: Option<&std::cell::Cell<bool>>,
+    enrollment_attempt: Option<&EnrollmentAttempt>,
     native: Option<&super::codex_enrollment::NativeContext<'_>>,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -17560,8 +17613,8 @@ fn renew_one_for_operation(
         if host.work_cancelled() {
             return Renewal::Deferred;
         }
-        if let Some(attempted) = provider_attempted {
-            attempted.set(true);
+        if let Some(attempt) = enrollment_attempt {
+            attempt.provider_attempted.set(true);
         }
         let drove = plan.drive(cli, host, row, store, native);
         if matches!(
@@ -17577,11 +17630,16 @@ fn renew_one_for_operation(
         }
         // This exact native outcome promises no provider action or retained
         // completion. PageNotOpened and generic failure make no such promise.
-        if matches!(&drove.outcome, Outcome::NotRun(_))
-            && !plan.publication.is_saved()
-            && let Some(attempted) = provider_attempted
+        if matches!(
+            &drove.outcome,
+            Outcome::NotRun(_) | Outcome::PreparationFailed(_)
+        ) && !plan.publication.is_saved()
+            && let Some(attempt) = enrollment_attempt
         {
-            attempted.set(false);
+            attempt.provider_attempted.set(false);
+            if let Outcome::PreparationFailed(stage) = &drove.outcome {
+                attempt.preparation_stage.set(Some(*stage));
+            }
         }
         if host.work_cancelled() {
             return Renewal::Deferred;
@@ -18482,7 +18540,7 @@ fn run_accounts_browser_with(
         Err(_) => "untidied",
     };
     let mut event = accounts::Event::new(now, accounts::Kind::SignIn, label)
-        .because(&format!("{site} window {} {state}", end.word()));
+        .because(&super::browser_window::ledger_why(&site, end, state));
     event.workflow = Some(workflow);
     // Cleanup above is unconditional. A result for the old row must not unpark
     // or otherwise become history for a replacement login under the same label.
@@ -19872,7 +19930,6 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
         Cmd::Ledger { file, count, json } => run_ledger(env, file, *count, *json, out, err),
         Cmd::Upgrade { sid, dry_run, json } => run_upgrade(env, sid, *dry_run, *json, out, err),
         Cmd::UpgradeOwner { sid, ask, json } => run_upgrade_owner(env, sid, *ask, *json, out, err),
-        Cmd::UpgradeModels { set } => run_upgrade_models(env, set.as_deref(), out, err),
         Cmd::Accounts(form) => run_accounts(form, env, &LiveAccounts::default(), out, err),
         Cmd::AccountsOf(of) => run_accounts_of(of, env, &LiveAccounts::default(), out, err),
         Cmd::AccountsAll { json } => {
@@ -20672,7 +20729,7 @@ pub(super) fn enroll_codex_operation_custody(
     if let Some(admitted_work) = admitted_work {
         admitted_work.original();
     }
-    let provider_attempted = std::cell::Cell::new(false);
+    let attempt = EnrollmentAttempt::default();
     let result = renew_one_for_operation(
         Cli::Codex,
         env.now,
@@ -20681,7 +20738,7 @@ pub(super) fn enroll_codex_operation_custody(
         (row, &path, &records.logins),
         (raw.dir.as_deref(), person_sign_in(Cli::Codex, &row.label)),
         Some(request),
-        Some(&provider_attempted),
+        Some(&attempt),
         native,
         &mut quiet,
         &mut io::sink(),
@@ -20692,7 +20749,7 @@ pub(super) fn enroll_codex_operation_custody(
     let phase = match result {
         Renewal::NeedsPerson | Renewal::BotCheck => Some(Phase::AuthenticationRequired),
         Renewal::WrongAccount | Renewal::AuthFailed => Some(Phase::Refused),
-        _ if !provider_attempted.get() => Some(Phase::Refused),
+        _ if !attempt.provider_attempted.get() => Some(Phase::Refused),
         _ => None,
     };
     if let Some(phase) = phase {
@@ -20703,7 +20760,14 @@ pub(super) fn enroll_codex_operation_custody(
             &mut None,
             |_, _, logins| {
                 if logins.enrollment.require_running(request).is_ok() {
-                    logins.enrollment.finish(request, phase)?;
+                    if phase == Phase::Refused
+                        && !attempt.provider_attempted.get()
+                        && let Some(stage) = attempt.preparation_stage.get()
+                    {
+                        logins.enrollment.refuse_preparation(request, stage)?;
+                    } else {
+                        logins.enrollment.finish(request, phase)?;
+                    }
                 }
                 Ok(Vec::new())
             },

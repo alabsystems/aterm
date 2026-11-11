@@ -2357,7 +2357,7 @@ fn transcript_row_at(line: &str) -> Option<u64> {
     let v: Value = aterm_json::from_str(line).ok()?;
     v.get("timestamp")
         .and_then(Value::as_str)
-        .and_then(super::upgrade_models::parse_utc)
+        .and_then(super::unix_time::parse_utc)
 }
 
 /// Fold one transcript line into `rows` and `last_at`.

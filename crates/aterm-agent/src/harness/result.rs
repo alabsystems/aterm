@@ -1006,7 +1006,7 @@ pub fn note_checked(path: &Path, word: &str) -> std::io::Result<()> {
                 format!("{} holds no source", sidecar.display()),
             )
         })?;
-    super::upgrade_models::write_atomic(&sidecar, &format!("{}\n", with_checked_key(&line, word)))
+    super::atomic_write::write_atomic(&sidecar, &format!("{}\n", with_checked_key(&line, word)))
 }
 
 /// The `checked=` word the sidecar beside the snapshot at `path` holds ([`note_checked`]), or
@@ -1279,14 +1279,14 @@ fn write_snapshot(
         dir.create(tasks)?;
     }
     let path = tasks.join(format!("{stem}.result.md"));
-    super::upgrade_models::write_atomic(&path, text)?;
+    super::atomic_write::write_atomic(&path, text)?;
     // A FAILED CONCLUSION'S MISS IS READ AGAIN BY ITS OWN RULE ([`failed_rule`]).
     let rule = if by == DoneBy::Failed {
         format!(" {FAILED_RULE}")
     } else {
         String::new()
     };
-    super::upgrade_models::write_atomic(&sidecar_of(&path), &format!("{}{rule}\n", source.line()))?;
+    super::atomic_write::write_atomic(&sidecar_of(&path), &format!("{}{rule}\n", source.line()))?;
     Ok(Snapshot {
         path,
         bytes: text.len() as u64,
@@ -1549,13 +1549,13 @@ impl Reread {
     /// A file could not be written.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
         let checked = checked_of(path);
-        super::upgrade_models::write_atomic(path, &self.report.text)?;
+        super::atomic_write::write_atomic(path, &self.report.text)?;
         let line = self.source().line();
         let line = match &checked {
             Some(word) => with_checked_key(&line, word),
             None => line,
         };
-        super::upgrade_models::write_atomic(&sidecar_of(path), &format!("{line}\n"))
+        super::atomic_write::write_atomic(&sidecar_of(path), &format!("{line}\n"))
     }
 
     /// The `result [full]` reply for it ([`answer`]), whether or not it was written over the

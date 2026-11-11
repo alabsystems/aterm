@@ -251,8 +251,9 @@ fn validate(key: &str, value: &Value) -> Result<()> {
             column(&row["machine_column"])?;
         }
         if !row["machine_slot_hint"].is_null() {
-            // The grammar the writing builds checked, so 0.146/0.147 rows keep validating.
-            if !crate::machines::Slot::legacy(field(row, "machine_slot_hint")?) {
+            let hint = field(row, "machine_slot_hint")?;
+            // Accept current IDs, including zero, and retain older replicated slot spellings.
+            if crate::machines::Slot::parse(hint).is_err() && !crate::machines::Slot::legacy(hint) {
                 return Err(Error::new("account slot must be a positive number"));
             }
             column(&row["machine_column"])?;

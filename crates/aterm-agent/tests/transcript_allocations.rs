@@ -6,7 +6,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use aterm_agent::harness::{codex_steps, footer, steps, upgrade, upgrade_models, usage};
+use aterm_agent::harness::{codex_steps, footer, steps, unix_time, upgrade, usage};
 
 static COUNTING: AtomicBool = AtomicBool::new(false);
 static BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -105,7 +105,7 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
         assert_eq!(fold.per_model()[model].output, 7);
         assert_eq!(
             fold.served_at(),
-            upgrade_models::parse_utc("2026-09-28T12:00:00Z").and_then(|t| i64::try_from(t).ok()),
+            unix_time::parse_utc("2026-09-28T12:00:00Z").and_then(|t| i64::try_from(t).ok()),
             "the allocation-saving projection still feeds the live wall's served time"
         );
         let facts = bounded("footer", || footer::tail_facts(row.as_bytes(), None));
@@ -125,27 +125,6 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
             ))
             .as_deref(),
             Some(model)
-        );
-        assert_eq!(
-            bounded("live model", || upgrade_models::live_model(&row, None))
-                .expect("model")
-                .id,
-            model
-        );
-        assert_eq!(
-            bounded("answer age", || upgrade_models::last_answer_at(&row)),
-            upgrade_models::parse_utc("2026-09-28T12:00:00Z")
-        );
-        assert_eq!(
-            bounded("resumed model", || upgrade_models::live_model_at(
-                &row,
-                None,
-                Some(model),
-                Some(1)
-            ))
-            .expect("model")
-            .id,
-            model
         );
         assert!(!within("READY", 32 * 1024, 128, || {
             upgrade::transcript_has_ready(&row, "ATERM-UPGRADE-READY-0badf00d")

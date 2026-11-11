@@ -192,6 +192,10 @@ pub struct CensusSummary {
 pub struct RotationSummary {
     /// Macs with sessions heard within a day.
     pub macs: usize,
+    /// Fleet Macs heard within a day whose newest facts are older than a day, or that sent none
+    /// ([`silent_members`]), in label order: none of them is in [`Self::macs`], so what they
+    /// hold and whether they moved is unknown, never none.
+    pub silent: Vec<String>,
     /// Those that could not read a pool, whose rows of it are unknown, never none.
     pub unread: usize,
     /// Those holding two or more rows of one CLI that do not read signed out: the condition of
@@ -238,6 +242,14 @@ impl RotationSummary {
             0 => String::new(),
             n => format!(", {n} of them could not read a pool"),
         };
+        let silent = match self.silent.len() {
+            0 => String::new(),
+            n => format!(
+                ", and {n} more heard within a day sent no facts newer than a day ({}), so what \
+                 they hold is unknown",
+                named(&self.silent)
+            ),
+        };
         let moved = if self.reporting == 0 {
             "whether any has moved is unknown: none of them reports it".to_owned()
         } else {
@@ -255,7 +267,7 @@ impl RotationSummary {
         };
         format!(
             "rotation: {} of {} Macs with sessions hold two signed-in accounts of one CLI{can}\
-             {unread}; {moved}",
+             {unread}{silent}; {moved}",
             self.two_logins.len(),
             self.macs,
         )
@@ -389,6 +401,29 @@ fn strings_of(value: Option<&aterm_json::Value>) -> Vec<String> {
                 .map(str::to_owned)
                 .collect()
         })
+}
+
+/// The fleet members heard within a day (`last_seen`) whose newest heartbeat was received more
+/// than a day ago, or never, in label order: [`rotation_of`] counts none of them. One that is
+/// heard and sends nothing is not a Mac with nothing to report.
+fn silent_members(
+    members: &[CensusMember],
+    heartbeats: &BTreeMap<String, &HeartbeatInput>,
+    now_s: u64,
+) -> Vec<String> {
+    let fresh = |at: Option<u64>| at.is_some_and(|at| heard_within(now_s, at, HEARD_24H_S));
+    let mut silent: Vec<String> = members
+        .iter()
+        .filter(|m| m.in_fleet && fresh(m.last_seen))
+        .filter(|m| {
+            !heartbeats
+                .get(&m.label)
+                .is_some_and(|hb| fresh(hb.received_at))
+        })
+        .map(|m| m.label.clone())
+        .collect();
+    silent.sort_by_key(|label| label_sort_key(label));
+    silent
 }
 
 /// P3's shortfall and [`RotationSummary`], from the Macs with sessions heard within a day: each
@@ -1119,7 +1154,8 @@ impl SwarmCensus {
             .commons_member_count
             .unwrap_or_else(|| members.iter().filter(|m| m.in_commons).count());
 
-        let (shortfall, rotation) = rotation_of(&hb_by_label, now_s, now_i64);
+        let (shortfall, mut rotation) = rotation_of(&hb_by_label, now_s, now_i64);
+        rotation.silent = silent_members(&members, &hb_by_label, now_s);
 
         let steward = inputs
             .steward
@@ -1278,6 +1314,10 @@ impl SwarmCensus {
             let mut rotation = aterm_json::Map::new();
             rotation.insert("macs".to_owned(), Value::from(r.macs as u64));
             rotation.insert("unread".to_owned(), Value::from(r.unread as u64));
+            rotation.insert(
+                "silent".to_owned(),
+                Value::Array(r.silent.iter().cloned().map(Value::String).collect()),
+            );
             rotation.insert(
                 "two_logins".to_owned(),
                 Value::Array(r.two_logins.iter().cloned().map(Value::String).collect()),
@@ -1476,6 +1516,7 @@ impl SwarmCensus {
                 RotationSummary {
                     macs: n("macs"),
                     unread: n("unread"),
+                    silent: strings_of(r.get("silent")),
                     two_logins: strings_of(r.get("two_logins")),
                     reporting: n("reporting"),
                     moved_7d: n("moved_7d"),
@@ -1954,9 +1995,14 @@ fn collect_local_census_inputs_until(
         .into_iter()
         .filter_map(|(node, (_, _, name))| Some((node, name?)))
         .collect();
-    let own_node = aterm_net::fleet_member::read_node_id(state_dir)
-        .ok()
-        .flatten();
+    let own_node = own_identity
+        .as_ref()
+        .map(|own| own.node().to_owned())
+        .or_else(|| {
+            aterm_net::fleet_member::read_node_id(state_dir)
+                .ok()
+                .flatten()
+        });
     let own_label_denied = steward.as_deref().is_some_and(|st| {
         let st_stem = canonical_host_stem(st);
         roster.is_label_denied(&st_stem)

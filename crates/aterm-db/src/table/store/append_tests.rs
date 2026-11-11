@@ -192,3 +192,159 @@ fn a_fence_stands_where_its_stores_check_passes() {
         "a membership change moves the access the store was read under"
     );
 }
+
+/// What a store counts of each writer ([`Store::writers`]) is what a walk of its records gives,
+/// whether it holds them by its own commits, by an ingest of another writer's record, by a
+/// writing reopen's replay, by an observation's, or by a combined view taking its primary's
+/// records beside the recovery's (one of them held by both), and the writer quota reads that
+/// count: a reopened store whose writer holds its quota refuses that writer's next record, and
+/// one a record short takes it.
+/// NEGATIVE CONTROL: `Store::hold` counting nothing fails the first assertion, `admit_records`
+/// reading no count takes the record the quota refuses, and `with_observed_primary` holding the
+/// primary's records uncounted fails the combined view's assertion.
+#[test]
+fn a_stores_writer_counts_are_what_a_walk_of_its_records_gives() {
+    let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Writer]);
+    let dir = lab._home.path().join("writer-counts");
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let peer = lab.bootstrap(1);
+    let signer = Session::open(&peer).unwrap();
+    let counted = |store: &Store| {
+        store
+            .writers
+            .iter()
+            .map(|(actor, held)| (*actor, (held.records, held.bytes)))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let walked = |store: &Store| {
+        let mut walked = BTreeMap::<Actor, (usize, usize)>::new();
+        for stored in store.records.values() {
+            let held = walked.entry(stored.header.actor).or_default();
+            held.0 += 1;
+            held.1 += stored.wire.len();
+        }
+        walked
+    };
+    let mut store = Store::create(&session, &dir).unwrap();
+    let scope = store.scope();
+    for row in [&b"first"[..], b"second row", b"third, longer row"] {
+        store.commit_catalog(&session, row).unwrap();
+    }
+    let wire = signer
+        .seal(
+            scope,
+            Causal {
+                sequence: 1,
+                previous: None,
+                parents: &[],
+            },
+            b"the peer's row",
+        )
+        .unwrap();
+    store.ingest(&session, &wire).unwrap();
+    assert_eq!(counted(&store), walked(&store), "held by commit and ingest");
+    assert_eq!(
+        walked(&store).len(),
+        2,
+        "CONTROL: the store holds two writers' records"
+    );
+    drop(store);
+    let mut reopened = Store::open(&session, &dir, scope).unwrap();
+    assert_eq!(
+        counted(&reopened),
+        walked(&reopened),
+        "held by a writing reopen"
+    );
+    assert_eq!(reopened.retained_by(&session, session.actor()).unwrap(), 3);
+    assert_eq!(reopened.retained_by(&session, signer.actor()).unwrap(), 1);
+    reopened.writer_records = 3;
+    let refused = reopened.commit_catalog(&session, b"over the quota");
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("writer evidence quota")),
+        "a writer holding its quota is refused its next record: {refused:?}"
+    );
+    reopened.writer_records = 4;
+    reopened
+        .commit_catalog(&session, b"within the quota")
+        .unwrap();
+    assert_eq!(counted(&reopened), walked(&reopened));
+    drop(reopened);
+    let observer = Session::observe(&bootstrap).unwrap();
+    let observed = Store::observe(&observer, &dir, scope).unwrap();
+    assert_eq!(
+        counted(&observed),
+        walked(&observed),
+        "held by an observation"
+    );
+    assert_eq!(observed.retained_by(&observer, session.actor()).unwrap(), 4);
+    drop(observed);
+    let recovery_dir = bootstrap
+        .paths()
+        .dir
+        .join("commons/recovery/tables")
+        .join(aterm_codec::hex::encode_lower(&scope.digest()));
+    let mut recovery = Store::join_recovery(&session, &recovery_dir, scope).unwrap();
+    recovery.ingest(&session, &wire).unwrap();
+    drop(recovery);
+    let combined = Store::observe_recovery(&session, &recovery_dir, scope)
+        .unwrap()
+        .with_observed_primary(&session, Store::observe(&session, &dir, scope).unwrap())
+        .unwrap();
+    assert_eq!(
+        counted(&combined),
+        walked(&combined),
+        "held by a combined view"
+    );
+    assert_eq!(combined.retained_by(&session, session.actor()).unwrap(), 4);
+    assert_eq!(combined.retained_by(&session, signer.actor()).unwrap(), 1);
+}
+
+/// An open's replay checks each operation record's signature under the identifier its receipt took
+/// as the journal was read (`signatures::Identified`), so each operation record's wire is hashed
+/// once: a writing reopen and an observation of a table of three operation records hash three
+/// wires each, where a plain check of a record's envelope hashes its wire again.
+/// NEGATIVE CONTROL: `replay::restore` parsing its envelope with `Envelope::parse` hashes six.
+#[test]
+fn a_replay_hashes_each_records_wire_once() {
+    use crate::table::signatures::test_hashed;
+    let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+    let dir = lab._home.path().join("hashed-once");
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let mut store = Store::create(&session, &dir).unwrap();
+    let scope = store.scope();
+    let mut wire = Vec::new();
+    for row in [&b"one"[..], b"two", b"three"] {
+        let receipt = store.commit_catalog(&session, row).unwrap();
+        wire = store.wire(&session, &receipt.id).unwrap().unwrap().to_vec();
+    }
+    drop(store);
+    let before = test_hashed();
+    let reopened = Store::open(&session, &dir, scope).unwrap();
+    assert_eq!(reopened.records.len(), 3);
+    assert_eq!(
+        test_hashed() - before,
+        3,
+        "a writing reopen hashes each wire once"
+    );
+    drop(reopened);
+    let observer = Session::observe(&bootstrap).unwrap();
+    let before = test_hashed();
+    let observed = Store::observe(&observer, &dir, scope).unwrap();
+    assert_eq!(observed.records.len(), 3);
+    assert_eq!(
+        test_hashed() - before,
+        3,
+        "an observation hashes each wire once"
+    );
+    let before = test_hashed();
+    crate::table::Envelope::parse(scope, &wire).unwrap();
+    assert_eq!(
+        test_hashed() - before,
+        1,
+        "CONTROL: a plain check hashes its wire"
+    );
+}

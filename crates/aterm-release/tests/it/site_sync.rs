@@ -134,7 +134,7 @@ fn copy_tree(from: &Path, to: &Path) {
         if e.file_type().unwrap().is_dir() {
             copy_tree(&e.path(), &dest);
         } else {
-            std::fs::copy(e.path(), &dest).unwrap();
+            aterm_tempfile::copy_to_new_file(e.path(), &dest).unwrap();
         }
     }
 }
@@ -636,7 +636,8 @@ impl Lab {
             "[workspace]\nmembers = [\"crates/aterm-wasm\"]\n\n[workspace.package]\nversion = \"0.64.0\"\n",
         )
         .unwrap();
-        std::fs::copy(installer(), src.join(crate::site::INSTALLER_SOURCE)).unwrap();
+        aterm_tempfile::copy_to_new_file(installer(), src.join(crate::site::INSTALLER_SOURCE))
+            .unwrap();
         std::fs::write(
             src.join("crates/aterm-wasm/Cargo.toml"),
             format!(
@@ -646,7 +647,8 @@ impl Lab {
         )
         .unwrap();
         if changelog {
-            std::fs::copy(fixture("CHANGELOG.md"), src.join("CHANGELOG.md")).unwrap();
+            aterm_tempfile::copy_to_new_file(fixture("CHANGELOG.md"), src.join("CHANGELOG.md"))
+                .unwrap();
         }
         edit(&src);
         self.git.ok(
@@ -673,7 +675,8 @@ impl Lab {
             let _ = std::fs::remove_dir_all(d);
         }
         copy_tree(&fixture("public"), &self.site.join("public"));
-        std::fs::copy(fixture("firebase.json"), self.site.join("firebase.json")).unwrap();
+        aterm_tempfile::copy_to_new_file(fixture("firebase.json"), self.site.join("firebase.json"))
+            .unwrap();
         self.git.ok(
             &self.root,
             &[

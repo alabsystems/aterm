@@ -1147,11 +1147,33 @@ impl std::fmt::Debug for PreparedGrant {
     }
 }
 
+#[cfg(all(unix, any(test, debug_assertions)))]
 pub(super) fn prepare(
     env: &Env,
     request: &codex_enrollment::Request,
     stage: &Path,
     source_fence: &str,
+) -> Result<PreparedGrant, String> {
+    prepare_with_writer(env, request, stage, source_fence, None)
+}
+
+pub(super) fn prepare_held(
+    env: &Env,
+    request: &codex_enrollment::Request,
+    stage: &Path,
+    source_fence: &str,
+    store: &super::accounts::Store,
+    held: &super::accounts::Lock,
+) -> Result<PreparedGrant, String> {
+    prepare_with_writer(env, request, stage, source_fence, Some((store, held)))
+}
+
+fn prepare_with_writer(
+    env: &Env,
+    request: &codex_enrollment::Request,
+    stage: &Path,
+    source_fence: &str,
+    writer: Option<(&super::accounts::Store, &super::accounts::Lock)>,
 ) -> Result<PreparedGrant, String> {
     platform::require_available()?;
     if !request.valid() || !valid_hex(source_fence, 64) {
@@ -1160,7 +1182,10 @@ pub(super) fn prepare(
     let stage = stage_path(stage)?;
     let stage_witness = codex_app_login::StagedWitness::open(&stage)?;
     let (_, stage_device, stage_inode) = stage_witness.coordinates()?;
-    let catalogue_scope = catalogue::prepare(env, request, &stage)?;
+    let catalogue_scope = match writer {
+        Some((store, held)) => catalogue::prepare_held(env, request, &stage, store, held)?,
+        None => catalogue::prepare(env, request, &stage)?,
+    };
     let (directory, _) = Store::location(env, &request.id)?;
     let root = directory
         .parent()
@@ -3101,6 +3126,9 @@ pub(in crate::harness) fn with_global_code_fixture(
 ) {
     row_fixture::with_global_code_fixture(test);
 }
+
+#[cfg(all(test, unix))]
+pub(in crate::harness) use row_fixture::with_preparation_fixture;
 
 /// Exact authenticated fixture occurrence locator; never owner adoption from a path.
 #[cfg(all(test, unix))]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! This machine's name (`docs/DESIGN-machine-names-2026-11-04.md`): its NAME (`m8`, or `m0`
+//! This machine's name (`docs/DESIGN-machine-names-2026-11-04.md`): its NAME (`m8`, or `unnumbered`
 //! while unnumbered), nickname and earlier numbers, kept in `machine-name.toml` whether or not it
 //! is in a fleet ([`file`]), made at first run by [`ensure`], and, once a number is chosen,
 //! published to its other readers ([`publish`]).
@@ -129,7 +129,7 @@ pub enum Origin {
     /// Legacy evidence: the roster label's NAME, else an older build's `fleet-name` NAME,
     /// with a word-valued `fleet-name` as the nickname.
     Evidence,
-    /// None of these: `m0` and a drawn noun (§2.4).
+    /// None of these: `unnumbered` and a drawn noun (§2.4).
     Drawn,
 }
 
@@ -161,16 +161,17 @@ pub enum RegistryNameRead {
 /// no pending book migration. Its nickname retains its provenance, or a null nickname draws a
 /// local automatic noun. A pending registry projection or invalid bound name stops creation.
 /// Without a binding, the roster's bare NAME wins, then an older `fleet-name`'s bare NAME,
-/// else `m0` and a noun `in_use` does not name, drawn. A word-valued `fleet-name` supplies its
+/// else `unnumbered` and a noun `in_use` does not name, drawn. A word-valued `fleet-name` supplies its
 /// chosen nickname. Legacy numbering is seeded at the implied rank with migration pending.
 /// Signed book records never restore or replace this local mirror. A `fleet-name` whose text
 /// is no name is no evidence; one that cannot be
 /// read, a node key that cannot be read and a roster that cannot be read stop creation, so no
-/// passing failure is kept as `m0` and the next reader tries again (§11.79).
+/// passing failure is kept as `unnumbered` and the next reader tries again (§11.79).
 ///
 /// # Errors
 /// `machine-name.toml` cannot be read or written; or, while no other reader supplies the name,
-/// the registry name, `fleet-name`, the node key, `roster` or the CSPRNG cannot be read.
+/// the registry name, `fleet-name`, the node key, `roster` or the CSPRNG cannot be read,
+/// or every default noun is already in use.
 pub fn ensure(
     state: &Path,
     roster: impl FnOnce() -> io::Result<Option<String>>,
@@ -350,8 +351,8 @@ pub struct NameSet {
 /// # Errors
 /// As [`ensure_in_view`]; `lab` fails; the node, seed or books cannot be read, a signed node or
 /// the vault holds the number, the move would leave the policy's server name, the stored number
-/// moved under the lock while `lab` was unread, a lock cannot be taken, or the changed name
-/// cannot be written.
+/// moved under the lock while `lab` was unread, another node holds the chosen nickname,
+/// a lock cannot be taken, or the changed name cannot be written.
 pub fn set_name(
     state: &Path,
     to: &NameTo,
@@ -380,11 +381,13 @@ pub fn set_name(
     let lab = if keeps { None } else { Some(lab()?) };
     let kept = kept_labels(lab.as_ref());
     aterm_net::fleet_member::write_held(state, aterm_net::fleet_member::Began::Here, |_| {
-        let mut view = rename_view(state, now_ms)?;
+        let books = rename_books(state, now_ms)?;
         let node = match by {
             Some(by) => by.node,
-            None => absent_node(&view)?,
+            None => absent_node(&books.view)?,
         };
+        let taken = books.taken_except(node);
+        let mut view = books.view;
         let mut changed = false;
         let mut preview = None;
         let name = file::replace(state, |stored| {
@@ -450,6 +453,7 @@ pub fn set_name(
                 next.migration = None;
             }
             if let Some(nick) = &to.nick {
+                require_free_nick(&taken, nick)?;
                 next.nick = nick.clone();
                 next.nick_class = NickClass::Chosen;
             }
@@ -469,10 +473,7 @@ pub fn set_name(
             Ok(())
         })?;
         let name = preview.unwrap_or(name);
-        let shared = in_view(
-            &taken_in(state, me.as_ref().map(|me| me.node())),
-            name.nick.as_str(),
-        );
+        let shared = in_view(&taken, name.nick.as_str());
         Ok(NameSet {
             name,
             origin,
@@ -656,8 +657,7 @@ impl RenamePreview {
         judge(num, &self.name, lab, &fleet, self.node)
     }
 
-    /// Whether another node's record in this node's books carries `nick` too: information only,
-    /// since two machines may share one (§5.4 `Shared`).
+    /// Whether another node's record carries the same canonical name key.
     #[must_use]
     pub fn shared(&self, nick: &Nickname) -> bool {
         in_view(&self.taken, nick.as_str())
@@ -698,19 +698,20 @@ pub fn rename_preview(
 ) -> io::Result<RenamePreview> {
     let (name, _) = ensure_in_view(state, roster, now_ms)?;
     let me = read_node_identity(state)?;
-    let mut view = rename_view(state, now_ms)?;
+    let books = rename_books(state, now_ms)?;
     let node = match &me {
         Some(me) => node_of(me.node())
             .ok_or_else(|| io::Error::other("this machine has no valid node id"))?,
-        None => absent_node(&view)?,
+        None => absent_node(&books.view)?,
     };
+    let taken = books.taken_except(node);
+    let mut view = books.view;
     let current = current_record(&name);
     let top = current.top;
     view.insert(node, Entry::Record(current));
     let settled = settle(&view);
     let lab = lab().map_err(|why| why.to_string());
     let kept = kept_labels(lab.as_ref().ok());
-    let taken = taken_in(state, me.as_ref().map(|me| me.node()));
     Ok(RenamePreview {
         name,
         view,
@@ -723,9 +724,24 @@ pub fn rename_preview(
     })
 }
 
-/// The newest signed claim for each node in both books. Failed reads stop a rename rather
-/// than treating an unread book as empty; unsigned rows cannot reserve a machine number.
-fn rename_view(state: &Path, now_ms: u64) -> io::Result<BTreeMap<NodeId, Entry>> {
+struct RenameBooks {
+    view: BTreeMap<NodeId, Entry>,
+    names: BTreeMap<NodeId, Nickname>,
+}
+
+impl RenameBooks {
+    fn taken_except(&self, me: NodeId) -> Vec<Nickname> {
+        self.names
+            .iter()
+            .filter(|(node, _)| **node != me)
+            .map(|(_, nick)| nick.clone())
+            .collect()
+    }
+}
+
+/// The newest signed claim and display name for each node in both books. Failed reads stop
+/// a rename; unsigned rows and stale records cannot reserve an ID or a display-name key.
+fn rename_books(state: &Path, now_ms: u64) -> io::Result<RenameBooks> {
     use aterm_net::fleet_member::name_record::{Accepted, Source, accept};
     use aterm_net::fleet_member::{ISSUER_BOOK_FILE, PEERS_FILE, PEERS_FILE_MAX, Peer};
     let digest = fleet_seed::read(state)?.map_or(ZERO_DIGEST, |seed| seed.digest());
@@ -766,32 +782,43 @@ fn rename_view(state: &Path, now_ms: u64) -> io::Result<BTreeMap<NodeId, Entry>>
                 accept(carried, (word, &key), digest, Source::Entry, None, now_ms).ok()
             });
             let verified = accepted.is_some();
-            let (entry, eseq, rev) = match accepted {
+            let (entry, nick, eseq, rev) = match accepted {
                 Some(Accepted::Record { record, .. }) => {
                     let (eseq, rev) = (record.eseq, record.rev);
-                    (Entry::Record(record.claim), eseq, rev)
+                    (Entry::Record(record.claim), record.nick, eseq, rev)
                 }
                 Some(Accepted::Ahead(record)) => (
                     Entry::Unknown(record.claim.num.or(primary)),
+                    None,
                     record.eseq,
                     record.rev,
                 ),
-                None if signed.record().is_some() => (Entry::Unknown(primary), 0, 0),
-                None => (primary.map_or(Entry::Unknown(None), Entry::Implied), 0, 0),
+                None if signed.record().is_some() => (Entry::Unknown(primary), None, 0, 0),
+                None => (
+                    primary.map_or(Entry::Unknown(None), Entry::Implied),
+                    None,
+                    0,
+                    0,
+                ),
             };
             // The record has its own signed currency. A newer descriptor can carry a stale
             // record or have had its record stripped by an older relay; neither rolls back a
             // record already verified in this view.
             let rank = (u8::from(verified), eseq, rev, signed.seq);
-            if newest.get(&node).is_none_or(|(held, _)| rank > *held) {
-                newest.insert(node, (rank, entry));
+            if newest.get(&node).is_none_or(|(held, _, _)| rank > *held) {
+                newest.insert(node, (rank, entry, nick));
             }
         }
     }
-    Ok(newest
-        .into_iter()
-        .map(|(node, (_, entry))| (node, entry))
-        .collect())
+    let mut view = BTreeMap::new();
+    let mut names = BTreeMap::new();
+    for (node, (_, entry, nick)) in newest {
+        view.insert(node, entry);
+        if let Some(nick) = nick {
+            names.insert(node, nick);
+        }
+    }
+    Ok(RenameBooks { view, names })
 }
 
 /// `name` with the nickname `nick`, set by `by`: `chosen`, and the claim (NAME, class, `since`,
@@ -812,17 +839,19 @@ pub fn renicked(name: &MachineName, nick: Nickname, by: Option<By>) -> Option<Ma
 }
 
 /// Set this machine's nickname to `to` for `kind`, after making the name where none is there
-/// ([`ensure_in_view`], which reads `roster` only then). A drawn noun is redrawn, up to eight
-/// times, while it is one of the nicknames in view or the one held; either nickname is `chosen`,
+/// ([`ensure_in_view`], which reads `roster` only then). Up to eight random draws precede a
+/// bounded pool search for a noun neither in view nor held; either nickname is `chosen`,
 /// since a person's press or an agent's act chose it, and so never changes by itself. `by` names
 /// this node, minted where it has none. A dry run changes no nickname and mints no node, though
 /// its read makes the name as any first read does.
-/// The local name lock serializes edits; nickname collision checks are advisory, and no book
-/// record can replace the local name or its number during a nickname edit.
+/// The book and name locks serialize edits with incoming records. A chosen name is refused when another
+/// node's signed record carries its canonical key; no book record replaces the local number.
 ///
 /// # Errors
-/// As [`ensure_in_view`]; the node key cannot be read or minted; the CSPRNG cannot be read; the
-/// name lock cannot be taken; the file cannot be replaced ([`file::replace`]).
+/// As [`ensure_in_view`]; the node key cannot be read or minted; fleet state or books cannot be
+/// read; the CSPRNG cannot be read; a book or name lock cannot be taken; another node holds the
+/// chosen name; the file cannot be replaced
+/// ([`file::replace`]).
 pub fn set_nick(
     state: &Path,
     to: &NickTo,
@@ -845,33 +874,42 @@ pub fn set_nick(
                 .ok_or_else(|| io::Error::other("this machine has no valid node id"))
         })
         .transpose()?;
-    let taken = taken_in(state, me.as_ref().map(|me| me.node()));
-    let mut changed = false;
-    let mut preview = None;
-    let name = file::replace(state, |stored| {
-        let nick = match to {
-            NickTo::Word(word) => word.clone(),
-            NickTo::Random => file::draw_nick(|noun| {
-                in_view(&taken, noun) || noun.eq_ignore_ascii_case(stored.nick.as_str())
-            })?,
+    aterm_net::fleet_member::write_held(state, aterm_net::fleet_member::Began::Here, |_| {
+        let books = rename_books(state, now_ms)?;
+        let node = match by {
+            Some(by) => by.node,
+            None => absent_node(&books.view)?,
         };
-        let next = renicked(stored, nick, by).unwrap_or_else(|| stored.clone());
-        changed = next != *stored;
-        if dry_run {
-            preview = Some(next);
-        } else {
-            *stored = next;
-        }
-        Ok(())
-    })?;
-    let name = preview.unwrap_or(name);
-    let shared = in_view(&taken, name.nick.as_str());
-    Ok(NickSet {
-        name,
-        origin,
-        changed,
-        shared,
+        let taken = books.taken_except(node);
+        let mut changed = false;
+        let mut preview = None;
+        let name = file::replace(state, |stored| {
+            let nick = match to {
+                NickTo::Word(word) => word.clone(),
+                NickTo::Random => file::draw_nick(|noun| {
+                    in_view(&taken, noun) || noun.eq_ignore_ascii_case(stored.nick.as_str())
+                })?,
+            };
+            require_free_nick(&taken, &nick)?;
+            let next = renicked(stored, nick, by).unwrap_or_else(|| stored.clone());
+            changed = next != *stored;
+            if dry_run {
+                preview = Some(next);
+            } else {
+                *stored = next;
+            }
+            Ok(())
+        })?;
+        let name = preview.unwrap_or(name);
+        let shared = in_view(&taken, name.nick.as_str());
+        Ok(NickSet {
+            name,
+            origin,
+            changed,
+            shared,
+        })
     })
+    .map_err(|e| io::Error::other(e.to_string()))?
 }
 
 /// The vault whose standing says whether this Mac is in a fleet ([`InFleet::read`]), found where
@@ -933,9 +971,20 @@ pub fn taken_in(state: &Path, me: Option<&str>) -> Vec<Nickname> {
 /// Whether `word` is one of the nicknames `taken`, in any case (§2.4).
 #[must_use]
 pub fn in_view(taken: &[Nickname], word: &str) -> bool {
+    let key = Nickname::canonical(word);
     taken
         .iter()
-        .any(|nick| nick.as_str().eq_ignore_ascii_case(word))
+        .any(|nick| Nickname::canonical(nick.as_str()) == key)
+}
+
+fn require_free_nick(taken: &[Nickname], nick: &Nickname) -> io::Result<()> {
+    if in_view(taken, nick.as_str()) {
+        return Err(io::Error::other(format!(
+            "The name {} is already used by another machine.",
+            nick.as_str()
+        )));
+    }
+    Ok(())
 }
 
 /// What [`ensure`] writes when no file is there.

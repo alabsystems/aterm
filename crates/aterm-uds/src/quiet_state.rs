@@ -29,6 +29,30 @@ pub fn destination(legacy: &Path) -> PathBuf {
     legacy.to_path_buf()
 }
 
+/// Prepare a private quiet-state parent. An owned, non-shared directory whose owner already
+/// has full access can have others' read/search access removed. Only directories observed
+/// with full owner access are repair candidates; writable or sticky shared directories
+/// retain the strict creation check. No symlink, foreign directory or ACL grant is repaired.
+/// # Errors
+/// The directory cannot be created, inspected or made private, or it is shared or unsafe.
+#[cfg(unix)]
+pub fn prepare_private_parent(dir: &Path) -> io::Result<()> {
+    use crate::private_file::{self, PrivateDir};
+    use std::os::unix::fs::MetadataExt as _;
+    match private_file::judge_private_dir(dir)? {
+        PrivateDir::Private => Ok(()),
+        PrivateDir::Open(_) => {
+            let mode = std::fs::symlink_metadata(dir)?.mode();
+            if mode & 0o1700 == 0o700 && mode & 0o022 == 0 {
+                private_file::ensure_private_dir(dir).map(|_| ())
+            } else {
+                private_file::create_private_dir(dir)
+            }
+        }
+        _ => private_file::create_private_dir(dir),
+    }
+}
+
 /// Read-only selection during the one-time handoff. Before retirement all callers use
 /// the legacy directory; afterward all callers use the quiet directory, even if damaged.
 /// There is no fallback to a retired store and no second writable copy.
@@ -50,6 +74,8 @@ pub fn selected(legacy: &Path) -> PathBuf {
 /// # Errors
 /// On macOS, refuses unsafe/private state, files exceeding `maximum`, ambiguous stores,
 /// a busy migration, unsupported atomic exchanges and filesystem/durability failures.
+/// An owned, non-shared quiet parent is made private before taking its migration lease; symlinks,
+/// foreign ownership and ACL grants are refused before repair.
 pub fn prepare_file_cache(legacy: &Path, maximum: usize) -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     return mac::prepare_file_cache(legacy, maximum).map(|()| destination(legacy));
@@ -70,6 +96,8 @@ pub fn prepare_file_cache(legacy: &Path, maximum: usize) -> io::Result<PathBuf> 
 /// unsupported atomic exchanges, and filesystem/durability failures. No fallback store is
 /// created. A crash before exchange leaves the original directory and a marker at the new
 /// name; one after exchange leaves the migrated directory and a fence at the old name.
+/// An owned, non-shared quiet parent is made private before taking its migration lease; legacy state
+/// still has to pass its private-directory checks.
 pub fn prepare<G>(legacy: &Path, acquire: impl FnOnce() -> io::Result<G>) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     return mac::prepare(legacy, acquire);
@@ -155,7 +183,7 @@ mod mac {
         let parent = target
             .parent()
             .ok_or_else(|| io::Error::other("cache needs a parent"))?;
-        private_file::create_private_dir(parent)?;
+        prepare_private_parent(parent)?;
         let _migration = private_file::PrivateLock::take(
             parent,
             &format!("{name}.migration.lock"),
@@ -256,7 +284,7 @@ mod mac {
         let parent = target
             .parent()
             .ok_or_else(|| io::Error::other("state needs a parent"))?;
-        private_file::create_private_dir(parent)?;
+        prepare_private_parent(parent)?;
         let _migration = private_file::PrivateLock::take(
             parent,
             &format!("{name}.migration.lock"),
@@ -320,6 +348,107 @@ mod mac {
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    #[test]
+    fn owned_open_quiet_parent_is_narrowed_before_file_and_directory_handoffs() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let cache = scratch.path().join("cache");
+        crate::private_file::write_private(scratch.path(), "cache", b"retained cache").unwrap();
+        let quiet_parent = destination(&cache).parent().unwrap().to_path_buf();
+        std::fs::create_dir(&quiet_parent).unwrap();
+        std::fs::set_permissions(&quiet_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache_inode = std::fs::metadata(&cache).unwrap().ino();
+        let target = prepare_file_cache(&cache, 1024).unwrap();
+        assert_eq!(
+            std::fs::metadata(&quiet_parent).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(std::fs::metadata(&target).unwrap().ino(), cache_inode);
+        assert_eq!(std::fs::read(target).unwrap(), b"retained cache");
+
+        let history = scratch.path().join("history");
+        crate::private_file::create_private_dir(&history).unwrap();
+        crate::private_file::write_private(&history, "retained", b"acknowledged history").unwrap();
+        let history_inode = std::fs::metadata(&history).unwrap().ino();
+        std::fs::set_permissions(&quiet_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare(&history, || Ok(())).unwrap();
+        assert_eq!(
+            std::fs::metadata(&quiet_parent).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(destination(&history)).unwrap().ino(),
+            history_inode
+        );
+        assert_eq!(
+            std::fs::read(destination(&history).join("retained")).unwrap(),
+            b"acknowledged history"
+        );
+    }
+
+    #[test]
+    fn a_linked_quiet_parent_is_not_narrowed_or_used() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = scratch.path().join("cache");
+        crate::private_file::write_private(scratch.path(), "cache", b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, destination(&cache).parent().unwrap()).unwrap();
+        assert!(prepare_file_cache(&cache, 1024).is_err());
+        let history = scratch.path().join("history");
+        crate::private_file::create_private_dir(&history).unwrap();
+        assert!(
+            prepare(&history, || -> io::Result<()> {
+                panic!("no legacy lease through a linked parent")
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::metadata(&outside).unwrap().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(std::fs::read(cache).unwrap(), b"untouched");
+        assert!(history.is_dir());
+    }
+
+    #[test]
+    fn repairing_the_quiet_parent_does_not_relax_legacy_store_checks() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let history = scratch.path().join("history");
+        std::fs::create_dir(&history).unwrap();
+        std::fs::set_permissions(&history, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(prepare(&history, || Ok(())).is_err());
+        assert_eq!(std::fs::metadata(&history).unwrap().mode() & 0o777, 0o755);
+        assert!(!destination(&history).exists());
+        let cache = scratch.path().join("cache");
+        std::fs::write(&cache, b"untrusted cache").unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(prepare_file_cache(&cache, 1024).is_err());
+        assert_eq!(std::fs::read(&cache).unwrap(), b"untrusted cache");
+        assert_eq!(std::fs::metadata(&cache).unwrap().mode() & 0o777, 0o644);
+        assert!(!destination(&cache).exists());
+    }
+
+    #[test]
+    fn shared_or_owner_readonly_quiet_parents_are_preserved() {
+        for mode in [0o555, 0o775, 0o777, 0o1755, 0o1777] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let cache = scratch.path().join("cache");
+            crate::private_file::write_private(scratch.path(), "cache", b"retained").unwrap();
+            let parent = destination(&cache).parent().unwrap().to_path_buf();
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(prepare_file_cache(&cache, 1024).is_err());
+            assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o7777, mode);
+            assert_eq!(std::fs::read(&cache).unwrap(), b"retained");
+            assert!(!destination(&cache).exists());
+            let history = scratch.path().join("history");
+            crate::private_file::create_private_dir(&history).unwrap();
+            assert!(prepare(&history, || Ok(())).is_err());
+            assert!(history.is_dir());
+            assert!(!destination(&history).exists());
+            assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o7777, mode);
+        }
+    }
 
     #[test]
     fn file_cache_exchange_preserves_the_inode_and_refuses_old_atomic_writers() {

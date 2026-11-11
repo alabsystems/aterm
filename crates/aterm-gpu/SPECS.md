@@ -7,66 +7,6 @@
 the spec that retires it. A test is deleted once its specs are proved through Trust/Clean. The claims
 come from reading the code, not from running it.
 
-> Status 2026-10-16: this is the crate's migration worklist. Nothing has been proved or
-> deleted yet. Each of the 89 specs below is proved through Trust/Clean, then the tests it
-> Status 2026-10-19: this is the crate's migration worklist. One spec is proved (below); no
-> test is deleted yet. Each of the 89 specs below is proved through Trust/Clean, then the tests it
-> subsumes are deleted. The 9 checks in §4 sample no spec and are deleted or moved now.
->
-> **Proved: `should-slice-nonempty`** (2026-10-19). `renderer::should_slice` carries
-> `ensures result == (byte_len != 0) by should_slice_is_nonempty`, a Clean theorem over
-> `trust_import_aterm_gpu__renderer__should_slice` for every `byte_len : UInt64` (`usize` at the
-> 64-bit pointer width). On Trust seal `150efe4a` (PM-1 increment 1 lets the unit compile) the fn row
-> is 2/2 proved, postcondition `clean-kernel-citation`, `Certified`, kernel-rechecked. Mutating the
-> body to `byte_len > 1` makes Clean reject the theorem (unsolved `simp` goal) and the row
-> `HasViolations`. Nothing is deleted. The one subsumed test also checks real slice decisions
-> against `aterm_models_render::gpu_encode_model` and its negative control on the interpreter,
-> which the theorem does not cover, so it stays.
->
-> **Retired: `scaled-border-px`** (2026-10-30, HR-ORACLE). `renderer::scaled_border_px` and its test
-> are gone: the present takes its drop border from aterm-render's `drop_overlay_border_px`
-> (`drop-overlay-border-px` there; §5 item 16). Its contract was refused on seal `150efe4a` (2026-10-19):
-> E6 minted no import for a body with an early `return` (`AutoBoundHeadOverApplied`, gap 3), and the
-> clause language could not state the `as u32` widening of the scale (gap 1/3).
-
-> Status 2026-10-23 (card engine lane B6): two specs added, `unorm-fetch-route` (the Metal
-> framebuffer-fetch route, its probe, its fail-closed gate and the warm's share of it), with the
-> twelve tests it names, and `opaque-under-store` (route (1) of the pass economy), with its two;
-> `shader-kernels-equal-cpu-functions` now covers `udiv_small` with one more test, and
-> `first-frame-warm-latch` and `metal-library-and-pipeline-build` one more each. The counts in
-> this file were taken before them.
-
-> Status 2026-10-24 (aos M5a stage B, design §12): four specs added for the Metal compute job,
-> `compute-job-typestate`, `compute-job-release-after-terminal`, `compute-job-completion-observed`
-> and `int-bag-mlp-equals-cpu-reference`, with the 16 tests and 8 doctests of `src/compute/` they
-> name. The kind table, the gap histogram and §2's count are recomputed from the TSVs as they now
-> stand (97 specs, 350 map rows); the counts in the prose elsewhere were taken before.
-
-> Status 2026-10-24 (aos M5a review fixes): the four compute specs now name 23 tests and 10 doctests
-> (9 compile_fail, 1 no_run). Seven tests were added: three to `compute-job-release-after-terminal`
-> (a recycled job grows within the domain exactly, never holds more than the job limit, and maps nothing
-> from a null or misaligned contents pointer), two to `compute-job-completion-observed` (each failed job
-> names its own cause; an unfinished status at the handler is a latched loss) and two to
-> `int-bag-mlp-equals-cpu-reference` (the qualification set catches faults in steps 4 to 6; a kernel that
-> floors in step 5 is refused). Two compile_fail doctests (E0594, E0616) were added to
-> `compute-job-typestate`. §2 then held 357 map rows; the kind table and gap histogram are unchanged.
-
-> Status 2026-10-26 (GW.6, docs/AUDIT-third-party-2026-10-15.md): the wgpu arm is gone. The
-> tests only the `wgpu-oracle` build compiled (the arm differentials, `block_on`, `wgpu_timer`,
-> `blit_bands`, `blit_invert`, `effect_pipeline_demand`, `gpu_memory_floor`, `present_real`) are
-> deleted with it and their map rows with them, as are `block-on-runs-to-ready` and
-> `effect-pipeline-demand`, whose demand function and tests went with the wgpu arm. Where a row still
-> says an arm equals wgpu's bytes, the frame record (`frame_record_tests`, `oracle/*.tsv`) is what
-> holds it now. A row's functions or tests can still name the wgpu side (`pick_surface_format`,
-> `build_wgpu`, a `wgpu present`) or a deleted test: those name the law as it was held before
-> GW.6, and §2's map holds only tests that exist. Counts elsewhere in this file were taken before.
-
-> Status 2026-10-26 (ORACLE-ADAPTER, docs/AUDIT-third-party-2026-10-15.md): the frame record's
-> verdict is each frame's CPU twin (the CPU renderer's frame of the same input, or the CPU's run of
-> the present's shaders over it) under the parity suites' tolerance, decided alike on any adapter;
-> wgpu's rows in `oracle/*.tsv` are a same-adapter signal that fails nothing. Where a row says an
-> arm equals wgpu's bytes, the frame record now holds that arm to its CPU twin.
-
 Source: `crates/aterm-gpu` (read only). Every `#[test]` in `src/` (block_on, device_layer, format_plan,
 lib, pipeline_table, present_glass, renderer, startup_probe, video_tap, window_atlas_tests, and
 `metal/{acquire_worker,encoder,ffi,loss,mod,pipelines,present,shaders,swapchain,warm}`) and in `tests/`
@@ -97,7 +37,7 @@ and `frame_instrumentation` test targets.
 - `ImgOrder(cell)`: the cell's image layers ordered by z, ties by placement order, in tiers split by `aterm_render::KITTY_IMAGE_BELOW_BG_Z_THRESHOLD` (T = i32::MIN/2): deepest (z < T), under-text (T <= z < 0), over-text (z >= 0).
 - For a `ty_model!` machine M: `Enabled_M(a, s)`, `Succ_M(a, s)`, `Inv_M(name, s)`; `proj(v)` is the projection of a Rust value onto M's state that the conformance test builds.
 - `MSL(L)` / `WGSL(L)`: the shader source compiled for `ShaderLibrary` L.
-- **Gaps** are rows of the gap list in §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`: 1 non-scalar carriers, 2 certified `&self`/`&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5 quantified clauses, 7 loops, 8 effects, FFI and platform, 9 the proc-macro boundary, 10 model-to-code refinement, 11 generics, 12 cross-crate theorem citation, 13 threads, async and closures, 14 Clean elaborator coverage.
+- **Gaps** are rows of the gap list in `docs/TRUST-LANE.md` (Blocking gaps): 1 non-scalar carriers, 2 certified `&self`/`&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5 quantified clauses, 7 loops, 8 effects, FFI and platform, 9 the proc-macro boundary, 10 model-to-code refinement, 11 generics, 12 cross-crate theorem citation, 13 threads, async and closures, 14 Clean elaborator coverage.
 - **GPU semantics.** A statement about bytes that Metal or wgpu execution produces needs a model of the GPU (rasterizer, blend, sampler, sRGB encode, copy engine), which neither Trust nor Clean has. Such specs list gap 8 and stay unprovable until a GPU execution model exists (§5.1).
 - **Owner.** A row whose `owner` is not aterm-gpu states a property of that crate which these GPU tests sample. It belongs in that crate's `SPECS.md`, with its tests; the GPU side is then `gpu-frame-refines-cpu` citing it (gap 12).
 
@@ -203,51 +143,6 @@ compute-job-release-after-terminal	contract	aterm-gpu	compute::{ComputeDevice::{
 compute-job-completion-observed	contract	aterm-gpu	compute::{Job::<Prepared>::submit,Job::<InFlight>::{wait,serial},Job::<Completed>::{serial,times},JobFailure,SubmitRefusal,HANG_DETECTOR,ticks,Timebase,JobTimes,ComputeDevice::{loss_reason,next_serial,arm_fault,shorten_hang_detector}}; compute::job::{Completion,settle,hang,terminal_outcome}; metal::ffi::{add_handler,commit,gpu_times}; metal::loss::{classify,command_buffer_status,command_buffer_error_code,LossLatch::record}	submit registers a scheduled and a completed handler on an uncommitted command buffer before commit, and gives the job back unsubmitted on every refusal, in the order DomainLost, OtherDomain, Unqualified, DimsMismatch (E, H, C or MIN_IDS), NotLoaded. wait returns once the completed handler stored the command buffer's terminal reading under the job's mutex and notified its condvar, or once HANG_DETECTOR passed: Completed when classify(status, error code) is Completed; Retryable (timeout, out of memory) without latching; Lost, latched, otherwise, carrying this job's own classification while the latch keeps the domain's first reason, and terminal_outcome reads an unfinished status at the handler as such a Lost; Hung, latched as compute job hung, when no reading arrived. Each terminal outcome is recorded on the domain's latch exactly once, and once it is latched every later Params::new, load and submit refuses DomainLost with the first reason. In debug builds lost@N and retryable@N replace the observation of the job committed with serial N after its real terminal status, and hang@N has its completed handler withhold the reading, so the waiter's own timed wait expires: after the domain's detector, which a debug build may shorten with shorten_hang_detector but never past HANG_DETECTOR (a release build always waits HANG_DETECTOR); the job is declared Hung once the withheld reading arrived, and its buffers stay leaked. A completed job's stamps are on mach_absolute_time and ordered: before_encode <= after_commit <= woke, handler <= woke, a scheduled stamp between before_encode and handler, GPUStartTime <= GPUEndTime. Needs a PlatformSpec of MTLCommandBuffer's handlers and status (gap 8) and the handler thread's happens-before through the mutex (gap 13).	src/compute/tests.rs::an_injected_retryable_failure_latches_nothing, src/compute/tests.rs::an_injected_loss_latches_the_domain, src/compute/tests.rs::an_injected_hang_leaks_counted_and_latches, src/compute/tests.rs::a_completed_job_carries_ordered_stamps, src/compute/tests.rs::a_repeated_job_gives_identical_words, src/compute/tests.rs::each_failed_job_names_its_own_cause, src/compute/tests.rs::an_unfinished_status_at_the_handler_is_a_latched_loss	8,13
 int-bag-mlp-equals-cpu-reference	equivalence	aterm-gpu	compute::{prelude,source,KERNEL,identity,Shape,Library::{compile,compile_salted},Pipeline::{new,new_salted,build,qualify,identity},Job::<Completed>::out}; compute::pipeline::qualification_set; shaders/int_bag_mlp.metal k_int_bag_mlp; aterm_effects::int_bag_mlp::{forward,LAYOUT,check,Batch::pack,interior_params_for,interior_rows}	For every params blob check accepts, every batch Batch::pack accepts against it and every pipeline of its Shape (E, H, C, MIN_IDS) that qualification accepted, with or without a library or run salt, the job's out words equal aterm_effects::int_bag_mlp::forward's word for word (each row's L as i32 bits, then its class; an abstaining row C zeros and class C), as aterm-effects' int-bag-mlp-forward-bounds states and bounds them. The kernel reads every header word by the name the prelude generates from LAYOUT, one constant per field at its index. A pipeline's identity is Digest::of(PIPELINE_DOMAIN, [the canonical source, E, H, C, MIN_IDS]), and no salt enters it; a run salt below 2^21 is refused, since a row index could reach it. Qualification runs two blobs at the pipeline's shape and compares every word with forward: the extreme blob with B = 65,536 over its extreme rows, three rows at MIN_IDS's edge and an all-abstain batch (batches 0 and 1), which drive every unit to a clamp, and the interior blob with B = 256 (weights of magnitude 1 or 2, MULT 181, G 8, T 127 and the identity LUT) over 64 rows (batch 2), where most units reach steps 4 to 6 unclamped, so a kernel that floors instead of truncating in step 5, divides by n - 1, shifts the LUT index or shifts by G - 1 differs on some word at every tested shape; one differing word refuses the pipeline for good, and submit refuses a pipeline not qualified. Needs a GPU execution model and MSL semantics (gap 8) and the cross-crate citation of forward (gap 12).	src/compute/tests.rs::every_word_equals_the_cpu_reference, src/compute/tests.rs::the_kernel_reads_every_header_word_by_its_generated_name, src/compute/tests.rs::the_prelude_and_the_pipeline_identity_are_pinned, src/compute/tests.rs::an_unqualified_or_mismatched_pipeline_refuses_the_job, src/compute/tests.rs::the_qualification_set_catches_faults_in_steps_4_to_6, src/compute/tests.rs::a_kernel_that_floors_in_step_5_is_refused	8,12
 ```
-
-### Distribution by kind (94)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 60 | frame-instrumentation, should-slice-nonempty, surface-attach-fallback, swapchain-config-validate, startup-probe-slot-encoding, band-shift-ops, present-copy-rect-union, present-crop-normalize, blit-uniform-layout, frame-latency-policy, capture-encoding-validity, swapchain-usage-and-alpha, hdr-gate-policy, hdr-probe-throttle, gpu-power-and-memblock-parse, glass-sample-classify, visible-source-scissor, fb-dim-clamp, frame-pass-coalescing, unorm-fetch-route, opaque-under-store, pack-image-plane, frame-plan-draw-order, atlas-shelf-packer, capture-store-ordered-budget, video-fps-gate, pixel-conversion-laws, present-tag-pacing, metal-device-selection, metal-upload-length-guards, readback-padding-contract, metal-pipeline-state-mapping, repaint-path-selection, dirty-gate, instance-stream-confined, command-buffer-outcome-observed, backend-crossing-refuses-by-name, metal-encoder-validators, acquire-bounded-and-failure-mapping, present-sample-publication, sdr-glow-envelope, metal-library-and-pipeline-build, appkit-surface-target-handle, minted-texture-storage-managed, swapchain-configure-postconditions, surface-reconfigure-retag-closure, atlas-follows-cpu-rasters, gpu-resource-residency, renderer-rebuild-preserves-config, metal-arm-disarm-sweep, metal-rescue-no-inline-wait, tray-composites-last, hdr-crown-emission, effect-layer-laws, supernova-emitter-envelope, cpu-image-layering, image-placement-decode, selection-paint, compute-job-release-after-terminal, compute-job-completion-observed |
-| table-property | 6 | dense-enum-tables, loss-classify-table, offscreen-format-plan, pipeline-table-binding-consistency, metal-enum-abi-constants, shader-interface-matches-table |
-| equivalence | 12 | acquire-worker-guards-refine-model, target-format-resolution, video-convert-worker-equals-inline, raw-capture-rows-equal-conversion, atlas-mirrors-cpu-glyph-cache, render-history-independence, metal-arm-byte-equals-wgpu-arm, present-arms-agree, shader-kernels-equal-cpu-functions, input-hot-invariance-and-bloom-adds-light, ink-equals-fg-recolor, int-bag-mlp-equals-cpu-reference |
-| refinement | 9 | capture-lifecycle-refinement, hdr-reconfigure-retag-refinement, acquire-worker-protocol-refinement, window-atlas-ownership-refinement, frame-cycle-presents-rendered-bytes, metal-encoder-implements-pass-semantics, present-blit-denotation, cached-render-equals-fresh, gpu-frame-refines-cpu |
-| round-trip | 1 | objc-bool-abi |
-| no-panic | 1 | render-no-panic-and-bounded-resources |
-| invariant | 5 | loss-latch-sticky-first-reason, encode-session-loss-protocol, loss-domain-seal, first-frame-warm-latch, compute-job-typestate |
-
-### Blocking-gap histogram
-
-Specs blocked by each audit §7 gap (a spec counts once per gap it lists):
-
-| gap | specs | what it is |
-|---|---|---|
-| 1 | 68 | non-scalar carriers |
-| 2 | 33 | certified &self/&mut self views |
-| 3 | 35 | E6 body widening |
-| 4 | 8 | callee-ensures composition |
-| 5 | 9 | quantified clauses |
-| 7 | 26 | loops |
-| 8 | 51 | effects / FFI / platform (and the missing GPU model) |
-| 9 | 1 | proc-macro boundary |
-| 10 | 8 | model-to-code refinement |
-| 11 | 4 | generics |
-| 12 | 18 | cross-crate theorem citation |
-| 13 | 19 | threads, async, closures |
-| 14 | 1 | Clean elaborator coverage |
-
-43 specs do not need gap 8; 51 do.
-
-### Proof dependency order
-
-Pure deciders and tables (`should-slice-nonempty`, the gap-1/3 contracts) → `hdr-gate-policy` →
-`hdr-reconfigure-retag-refinement` and `surface-reconfigure-retag-closure`. `loss-classify-table` →
-`loss-latch-sticky-first-reason` → `encode-session-loss-protocol` → `loss-domain-seal`. `band-shift-ops`,
-`present-copy-rect-union`, `present-crop-normalize`, `visible-source-scissor`, `fb-dim-clamp` →
-`repaint-path-selection` and `dirty-gate` → aterm-render's `compute_dirty_rows` soundness →
-`cached-render-equals-fresh`. `frame-plan-draw-order` + `frame-pass-coalescing` →
-plan equality CPU vs GPU → `gpu-frame-refines-cpu` (with the GPU model). `metal-encoder-validators` →
-`metal-encoder-implements-pass-semantics` → `metal-arm-byte-equals-wgpu-arm`.
 
 ## 2. Test → spec map (TSV)
 
@@ -662,27 +557,3 @@ tests/tray_present_scissor.rs	tray_present_scissors_and_stays_byte_identical_to_
     the code without an unbind, so `D3dWindowSurface::resize` unbinds nothing. The same binding does keep a
     dropped chain alive, and its window then refuses the next chain (`E_ACCESSDENIED`); the drop clears that
     (`Current::clear_state_and_flush`, `surface::tests::a_dropped_chain_leaves_its_window_to_the_next_one`).
-
-## 6. Proof order (easiest high-value first)
-
-1. **`should-slice-nonempty`**: the only spec blocked by gap 0 alone. One `usize` comparison, already bound
-   to the GpuEncode model; prove it the day a Clean-publishing seal lands, and it retires the GpuEncode
-   conformance test.
-2. **Gap-1/3 deciders**, each straight-line or a small `match`, decidable by evaluation or `omega`:
-   `surface-attach-fallback`, `swapchain-config-validate`, `band-shift-ops`, `present-copy-rect-union`,
-   `present-crop-normalize`, `startup-probe-slot-encoding`,
-   `frame-latency-policy`, `blit-uniform-layout`, `capture-encoding-validity`, `dense-enum-tables`,
-   `loss-classify-table`. Together they retire about 20 tests and force the enum/struct carriers (gap 1)
-   that everything after them needs.
-3. **`hdr-gate-policy`** (5 tests, an exhaustive bool/Option<f32> policy) then `hdr-reconfigure-retag-refinement`
-   and `acquire-worker-guards-refine-model` / `capture-lifecycle-refinement` (gap 10 refinements over
-   const fns): small state, high value, they bind existing `ty_model!` machines to the code.
-4. **`fb-dim-clamp`, `visible-source-scissor`, `frame-pass-coalescing`, `frame-plan-draw-order`**: the
-   pure planning layer under the GPU encode. With
-   `repaint-path-selection`, `dirty-gate` and aterm-render's `compute_dirty_rows` soundness lemma, this is the
-   pure core of `cached-render-equals-fresh` (40 tests).
-5. **`pixel-conversion-laws`** (10 tests; loops and floats) and `loss-latch-sticky-first-reason` →
-   `encode-session-loss-protocol` once `&self` views (gap 2) and atomics land.
-6. Everything with gap 8 waits for the platform lane and a GPU execution model (§5.1); start with plan
-   equality for `gpu-frame-refines-cpu`, the largest collapse in the crate.
-

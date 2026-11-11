@@ -390,6 +390,138 @@ fn supersession_is_durable_ordered_and_keeps_mains_tree() {
     assert!(line::supersede(&git, &origin, &backwards).is_err());
 }
 
+/// A replacement binds the selected main commit while the retirement record follows a
+/// concurrent main landing. A second cutter cannot replace that committed decision.
+#[test]
+fn supersession_retries_moving_main_without_reselecting_the_base() {
+    let f = Fixture::merging("supersede-moving-main");
+    // This release is still on VERSION, before the fixture's next bump and frozen changes.
+    run(
+        &f.origin,
+        &["update-ref", "refs/heads/main", &f.shas.rename],
+    );
+    run(&f.work, &["fetch", "-q", "origin", "main"]);
+    let old = Line::start(VERSION, &f.shas.g, 1);
+    assert!(matches!(
+        line::hop_tree(&f.git(), old.head(), &f.shas.fix_c).unwrap(),
+        Merged::Conflict(_)
+    ));
+    let selected = f.origin_main();
+    let replacement = Line::start(VERSION, &selected, 2);
+    // The old staged refusal leaves the full-tree backport workaround: the later fix
+    // conflicts, but copying main's complete tree onto the line passes admission.
+    let backport = run(
+        &f.work,
+        &[
+            "commit-tree",
+            &format!("{selected}^{{tree}}"),
+            "-p",
+            old.head(),
+            "-m",
+            "full-tree backport workaround",
+        ],
+    )
+    .trim()
+    .to_owned();
+    neutral_merge(&f, &backport, false);
+    assert!(matches!(
+        line::admit(&f.git(), &old, &backport),
+        Ok(Admitted::Fix(_))
+    ));
+    let record = line::Supersession {
+        previous: old.clone(),
+        replacement: replacement.clone(),
+        reason: "staged bundle failure".into(),
+    };
+    let mut origin = LocalOrigin::new(&f);
+    origin.before_write = RefCell::new(Box::new(|attempt| {
+        if attempt == 1 {
+            f.rival_moves_main("fn concurrent_main() {}\n");
+        }
+    }));
+    line::supersede(&f.git(), &origin, &record).unwrap();
+    assert_eq!(origin.writes.get(), 2);
+    assert_eq!(line::supersession(&f.git(), VERSION).unwrap(), Some(record));
+    assert_eq!(replacement.head(), selected);
+    line::verify(&f.git(), &replacement).unwrap();
+    assert_eq!(rev(&f.origin, "main^{tree}"), rev(&f.rival, "HEAD^{tree}"));
+    let competitor = line::Supersession {
+        previous: old,
+        replacement: Line::start(VERSION, &f.origin_main(), 3),
+        reason: "second cutter".into(),
+    };
+    assert!(line::supersede(&f.git(), &origin, &competitor).is_err());
+}
+
+/// NEGATIVE CONTROL: the former tip comparison expires after main edits a carried path.
+/// Step 4 must still verify the recorded hop against its immutable landed content.
+#[test]
+fn a_recorded_backport_reverifies_after_main_edits_its_paths() {
+    let f = Fixture::merging("expired-backport");
+    run(
+        &f.origin,
+        &["update-ref", "refs/heads/main", &f.shas.rename],
+    );
+    run(&f.work, &["fetch", "-q", "origin", "main"]);
+    let mut old = Line::start(VERSION, &f.shas.g, 1);
+    let selected = f.origin_main();
+    let backport = run(
+        &f.work,
+        &[
+            "commit-tree",
+            &format!("{selected}^{{tree}}"),
+            "-p",
+            old.head(),
+            "-m",
+            "full-tree backport",
+        ],
+    )
+    .trim()
+    .to_owned();
+    run(&f.rival, &["fetch", "-q", "origin", "main"]);
+    run(&f.rival, &["reset", "-q", "--hard", "origin/main"]);
+    commit(
+        &f.rival,
+        "concurrent unrelated landing",
+        &[("later.txt", "main moved\n")],
+    );
+    run(&f.rival, &["push", "-q", "origin", "main"]);
+    run(&f.work, &["fetch", "-q", "origin", "main"]);
+    neutral_merge(&f, &backport, false);
+    assert!(
+        !line::landed_since(&f.git(), old.head())
+            .unwrap()
+            .contains(&backport)
+    );
+    let admitted = fix_of(&f.git(), &old, &backport);
+    old.hops = line::carry(&f.git(), &old, &[admitted]).unwrap();
+    let origin = LocalOrigin::new(&f);
+    line::record(
+        &f.git(),
+        &origin,
+        VERSION,
+        old.head(),
+        line::MAX_RECORD_ATTEMPTS,
+    )
+    .unwrap();
+    line::verify(&f.git(), &old).unwrap();
+    let tip = f.rival_moves_main("fn later_main() {}\n");
+    origin.refresh_main().unwrap();
+    line::verify(&f.git(), &old).unwrap();
+    let replacement = Line::start(VERSION, &tip, 2);
+    let retirement = line::Supersession {
+        previous: old,
+        replacement: replacement.clone(),
+        reason: "replace the older line".into(),
+    };
+    line::supersede(&f.git(), &origin, &retirement).unwrap();
+    line::verify(&f.git(), &replacement).unwrap();
+    assert_eq!(
+        line::supersession(&f.git(), VERSION).unwrap(),
+        Some(retirement)
+    );
+}
+
 /// Real history input to the release flow, including the old reader's negative control.
 pub(super) fn hidden_supersession() -> line::Supersession {
     let fixture = Fixture::new("hidden-flow");
@@ -562,9 +694,9 @@ fn retirement_chain_ignores_log_order_and_rejects_cycles() {
 
 #[test]
 fn every_public_surface_prevents_supersession() {
-    assert!(line::require_unpublished([false; 5]).is_ok());
-    for index in 0..5 {
-        let mut public = [false; 5];
+    assert!(line::require_unpublished([false; 4]).is_ok());
+    for index in 0..4 {
+        let mut public = [false; 4];
         public[index] = true;
         assert!(
             line::require_unpublished(public).is_err(),
@@ -1260,7 +1392,7 @@ fn a_fix_that_conflicts_with_the_head_is_refused_with_its_paths() {
         stop.remedy.contains(short(&s.g))
             && stop
                 .remedy
-                .contains("every changed path matches origin/main"),
+                .contains("every changed path matches one landed main commit"),
         "{stop:?}"
     );
     let (code, last, rows) = super::release_flow::real_fix_fixture(
@@ -1370,6 +1502,183 @@ fn an_exact_backport_under_a_neutral_merge_is_admitted_and_dry_carried() {
     }
 }
 
+/// NEGATIVE CONTROL: a later neutral merge drops both the backport and its landing
+/// from landed_since. The retained content witness still admits the full-tree backport.
+#[test]
+fn a_backport_cut_off_by_a_later_neutral_merge_stays_admitted() {
+    let f = Fixture::merging("cut-off-backport");
+    run(
+        &f.origin,
+        &["update-ref", "refs/heads/main", &f.shas.rename],
+    );
+    run(&f.work, &["fetch", "-q", "origin", "main"]);
+    let line = Line::start(VERSION, &f.shas.g, 0);
+    let main = f.origin_main();
+    let backport = run(
+        &f.work,
+        &[
+            "commit-tree",
+            &format!("{main}^{{tree}}"),
+            "-p",
+            line.head(),
+            "-m",
+            "full-tree backport",
+        ],
+    )
+    .trim()
+    .to_owned();
+    let landing = neutral_merge(&f, &backport, false);
+    assert!(
+        line::landed_since(&f.git(), line.head())
+            .unwrap()
+            .contains(&backport)
+    );
+    // This branch already held all landing content before learning of the backport.
+    run(&f.rival, &["fetch", "-q", "origin", "main"]);
+    run(&f.rival, &["reset", "-q", "--hard", &main]);
+    let parallel = commit(
+        &f.rival,
+        "parallel main change",
+        &[("src/c2.rs", "later content\n")],
+    );
+    let merged = run(
+        &f.rival,
+        &[
+            "commit-tree",
+            &format!("{parallel}^{{tree}}"),
+            "-p",
+            &parallel,
+            "-p",
+            &landing,
+            "-m",
+            "merge redundant landing",
+        ],
+    )
+    .trim()
+    .to_owned();
+    run(
+        &f.rival,
+        &["push", "-q", "origin", &format!("{merged}:refs/heads/main")],
+    );
+    run(&f.work, &["fetch", "-q", "origin", "main"]);
+    let landed = line::landed_since(&f.git(), line.head()).unwrap();
+    assert!(!landed.contains(&landing));
+    assert!(!landed.contains(&backport));
+    assert!(landed.contains(&main));
+    let fix = fix_of(&f.git(), &line, &backport);
+    for dry in [true, false] {
+        let (code, last, rows) = super::release_flow::forgotten_fix_fixture(
+            &f.work,
+            &line,
+            std::slice::from_ref(&fix),
+            dry,
+        );
+        assert_eq!(code, 0, "{last}\n{rows:#?}");
+    }
+    let carried = Line {
+        hops: line::carry(&f.git(), &line, &[fix]).unwrap(),
+        ..line
+    };
+    line::verify_pending(&f.git(), &carried).unwrap();
+}
+
+/// Historical content is a witness even after a revert or a deleted path's return.
+#[test]
+fn historical_witnesses_survive_reverts_and_deleted_paths_reappearing() {
+    for deletion in [false, true] {
+        let f = Fixture::merging("historical-witness");
+        let line = Line::start(VERSION, &f.shas.g, 0);
+        run(&f.work, &["checkout", "-q", "--detach", "origin/main"]);
+        let original = fs::read_to_string(f.work.join("src/d.rs")).unwrap();
+        if deletion {
+            fs::remove_file(f.work.join("src/d.rs")).unwrap();
+        } else {
+            fs::write(f.work.join("src/d.rs"), "historical fix\n").unwrap();
+        }
+        let witness = commit(&f.work, "land content", &[]);
+        let reverted = commit(&f.work, "restore path", &[("src/d.rs", &original)]);
+        run(
+            &f.work,
+            &[
+                "push",
+                "-q",
+                "origin",
+                &format!("{reverted}:refs/heads/main"),
+            ],
+        );
+        run(&f.work, &["fetch", "-q", "origin", "main"]);
+        assert!(
+            line::landed_since(&f.git(), line.head())
+                .unwrap()
+                .contains(&witness)
+        );
+        run(&f.work, &["checkout", "-q", "--detach", line.head()]);
+        if deletion {
+            fs::remove_file(f.work.join("src/d.rs")).unwrap();
+        } else {
+            fs::write(f.work.join("src/d.rs"), "historical fix\n").unwrap();
+        }
+        let backport = commit(&f.work, "historical backport", &[]);
+        neutral_merge(&f, &backport, true);
+        let fix = fix_of(&f.git(), &line, &backport);
+        let carried = Line {
+            hops: line::carry(&f.git(), &line, &[fix]).unwrap(),
+            ..line.clone()
+        };
+        line::verify_pending(&f.git(), &carried).unwrap();
+        // NEGATIVE CONTROL: history cannot authorize content never present in
+        // any witness, even when the other paths and the parent match.
+        run(&f.work, &["checkout", "-q", "--detach", line.head()]);
+        let invented = commit(
+            &f.work,
+            "invented backport",
+            &[("src/d.rs", "never landed\n")],
+        );
+        neutral_merge(&f, &invented, true);
+        stopped(line::admit(&f.git(), &line, &invented), Reason::OffMain);
+    }
+}
+
+/// A side merge's matching tree is no authority when main reaches it only through
+/// a neutral merge. NEGATIVE CONTROL: scanning all ancestors admits this forged backport.
+#[test]
+fn an_unlanded_side_merge_cannot_witness_a_backport() {
+    let f = Fixture::merging("side-witness");
+    let line = Line::start(VERSION, &f.shas.g, 0);
+    run(&f.work, &["checkout", "-q", "--detach", line.head()]);
+    let backport = commit(
+        &f.work,
+        "unlanded content",
+        &[("src/d.rs", "never landed\n")],
+    );
+    let main = f.origin_main();
+    let side = run(
+        &f.work,
+        &[
+            "commit-tree",
+            &format!("{backport}^{{tree}}"),
+            "-p",
+            &main,
+            "-p",
+            &backport,
+            "-m",
+            "side merge holds unlanded content",
+        ],
+    )
+    .trim()
+    .to_owned();
+    neutral_merge(&f, &side, true);
+    let landed = line::landed_since(&f.git(), line.head()).unwrap();
+    assert!(!landed.contains(&side));
+    assert!(!landed.contains(&backport));
+    stopped(line::admit(&f.git(), &line, &backport), Reason::OffMain);
+    let forged = Line {
+        hops: vec![hand_hop(&f, line.head(), &backport)],
+        ..line
+    };
+    stopped(line::verify_pending(&f.git(), &forged), Reason::OffMain);
+}
+
 /// Retaining a backport in history is insufficient: every changed path must match, including
 /// a deletion or mode. A hand-built hop cannot bypass admission's content obligation.
 #[test]
@@ -1408,11 +1717,6 @@ fn a_neutral_backport_main_does_not_hold_is_refused_by_admit_and_verify() {
             );
             neutral_merge(&f, &backport, main_first);
             let stop = stopped(line::admit(&f.git(), &line, &backport), Reason::OffMain);
-            assert!(
-                stop.remedy
-                    .contains("every changed path matches origin/main"),
-                "{stop:?}"
-            );
             let (code, last, rows) = super::release_flow::real_fix_fixture(
                 &f.work,
                 &line,
@@ -2015,13 +2319,11 @@ fn verify_refuses_each_way_a_line_can_be_wrong_and_passes_the_honest_one() {
     }
 }
 
-/// A commit origin/main holds only through a content-neutral merge never landed: another line's
-/// hop (its record merge's second parent) and a commit pushed under a merge that keeps main's
-/// tree are refused by `admit` and fail `verify` as off main, while the fix the rival's hop
-/// carries is admitted and the rival's line verifies. NEGATIVE CONTROL: take any ancestor of
-/// origin/main as landed, and both are admitted and verify.
+/// Record-only history is not itself landing evidence. A rival hop can still be an exact
+/// backport of landed content, while an invented change has neither proof. NEGATIVE CONTROL:
+/// treating every ancestor as landed admits the invented change and verifies its forged hop.
 #[test]
-fn a_commit_main_holds_only_through_a_record_merge_never_landed() {
+fn record_only_history_requires_landed_content_evidence() {
     let fix = Fixture::merging("record-only");
     let (git, s) = (fix.git(), &fix.shas);
     let start = Line::start(VERSION, &s.g, 0);
@@ -2071,26 +2373,27 @@ fn a_commit_main_holds_only_through_a_record_merge_never_landed() {
     }
     for unlanded in [&rival_hop, &planted] {
         assert!(!landed.contains(unlanded), "{unlanded}: {landed:?}");
-        let stop = stopped(line::admit(&git, &start, unlanded), Reason::OffMain);
-        assert!(stop.why.contains("never landed in main's tree"), "{stop:?}");
-        let l = Line {
-            hops: vec![hand_hop(&fix, &s.g, unlanded)],
-            ..start.clone()
-        };
-        line::record(
-            &git,
-            &LocalOrigin::new(&fix),
-            VERSION,
-            l.head(),
-            line::MAX_RECORD_ATTEMPTS,
-        )
-        .unwrap();
-        let stop = stopped(line::verify(&git, &l), Reason::OffMain);
-        assert!(
-            stop.why.starts_with("hop 1: ") && stop.remedy.contains("--forget"),
-            "{stop:?}"
-        );
     }
+    assert_eq!(fix_of(&git, &start, &rival_hop).commit, rival_hop);
+    let stop = stopped(line::admit(&git, &start, &planted), Reason::OffMain);
+    assert!(stop.why.contains("never landed in main's tree"), "{stop:?}");
+    let forged = Line {
+        hops: vec![hand_hop(&fix, &s.g, &planted)],
+        ..start.clone()
+    };
+    line::record(
+        &git,
+        &LocalOrigin::new(&fix),
+        VERSION,
+        forged.head(),
+        line::MAX_RECORD_ATTEMPTS,
+    )
+    .unwrap();
+    let stop = stopped(line::verify(&git, &forged), Reason::OffMain);
+    assert!(
+        stop.why.starts_with("hop 1: ") && stop.remedy.contains("--forget"),
+        "{stop:?}"
+    );
     assert_eq!(fix_of(&git, &start, &s.fix_b).commit, s.fix_b);
     line::verify(&git, &rival).unwrap();
 }

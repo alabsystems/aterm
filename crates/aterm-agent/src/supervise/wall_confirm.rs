@@ -162,7 +162,7 @@ fn row_id(v: &Value) -> Option<String> {
 fn row_time(v: &Value) -> Option<i64> {
     v.get("timestamp")
         .and_then(Value::as_str)
-        .and_then(crate::harness::upgrade_models::parse_utc)
+        .and_then(crate::harness::unix_time::parse_utc)
         .and_then(|t| i64::try_from(t).ok())
 }
 

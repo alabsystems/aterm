@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fmt;
 use std::mem;
+use std::panic::AssertUnwindSafe;
 use std::rc::Weak;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -22,6 +23,11 @@ use aterm_objc::{autoreleasepool, class, sel, Bool, Id, MainThread};
 
 static QUIT_CONFIRM_HOOK: OnceLock<fn() -> bool> = OnceLock::new();
 
+// `NSApplicationTerminateReply`, named here because the Objective-C seam deliberately has no
+// AppKit dependency.
+const NS_TERMINATE_CANCEL: usize = 0;
+const NS_TERMINATE_NOW: usize = 1;
+
 /// Registers a handler consulted before the app terminates via AppKit's `terminate:`.
 pub(crate) fn set_quit_confirm_hook(hook: fn() -> bool) {
     let _ = QUIT_CONFIRM_HOOK.set(hook);
@@ -31,7 +37,12 @@ fn quit_confirm_allows() -> bool {
     QUIT_CONFIRM_HOOK.get().is_none_or(|hook| hook())
 }
 
-type HandlerWork = Box<dyn FnOnce(&ApplicationDelegate)>;
+type HandlerCallback = Box<dyn FnOnce(&ApplicationDelegate)>;
+
+enum HandlerWork {
+    Callback(HandlerCallback),
+    ExitBarrier,
+}
 
 /// Work that may enter the application event handler, in native-callback order.
 ///
@@ -92,6 +103,17 @@ impl<T> PendingHandlerWork<T> {
         debug_assert!(self.batch_in_progress, "only a started handler batch can finish");
         self.batch_in_progress = false;
     }
+
+    /// Finishes the active batch and extracts everything behind its ordered exit barrier.
+    ///
+    /// The caller drops the returned work after releasing the FIFO's `RefCell` borrow, so a
+    /// future callback capture with re-entrant `Drop` cannot collide with that borrow.
+    fn finish_batch_and_take_tail(&mut self) -> VecDeque<T> {
+        debug_assert!(self.batch_in_progress, "only a started handler batch can finish");
+        self.drain_armed = false;
+        self.batch_in_progress = false;
+        std::mem::take(&mut self.queue)
+    }
 }
 
 impl<T> fmt::Debug for PendingHandlerWork<T> {
@@ -104,9 +126,26 @@ impl<T> fmt::Debug for PendingHandlerWork<T> {
     }
 }
 
+/// Rearms work queued by a nested callback once the outer handler releases its borrow.
+///
+/// Objective-C exceptions unwind Rust drops before `aterm_objc::contain` catches them, without
+/// making `std::thread::panicking()` true. Rust panics do set it and stop the app, so retain the
+/// previous behavior of leaving work unarmed on that fatal path.
+struct HandlerWorkRearm<'a>(&'a ApplicationDelegate);
+
+impl Drop for HandlerWorkRearm<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.0.arm_handler_work();
+        }
+    }
+}
+
 use super::aterm_objc_seam::consts::NS_APPLICATION_ACTIVATION_POLICY_REGULAR;
 use super::event_handler::EventHandler;
-use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
+use super::event_loop::{
+    notify_windows_of_exit, stop_app_immediately, stop_app_on_panic, ActiveEventLoop, PanicInfo,
+};
 use super::observer::{EventLoopWaker, RunLoop};
 use super::{menu, wake_queue, WindowId};
 use crate::event::{Event, StartCause, WindowEvent};
@@ -120,8 +159,12 @@ pub(super) struct AppState {
     activate_ignoring_other_apps: bool,
     run_loop: RunLoop,
     event_handler: EventHandler,
+    /// The loop-owned panic slot that lets queued handler work return an unwind through the pump.
+    panic_info: Weak<PanicInfo>,
     /// Native callbacks deferred until the current event handler and any nested modal loop return.
     pending_handler_work: RefCell<PendingHandlerWork<HandlerWork>>,
+    /// One accepted native termination is waiting to be retried after the active handler.
+    termination_retry_pending: Cell<bool>,
     stop_on_launch: Cell<bool>,
     stop_before_wait: Cell<bool>,
     stop_after_wait: Cell<bool>,
@@ -132,6 +175,8 @@ pub(super) struct AppState {
     is_running: Cell<bool>,
     /// Whether the user has requested the event loop to exit.
     exit: Cell<bool>,
+    /// Whether the ordered exit barrier has drained everything owed before the request.
+    exit_committed: Cell<bool>,
     control_flow: Cell<ControlFlow>,
     waker: RefCell<EventLoopWaker>,
     start_time: Cell<Option<Instant>>,
@@ -168,12 +213,29 @@ aterm_objc::declare_class! {
 
         @sel(applicationShouldTerminate:)
         fn app_should_terminate(&self, _sender: Id) -> usize {
-            // NSApplicationTerminateReply: NSTerminateCancel = 0, NSTerminateNow = 1.
-            if quit_confirm_allows() {
-                1
-            } else {
-                0
+            if self.exiting() {
+                return NS_TERMINATE_CANCEL;
             }
+            if self.ivars().termination_retry_pending.get() {
+                return NS_TERMINATE_CANCEL;
+            }
+            if !quit_confirm_allows() {
+                return NS_TERMINATE_CANCEL;
+            }
+            if !self.ivars().event_handler.in_use() {
+                return NS_TERMINATE_NOW;
+            }
+
+            // `terminate:` may arrive from a nested modal run loop while the outer user callback
+            // still owns EventHandler's RefCell. Returning Now would synchronously enter
+            // `applicationWillTerminate:` and deliver LoopExiting through that same handler,
+            // panicking at the second mutable borrow. NSTerminateLater cannot defer this safely:
+            // AppKit's `terminate:` waits in `_shouldTerminate` for its reply, so the outer
+            // callback cannot unwind. Cancel only this synchronous attempt and retry it from the
+            // ordered handler-work queue, once every older callback has completed.
+            self.ivars().termination_retry_pending.set(true);
+            self.defer_termination_retry();
+            NS_TERMINATE_CANCEL
         }
     }
 }
@@ -183,6 +245,7 @@ impl ApplicationDelegate {
         mtm: MainThread,
         activation_policy: Option<isize>,
         activate_ignoring_other_apps: bool,
+        panic_info: Weak<PanicInfo>,
         wake_armed: wake_queue::Armed,
         drained: wake_queue::Drained,
     ) -> aterm_objc::Retained<Self> {
@@ -191,7 +254,9 @@ impl ApplicationDelegate {
             activate_ignoring_other_apps,
             run_loop: RunLoop::main(mtm),
             event_handler: EventHandler::new(),
+            panic_info,
             pending_handler_work: RefCell::new(PendingHandlerWork::new()),
+            termination_retry_pending: Cell::new(false),
             stop_on_launch: Cell::new(false),
             stop_before_wait: Cell::new(false),
             stop_after_wait: Cell::new(false),
@@ -199,6 +264,7 @@ impl ApplicationDelegate {
             is_launched: Cell::new(false),
             is_running: Cell::new(false),
             exit: Cell::new(false),
+            exit_committed: Cell::new(false),
             control_flow: Cell::new(ControlFlow::default()),
             waker: RefCell::new(EventLoopWaker::new(mtm)),
             start_time: Cell::new(None),
@@ -255,7 +321,7 @@ impl ApplicationDelegate {
         self.set_is_running(true);
         self.dispatch_init_events();
 
-        if self.ivars().stop_on_launch.get() {
+        if self.ivars().stop_on_launch.get() && !self.exiting() {
             // SAFETY: `app()` is the live shared `NSApplication`.
             unsafe { stop_app_immediately(app()) };
         }
@@ -394,11 +460,21 @@ impl ApplicationDelegate {
     }
 
     pub fn exit(&self) {
-        self.ivars().exit.set(true)
+        if !self.ivars().exit.replace(true) {
+            // A programmatic exit supersedes an AppKit `terminate:` retry accepted while the
+            // same handler was active. Its queued closures re-check this bit before retrying.
+            self.ivars().termination_retry_pending.set(false);
+            self.ivars().pending_handler_work.borrow_mut().push(HandlerWork::ExitBarrier);
+            self.arm_handler_work();
+        }
     }
 
     pub fn exiting(&self) -> bool {
         self.ivars().exit.get()
+    }
+
+    pub fn exit_committed(&self) -> bool {
+        self.ivars().exit_committed.get()
     }
 
     pub fn user_events_drained(&self) -> bool {
@@ -423,20 +499,39 @@ impl ApplicationDelegate {
 
     pub fn handle_redraw(&self, window_id: WindowId) {
         let _ = self.mtm();
-        if !self.ivars().event_handler.in_use() {
-            self.handle_event(Event::WindowEvent {
-                window_id: RootWindowId(window_id),
-                event: WindowEvent::RedrawRequested,
-            });
+        if self.exiting() {
+            return;
+        }
+        let origin = super::key_origin::capture();
+        let deliver = move |this: &ApplicationDelegate| {
+            this.handle_event_with_origin(
+                Event::WindowEvent {
+                    window_id: RootWindowId(window_id),
+                    event: WindowEvent::RedrawRequested,
+                },
+                origin,
+            );
 
-            if self.ivars().stop_on_redraw.get() {
+            if this.ivars().stop_on_redraw.get() && !this.exiting() {
                 // SAFETY: `app()` is the live shared `NSApplication`.
                 unsafe { stop_app_immediately(app()) };
             }
+        };
+        if !self.ivars().event_handler.in_use()
+            && self.ivars().pending_handler_work.borrow().can_run_inline()
+        {
+            deliver(self);
+        } else {
+            // This is one event per AppKit `drawRect:`, unlike coalesced application redraw
+            // requests. Keep it behind every older native callback without merging it.
+            self.queue_handler_work(deliver);
         }
     }
 
     pub fn queue_redraw(&self, window_id: WindowId) {
+        if self.exiting() {
+            return;
+        }
         let mut pending_redraw = self.ivars().pending_redraw.borrow_mut();
         if !pending_redraw.contains(&window_id) {
             pending_redraw.push(window_id);
@@ -446,6 +541,11 @@ impl ApplicationDelegate {
 
     #[track_caller]
     fn maybe_queue_event(&self, event: Event<HandlePendingUserEvents>) {
+        let exit_destroyed = self.exit_committed()
+            && matches!(&event, Event::WindowEvent { event: WindowEvent::Destroyed, .. });
+        if self.exiting() && !exit_destroyed {
+            return;
+        }
         let origin = super::key_origin::capture();
         if !self.ivars().event_handler.in_use()
             && self.ivars().pending_handler_work.borrow().can_run_inline()
@@ -463,8 +563,67 @@ impl ApplicationDelegate {
     /// `window_delegate` also uses this for scale-factor work whose synchronous size writer means
     /// the whole operation, rather than only its two events, has to wait for handler availability.
     pub(super) fn queue_handler_work(&self, work: impl FnOnce(&ApplicationDelegate) + 'static) {
-        self.ivars().pending_handler_work.borrow_mut().push(Box::new(work));
+        if self.exiting() {
+            return;
+        }
+        self.ivars().pending_handler_work.borrow_mut().push(HandlerWork::Callback(Box::new(work)));
         self.arm_handler_work();
+    }
+
+    /// Retries `terminate:` only after every handler callback older than the request.
+    ///
+    /// The FIFO sentinel schedules a separate run-loop block because `willTerminate:` closes our
+    /// windows synchronously. Their Destroyed events must run inline before LoopExiting, not queue
+    /// behind the batch containing the sentinel. If an older callback appended more FIFO work,
+    /// the block puts another sentinel at the tail and tries again after that work has drained.
+    fn defer_termination_retry(&self) {
+        self.queue_handler_work(|this| {
+            if !this.ivars().termination_retry_pending.get() || this.exiting() {
+                return;
+            }
+            let retained = this.retained();
+            this.ivars().run_loop.queue_closure(move || {
+                if !retained.ivars().termination_retry_pending.get() || retained.exiting() {
+                    return;
+                }
+                if retained.ivars().event_handler.in_use()
+                    || !retained.ivars().pending_handler_work.borrow().can_run_inline()
+                {
+                    retained.defer_termination_retry();
+                    return;
+                }
+                // Clear first: `terminate:` synchronously asks this delegate again, now with no
+                // active handler, and that second decision must be NSTerminateNow.
+                retained.ivars().termination_retry_pending.set(false);
+                // SAFETY: `app()` is the live shared `NSApplication`; `terminate:` is
+                // `v24@0:8@16`, and nil is the conventional programmatic sender.
+                unsafe {
+                    send_v_id(app(), sel!(terminate:), Id::NIL);
+                }
+            });
+            this.ivars().run_loop.wakeup();
+        });
+    }
+
+    /// Closes this backend's windows only after every callback owed before `exit()`.
+    fn commit_exit(&self) {
+        debug_assert!(self.exiting(), "only a requested exit can be committed");
+        debug_assert!(
+            self.ivars().pending_handler_work.borrow().can_run_inline(),
+            "the exit barrier must release the handler FIFO before closing windows"
+        );
+        self.ivars().exit_committed.set(true);
+        self.ivars().termination_retry_pending.set(false);
+
+        // Post the stop first so an Objective-C exception during a synchronous close cannot
+        // strand a committed exit. `NSApp run` cannot return until this block returns, so each
+        // `Destroyed` still runs inline before `pump_events` emits `LoopExiting`.
+        // SAFETY: `app()` is the live shared `NSApplication`.
+        unsafe {
+            let app = app();
+            stop_app_immediately(app);
+            notify_windows_of_exit(app);
+        }
     }
 
     fn arm_handler_work(&self) {
@@ -483,17 +642,63 @@ impl ApplicationDelegate {
                 .begin_batch(this.ivars().event_handler.in_use());
             if batch_len == 0 {
                 // A nested modal loop reached this block while another event was being handled.
-                // Its normal return tail below owns rearming; doing it here could spin.
+                // Its HandlerWorkRearm owns rearming once the borrow is released; doing it here
+                // could spin inside the nested loop.
                 return;
             }
-            for _ in 0..batch_len {
-                let work = this.ivars().pending_handler_work.borrow_mut().pop_batch_item();
-                // Contain here, inside the block's own outer guard, so an Objective-C exception
-                // cannot skip the remaining snapshot or strand every later callback behind it.
-                let _ = aterm_objc::contain("queued event-handler work", || work(&this));
+            let panic_info = Weak::clone(&this.ivars().panic_info);
+            let reached_exit_barrier = Cell::new(false);
+            let completed = stop_app_on_panic(
+                this.mtm(),
+                Weak::clone(&panic_info),
+                AssertUnwindSafe(|| {
+                    for _ in 0..batch_len {
+                        // A deeper AppKit guard can catch a panic into the same slot and return
+                        // normally through this work item. Once that happens, preserve the rest
+                        // of the snapshot for the fatal turn instead of running more user code.
+                        if panic_info.upgrade().is_some_and(|info| info.is_panicking()) {
+                            break;
+                        }
+                        let work = this.ivars().pending_handler_work.borrow_mut().pop_batch_item();
+                        match work {
+                            HandlerWork::Callback(work) => {
+                                // Contain here, inside the panic guard, so an Objective-C
+                                // exception cannot skip the remaining snapshot or strand every
+                                // later callback behind it.
+                                let _ = aterm_objc::contain("queued event-handler work", || {
+                                    work(&this);
+                                });
+                            },
+                            HandlerWork::ExitBarrier => {
+                                reached_exit_barrier.set(true);
+                                break;
+                            },
+                        }
+                    }
+                }),
+            );
+            let discarded_tail = {
+                let mut pending = this.ivars().pending_handler_work.borrow_mut();
+                if reached_exit_barrier.get() {
+                    Some(pending.finish_batch_and_take_tail())
+                } else {
+                    pending.finish_batch();
+                    None
+                }
+            };
+            drop(discarded_tail);
+            if completed.is_some() && !panic_info.upgrade().is_some_and(|info| info.is_panicking())
+            {
+                if reached_exit_barrier.get() {
+                    let _ = stop_app_on_panic(
+                        this.mtm(),
+                        Weak::clone(&panic_info),
+                        AssertUnwindSafe(|| this.commit_exit()),
+                    );
+                } else {
+                    this.arm_handler_work();
+                }
             }
-            this.ivars().pending_handler_work.borrow_mut().finish_batch();
-            this.arm_handler_work();
         });
         // `CFRunLoopPerformBlock` does not itself wake a run loop that is about to sleep.
         self.ivars().run_loop.wakeup();
@@ -509,6 +714,7 @@ impl ApplicationDelegate {
         event: Event<HandlePendingUserEvents>,
         origin: super::key_origin::Captured,
     ) {
+        let _rearm = HandlerWorkRearm(self);
         let window_event = matches!(&event, Event::WindowEvent { .. });
         let deliver = || {
             self.ivars()
@@ -520,9 +726,6 @@ impl ApplicationDelegate {
         } else {
             deliver();
         }
-        // `EventHandler::handle_event` released its RefCell borrow on the normal return above.
-        // A panic stops the app, so deliberately do not arm this from an unwind guard.
-        self.arm_handler_work();
     }
 
     /// Dispatches `NewEvents(Init)` and `Resumed`.
@@ -545,14 +748,13 @@ impl ApplicationDelegate {
             .upgrade()
             .expect("The panic info must exist here. This failure indicates a developer error.");
 
-        if panic_info.is_panicking() || !self.ivars().event_handler.ready() || !self.is_running() {
+        if panic_info.is_panicking()
+            || !self.ivars().event_handler.ready()
+            || !self.is_running()
+            || self.exiting()
+        {
             self.stop_waker_in_nested_loop();
             return;
-        }
-
-        if self.ivars().stop_after_wait.get() {
-            // SAFETY: `app()` is the live shared `NSApplication`.
-            unsafe { stop_app_immediately(app()) };
         }
 
         let start = self.ivars().start_time.get().unwrap();
@@ -568,7 +770,16 @@ impl ApplicationDelegate {
             },
         };
 
-        self.handle_event(Event::NewEvents(cause));
+        // Match `cleared`: an Objective-C exception in this callback must not skip the pump's
+        // ordinary stop. A Rust panic still escapes to the outer panic guard and wins.
+        let _ = aterm_objc::contain("CFRunLoop observer: NewEvents", || {
+            self.handle_event(Event::NewEvents(cause));
+        });
+
+        if self.ivars().stop_after_wait.get() && !self.exiting() {
+            // SAFETY: `app()` is the live shared `NSApplication`.
+            unsafe { stop_app_immediately(app()) };
+        }
     }
 
     pub fn cleared(&self, panic_info: Weak<PanicInfo>) {
@@ -579,6 +790,9 @@ impl ApplicationDelegate {
 
         if panic_info.is_panicking() || !self.ivars().event_handler.ready() || !self.is_running() {
             self.stop_waker_in_nested_loop();
+            return;
+        }
+        if self.exiting() {
             return;
         }
 
@@ -614,12 +828,9 @@ impl ApplicationDelegate {
         });
 
         if self.exiting() {
-            // SAFETY: `app()` is the live shared `NSApplication`.
-            unsafe {
-                let app = app();
-                stop_app_immediately(app);
-                notify_windows_of_exit(app);
-            }
+            // The barrier armed by `exit()` owns closing and stopping. Let the current turn end,
+            // but do not let a pump stop overtake callbacks queued ahead of that barrier.
+            return;
         }
 
         if self.ivars().stop_before_wait.get() {
@@ -685,37 +896,5 @@ fn app() -> Id {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::PendingHandlerWork;
-
-    #[test]
-    fn pending_handler_work_waits_out_a_nested_handler_and_keeps_fifo_order() {
-        let mut pending = PendingHandlerWork::new();
-        pending.push(11);
-        pending.push(22);
-
-        assert!(pending.arm());
-        assert!(!pending.arm(), "only one run-loop block is armed");
-        assert_eq!(pending.begin_batch(true), 0, "a nested handler consumes nothing");
-        assert!(!pending.queue.is_empty());
-
-        assert!(pending.arm(), "the outer handler can rearm after it returns");
-        assert_eq!(pending.begin_batch(false), 2);
-        assert_eq!(pending.pop_batch_item(), 11);
-        pending.push(33);
-        assert!(!pending.can_run_inline(), "callbacks cannot overtake active handler work");
-        assert!(!pending.arm(), "active handler work cannot arm a nested delivery");
-        assert_eq!(pending.pop_batch_item(), 22);
-        pending.finish_batch();
-        assert!(pending.arm(), "work appended by a batch waits for the next block");
-        assert_eq!(pending.begin_batch(false), 1);
-        assert_eq!(pending.pop_batch_item(), 33);
-        assert!(
-            !pending.can_run_inline(),
-            "the last dequeued item remains active until it finishes"
-        );
-        pending.finish_batch();
-        assert!(!pending.arm(), "an empty FIFO arms no block");
-        assert!(pending.can_run_inline());
-    }
-}
+#[path = "app_state_tests.rs"]
+mod tests;

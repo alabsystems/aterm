@@ -1452,7 +1452,7 @@ pub(crate) struct TurnIo<'a> {
     pub momentum: &'a dyn Fn() -> Result<(f32, std::time::Instant), String>,
     /// WHO is driving: the session the connection's edge token was granted to (`EdgeTable::src_of` on the resolved target's table — the one that authorized this request), or `None` for an Owner-class caller (the per-instance token, the bridge), neither of which is a session.
     pub driver: Option<aterm_session::SessionId>,
-    /// WHO is calling, for the turn's ledger record ([`turn_by`]: the connection's identity, `ctl`, `bridge` or the edge's sid).
+    /// WHO is calling, for the turn's ledger record ([`turn_by`]: the authenticated fleet actor, `ctl`, `bridge` or the edge's sid).
     pub by: TurnBy,
     /// The session log's `by=` for the turn this exchange opens: the connection's ([`log_actor`]: `harness`, `ctl`, `bridge`, an edge's minted sid, else `-`), never a parameter.
     pub actor: aterm_slog::Actor,
@@ -6207,8 +6207,15 @@ pub(crate) fn owner_tab_sid(who: &crate::typed_by::Who, store: &Store) -> Option
         .map(|(.., sid)| sid)
 }
 
-/// The turn ledger's `by=` for a `turn` from this connection ([`TurnIo::by`]), from the scope and the driver the dispatch already resolved from it (an edge's source in the target's table, `crate::control::turn_driver`): `ctl` for an owner-token client, `bridge` for the fabric bridge, an edge-scoped caller's own sid, `-` for an edge whose grant is not in the target's table. The exits ledger ([`caller_actor`]) names an edge, the bridge and an owner client in no tab in these same words; it names further what this ledger leaves `ctl` (an owner client run from a tab, as that tab's session; aterm's harness token; a fleet drive), which the turn ledger's readers ([`typed_by`]) name their own way.
+/// The turn ledger's `by=` for a `turn` from this connection ([`TurnIo::by`]): the authenticated
+/// fleet driver, when serving one, otherwise the resolved scope and edge source. Fleet identity
+/// has the same precedence and token spelling as the exits ledger ([`caller_actor`]); neither
+/// request text nor the target's last typist names the caller. Local owner clients remain `ctl`
+/// until [`typed_by`] recognizes this process's harness hand.
 pub(crate) fn turn_by(scope: Scope, driver: Option<&SessionId>) -> TurnBy {
+    if let Some(driver) = crate::fabric::serving_driver() {
+        return TurnBy::from_wire(ExitActor::fleet(&driver.host).as_wire());
+    }
     match scope {
         Scope::Owner => TurnBy::Ctl,
         #[cfg(any(unix, test))]
@@ -6305,6 +6312,9 @@ pub(crate) fn ledger_typed_input(
 /// The session log's `by=` for a request on `scope` against `target` (`docs/DESIGN-session-log-2026-10-15.md` §2.5): who the connection is, never a parameter.
 pub(crate) fn log_actor(scope: Scope, target: &SessionCtx) -> aterm_slog::Actor {
     use aterm_slog::Actor;
+    if let Some(driver) = crate::fabric::serving_driver() {
+        return Actor::fleet(&driver.host);
+    }
     match scope {
         Scope::Owner => match crate::control::serving_principal() {
             crate::control::Principal::Harness => Actor::Harness,
@@ -10036,7 +10046,8 @@ mod exits_tests {
                 ExitActor::Ctl => TurnBy::Ctl,
                 ExitActor::Bridge => TurnBy::Bridge,
                 ExitActor::Harness => TurnBy::Harness,
-                ExitActor::Human | ExitActor::Fleet(_) | ExitActor::Unknown => TurnBy::Unknown,
+                ExitActor::Fleet(token) => TurnBy::Fleet(token),
+                ExitActor::Human | ExitActor::Unknown => TurnBy::Unknown,
             };
             assert_eq!(by, named, "{scope:?}");
             by
@@ -10118,6 +10129,44 @@ mod exits_tests {
             assert_eq!(typed_by(&caller, Some(&hand)), caller, "{caller:?}");
         }
     }
+
+    #[test]
+    fn authenticated_fleet_turns_keep_the_same_actor_as_exits_and_restore_local_scope() {
+        let store = new_store();
+        let local = || turn_by(Scope::Owner, None);
+        assert_eq!(local(), TurnBy::Ctl);
+        let actor = ExitActor::fleet(" m72 / remote=desk ");
+        {
+            let _serving = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+                node: "authenticated-node".to_string(),
+                host: " m72 / remote=desk ".to_string(),
+            });
+            let by = local();
+            assert_eq!(by.as_wire(), actor.as_wire());
+            assert!(matches!(by, TurnBy::Fleet(_)));
+            assert_eq!(caller_actor_of(Scope::Owner, None, &store), actor);
+            assert_eq!(turn_by(Scope::Bridge, None), by);
+            let hand = crate::Lease::Drive {
+                holder: crate::harness_host::holder(),
+                expires_us: u64::MAX,
+                conn: Some(1),
+                hard: true,
+                here: false,
+                holder_pid: None,
+            };
+            assert_eq!(
+                typed_by(&by, Some(&hand)),
+                by,
+                "a harness hand cannot replace the authenticated remote actor"
+            );
+        }
+        assert_eq!(
+            local(),
+            TurnBy::Ctl,
+            "the connection guard does not leak to the next caller"
+        );
+        assert_eq!(turn_by(Scope::Bridge, None), TurnBy::Bridge);
+    }
 }
 
 #[cfg(test)]
@@ -10133,6 +10182,42 @@ mod log_actor_tests {
         let caller = test_handle(1);
         let target = test_handle(2);
         assert_eq!(log_actor(Scope::Owner, &target.ctx), Actor::Ctl);
+        assert_eq!(
+            log_actor(
+                Scope::Fleet {
+                    content: true,
+                    drive: true
+                },
+                &target.ctx
+            ),
+            Actor::Nobody
+        );
+        {
+            let _driver = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+                node: "authenticated-node".to_owned(),
+                host: "m72 / remote=desk".to_owned(),
+            });
+            let expected = Actor::fleet("m72 / remote=desk");
+            assert_eq!(log_actor(Scope::Owner, &target.ctx), expected);
+            let _harness = ServingPrincipal::enter(Principal::Harness);
+            assert_eq!(log_actor(Scope::Owner, &target.ctx), expected);
+            assert_eq!(log_actor(Scope::Bridge, &target.ctx), expected);
+            assert_eq!(
+                log_actor(
+                    Scope::Fleet {
+                        content: true,
+                        drive: true
+                    },
+                    &target.ctx
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            log_actor(Scope::Owner, &target.ctx),
+            Actor::Ctl,
+            "driver context restored"
+        );
         {
             let _harness = ServingPrincipal::enter(Principal::Harness);
             assert_eq!(log_actor(Scope::Owner, &target.ctx), Actor::Harness);
@@ -10175,6 +10260,58 @@ mod log_actor_tests {
             log_actor(Scope::Edge(EdgeToken::generate()), &target.ctx),
             Actor::Nobody
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fleet_input_completion_keeps_admitted_actor_after_driver_context_ends() {
+        use crate::control_input_ack::{InputMark, testing};
+        use aterm_slog::{Conf, Key, Kind, Src, Val};
+        let (handle, mut reader) = testing::owned_handle(1);
+        let expected = Actor::fleet("m72 / remote=desk");
+        let mark = {
+            let _driver = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+                node: "authenticated-node".to_owned(),
+                host: "m72 / remote=desk".to_owned(),
+            });
+            InputMark::at_epoch(
+                &handle.ctx,
+                1,
+                log_actor(Scope::Owner, &handle.ctx),
+                crate::session_log::InputVerb::Paste,
+                None,
+                false,
+            )
+            .typed_by(
+                &handle.ctx,
+                Some(crate::typed_by::Caller::new(crate::typed_by::Who::Word(
+                    "harness".to_owned(),
+                ))),
+            )
+        };
+        assert_eq!(log_actor(Scope::Owner, &handle.ctx), Actor::Ctl);
+        assert_eq!(testing::input_count(&handle), 0, "admission is not a write");
+        assert!(testing::paste(&handle, &mark, "by=harness"));
+        assert_eq!(
+            testing::byte(&mut reader),
+            b'b',
+            "actual accepted pipe byte"
+        );
+        let timeline = handle.ctx.timeline.lock().unwrap();
+        let rows: Vec<_> = timeline
+            .slog()
+            .log()
+            .window()
+            .filter(|row| row.k == Kind::Input)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].by, expected,
+            "neither later TLS, text nor typist selects the actor"
+        );
+        assert_eq!(rows[0].src, Src::Ctl);
+        assert_eq!(rows[0].conf, Conf::Strong);
+        assert_eq!(rows[0].f.get(Key::Verb), Some(&Val::Word("paste")));
     }
 
     #[test]

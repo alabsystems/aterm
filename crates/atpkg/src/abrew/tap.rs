@@ -1008,13 +1008,24 @@ pub fn formula_file(tap: &Tap, name: &str) -> Option<PathBuf> {
             return Some(c);
         }
     }
-    let first = name.chars().next()?.to_string();
-    let sharded = tap
-        .path
-        .join("Formula")
-        .join(first)
-        .join(format!("{name}.rb"));
-    inside(&sharded).then_some(sharded)
+    // Brew shards by first letter, with `lib*` formulae
+    // together under `Formula/lib/`.
+    let shards: Vec<String> = if name.starts_with("lib") {
+        vec!["lib".to_string(), name.chars().next()?.to_string()]
+    } else {
+        vec![name.chars().next()?.to_string()]
+    };
+    for shard in shards {
+        let sharded = tap
+            .path
+            .join("Formula")
+            .join(shard)
+            .join(format!("{name}.rb"));
+        if inside(&sharded) {
+            return Some(sharded);
+        }
+    }
+    None
 }
 
 /// Parse a formula `.rb` as data without evaluating Ruby.
@@ -1103,7 +1114,156 @@ pub fn parse_rb_as_data(text: &str, full_name: &str) -> Formula {
     if f.version.is_empty() {
         f.version = version_from_url(&f.stable_url);
     }
+    f.service = parse_service_block(text, &f.name.clone()).map(Box::new);
+    f.livecheck = parse_livecheck_block(text).map(|spec| {
+        f.skip_livecheck = spec.skip.is_some();
+        Box::new(spec)
+    });
+    f.no_autobump = text
+        .lines()
+        .any(|l| l.trim_start().starts_with("no_autobump!"));
     f
+}
+
+/// A tap formula's `service do ... end` block as data: the
+/// run argv (brew's `$HOMEBREW_PREFIX` placeholder forms),
+/// `require_root`, simple `environment_variables` pairs and
+/// an explicit macOS name. Anything beyond plain literals
+/// and `opt_bin`/`bin`-style joins (interpolation, computed
+/// values) yields no service, the data-only limit.
+fn parse_service_block(text: &str, name: &str) -> Option<super::formula::ServiceInfo> {
+    let mut lines = text.lines().map(str::trim);
+    lines.find(|l| *l == "service do" || l.starts_with("service do "))?;
+    let mut block: Vec<String> = Vec::new();
+    for line in lines {
+        if line == "end" {
+            break;
+        }
+        block.push(line.to_string());
+    }
+    let token = |tok: &str| -> Option<String> {
+        let tok = tok.trim().trim_end_matches(',');
+        if let Some(inner) = tok
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .filter(|s| !s.contains("#{"))
+        {
+            return Some(inner.to_string());
+        }
+        // receiver/"a"/"b" path joins.
+        let (recv, rest) = tok.split_once('/')?;
+        let base = match recv {
+            "opt_bin" => format!("$HOMEBREW_PREFIX/opt/{name}/bin"),
+            "opt_sbin" => format!("$HOMEBREW_PREFIX/opt/{name}/sbin"),
+            "opt_libexec" => format!("$HOMEBREW_PREFIX/opt/{name}/libexec"),
+            "bin" => "$HOMEBREW_PREFIX/bin".to_string(),
+            "sbin" => "$HOMEBREW_PREFIX/sbin".to_string(),
+            "libexec" => "$HOMEBREW_PREFIX/libexec".to_string(),
+            "var" => "$HOMEBREW_PREFIX/var".to_string(),
+            "etc" => "$HOMEBREW_PREFIX/etc".to_string(),
+            _ => return None,
+        };
+        let mut out = base;
+        let mut rest = rest;
+        loop {
+            let seg = rest.strip_prefix('"')?;
+            let end = seg.find('"')?;
+            let inner = &seg[..end];
+            if inner.contains("#{") {
+                return None;
+            }
+            out.push('/');
+            out.push_str(inner);
+            rest = seg[end + 1..].trim_start();
+            match rest.strip_prefix('/') {
+                Some(more) => rest = more,
+                None => break,
+            }
+        }
+        Some(out)
+    };
+    let mut run: Vec<String> = Vec::new();
+    let mut require_root = false;
+    let mut environment_variables: Vec<(String, String)> = Vec::new();
+    let mut explicit_name: Option<String> = None;
+    let mut working_dir: Option<String> = None;
+    let mut root_dir: Option<String> = None;
+    let mut log_path: Option<String> = None;
+    let mut error_log_path: Option<String> = None;
+    let mut interval: Option<i64> = None;
+    let mut cron: Option<String> = None;
+    // A bare directory receiver (`working_dir var`) or a
+    // receiver/"seg" join, as a placeholder path.
+    let path_token = |tok: &str| -> Option<String> {
+        match tok.trim().trim_end_matches(',') {
+            "var" => Some("$HOMEBREW_PREFIX/var".to_string()),
+            "etc" => Some("$HOMEBREW_PREFIX/etc".to_string()),
+            other => token(other),
+        }
+    };
+    let mut it = block.iter().peekable();
+    while let Some(line) = it.next() {
+        if let Some(rest) = line.strip_prefix("run ") {
+            let mut expr = rest.trim().to_string();
+            while expr.starts_with('[') && !expr.contains(']') {
+                expr.push(' ');
+                expr.push_str(it.next()?);
+            }
+            let items: Vec<&str> =
+                if let Some(inner) = expr.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                    inner.split(',').collect()
+                } else {
+                    vec![expr.as_str()]
+                };
+            for item in items {
+                if item.trim().is_empty() {
+                    continue;
+                }
+                run.push(token(item)?);
+            }
+        } else if line.starts_with("require_root") {
+            require_root = line.contains("true");
+        } else if let Some(rest) = line.strip_prefix("environment_variables ") {
+            for pair in rest.split(',') {
+                if let Some((key, value)) = pair.split_once(':')
+                    && let Some(v) = token(value)
+                {
+                    environment_variables.push((key.trim().to_string(), v));
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("name ") {
+            let macos = rest.split("macos:").nth(1).unwrap_or(rest);
+            explicit_name = cask_quoted(macos.trim_start(), "").or(explicit_name);
+        } else if let Some(rest) = line.strip_prefix("working_dir ") {
+            working_dir = path_token(rest).or(working_dir);
+        } else if let Some(rest) = line.strip_prefix("root_dir ") {
+            root_dir = path_token(rest).or(root_dir);
+        } else if let Some(rest) = line.strip_prefix("log_path ") {
+            log_path = path_token(rest).or(log_path);
+        } else if let Some(rest) = line.strip_prefix("error_log_path ") {
+            error_log_path = path_token(rest).or(error_log_path);
+        } else if let Some(rest) = line.strip_prefix("interval ") {
+            interval = rest.trim().parse().ok().or(interval);
+        } else if let Some(rest) = line.strip_prefix("cron ") {
+            cron = cask_quoted(rest.trim_start(), "").or(cron);
+        }
+    }
+    if run.is_empty() {
+        return None;
+    }
+    environment_variables.sort();
+    Some(super::formula::ServiceInfo {
+        run,
+        require_root,
+        environment_variables,
+        name: explicit_name,
+        working_dir,
+        root_dir,
+        log_path,
+        error_log_path,
+        interval,
+        cron,
+    })
 }
 
 fn version_from_url(url: &str) -> String {
@@ -1216,6 +1376,216 @@ fn macos_symbol_version(symbol: &str) -> Option<String> {
         }
         .to_string(),
     )
+}
+
+/// Whether a trimmed Ruby line opens a `do … end` block.
+fn line_opens_block(t: &str) -> bool {
+    t.ends_with(" do") || t.contains(" do |")
+}
+
+/// One quoted string token at the start of `s` (double quotes,
+/// interpolation already refused by the caller).
+fn quoted_token(s: &str) -> Option<(String, &str)> {
+    let inner = s.strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some((inner[..end].to_string(), &inner[end + 1..]))
+}
+
+/// A `:symbol` token at the start of `s`, colon stripped.
+fn symbol_token(s: &str) -> Option<(String, &str)> {
+    let inner = s.strip_prefix(':')?;
+    let len = inner
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(inner.len());
+    if len == 0 {
+        return None;
+    }
+    Some((inner[..len].to_string(), &inner[len..]))
+}
+
+/// The contents and option letters of a regex literal at the
+/// start of `s` (`/…/` or `%r{…}`), plus the unparsed tail.
+fn regex_literal(s: &str) -> Option<(String, String, &str)> {
+    let (open, close, rest) = match s.strip_prefix('/') {
+        Some(r) => ('/', '/', r),
+        None => ('{', '}', s.strip_prefix("%r{")?),
+    };
+    let mut depth = 1usize;
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == open && open != close {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                let tail = &rest[i + c.len_utf8()..];
+                let flen = tail
+                    .find(|c: char| !c.is_ascii_alphabetic())
+                    .unwrap_or(tail.len());
+                return Some((
+                    rest[..i].to_string(),
+                    tail[..flen].to_string(),
+                    &tail[flen..],
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Parse the package-level `livecheck do … end` block as data
+/// (brew's livecheck reads these blocks from tap files; the
+/// API JSON never carries them). Accepted, one statement per
+/// line: `url` (:sym or "str", trailing options only flagged),
+/// `regex(/…/flags)` / `regex(%r{…}flags)`, `strategy :sym`
+/// (an attached `do … end` Ruby block is flagged, not read),
+/// `skip ["msg"]`, `throttle [n] [days: m]`, `formula` /
+/// Whether `line` opens the package-level `livecheck` block
+/// (exactly two-space indent, tap style).
+fn livecheck_block_open(line: &str) -> bool {
+    line.strip_prefix("  ").is_some_and(|r| {
+        !r.starts_with(' ') && (r == "livecheck do" || r.starts_with("livecheck do "))
+    })
+}
+
+/// Whether the tap file text carries a package-level
+/// `livecheck` block at all (brew's `livecheck_defined?`, as
+/// far as data can tell) — distinguishes "no block" from
+/// "block [`parse_livecheck_block`] refused".
+#[must_use]
+pub fn livecheck_block_present(text: &str) -> bool {
+    text.lines().any(livecheck_block_open)
+}
+
+/// `cask` references. Any interpolation or other statement
+/// makes the whole block unparseable — fail-closed, the
+/// `parse_service_block` discipline. The package-level block
+/// is the one indented exactly two spaces (tap style);
+/// resource-level blocks nest deeper and are not this.
+#[must_use]
+pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec> {
+    use super::formula::{LivecheckSpec, LivecheckUrl};
+    let mut lines = text.lines();
+    lines.find(|l| livecheck_block_open(l))?;
+    let mut body: Vec<&str> = Vec::new();
+    let mut depth = 1usize;
+    for line in lines {
+        let t = line.trim();
+        if t == "end" {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        } else if line_opens_block(t) {
+            depth += 1;
+        }
+        body.push(t);
+    }
+    if depth != 0 {
+        return None;
+    }
+    let mut spec = LivecheckSpec::default();
+    let mut depth = 1usize;
+    for t in body {
+        if t == "end" {
+            depth -= 1;
+            continue;
+        }
+        let opens = line_opens_block(t);
+        // Interpolation in a statement we read is not data; a
+        // strategy block's unread Ruby body may contain it.
+        if depth == 1 && t.contains("#{") {
+            return None;
+        }
+        if depth == 1 && !t.is_empty() && !t.starts_with('#') {
+            if let Some(rest) = t.strip_prefix("url ") {
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix('(')
+                    .unwrap_or(rest.trim_start());
+                let (url, tail) = if rest.starts_with(':') {
+                    let (sym, tail) = symbol_token(rest)?;
+                    (LivecheckUrl::Symbol(sym), tail)
+                } else {
+                    let (s, tail) = quoted_token(rest)?;
+                    (LivecheckUrl::Literal(s), tail)
+                };
+                spec.url = Some(url);
+                spec.url_options = !tail.trim().trim_end_matches(')').trim().is_empty();
+            } else if let Some(rest) = t.strip_prefix("regex(") {
+                let (pattern, flags, tail) = regex_literal(rest)?;
+                if tail.trim() != ")" {
+                    return None;
+                }
+                spec.regex = Some(pattern);
+                spec.regex_flags = flags;
+            } else if let Some(rest) = t.strip_prefix("strategy ") {
+                let (sym, tail) = symbol_token(rest.trim_start())?;
+                let tail = tail.trim();
+                if !(tail.is_empty()
+                    || tail == "do"
+                    || (tail.starts_with("do |") && tail.ends_with('|')))
+                {
+                    return None;
+                }
+                spec.strategy = Some(sym);
+                spec.strategy_block = opens;
+            } else if t == "skip" {
+                spec.skip = Some(String::new());
+            } else if let Some(rest) = t.strip_prefix("skip ").or_else(|| t.strip_prefix("skip(")) {
+                let (msg, tail) = quoted_token(rest.trim_start())?;
+                if !matches!(tail.trim(), "" | ")") {
+                    return None;
+                }
+                spec.skip = Some(msg);
+            } else if let Some(rest) = t.strip_prefix("throttle ") {
+                for part in rest.split(',') {
+                    let part = part.trim();
+                    if let Some(days) = part.strip_prefix("days:") {
+                        spec.throttle_days = Some(days.trim().parse().ok()?);
+                    } else {
+                        spec.throttle = Some(part.parse().ok()?);
+                    }
+                }
+            } else if let Some(rest) = t.strip_prefix("formula ") {
+                let rest = rest.trim_start();
+                spec.formula_ref = Some(if rest.starts_with(':') {
+                    let (sym, tail) = symbol_token(rest)?;
+                    if !tail.trim().is_empty() {
+                        return None;
+                    }
+                    format!(":{sym}")
+                } else {
+                    let (name, tail) = quoted_token(rest)?;
+                    if !tail.trim().is_empty() {
+                        return None;
+                    }
+                    name
+                });
+            } else {
+                // The remaining known statement; anything else
+                // refuses the block (the `?`).
+                let rest = t.strip_prefix("cask ")?;
+                let (name, tail) = quoted_token(rest.trim_start())?;
+                if !tail.trim().is_empty() {
+                    return None;
+                }
+                spec.cask_ref = Some(name);
+            }
+        }
+        if opens {
+            depth += 1;
+        }
+    }
+    Some(spec)
 }
 
 /// Parse a cask `.rb` as data without evaluating Ruby, the
@@ -1378,6 +1748,13 @@ pub fn parse_cask_rb_as_data(text: &str, token: &str) -> Cask {
         interpolate_artifact(artifact, &c.version, &mut unsupported);
     }
     c.caveats = c.caveats.trim_start_matches('\u{1}').to_string();
+    c.livecheck = parse_livecheck_block(text).map(|spec| {
+        c.skip_livecheck = spec.skip.is_some();
+        Box::new(spec)
+    });
+    c.no_autobump = text
+        .lines()
+        .any(|l| l.trim_start().starts_with("no_autobump!"));
     c.unsupported_constraints = unsupported;
     c
 }
@@ -1722,6 +2099,83 @@ mod tests {
         );
     }
 
+    /// r376: livecheck blocks parse as data across the shapes
+    /// the core tap actually uses (samples verbatim from
+    /// homebrew-core); interpolation and unknown statements
+    /// refuse the whole block (fail-closed).
+    #[test]
+    fn livecheck_block_parses_as_data() {
+        use super::super::formula::LivecheckUrl;
+        let spec = parse_livecheck_block(
+            "class Jq < Formula\n  livecheck do\n    url :stable\n    regex(/^(?:jq[._-])?v?(\\d+(?:\\.\\d+)+)$/i)\n  end\nend\n",
+        )
+        .unwrap();
+        assert_eq!(spec.url, Some(LivecheckUrl::Symbol("stable".into())));
+        assert_eq!(
+            spec.regex.as_deref(),
+            Some(r"^(?:jq[._-])?v?(\d+(?:\.\d+)+)$")
+        );
+        assert_eq!(spec.regex_flags, "i");
+        assert!(!spec.url_options && !spec.strategy_block);
+
+        let spec = parse_livecheck_block(
+            "  livecheck do\n    url \"https://files.radicle.xyz/releases/latest/radicle.json\"\n    strategy :json do |json|\n      json[\"version\"]\n    end\n  end\n",
+        )
+        .unwrap();
+        assert_eq!(
+            spec.url,
+            Some(LivecheckUrl::Literal(
+                "https://files.radicle.xyz/releases/latest/radicle.json".into()
+            ))
+        );
+        assert_eq!(spec.strategy.as_deref(), Some("json"));
+        assert!(spec.strategy_block);
+
+        let spec = parse_livecheck_block(
+            "  livecheck do\n    regex(%r{<version>v?(\\d+(?:\\.\\d+)+)</version>}i)\n    throttle days: 1\n  end\n",
+        )
+        .unwrap();
+        assert_eq!(
+            spec.regex.as_deref(),
+            Some(r"<version>v?(\d+(?:\.\d+)+)</version>")
+        );
+        assert_eq!(spec.throttle_days, Some(1));
+
+        let spec = parse_livecheck_block(
+            "  livecheck do\n    skip \"Not actively developed or maintained\"\n  end\n",
+        )
+        .unwrap();
+        assert_eq!(
+            spec.skip.as_deref(),
+            Some("Not actively developed or maintained")
+        );
+
+        // Nested resource block is not the package block, and a
+        // block after it still resolves as the package one.
+        let none = parse_livecheck_block(
+            "  resource \"man\" do\n    livecheck do\n      formula :parent\n    end\n  end\n",
+        );
+        assert!(none.is_none());
+        let spec = parse_livecheck_block(
+            "  livecheck do\n    formula \"git\"\n  end\n  resource \"man\" do\n    livecheck do\n      formula :parent\n    end\n  end\n",
+        )
+        .unwrap();
+        assert_eq!(spec.formula_ref.as_deref(), Some("git"));
+
+        // Interpolation and unknown statements refuse.
+        assert!(
+            parse_livecheck_block(
+                "  livecheck do\n    url \"https://example.com/#{version}/\"\n  end\n"
+            )
+            .is_none()
+        );
+        assert!(
+            parse_livecheck_block("  livecheck do\n    url :stable\n    whatever 1\n  end\n")
+                .is_none()
+        );
+        assert!(parse_livecheck_block("class X < Formula\nend\n").is_none());
+    }
+
     #[test]
     fn tap_add_refusals_match_brew() {
         let tmp = aterm_tempfile::tempdir().unwrap();
@@ -2004,6 +2458,40 @@ mod tests {
         assert_eq!(f.version, "2.1");
         assert_eq!(f.stable_sha256, "aaaa");
         assert_eq!(f.dependencies, ["openssl@3"]);
+    }
+
+    #[test]
+    fn rb_parse_service_block_as_data() {
+        let rb = "class Foo < Formula\n  url \"https://foo.example/foo-2.1.tar.gz\"\n  service do\n    run [opt_bin/\"foo\", \"--serve\", \"-c\", etc/\"foo.conf\"]\n    require_root true\n    environment_variables FOO: \"bar\"\n    log_path var/\"log/foo.log\"\n    error_log_path var/\"log/foo.err\"\n    interval 3600\n    name macos: \"com.example.foo\"\n  end\nend\n";
+        let f = parse_rb_as_data(rb, "me/tap/foo");
+        let svc = f.service.expect("service block parsed");
+        assert_eq!(
+            svc.run,
+            [
+                "$HOMEBREW_PREFIX/opt/foo/bin/foo",
+                "--serve",
+                "-c",
+                "$HOMEBREW_PREFIX/etc/foo.conf",
+            ]
+        );
+        assert!(svc.require_root);
+        assert_eq!(
+            svc.environment_variables,
+            [("FOO".to_string(), "bar".to_string())]
+        );
+        assert_eq!(
+            svc.log_path.as_deref(),
+            Some("$HOMEBREW_PREFIX/var/log/foo.log")
+        );
+        assert_eq!(
+            svc.error_log_path.as_deref(),
+            Some("$HOMEBREW_PREFIX/var/log/foo.err")
+        );
+        assert_eq!(svc.interval, Some(3600));
+        assert_eq!(svc.name.as_deref(), Some("com.example.foo"));
+        // An interpolated run is beyond data-only parsing.
+        let rb = "class Foo < Formula\n  service do\n    run [opt_bin/\"foo\", \"--opt=#{etc}/x\"]\n  end\nend\n";
+        assert!(parse_rb_as_data(rb, "me/tap/foo").service.is_none());
     }
 
     #[test]

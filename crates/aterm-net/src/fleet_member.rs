@@ -3864,19 +3864,27 @@ pub fn recheck_driver(
     driver_as_of(Some(proof), (state_dir, grants), log)
 }
 
-fn driver_as_of(
+fn own_node_and_key_mismatch(state_dir: &Path, proved: &NodeProof) -> (Option<String>, bool) {
+    match read_node_identity(state_dir).ok().flatten() {
+        Some(own) => {
+            let mismatch = own.node() == proved.node && own.key() != proved.key;
+            (Some(own.node().to_owned()), mismatch)
+        }
+        None => {
+            let own_node = read_node_id(state_dir).ok().flatten();
+            let mismatch = own_node.as_deref() == Some(proved.node.as_str());
+            (own_node, mismatch)
+        }
+    }
+}
+
+fn driver_in_keyring<'a>(
     proof: Option<&NodeProof>,
-    (state_dir, grants): (&Path, &[DriveGrant]),
+    (own_key_mismatch, grants): (bool, &[DriveGrant]),
     log: Option<&MemberKeys>,
+    keys: impl FnOnce() -> &'a Keyring,
 ) -> Result<String, Undriven> {
     let proved = proof.ok_or(Undriven::Unproven(Unproven::NoProof))?;
-    let own_key_mismatch = match read_node_identity(state_dir).ok().flatten() {
-        Some(own) => own.node() == proved.node && own.key() != proved.key,
-        None => read_node_id(state_dir)
-            .ok()
-            .flatten()
-            .is_some_and(|own_node| own_node == proved.node),
-    };
     if own_key_mismatch {
         return Err(Undriven::Unproven(Unproven::OtherKey(proved.node.clone())));
     }
@@ -3886,7 +3894,7 @@ fn driver_as_of(
             why: why.clone(),
         }),
         Some(Standing::Member) => {
-            let keys = Keyring::read(state_dir);
+            let keys = keys();
             // A node id the book binds to another key the log did not take out is that member's.
             if let Some(bound) = keys.bound(&proved.node)
                 && bound != proved.key
@@ -3902,8 +3910,88 @@ fn driver_as_of(
                 Err(Undriven::Unlisted(proved.node.clone()))
             }
         }
-        None => Keyring::read(state_dir).driver(proof, grants),
+        None => keys().driver(proof, grants),
     }
+}
+
+fn driver_as_of(
+    proof: Option<&NodeProof>,
+    (state_dir, grants): (&Path, &[DriveGrant]),
+    log: Option<&MemberKeys>,
+) -> Result<String, Undriven> {
+    let proved = proof.ok_or(Undriven::Unproven(Unproven::NoProof))?;
+    let (_, own_key_mismatch) = own_node_and_key_mismatch(state_dir, proved);
+    let keyring = std::cell::OnceCell::new();
+    driver_in_keyring(Some(proved), (own_key_mismatch, grants), log, || {
+        keyring.get_or_init(|| Keyring::read(state_dir))
+    })
+}
+
+/// Verdict from [`recheck_driver_and_peer`]: `Ok((node, peer))` when admitted under the
+/// current bindings, membership log and grants, or `Err(why)` when refused.
+pub type DriverPeerVerdict = Result<(String, Option<Peer>), Undriven>;
+
+/// [`recheck_driver`] together with [`known_nodes`] and [`peer_of`] from one read of
+/// `state_dir`'s identity, book and issuer-book copy: returns `(verdict, knows)` where
+/// `verdict` is `Ok((node, peer))` when admitted under `grants` and `log` or `Err(why)`
+/// when refused, and `knows` holds every known node id for [`driver_name`] or [`Undriven::said`].
+pub fn recheck_driver_and_peer(
+    proof: Option<&NodeProof>,
+    state_dir: &Path,
+    grants: &[DriveGrant],
+    log: Option<&MemberKeys>,
+) -> (DriverPeerVerdict, Vec<String>) {
+    let Some(proved) = proof else {
+        return (Err(Undriven::Unproven(Unproven::NoProof)), Vec::new());
+    };
+    let (own_node, own_key_mismatch) = own_node_and_key_mismatch(state_dir, proved);
+    let (mut peers, copies) = book_and_copies(state_dir);
+    let knows: Vec<String> = own_node
+        .into_iter()
+        .chain(
+            peers
+                .iter()
+                .chain(&copies)
+                .filter_map(|peer| peer.node.clone()),
+        )
+        .collect();
+    let keys = Keyring::of(peers.iter().chain(&copies));
+    let verdict = match driver_in_keyring(Some(proved), (own_key_mismatch, grants), log, || &keys) {
+        Ok(node) => {
+            with_copies(&mut peers, copies);
+            let peer = peers
+                .into_iter()
+                .find(|peer| peer.node.as_deref() == Some(node.as_str()));
+            Ok((node, peer))
+        }
+        Err(why) => Err(why),
+    };
+    (verdict, knows)
+}
+
+/// Read `state_dir`'s book and issuer-book copy once to supply what a `vault-join` channel
+/// judgment needs for `proof`: whether `proof` is admitted as a driver under `grants` and
+/// `log` ([`proven_driver`]), the key the keyring binds `proof.node` to ([`Keyring::bound`]),
+/// and the book's peers (`None` when the book could not be read).
+#[must_use]
+pub fn vault_join_driver_and_book(
+    proof: &NodeProof,
+    state_dir: &Path,
+    grants: &[DriveGrant],
+    log: Option<&MemberKeys>,
+) -> (bool, Option<NodeKey>, Option<Vec<Peer>>) {
+    let (_, own_key_mismatch) = own_node_and_key_mismatch(state_dir, proof);
+    let peers = read_peers(state_dir).ok();
+    let copies = peers
+        .as_deref()
+        .and_then(issuer_of)
+        .and_then(|issuer| issuer.node.as_deref())
+        .map(|issuer| read_issuer_book(state_dir, issuer))
+        .unwrap_or_default();
+    let keys = Keyring::of(peers.iter().flatten().chain(&copies));
+    let driven = driver_in_keyring(Some(proof), (own_key_mismatch, grants), log, || &keys).is_ok();
+    let bound = keys.bound(&proof.node);
+    (driven, bound, peers)
 }
 
 fn issuer_of(book: &[Peer]) -> Option<&Peer> {
@@ -5197,7 +5285,15 @@ pub fn heartbeat_members_while(
             // The seed a member's reply relays in its trailer, once this book, merged, binds its
             // minter (machine names §3.3). One not written now is offered again by the next
             // round's reads, so its failure stops none of this round's writes.
-            let updated_keys = Keyring::of(updated_peers.iter().chain(&effective_issuer_copies));
+            // Copied keys belong to the issuer the updated book names, which pruning or
+            // another write may have changed since this round captured its first copy.
+            let seed_copies = match issuer_of(&updated_peers).and_then(|peer| peer.node.as_deref())
+            {
+                Some(current) if Some(current) == issuer.as_deref() => effective_issuer_copies,
+                Some(current) => read_issuer_book(state_dir, current),
+                None => Vec::new(),
+            };
+            let updated_keys = Keyring::of(updated_peers.iter().chain(&seed_copies));
             let _ = book.adopt_relayed_seed_with_keys(
                 me,
                 secret.mark(),
@@ -6972,6 +7068,30 @@ pub fn dial(
     )
 }
 
+/// Resolve a named fallback after a numeric preparation round, without retrying
+/// any numeric address that round already covered. This owns no background work.
+///
+/// # Errors
+/// As [`dial`], under the same original deadline and source policy.
+pub fn dial_named_avoiding(
+    host: &str,
+    port: u16,
+    identity: (&FleetSecret, Option<&NodeIdentity>),
+    op: FleetOp,
+    deadline: (Instant, Duration),
+    avoid: &[SocketAddr],
+) -> Result<Reached, Unreached> {
+    dial_avoiding(
+        host,
+        None,
+        port,
+        identity,
+        op,
+        deadline,
+        (avoid, resolve, &|_, _| None),
+    )
+}
+
 /// Dial `host` (`addr` first) on `port` on [`crate::fleet::ALPN_ASK`] by `within`, holding no fleet
 /// secret: a Mac asking to join reaches a member's ask handler and nothing else
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10). Each address is walked as [`dial`] walks it: the
@@ -7010,6 +7130,74 @@ pub fn dial_ask(
             }
         },
     )
+}
+
+/// Prepare one numeric ask connection without sending an admission request.
+/// Cancellation interrupts connect, TLS and the bounded stream's later greeting read.
+///
+/// # Errors
+/// The route, current cancellation, connection, TLS or original deadline refuses it.
+pub fn prepare_ask(
+    to: SocketAddr,
+    (deadline, within): (Instant, Duration),
+    control: &std::sync::Arc<crate::tls::PreparationControl>,
+) -> Result<crate::tls::BoundedStream<ClientConnection>, Unreached> {
+    prepare_source(to)?;
+    control
+        .check()
+        .map_err(|error| Unreached::Connect(to, error))?;
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(Unreached::Deadline(Stage::Connect, within));
+    }
+    let tcp = aterm_uds::connect_tcp_stopped(&to, left.min(CONNECT_WITHIN), control.stop())
+        .map_err(|error| Unreached::Connect(to, error))?;
+    let left = deadline
+        .saturating_duration_since(Instant::now())
+        .min(address_handshake_within());
+    let transport = crate::fleet::ask_handshake_stopped(tcp, left, control)
+        .map_err(|error| Unreached::Handshake(to, error))?;
+    transport
+        .into_preparing_stream(deadline, std::sync::Arc::clone(control))
+        .map_err(|error| Unreached::Connect(to, error))
+}
+
+/// Prepare the fleet-authenticated numeric recovery channel, without a vault request.
+/// The existing fleet proof, mesh fallback and deadline retain their ordinary meaning.
+///
+/// # Errors
+/// The route, cancellation, fleet proof, connect or original deadline refuses it.
+pub fn prepare_vault_join(
+    to: SocketAddr,
+    (secret, me): (&FleetSecret, &NodeIdentity),
+    (deadline, within): (Instant, Duration),
+    control: &std::sync::Arc<crate::tls::PreparationControl>,
+) -> Result<crate::tls::BoundedStream<ClientConnection>, Unreached> {
+    prepare_source(to)?;
+    let reached = match reach_controlled(
+        to,
+        (secret, Some(me)),
+        FleetOp::VaultJoin,
+        (deadline, within),
+        &|_, _| None,
+        Some(control),
+    ) {
+        AtAddr::Reached(reached) => reached,
+        AtAddr::Passed(why) | AtAddr::Ended(why) => return Err(why),
+        AtAddr::Refused(refused) => return Err(refused.why),
+    };
+    reached
+        .transport
+        .into_preparing_stream(deadline, std::sync::Arc::clone(control))
+        .map_err(|error| Unreached::Connect(to, error))
+}
+
+fn prepare_source(to: SocketAddr) -> Result<(), Unreached> {
+    if !crate::fleet::is_fleet_source(to.ip()) {
+        return Err(Unreached::NotFleet(to));
+    }
+    crate::loopback::check(crate::loopback::Reach::Dial(to))
+        .map_err(|refused| Unreached::Local(refused.to_string()))
 }
 
 type Resolver = fn(&str, u16) -> Vec<SocketAddr>;
@@ -7355,11 +7543,28 @@ fn reach(
     (deadline, within): (Instant, Duration),
     refused: RefusedBy<'_>,
 ) -> AtAddr<Reached> {
+    reach_controlled(to, (secret, me), op, (deadline, within), refused, None)
+}
+
+fn reach_controlled(
+    to: SocketAddr,
+    (secret, me): (&FleetSecret, Option<&NodeIdentity>),
+    op: FleetOp,
+    (deadline, within): (Instant, Duration),
+    refused: RefusedBy<'_>,
+    control: Option<&std::sync::Arc<crate::tls::PreparationControl>>,
+) -> AtAddr<Reached> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return AtAddr::Ended(Unreached::Deadline(Stage::Connect, within));
     }
-    match aterm_uds::connect_tcp(&to, left.min(CONNECT_WITHIN)) {
+    let tcp = match control {
+        Some(control) => {
+            aterm_uds::connect_tcp_stopped(&to, left.min(CONNECT_WITHIN), control.stop())
+        }
+        None => aterm_uds::connect_tcp(&to, left.min(CONNECT_WITHIN)),
+    };
+    match tcp {
         Ok(tcp) => {
             let left = deadline
                 .saturating_duration_since(Instant::now())
@@ -7370,7 +7575,13 @@ fn reach(
             } else {
                 left
             };
-            match client_handshake_by(tcp, secret, me, op, left) {
+            let handshake = match control {
+                Some(control) => {
+                    crate::fleet::client_handshake_by_stopped(tcp, secret, me, op, left, control)
+                }
+                None => client_handshake_by(tcp, secret, me, op, left),
+            };
+            match handshake {
                 Ok(Dialed {
                     transport,
                     scope,
@@ -7392,12 +7603,13 @@ fn reach(
                         offer(to);
                     }
                     let fleet = me.map(|me| me.clone().dialing_mesh(None));
-                    reach(
+                    reach_controlled(
                         to,
                         (secret, fleet.as_ref()),
                         op,
                         (deadline, within),
                         refused,
+                        control,
                     )
                 }
                 Err(Undialed { error, refused_by }) => {
@@ -9473,7 +9685,7 @@ pub fn read_admitted_pushed_facts(
     let Ok(judged) = aterm_uds::private_file::JudgedDir::judge(&dir) else {
         return Vec::new();
     };
-    let keyring = Keyring::read(state_dir);
+    let keyring = std::cell::OnceCell::new();
     let key_denied = |key: &NodeKey| {
         crate::fleet::is_denied_key(key, denied_nodes) || log.is_some_and(|log| log.holds_out(key))
     };
@@ -9490,7 +9702,11 @@ pub fn read_admitted_pushed_facts(
             let facts = pushed_facts_at(&judged, &node)?;
             if facts
                 .key
-                .or_else(|| keyring.bound(&node))
+                .or_else(|| {
+                    keyring
+                        .get_or_init(|| Keyring::read(state_dir))
+                        .bound(&node)
+                })
                 .as_ref()
                 .is_some_and(key_denied)
             {

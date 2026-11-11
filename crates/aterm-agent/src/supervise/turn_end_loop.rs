@@ -887,121 +887,17 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// The model switch an earlier loop left open.
-    pub(super) fn carried_model_switch(&self, open: approvals::OpenSwitch) -> ModelSwitch {
-        ModelSwitch {
-            from: open.from,
-            to: open.to,
-            back_at: open.back_at_unix.map(|unix| self.instant_of(unix)),
-            proc: open.proc,
-            unproven: false,
-        }
-    }
-
-    /// The model switch in force, scoped to the agent process the host names
-    /// ([`TurnEndState::agent_process`]); a move or an end is written for a loop that follows.
-    fn scope_model_switch(&mut self, host: Option<&Arc<dyn IdleHost>>, seq: u64) {
-        if self.turn_end.model_switch().is_none() {
-            return;
-        }
-        let Some(h) = host else {
-            return;
-        };
-        let (Some(pid), Some(start)) = (h.agent_pid(), h.agent_started()) else {
-            return;
-        };
-        self.scope_model_switch_to(h, pid, start, seq);
-    }
-
-    /// [`Self::scope_model_switch`] at the process (`pid`, started at `start` unix seconds) the
-    /// host's point read named ([`IdleHost::agent_resumed`]), when the switch is not in it: the
-    /// host forgets an exited agent's snapshot, so the reading at a new program's first point may
-    /// name no process, and the host reads it only then. A switch already in that process is
-    /// left as it stands: that process keeps the switch's return on any conversation it holds.
-    fn scope_model_switch_at_point(
-        &mut self,
-        h: &Arc<dyn IdleHost>,
-        pid: u32,
-        start: i64,
-        seq: u64,
-    ) {
-        let elsewhere = self.turn_end.model_switch().is_some_and(|m| {
-            m.proc
-                .as_ref()
-                .is_none_or(|p| (p.pid, p.start) != (pid, start))
-        });
-        if elsewhere {
-            self.scope_model_switch_to(h, pid, start, seq);
-        }
-    }
-
-    /// [`Self::scope_model_switch`] at the process the host named, with the conversation it names.
-    fn scope_model_switch_to(&mut self, h: &Arc<dyn IdleHost>, pid: u32, start: i64, seq: u64) {
-        use super::super::policy::turn_end::{
-            RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, SwitchScope,
-        };
-        let conversation = h.agent_conversation();
-        match self
-            .turn_end
-            .agent_process(pid, start, conversation.as_deref(), || h.relaunch_owed())
-        {
-            None => {}
-            Some(SwitchScope::Moved(p)) => self.ledger_row(
-                RULE_MODEL_FALLBACK,
-                approvals::Outcome::Waiting,
-                "",
-                &approvals::switch_process_reason(&p),
-                seq,
-            ),
-            Some(SwitchScope::Closed) => self.ledger_row(
-                RULE_MODEL_RESTORE,
-                approvals::Outcome::Waiting,
-                "",
-                approvals::SWITCH_CLOSED,
-                seq,
-            ),
-        }
-    }
-
-    /// THE MODEL SWITCH AN EARLIER LOOP MADE ([`approvals::open_model_switch`]).
-    #[cfg(test)]
-    pub(super) fn seed_model_switch(&mut self, path: &std::path::Path) {
-        let body = self.fx.read_text(path).unwrap_or_default();
-        self.seed_model_switch_in(&body, None);
-    }
-
-    /// `Self::seed_model_switch` over the ledger's text: the switch the ledger shows made and not
-    /// yet taken back, dated by its row's `made=`, or, where the loop reads the journal beside a
-    /// ledger an older build left with no point rows (`journal`), by the earlier of that and the
-    /// second the journal's restart notes show the claim that made it taken
-    /// ([`journaled_fallback_made`]). A move still waiting is restored from the journal alone, by
-    /// its claim ([`Self::seed_open_move_in`]).
-    pub(super) fn seed_model_switch_in(&mut self, body: &str, journal: Option<&str>) {
-        let Some(open) = approvals::open_model_switch_in(body, self.setup.sid.as_deref()) else {
-            return;
-        };
-        let made_at = journal
-            .and_then(|j| journaled_fallback_made(j, self.setup.sid.as_deref()))
-            .map_or(open.made_unix, |m| m.min(open.made_unix));
-        let asked = open.asked;
-        let switch = self.carried_model_switch(open);
-        self.turn_end.seed_model(switch);
-        if !asked {
-            self.turn_end.seed_fallback_unasked(made_at);
-        }
-    }
-
     /// THE RUNS OF THE MOVES AN EARLIER LOOP LEFT OPEN, restored from the journal beside the
     /// ledger (`journal`, [`journaled_open_moves`]): the run in the slot and the one set aside
     /// beside an account move's (`Session::restart_aside`), each a move's run that outlives the
-    /// loop's acts ([`RestartRun::move_outlives_acts`]): a model's move onto its fallback or back,
-    /// or an account move, in a run that held a live claim of the conversation's record
+    /// loop's acts ([`RestartRun::move_outlives_acts`]): a route move or an account move, in a
+    /// run that held a live claim of the conversation's record
     /// ([`RestartRun::claimed`]), or an account move ahead put off to a quiet moment, whatever it
     /// held. Each comes back holding what its notes name, so it outlives this loop's acts as it
     /// outlived the earlier loop's (`Self::run_outlives_act`), and the move asked here is asked as
     /// the earlier loop asked it: a claimed move meets the record its ask claimed and landed a
     /// relaunch for (`relaunch::its_own`), carried while in flight, made once carried on in the
-    /// asker (`relaunch::already_made`), never restarted over, and is dated by that claim; an
+    /// asker (`relaunch::already_made`), never restarted over; an
     /// account move's record is never its own, so the move ahead keeps its ask with no other
     /// effect. Only their back-off starts again. A move whose last note held no claim and is no
     /// account move ahead leaves no run: its next ask here is a run of this loop's, as it would have
@@ -1742,9 +1638,6 @@ impl<C: Ctl> Session<'_, C> {
             let at = self.instant_of(started);
             self.turn_end.agent_started(at);
             self.turn_end.agent_started_unix(started);
-        }
-        if check == Check::Decide {
-            self.scope_model_switch(opts.idle_host.as_ref(), screen.seq);
         }
         if check == Check::Decide && self.turn_end.reads_opening() {
             self.turn_end.opening_read(reader.opening(&screen.rows));
@@ -2491,13 +2384,6 @@ impl<C: Ctl> Session<'_, C> {
                 let at = self.instant_of(started);
                 self.turn_end.agent_started(at);
                 self.turn_end.agent_started_unix(started);
-            }
-            // The model switch is scoped to that process too, before the point is decided: a fresh
-            // program the reading could not name never has the switch's return made onto it.
-            if let Some(cur) = current
-                && let Some(started) = cur.started
-            {
-                self.scope_model_switch_at_point(host, cur.pid, started, seq);
             }
         }
         let awaited = self.turn_end.account_answer_awaited(r);
@@ -4333,8 +4219,8 @@ impl<C: Ctl> Session<'_, C> {
     /// RESTART ([`Self::turn_end_execute`]), which ends every other run and its back-off: the run
     /// of a lost line's restart ([`Restart::InputLost`]) while a line stands held in [`Custody`],
     /// as a write the custody holds may turn into that restart (`Self::custody_lost`), its
-    /// back-off going on; the run of a move ([`Restart::moves`]: a model's move onto its fallback
-    /// or back, an account move) while it holds a live claim of the conversation's record
+    /// back-off going on; the run of a move ([`Restart::moves`]: an account move or a route move)
+    /// while it holds a live claim of the conversation's record
     /// ([`RestartRun::claimed`], [`RestartClaim`]); and the run of an account move ahead
     /// ([`Restart::ACCOUNT_AHEAD`], put off to a quiet moment), whatever it holds
     /// ([`Self::outlives_act`]). A move's run so kept stands until the move is made or refused or
@@ -4347,10 +4233,8 @@ impl<C: Ctl> Session<'_, C> {
     /// move at the turn ends that come (`upgrading`), so the move's next ask must be the same to
     /// meet that record (`relaunch::its_own`): carried while in flight, made once carried on in the
     /// asker (`relaunch::already_made`), never a second relaunch, as a later loop's is
-    /// ([`Self::seed_open_move_in`]). A model's move whose run holds no claim ends its run here, so
-    /// a later ask that claims the record is another run's. Either way the move is dated by the
-    /// second its claim was taken ([`approvals::model_switch_reason`]), so a run kept past the act
-    /// dates no move by an ask that claimed nothing. No account move's record is its own, so no
+    /// ([`Self::seed_open_move_in`]). A route move whose run holds no claim ends its run here, so
+    /// a later ask that claims the record is another run's. No account move's record is its own, so no
     /// account move's answer holds or takes a claim, and the move ahead's kept run changes no
     /// answer: it keeps the move's back-off, so the move is asked again on its own step (a run
     /// minted afresh at every point would hold the point's wait, and the move's asks, at the
@@ -4814,7 +4698,7 @@ impl<C: Ctl> Session<'_, C> {
     /// The restart the policy asked for, made by the host and journaled `HOST seq=<n>
     /// restart:<why> ask=<ask> claimed=<second|no> step=<word>` (the host's answer,
     /// [`RestartAnswer`]: its word, and what it read of the conversation's record, which sets the
-    /// claim the run holds, [`RestartRun::claimed`], by which a model's move is dated). The host's
+    /// claim the run holds, [`RestartRun::claimed`]). The host's
     /// success word says it made the
     /// restart, and the process the restart's own report names after it
     /// (`IdleHost::restart_left`), else the one the host names now, is the evidence
@@ -4882,7 +4766,7 @@ impl<C: Ctl> Session<'_, C> {
         let answer: Option<RestartAnswer> =
             opts.idle_host.as_ref().and_then(|h| h.restart(why, &ask));
         // The claim the run holds, which keeps a move's ask past the loop's other acts
-        // (`Self::run_outlives_act`) and dates the move: taken at this answer's second, held as
+        // (`Self::run_outlives_act`): taken at this answer's second, held as
         // it was (at the run's second where this loop never saw it taken), lapsed where the
         // answer read the record and found no live claim of the run's, and kept as it was where
         // the answer read no record (another sweep's lock, no session record of the asker).
@@ -4897,9 +4781,6 @@ impl<C: Ctl> Session<'_, C> {
             run.claimed = claimed;
         }
         let step = answer.map(|a| a.step);
-        // The second a move made by this answer is dated by (`fallback_made_at`,
-        // `approvals::model_switch_reason`): its claim's, else the run's.
-        let made_unix = claimed.unwrap_or(asked_unix);
         // The note a later loop reads the run back from (`journaled_open_moves`): at the run's
         // first asks, where its claim changed, and at every answer that ends it (`-`: none), so
         // the journal's last note of a run says what the loop last knew of it.
@@ -4972,13 +4853,6 @@ impl<C: Ctl> Session<'_, C> {
                     let at = after.as_ref().and_then(|s| self.counted_conversation(s));
                     self.turn_end.counted_after_harness(at);
                 }
-                if matches!(why, Restart::Model { .. }) {
-                    self.turn_end.fallback_made_at(made_unix);
-                    if let Some(kept) = &mut self.credits_kept {
-                        kept.model = None;
-                    }
-                }
-                let unasked = self.turn_end.fallback_unasked();
                 if word == Some("continued") {
                     let kind = step
                         .as_deref()
@@ -4994,13 +4868,6 @@ impl<C: Ctl> Session<'_, C> {
                     },
                     Restart::InputLost { .. } => {
                         "the agent, for the line it read and drew none of".to_string()
-                    }
-                    Restart::Model { to } => format!("relaunch --model {to}"),
-                    Restart::ModelBack { to } => {
-                        format!(
-                            "relaunch --model {}",
-                            to.as_deref().unwrap_or("(its launch's)")
-                        )
                     }
                     Restart::Account { to, .. } => {
                         format!("{}{to}", approvals::ACCOUNT_MOVE_COMMAND)
@@ -5030,58 +4897,31 @@ impl<C: Ctl> Session<'_, C> {
                         review,
                     )?;
                 }
-                let switch = self
-                    .turn_end
-                    .model_switch()
-                    .filter(|_| matches!(why, Restart::Model { .. }))
-                    .cloned();
-                let back = match (&switch, why) {
-                    (Some(m), _) => format!(
-                        " (from {}, {}; session-only)",
-                        m.from.as_deref().unwrap_or("the launch's model"),
-                        m.back_at.map_or_else(
-                            || "no return scheduled: the notice names no reset".to_string(),
-                            |at| format!("back at {}", self.stamp_in(at))
-                        )
-                    ),
-                    (
-                        None,
-                        Restart::Account {
-                            at: AccountAt::Wall,
-                            ..
-                        },
-                    ) => " (from the limit its turn ended on; the same conversation)".to_string(),
-                    (
-                        None,
-                        Restart::Account {
-                            at: AccountAt::Ahead,
-                            ..
-                        },
-                    ) => " (at a turn end; the same conversation)".to_string(),
-                    (None, _) => String::new(),
+                let back = match why {
+                    Restart::Account {
+                        at: AccountAt::Wall,
+                        ..
+                    } => " (from the limit its turn ended on; the same conversation)".to_string(),
+                    Restart::Account {
+                        at: AccountAt::Ahead,
+                        ..
+                    } => " (at a turn end; the same conversation)".to_string(),
+                    _ => String::new(),
                 };
                 review.say(&format!("RESTARTED seq={seq} rule={rule} {what}{back}"))?;
                 if let (Restart::Memory, Some(over)) = (why, measured) {
                     self.memory_say(&point.screen, over, true, opts, review);
                 }
                 if !matches!(why, Restart::Memory) {
-                    let reason = match (&switch, why) {
-                        (Some(m), _) => approvals::model_switch_reason(
-                            m.from.as_deref(),
-                            m.back_at.map(|at| self.unix_of(at)),
-                            made_unix,
-                        ),
-                        (None, Restart::Account { to, at }) => {
-                            approvals::account_switch_reason(to, *at)
-                        }
-                        (None, Restart::InputLost { .. }) => {
+                    let reason = match why {
+                        Restart::Account { to, at } => approvals::account_switch_reason(to, *at),
+                        Restart::InputLost { .. } => {
                             super::super::journal::LINE_READ_UNDRAWN.to_string()
                         }
-                        (None, _) => "the turn-end policy".to_string(),
+                        _ => "the turn-end policy".to_string(),
                     };
                     self.ledger_row(rule, approvals::Outcome::Typed, &what, &reason, seq);
                 }
-                self.fallback_asked(unasked, seq);
                 Ok(())
             }
             (Some("wait" | "busy"), Some(step)) if Restart::put_off(why.word()) && defers(step) => {
@@ -5092,10 +4932,10 @@ impl<C: Ctl> Session<'_, C> {
                 // While the run holds a live claim of the conversation's record, the act the
                 // point goes on with, and every act after it, keeps the move's run
                 // (`Self::run_outlives_act`), so the move asked again at a later turn end is the
-                // same ask (`RestartAsk`). The way back so meets the record its ask claimed
+                // same ask (`RestartAsk`). A route move so meets the record its ask claimed
                 // (`relaunch::its_own`): carried, or made where its relaunch was carried on in
                 // the asker (`relaunch::already_made`), never restarted over. Deferred with no
-                // claim held, the act ends the way back's run, and the next ask is another run's.
+                // claim held, the act ends the route move's run, and the next ask is another run's.
                 // No account move's record is its own, so no account move's answer holds or
                 // takes a claim: the move ahead's record is carried in flight whatever its ask
                 // (`relaunch::carried_word`), and restarted over once carried on. Its run outlives
@@ -8013,8 +7853,8 @@ pub(super) fn journaled_restart_floor(journal: &str, sid: Option<&str>) -> Optio
 
 /// THE RUNS OF THE MOVES AN EARLIER LOOP LEFT OPEN, read from the journal beside `sid`'s ledger
 /// (`journal`): the run in the loop's slot and the one set aside beside an account move's
-/// (`Session::restart_aside`), each a move's ([`Restart::MOVES`]: a model's move onto its fallback
-/// or back, an account move) whose last note was a deferral ([`defers`]) in a run that outlives
+/// (`Session::restart_aside`), each a move's ([`Restart::MOVES`]: an account move or a route
+/// move) whose last note was a deferral ([`defers`]) in a run that outlives
 /// the loop's acts ([`RestartRun::move_outlives_acts`]: one that held a live claim of the
 /// conversation's record, `claimed=<second>`, or an account move ahead's, whatever it held). The
 /// session's restart notes ([`restart_note`]) are read in order as the loop moved its runs
@@ -8073,28 +7913,6 @@ fn made_word(step: &str) -> bool {
         step.split_once(':').map_or(step, |(head, _)| head),
         "adopted" | "relaunched" | "continued" | "done"
     )
-}
-
-/// WHEN THE CLAIM THAT MADE THE FALLBACK'S LAST RELAUNCH WAS TAKEN, read from the journal beside
-/// `sid`'s ledger (`journal`): the claim's second the model move's last restart note before its
-/// `RESTARTED` record names ([`restart_note`]: the note of the answer that made it, as every answer
-/// that ends a run is noted), else that note's run's second, else that record's own second. `None`
-/// where no relaunch onto the fallback was made.
-pub(super) fn journaled_fallback_made(journal: &str, sid: Option<&str>) -> Option<i64> {
-    let mut asked: Option<i64> = None;
-    let mut made = None;
-    for rec in session_records(journal, sid) {
-        if rec.kind == "restarted"
-            && rec.phase == crate::supervise::policy::turn_end::RULE_MODEL_FALLBACK
-        {
-            made = Some(asked.take().unwrap_or_else(|| rec.t.div_euclid(1000)));
-        } else if let Some(note) = restart_note(&rec)
-            && note.kind == Restart::MODEL
-        {
-            asked = Some(note.claimed.unwrap_or(note.at));
-        }
-    }
-    made
 }
 
 #[cfg(test)]

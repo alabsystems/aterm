@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use aterm_json::Value;
 
 use super::steps::{BASH_INPUT, BASH_STDERR, BASH_STDOUT, INTERRUPTED, TASK_NOTIFICATION};
-use super::upgrade_models as models;
 use crate::supervise::approvals::Typed;
 use crate::supervise::policy::turn_end;
 use crate::supervise::policy::turn_end::PermissionTo;
@@ -462,6 +461,9 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--json-schema", Arity::One, Fate::Refuse),
     ("--max-budget-usd", Arity::One, Fate::Keep),
     ("--mcp-config", Arity::Many, Fate::Keep),
+    // Kept as launched (owner ruling 2026-11-09): a relaunch carries the launch's own `--model`
+    // words in their own spelling and adds none, so a session launched without one comes back on
+    // the model its settings name.
     ("--model", Arity::One, Fate::Keep),
     ("-n", Arity::One, Fate::Keep),
     ("--name", Arity::One, Fate::Keep),
@@ -1736,66 +1738,6 @@ fn path_middle(word: &str) -> Option<String> {
     (elided.chars().count() < word.chars().count()).then_some(elided)
 }
 
-/// Builds [`prepare_prompt`] when the restart also switches models from `running` to `model`.
-#[must_use]
-pub fn prepare_prompt_with_model(
-    from: &Version,
-    to: &Version,
-    source: Source,
-    marker: &str,
-    model: Option<&str>,
-    running: Option<&str>,
-) -> String {
-    let Some(model) = model else {
-        return prepare_prompt(from, to, source, marker);
-    };
-    let why = models::move_why(running, model).words();
-    let what = if to == from {
-        format!(
-            "{ANNOUNCE_HEAD}{to} can run {model}, {why}, which this session does not run. To \
-             move you onto it, aterm will restart this Claude Code in place and resume this same \
-             conversation on {model} (claude --resume --model {model}, same tab, same flags)."
-        )
-    } else {
-        format!(
-            "{ANNOUNCE_HEAD}{to} ({}) is installed; this session runs {from}. To move you onto \
-             it, and onto {model} ({why}), aterm will restart this Claude Code in place and \
-             resume this same conversation (claude --resume --model {model}, same tab, same \
-             flags).",
-            source.as_str()
-        )
-    };
-    format!("{what} {STOPPING_POINT} {READINESS_ANSWER} Notice reference: {marker}. {NOTICE_CLOSE}")
-}
-
-/// Builds [`continue_prompt`] when the relaunch requested `model`.
-#[must_use]
-pub fn continue_prompt_with_model(
-    from: &Version,
-    to: &Version,
-    ran: Option<&str>,
-    model: Option<&str>,
-) -> String {
-    let Some(model) = model else {
-        return continue_prompt(from, to, ran);
-    };
-    let build = if to == from {
-        format!("on Claude Code {to}")
-    } else {
-        format!("on Claude Code {to} (from {from})")
-    };
-    let runs = ran.map_or_else(
-        || "it now runs".to_string(),
-        |m| format!("it ran {m} before the restart and now runs"),
-    );
-    let why = models::move_why(ran, model).words();
-    format!(
-        "{HARNESS_MARK} Upgraded: this session was restarted {build} and resumed; {runs} \
-         {model}, {why} (for this session only: your default model is unchanged). \
-         {RESTART_WATCHES} {RELAUNCH_RESTORES} {CARRY_ON}"
-    )
-}
-
 /// Builds the continuation prompt typed once the relaunched process resumes the session.
 #[must_use]
 pub fn continue_prompt(from: &Version, to: &Version, ran: Option<&str>) -> String {
@@ -1870,7 +1812,7 @@ pub fn resumed_build_warned(jsonl: &str, version: &str, from: u64, to: u64) -> b
                 return false;
             };
             let field = |key: &str| v.get(key).and_then(Value::as_str);
-            let at = field("timestamp").and_then(models::parse_utc);
+            let at = field("timestamp").and_then(super::unix_time::parse_utc);
             field("type") == Some("system")
                 && field("subtype") == Some("informational")
                 && field("level") == Some("warning")
@@ -1939,45 +1881,6 @@ pub fn restart_outcome(
         (_, Some(a)) => format!("{head} {a}"),
         (Some(b), None) => format!("{head} unconfirmed (it ran {b} before the restart)"),
         (None, None) => format!("{head} unconfirmed"),
-    }
-}
-
-/// Formats [`restart_outcome`] when the relaunch requested `chosen` via `upgrade_models`.
-#[must_use]
-pub fn restart_outcome_listed(
-    to: &str,
-    before: Option<&str>,
-    after: Option<&str>,
-    chosen: &str,
-) -> String {
-    let head = format!("claude restarted on {to} · model");
-    let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
-    let (asked, chose) = match models::move_why(before, chosen) {
-        models::MoveWhy::Family => (
-            format!("the relaunch asked for {chosen}, the newest of its family"),
-            "the newest of its family",
-        ),
-        models::MoveWhy::List => (
-            format!("the priority list asked for {chosen}"),
-            "the priority list chose it",
-        ),
-        models::MoveWhy::Unknown => (
-            format!("the relaunch asked for {chosen}"),
-            "the model rule chose it",
-        ),
-    };
-    match (before, after) {
-        (_, Some(a)) if base(a) != base(chosen) => {
-            format!("{head} {a} ({asked}; it was not taken)")
-        }
-        (Some(b), Some(a)) if base(b) != base(a) => {
-            format!("{head} {b} -> {a} ({chose}; /model changes it)")
-        }
-        (_, Some(a)) => format!("{head} {a}"),
-        (Some(b), None) => {
-            format!("{head} unconfirmed (it ran {b} before the restart; asked for {chosen})")
-        }
-        (None, None) => format!("{head} unconfirmed (asked for {chosen})"),
     }
 }
 
@@ -2939,7 +2842,7 @@ fn login_row(line: &str) -> Option<(LoginRow, Option<u64>)> {
     let at = v
         .get("timestamp")
         .and_then(Value::as_str)
-        .and_then(super::upgrade_models::parse_utc);
+        .and_then(super::unix_time::parse_utc);
     if is_auth_wall_row(&v) {
         return Some((LoginRow::Wall, at));
     }
@@ -3207,7 +3110,7 @@ pub fn notice_scan(jsonl: &str, marker: &str) -> Option<Scan> {
 pub(crate) fn row_time(v: &Value) -> Option<u64> {
     v.get("timestamp")
         .and_then(Value::as_str)
-        .and_then(super::upgrade_models::parse_utc)
+        .and_then(super::unix_time::parse_utc)
 }
 
 fn limit_holds_until(v: &Value) -> Option<u64> {
@@ -3795,7 +3698,7 @@ fn prompt_of(row: &Value, ours: &[Typed]) -> Prompt {
 fn recorded_ms(row: &Value) -> Option<u64> {
     row.get("timestamp")
         .and_then(Value::as_str)
-        .and_then(models::parse_utc)
+        .and_then(super::unix_time::parse_utc)
         .map(|s| s.saturating_mul(1000))
 }
 
@@ -4654,7 +4557,7 @@ pub const RELEASE_HEAD: &str = "[aterm harness] Upgrade off: ";
 pub const TELL_HEAD: &str = "[aterm harness] Upgrade waiting: ";
 
 /// The heads of aterm's continuation after a restart it made: the upgrade's
-/// ([`continue_prompt_with_model`]) and a relaunch's (`relaunch::resumed_prompt_as`). A continuation
+/// ([`continue_prompt`]) and a relaunch's (`relaunch::resumed_prompt_as`). A continuation
 /// a person's key cut stands unsent in the composer; these say it is aterm's.
 pub const CONTINUE_HEADS: [&str; 3] = [
     concat!(harness_mark!(), " Upgraded: "),

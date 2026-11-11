@@ -674,41 +674,6 @@ fn store_rejects_fifos_and_replaces_them_atomically() {
     );
 }
 
-/// A running session between turns reads nothing, however old the record: it rotates on what
-/// launches and walls last read. CONTROL: a launch on the same aged record does ask agy.
-#[test]
-fn a_running_session_rotates_on_the_record_and_asks_agy_nothing() {
-    let dir = tmp("on-record");
-    let store = Store::new(dir.path(), "running");
-    let r = agy_quota::Rotation::default();
-    let asked = Some("claude-opus-5-5-medium");
-    let (none, events) =
-        crate::harness::provider_read::captured(|| rotate_on_record(asked, &store, &r, NOW));
-    assert_eq!(none, None, "nothing on record, and nothing asked");
-    assert!(events.is_empty());
-    let spent = Recorded::new(Ok(doc(0.95, 0.0, 0.0)));
-    let _ = rotate_launch(asked, &store, &spent, &r, NOW);
-    assert_eq!(spent.reads.get(), 1);
-    let aged = NOW + FRESH_OPEN_S * 2;
-    let (pick, events) =
-        crate::harness::provider_read::captured(|| rotate_on_record(asked, &store, &r, aged));
-    let pick = pick.expect("the record speaks");
-    assert!(
-        matches!(pick.pick, agy_quota::Pick::Rotate { .. }),
-        "{pick:?}"
-    );
-    assert_eq!(pick.got, Got::Stale);
-    assert!(events.is_empty(), "no read, no report");
-    let (_, events) =
-        crate::harness::provider_read::captured(|| rotate_launch(asked, &store, &spent, &r, aged));
-    assert_eq!(spent.reads.get(), 2, "CONTROL: a launch reads");
-    assert_eq!(events.len(), 1);
-    assert_eq!(
-        events[0].why,
-        crate::harness::provider_read::InUse::Launching
-    );
-}
-
 /// However many times the loop looks at a wall, it reads once; a refill the reading records, or a
 /// wall standing past [`WALL_READ_SPENT_S`], reads once more. CONTROL: the first look and those
 /// two do read, on the same store, so the spent stamp is what holds the other looks back.

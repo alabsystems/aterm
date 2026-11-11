@@ -88,7 +88,7 @@ fn publish_case(state: &aterm_spec::interp::State, buggy: u8) -> aterm_spec::int
         if (buggy == 1 && result == Err("receipt-consumed-changed")) || (buggy == 2 && kind == 8) {
             // Negative control: the former raw writer can replace accepted or
             // unreadable custody with a stale caller's complete projection.
-            super::super::super::super::upgrade_models::write_atomic_mode(
+            super::super::super::super::atomic_write::write_atomic_mode(
                 &path,
                 &aterm_json::to_string(&next).unwrap(),
                 Some(0o600),

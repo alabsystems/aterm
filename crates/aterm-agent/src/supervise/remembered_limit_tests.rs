@@ -93,7 +93,6 @@ fn a_remembered_bucket_obeys_the_newest_model_choice_under_background_work() {
         s.ledger = approvals::Ledger::open(Some(&ledger), Some("@s-1"), &mut notes);
         assert!(notes.is_empty(), "the scratch ledger opens: {notes:?}");
         let mut opts = hosted(30);
-        opts.policy.model_fallback = None;
         opts.policy.human_grace_s = 0;
         let armed = screen(WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
         let (initial, action) = fold(&mut s, armed.clone(), &opts);

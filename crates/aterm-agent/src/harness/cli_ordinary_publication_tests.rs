@@ -313,7 +313,7 @@ fn ordinary_native_publication_and_wrong_account_evidence_keep_the_original_work
                     admitted: RefCell::new(None),
                 };
                 let records = store.read_account_records(Some(&path), env.now).unwrap();
-                let attempted = std::cell::Cell::new(false);
+                let attempted = EnrollmentAttempt::default();
                 let result = renew_one_for_operation(
                     Cli::Codex,
                     env.now,
@@ -333,7 +333,7 @@ fn ordinary_native_publication_and_wrong_account_evidence_keep_the_original_work
                 let admitted = host.admitted.borrow().clone();
                 let calls = host.calls.get();
                 drop(host);
-                (result, admitted, calls, attempted.get())
+                (result, admitted, calls, attempted.provider_attempted.get())
             });
             let ready = ready_receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
             let candidate = ready

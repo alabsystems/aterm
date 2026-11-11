@@ -109,6 +109,30 @@ enum ClosurePolicy {
     BootOnly,
 }
 
+/// Evidence from the lifetime read that refused FINISH, never a later observation.
+#[derive(Debug)]
+struct DrainRefusal {
+    observed: Option<Lifetime>,
+    policy: ClosurePolicy,
+    subgroups: usize,
+}
+
+impl std::fmt::Display for DrainRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cohort custody has no conclusive drain; retain its complete reservation")?;
+        match self.observed {
+            Some(observed) => write!(
+                f,
+                " (observed lifetime: {observed:?}; closure policy: {:?}; subgroups: {})",
+                self.policy, self.subgroups
+            ),
+            None => f.write_str(" (root is still armed, not bound)"),
+        }
+    }
+}
+
+impl std::error::Error for DrainRefusal {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Subgroup {
     key: Birth,
@@ -554,6 +578,14 @@ impl Journal {
     }
 
     pub(crate) fn finish(&self) -> io::Result<Option<(String, Self)>> {
+        self.finish_with(|| self.lifetime())
+    }
+
+    /// Read once, retaining exactly the observation that decides the finish.
+    fn finish_with(
+        &self,
+        observe: impl FnOnce() -> Lifetime,
+    ) -> io::Result<Option<(String, Self)>> {
         if self.gnu.as_ref().is_some_and(|(_, retired)| !retired) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -562,17 +594,29 @@ impl Journal {
         }
         match &self.state {
             State::Description => Ok(None),
-            State::Bound(key, _) if self.lifetime() == Lifetime::Drained => {
+            State::Bound(key, _) => {
+                let observed = observe();
+                if observed != Lifetime::Drained {
+                    return Err(self.drain_refusal(Some(observed)));
+                }
                 let event = aterm_json::json!({"phase": "finish", "key": key.encode()});
                 let mut next = self.clone();
                 next.apply(&event)?;
                 Ok(Some((line(&aterm_json::json!({"cohort": event}))?, next)))
             }
-            _ => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "cohort custody has no conclusive drain; retain its complete reservation",
-            )),
+            State::Armed(_) => Err(self.drain_refusal(None)),
         }
+    }
+
+    fn drain_refusal(&self, observed: Option<Lifetime>) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            DrainRefusal {
+                observed,
+                policy: self.policy,
+                subgroups: self.subgroups.len(),
+            },
+        )
     }
 
     fn match_arm(&self, key: &BirthKey) -> io::Result<()> {
@@ -1040,6 +1084,86 @@ mod compact_snapshot_tests {
     fn namespace(text: &str) -> String {
         let head: Value = aterm_json::from_str(text.lines().next().unwrap()).unwrap();
         head["namespace"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn finish_refusal_retains_the_observation_that_decided_it_without_another_read() {
+        use std::cell::Cell;
+
+        let (_, mut journal) = fixture(2);
+        journal.policy = ClosurePolicy::Group;
+        let original = journal.clone();
+        for observed in [Lifetime::Present, Lifetime::Unknown, Lifetime::Drained] {
+            let reads = Cell::new(0);
+            let result = journal.finish_with(|| {
+                reads.set(reads.get() + 1);
+                observed
+            });
+            assert_eq!(reads.get(), 1);
+            assert_eq!(
+                journal, original,
+                "FINISH proposes an event without applying it"
+            );
+            if observed == Lifetime::Drained {
+                let (event, next) = result.unwrap().unwrap();
+                assert_eq!(
+                    aterm_json::from_str::<Value>(&event).unwrap()["cohort"]["phase"].as_str(),
+                    Some("finish")
+                );
+                assert!(next.description());
+                assert!(next.subgroups.is_empty());
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                let evidence = error
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<DrainRefusal>()
+                    .unwrap();
+                assert_eq!(evidence.observed, Some(observed));
+                assert_eq!(evidence.policy, ClosurePolicy::Group);
+                assert_eq!(evidence.subgroups, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn finish_reads_no_lifetime_for_an_unbound_root_or_a_pending_gnu_epoch() {
+        let (_, mut journal) = fixture(0);
+        let bound = journal.state.clone();
+        let State::Bound(key, _) = &journal.state else {
+            panic!("the fixture is bound");
+        };
+        let key = key.clone();
+        journal.state = State::Description;
+        assert!(
+            journal
+                .finish_with(|| panic!("no bound cohort to read"))
+                .unwrap()
+                .is_none()
+        );
+        journal.state = State::Armed(key);
+        let error = journal
+            .finish_with(|| panic!("no bound cohort to read"))
+            .unwrap_err();
+        let evidence = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<DrainRefusal>()
+            .unwrap();
+        assert_eq!(evidence.observed, None);
+        journal.state = bound;
+        journal.gnu = Some(("unretired-epoch".into(), false));
+        let error = journal
+            .finish_with(|| panic!("the GNU epoch refuses first"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<DrainRefusal>())
+                .is_none()
+        );
     }
 
     #[test]

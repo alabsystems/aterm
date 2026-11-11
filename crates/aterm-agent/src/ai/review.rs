@@ -1367,7 +1367,7 @@ pub fn keep(store: &Store, id: &str, json: &str) -> std::io::Result<PathBuf> {
     }
     #[cfg(not(unix))]
     std::fs::DirBuilder::new().create(&dir)?;
-    crate::harness::upgrade_models::write_atomic_ordered(&dir.join("review.json"), json)?;
+    crate::harness::atomic_write::write_atomic_ordered(&dir.join("review.json"), json)?;
     Ok(dir)
 }
 

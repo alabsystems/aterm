@@ -2693,7 +2693,7 @@ const CHECKER_DEFERRAL_LOG_EVERY: u64 = 3600 / cadence::INTERVAL_SECS;
 /// Every how many consecutive cycles that found this process's own check lane busy the loop
 /// says so again.
 #[cfg(target_os = "macos")]
-const LANE_BUSY_LOG_EVERY: u64 = 6;
+const LANE_BUSY_LOG_EVERY: u64 = 12 * 60 / cadence::LANE_BUSY_RETRY.as_secs();
 
 /// What the check loop runs on, shared by the thread and any replacement for it.
 #[cfg(target_os = "macos")]
@@ -3584,7 +3584,8 @@ fn run_checker(
             if !stamp(CheckerPhase::Waiting) {
                 return Cycle::Superseded(last.get());
             }
-            if matches!(wait(&schedule), cadence::Waited::Woke(_)) {
+            let next = schedule.after_lane(lane_busy.consecutive() != 0);
+            if matches!(wait(&next), cadence::Waited::Woke(_)) {
                 settle(&mut schedule, &mut failures, &mut woke_at);
             }
             Cycle::Next

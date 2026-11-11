@@ -7,10 +7,9 @@
 use super::{CONFLICT_SUBJECT, Receipt, SUBJECT, Stored, Witness};
 use crate::{
     Error, Result,
-    table::{Envelope, ReadBatch},
+    table::{Envelope, ReadBatch, signatures::Identified},
 };
 use astream_wire::Offset;
-use aterm_digest::Sha256;
 use aterm_journal::Log;
 
 pub(super) struct Replay {
@@ -20,7 +19,8 @@ pub(super) struct Replay {
 
 pub(super) struct Entry {
     pub receipt: Receipt,
-    pub wire: Vec<u8>,
+    /// The record's bytes, which `receipt.id` names: their identifier, taken once as they were read.
+    pub wire: Identified,
     pub conflict: bool,
 }
 
@@ -94,7 +94,10 @@ impl Builder {
             return Err(Error::new("foreign table journal record"));
         }
         let received_ms = u64::from_le_bytes(entry.body[..8].try_into().unwrap());
-        let id = Sha256::digest(&entry.body[8..]);
+        let mut wire = entry.body;
+        wire.drain(..8);
+        let wire = Identified::new(wire);
+        let id = wire.id();
         self.witness = self.witness.advance(entry.seq.0, id, received_ms)?;
         if self.witness.count > self.acknowledged.count + 1 {
             return Err(Error::new(
@@ -109,8 +112,6 @@ impl Builder {
             }
             self.prefix_checked = true;
         }
-        let mut wire = entry.body;
-        wire.drain(..8);
         self.entries.push(Entry {
             receipt: Receipt {
                 id,
@@ -185,14 +186,14 @@ impl Builder {
 pub(super) fn restore(
     batch: &ReadBatch<'_, '_>,
     receipt: Receipt,
-    wire: Vec<u8>,
+    wire: Identified,
     acknowledged: u64,
 ) -> Result<Stored> {
     let scope = batch.scope;
     // Store::open_region checks live authority around this held-source replay
     // and before finalization. Keep signed-envelope and historical validation
     // per record without repeating those filesystem checks for every entry.
-    let envelope = Envelope::parse(scope, &wire)?;
+    let envelope = Envelope::parse_identified(scope, &wire)?;
     super::operation_policy(scope, &envelope.header, envelope.body.len() - 16)?;
     let (header, quarantine, cut) = if aterm_db_core::quarantine_eligible(
         acknowledged,
@@ -213,7 +214,7 @@ pub(super) fn restore(
         return Err(Error::new("replayed receipt differs from ciphertext"));
     }
     Ok(Stored {
-        wire,
+        wire: wire.into_wire(),
         header,
         receipt,
         quarantine,

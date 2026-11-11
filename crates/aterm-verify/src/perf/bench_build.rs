@@ -277,12 +277,14 @@ impl<'a> Targo<'a> {
     }
 
     pub(crate) fn command(&self, verb: &str) -> Command {
-        let mut cmd = crate::exec::check_command(&self.driver.program);
+        let mut cmd = self.driver.base_command();
         cmd.args(self.lead(verb)).current_dir(workspace_root());
         self.environment(&mut cmd);
         cmd
     }
 
+    /// Normalize flags and stamp inputs for both compilers and built benches. A bench keeps
+    /// its runtime package metadata; [`Self::command`] clears that metadata for Cargo alone.
     pub(crate) fn environment(&self, cmd: &mut Command) {
         for (key, _) in std::env::vars_os() {
             if key.to_str().is_some_and(flags::is_env_source) {

@@ -935,6 +935,7 @@ impl Header {
         })?;
         r.section("policy");
         r.retired_parsed::<bool>("session_questions")?;
+        r.retired_text("model_fallback")?;
         let policy_exact = r.parsed("exact")?;
         let mut withheld = Vec::new();
         for (key, value, at) in r.prefixed(WITHHELD) {

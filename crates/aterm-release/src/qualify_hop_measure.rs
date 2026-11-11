@@ -160,7 +160,8 @@ fn two_historical_trees() {
                 .into_iter()
                 .map(|(triple, target)| {
                     require_rustup_target(X86_64).unwrap();
-                    // Sequential to bound memory. Use the cut's exact warm target, source,
+                    // Sequential and deliberately unwrapped: use the unmeasured slice's
+                    // exclusive learning admission. Match the cut's warm target, source,
                     // release profile and sealed environment; only omit its executable wrapper.
                     let _memory = aterm_capacity::admit(
                         crate::slice_units::slice_need(triple, None),

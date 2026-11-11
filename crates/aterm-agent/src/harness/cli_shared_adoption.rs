@@ -577,7 +577,7 @@ pub(in crate::harness) fn adopt(
                 );
                 Ok(vec![
                     accounts::Event::new(env.now, accounts::Kind::SignIn, &row.label)
-                        .because("shared adoption begun"),
+                        .because(accounts::SHARED_ADOPTION_BEGUN),
                 ])
             },
             || Ok(()),

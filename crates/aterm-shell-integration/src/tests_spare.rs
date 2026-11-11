@@ -1748,7 +1748,7 @@ fn a_fish_start_record_names_the_roots_its_conf_d_loop_walks() {
         let inherited = root.path().join(name);
         let vendor = inherited.join("fish").join("vendor_conf.d");
         std::fs::create_dir_all(&vendor).expect("vendor conf.d");
-        std::fs::copy(
+        aterm_tempfile::copy_to_new_file(
             format!(
                 "{}/src/scripts/aterm_shell_integration.fish",
                 aterm_tempfile::manifest_dir().display()

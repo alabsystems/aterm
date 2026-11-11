@@ -572,7 +572,7 @@ fn authenticated_entry_versions_retain_absence_and_reject_rollback_forks() {
     assert!(absent.version.not_before(&first.version));
     assert!(!first.version.not_before(&absent.version));
     let mut fork = absent.version.clone();
-    fork.envelope[0] ^= 1;
+    fork.vault.envelope[0] ^= 1;
     assert!(!fork.not_before(&absent.version));
     assert!(!absent.version.not_before(&fork));
     f.publish(|doc| {
@@ -610,19 +610,19 @@ fn authenticated_entry_versions_retain_absence_and_reject_rollback_forks() {
 fn entry_versions_require_retained_log_facts_even_with_an_unchanged_envelope() {
     let f = Fixture::new();
     let mut first = f.read_token().unwrap().snapshot().version();
-    first.log_ids = Some(std::sync::Arc::new([[1; 32]].into_iter().collect()));
+    first.vault.log_ids = Some(std::sync::Arc::new([[1; 32]].into_iter().collect()));
     let mut extended = first.clone();
-    extended.log_ids = Some(std::sync::Arc::new(
+    extended.vault.log_ids = Some(std::sync::Arc::new(
         [[1; 32], [2; 32]].into_iter().collect(),
     ));
     assert!(extended.not_before(&first));
     assert!(!first.not_before(&extended));
     let mut replaced = extended.clone();
-    replaced.log_ids = Some(std::sync::Arc::new(
+    replaced.vault.log_ids = Some(std::sync::Arc::new(
         [[2; 32], [3; 32], [4; 32]].into_iter().collect(),
     ));
     assert!(!replaced.not_before(&first));
-    replaced.log_ids = None;
+    replaced.vault.log_ids = None;
     assert!(!replaced.not_before(&first));
 
     // A public frontier may redundantly name an ancestor. That changes its encoding,
@@ -767,36 +767,36 @@ fn version_transition_with(
 ) -> aterm_spec::interp::State {
     let f = Fixture::new();
     let mut floor = f.read_token().unwrap().snapshot().version();
-    floor.seq = 1;
-    floor.envelope = [1; 32];
-    floor.log_ids = Some(std::sync::Arc::new([[1; 32]].into_iter().collect()));
+    floor.vault.seq = 1;
+    floor.vault.envelope = [1; 32];
+    floor.vault.log_ids = Some(std::sync::Arc::new([[1; 32]].into_iter().collect()));
     let mut candidate = floor.clone();
     let scenario = match action {
         "Same" => 1,
         "Advance" => {
-            candidate.seq = 2;
+            candidate.vault.seq = 2;
             2
         }
         "Rollback" => {
-            candidate.seq = 0;
+            candidate.vault.seq = 0;
             3
         }
         "Fork" => {
-            candidate.envelope = [2; 32];
+            candidate.vault.envelope = [2; 32];
             4
         }
         "LogExtend" => {
-            candidate.log_ids = Some(std::sync::Arc::new(
+            candidate.vault.log_ids = Some(std::sync::Arc::new(
                 [[1; 32], [2; 32]].into_iter().collect(),
             ));
             5
         }
         "LogDrop" => {
-            candidate.log_ids = None;
+            candidate.vault.log_ids = None;
             6
         }
         "LogSwap" => {
-            candidate.log_ids = Some(std::sync::Arc::new(
+            candidate.vault.log_ids = Some(std::sync::Arc::new(
                 [[2; 32], [3; 32]].into_iter().collect(),
             ));
             7
@@ -808,7 +808,7 @@ fn version_transition_with(
         _ => unreachable!(),
     };
     let accepted = if bypass {
-        candidate.seq >= floor.seq
+        candidate.vault.seq >= floor.vault.seq
     } else {
         candidate.not_before(&floor)
     };

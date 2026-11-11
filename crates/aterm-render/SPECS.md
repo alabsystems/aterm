@@ -30,7 +30,7 @@ Pixels and blending:
 - Pixels are `0xTTRRGGBB`, where `TT` is the transmittance byte. `mul8(c,f) = (c·f+127)/255`. `over_rgb(d,s,a)` = per channel `(s·a + d·(255−a) + 127)/255`, keeping `d`'s top byte. `add_sat(d,s)` = per channel `min(255, d+s)`, keeping `d`'s top byte. `premul_rgb(c,a)` = per channel `(c·a + 127)/255`. `L(·)` = BT.709 linear luminance. `EPS` = `TEXT_BLEND_EPS`.
 
 Gaps:
-- `blocking_gaps` numbers the rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes Clean rows) is on every row; seal `150efe4a` closes it.
+- `blocking_gaps` numbers the rows of the gap table in `docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (a seal that publishes Clean rows) is on every row; seal `150efe4a` closes it.
 - The audit has no f32/f64-semantics row; float specs cite gap 3 as the nearest.
 - A spec bound to a `ty_model!` (LigatureGate, CtFracBearing, DecoBandContainment, PadAbsorption, AsymmetricPadLayout, RainBandContainment, DecodeCacheFrameWorkingSet, GlyphImageClearAccounting) is proved against the model's invariant on the shipping function, and its conformance tests go with it.
 
@@ -1041,18 +1041,6 @@ crates/aterm-render/tests/word_decorations.rs	settled_lifted_add_deco_with_dirt_
 | `crates/aterm-render/src/lib.rs::text_caches_spread_a_precomputed_colliding_key_set` | A statistical hash-quality property that depends on the per-process keyed hasher's random secret. The code-level fact (the caches use the keyed hasher, not `FxBuildHasher`) is a type annotation. | **move-to-bench** |
 | `crates/aterm-render/tests/windows_grid_fit.rs::bold_stays_bold_when_grid_fitted` | Asserts an ink-ratio threshold (`gain_full ≥ 0.9·gain_off`). The spec it stands for: under hinting, a bold cell on a variable primary is `hinted_glyph_raster` at `debug_vf_bold_coords` (the hinted twin of `vf-bold-instance-raster`). | **becomes-spec-after-fix** |
 | `crates/aterm-render/tests/windows_grid_fit.rs::variable_primary_is_grid_fitted_at_12px` | Quality heuristics on a host font (more solid texels, less fringe, coverage mass within ±25%), not a property of the code. | **move-to-bench** |
-
-## 4. Proof order (easiest high-value first)
-
-After gap 0, gaps 1, 3 and 5 (carriers, body widening, quantifiers) are the cheapest, and the integer-only specs among them are `omega`-class. Float specs wait for float semantics (§0) even when their gap list is short.
-
-1. **`shaping-gate`'s `shaping_min_run` half**, once the citation goal builder types an integer `result` correctly.
-2. **Integer arithmetic laws** (gaps 3 and 5): `wide-center-offset`, `weight-rank`, `premul-add-sat`, `over-premul-law`, `cap-centering-law`, `q-round-half-px`, `glow-lerp-law`, `aspect-fit-box`. The blend, chrome and image specs build on them.
-3. **Model-bound scalar specs** (gaps 1 and 3): `pad-split` (PadAbsorption), `classify-shape` (LigatureGate), `band-clamp`, `clip-span-partition`, `select-face-gate`, `slice-key-encoding`, `shade-phase-key`, `procedural-metrics-nesting`, `grid-band-px`.
-4. **`resolve-styled-face`** and **`resolve-styled-face-lazy`**: finite decision trees, decidable by evaluation once the enum payload and the closure are admitted. Every styled-face rendering spec builds on them.
-5. **First float specs**, each straight-line over `f32`: `ct-pen-and-bearing` (CtFracBearing), `dark-nudge-gate`, `variation-clamp-axis`, `sanitize-edr`, `clamp-add-bounded`, `fallback-scale-clamp`, `fallback-fit-scales`, `shrink-ymin`.
-6. **Pure slice and table specs** (gaps 1, 3, 7): `ink-skip-spans`, `cursor-cutout-cols`, `fallback-chain-order`, `frame-raster-cap`, `cursor-rect-geometry`, `deco-resolve-metrics`, `scroll-band-translate`, `incoming-strip`, `procedural-coverage-contract`.
-7. **The damage-cache theorem**, last: `dirty-rows-sound`, `dirty-rows-exact` and `scroll-shift-plan-diff` as per-row lemmas, then `cached-render-equals-fresh`. It retires the most tests in the crate but needs nearly every gap and a model of the whole CPU renderer.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

@@ -20,8 +20,6 @@ fn scratch(tag: &str) -> (crate::supervise::ScratchDir, Opts) {
         background: false,
         aterm_state: None,
         ask: true,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -55,7 +53,6 @@ fn an_in_memory_candidate_is_held_before_retirement_flag_normalization() {
         Some(prior.clone()),
         &Version::parse("1.0.0").unwrap(),
         &target,
-        None,
         Proc::default(),
         T0,
     );
@@ -777,14 +774,13 @@ fn the_watch_retargets_and_holds_tab_ones_record_off_any_point_with_no_hands() {
 }
 
 #[test]
-fn the_watch_keeps_an_announced_round_whose_model_rides_the_restart_in_place() {
+fn the_watch_keeps_an_announced_round_an_older_build_recorded_with_a_model() {
     let one = TabOne::new("t1c-model", "2.1.284");
-    let promised = one
+    let recorded = one
         .raw()
         .replace("\"model_list\":\"\"", "\"model_list\":\"claude-opus-5-5\"");
-    std::fs::write(state_path(&one.opts, SESSION), promised).expect("the promise");
-    let prior = one.record();
-    assert_eq!(prior.promised_model(), Some("claude-opus-5-5"));
+    assert!(recorded.contains("claude-opus-5-5"), "the record names it");
+    std::fs::write(state_path(&one.opts, SESSION), recorded).expect("the older record");
     let reads = std::cell::Cell::new(0);
     let w = watch_with(&one.opts, TAB_ONE, &looker(), NOW_28TH, &one.read(&reads));
     assert!(
@@ -799,28 +795,13 @@ fn the_watch_keeps_an_announced_round_whose_model_rides_the_restart_in_place() {
         st.phase
     );
     assert_eq!(st.marker, "ATERM-UPGRADE-READY-5f3a1c9e", "its marker kept");
-    assert_eq!(st.model_list, "claude-opus-5-5", "its promise kept");
     assert!(st.release.is_empty(), "no release owed: {:?}", st.release);
+    let saved = one.raw();
+    assert!(
+        !saved.contains("claude-opus-5-5"),
+        "the saved record names no model: {saved}"
+    );
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
-    let from = Version::parse("2.1.280").expect("from");
-    let to = Candidate {
-        exe: PathBuf::new(),
-        version: Version::parse("2.1.284").expect("to"),
-        source: Source::Managed,
-    };
-    for model in [None, Some("claude-opus-4-1")] {
-        let other = St::for_target(
-            Some(prior.clone()),
-            &from,
-            &to,
-            model,
-            Proc::default(),
-            NOW_28TH,
-        );
-        assert_eq!(other.phase, Phase::Pending, "{model:?}");
-        assert!(other.marker.is_empty(), "{model:?}");
-        assert_eq!(other.release, "retargeted", "{model:?}");
-    }
 }
 
 #[test]
@@ -1093,7 +1074,7 @@ fn the_real_watch_is_the_derived_look() {
     let read = |o: &Opts| {
         assert!(o.dry_run, "the watch reads through a dry run");
         let files = session_files(&o.home);
-        visit_with_claim(
+        visit_build(
             o,
             &one.sf,
             files.as_deref(),

@@ -318,7 +318,7 @@ fn forecast(
         .map(|(r, share)| r.wall(cut.exposure * share))
         .fold(0.0, f64::max);
     let rate = cut.slice_cpu / chain;
-    let export_cores = crate::release_steps::export_share(cores, true) as f64;
+    let export_cores = crate::release_steps::export_share(cores, true, true) as f64;
     let left = cores as f64 - rate;
     if left <= export_cores {
         return Err("slice service is infeasible beside the export reservation".into());

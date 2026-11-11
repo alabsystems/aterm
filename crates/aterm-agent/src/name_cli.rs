@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm name`: this machine's name, its NAME (`m8`, or `m0` until it is numbered) and nickname
+//! `aterm name`: this machine's name, its NAME (`m8`, or `unnumbered` until it is numbered) and nickname
 //! (`docs/DESIGN-machine-names-2026-11-04.md` §5.7), made by the first read that finds none
 //! ([`crate::machine_name::ensure`]). `aterm help name` is its page.
 
@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 /// `aterm name --help`.
 pub const USAGE: &str = "\
-aterm name — this machine's name: its NAME (`m8`, or `m0` until it is numbered) and nickname
+aterm name — this machine's name: its NAME (`m8`, or `unnumbered` until it is numbered) and nickname
 
   aterm name [--json]
   aterm name set <mN|N> [--nick <word>] [--dry-run] [--json]
@@ -21,8 +21,9 @@ aterm name — this machine's name: its NAME (`m8`, or `m0` until it is numbered
   object of its fields; the first run to find no `machine-name.toml` makes it. `set` chooses
   this machine's number, optionally its nickname in the same change; a number another signed
   node currently holds is refused. A successful set also records the explicit naming policy
-  and publishes the checked fleet name. On macOS, one password approval changes all three
-  system names. A failed later step reports publication pending.
+  and publishes the checked fleet name. On macOS the existing setup authorization changes all three system names,
+  generated from the saved number and nickname. Missing authorization stays pending; this
+  command does not open a password prompt.
   `nick` sets the
   nickname to <word> (one argument: quote `Blue Heron`) or to a noun drawn again, as a chosen
   nickname, and prints the name as it then stands; `--dry-run` changes no nickname (a first
@@ -171,10 +172,6 @@ fn parse_nick(words: &[&str]) -> Result<Mode, String> {
 /// `aterm name …`: `argv[1..]` in, exit code out (2 for a usage error or a platform that keeps no
 /// machine name, 1 for a name that cannot be read, made or changed).
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
-    #[cfg(target_os = "macos")]
-    if argv.first().is_some_and(|arg| arg == "apply-system") {
-        return apply_system(&argv[1..]);
-    }
     match parse(&argv) {
         Ok(Mode::Help) => aterm_uds::stdout::answer_exit("aterm name", USAGE, 0),
         Ok(Mode::Show { json }) => show(json),
@@ -228,7 +225,7 @@ fn set(to: &Name, dry_run: bool, json: bool) -> ExitCode {
     ) {
         Ok((text, notes)) => {
             #[cfg(target_os = "macos")]
-            let system: Option<&dyn publish::SystemNames> = Some(&CtlSudo);
+            let system: Option<&dyn publish::SystemNames> = Some(&SystemNaming);
             #[cfg(not(target_os = "macos"))]
             let system: Option<&dyn publish::SystemNames> = None;
             if !dry_run && let Err(pending) = publish::publish(&state, &config, &policy, system) {
@@ -251,65 +248,24 @@ fn set(to: &Name, dry_run: bool, json: bool) -> ExitCode {
     }
 }
 
-/// `aterm name set`'s way to macOS's names: read with scutil, and set by the root half
-/// (`aterm name apply-system mN`, [`apply_system`]) run through `aterm ctl sudo`, whose one
-/// password sheet covers all three, within
-/// [`crate::machine_name::publish::SYSTEM_RENAME_WAIT`].
+/// CLI and menu publication share the application's existing noninteractive rule.
 #[cfg(target_os = "macos")]
-struct CtlSudo;
+struct SystemNaming;
 
 #[cfg(target_os = "macos")]
-impl crate::machine_name::publish::SystemNames for CtlSudo {
+impl crate::machine_name::publish::SystemNames for SystemNaming {
     fn read(&self) -> [Option<String>; 3] {
         crate::machine_name::publish::read_system_names()
     }
 
-    /// # Errors
-    /// This program's own path cannot be found ([`crate::own_exe`]) or is not UTF-8, or
-    /// `aterm ctl sudo` could not be run in time (`system rename: …`) or did not succeed
-    /// (`system rename: ` and what it said on stderr).
-    fn apply(&self, number: aterm_types::machine_name::Number) -> Result<(), String> {
-        use crate::machine_name::publish;
-        let exe = crate::own_exe()?;
-        let mut command = aterm_uds::spawnfd::command(&exe);
-        command
-            .args(["ctl", "sudo", "--"])
-            .args(publish::apply_system_words(&exe, number)?);
-        let out = aterm_uds::deadline::output_within(&mut command, publish::SYSTEM_RENAME_WAIT)
-            .map_err(|e| format!("system rename: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "system rename: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(())
+    fn apply(
+        &self,
+        state: &std::path::Path,
+        config: &std::path::Path,
+        names: &aterm_types::machine_name::GeneratedNames,
+    ) -> Result<(), String> {
+        crate::machine_name::publish::apply_registered(state, config, names)
     }
-}
-
-/// The fixed privileged half: no configuration, registry or user path is read as root
-/// ([`crate::machine_name::publish::set_as_root`]).
-#[cfg(target_os = "macos")]
-fn apply_system(args: &[OsString]) -> ExitCode {
-    let number = match args {
-        [number] => number
-            .to_str()
-            .and_then(|number| aterm_types::machine_name::Number::parse(number).ok()),
-        _ => None,
-    };
-    let Some(number) = number else {
-        return ExitCode::from(2);
-    };
-    // SAFETY: geteuid is a side-effect-free getter with no pointer arguments.
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("aterm name: apply-system requires system authorization");
-        return ExitCode::from(1);
-    }
-    let failed = crate::machine_name::publish::set_as_root(number);
-    for field in &failed {
-        eprintln!("aterm name: macOS could not set {field}");
-    }
-    ExitCode::from(u8::from(!failed.is_empty()))
 }
 
 #[cfg(not(unix))]
@@ -403,6 +359,28 @@ fn nick(to: &Nick, dry_run: bool, json: bool) -> ExitCode {
         eprintln!("aterm name: no state directory: $HOME is not set");
         return ExitCode::from(1);
     };
+    let policy = (|| {
+        let current = crate::machine_name::file::read(&state).map_err(|why| why.to_string())?;
+        let Some(number) = current
+            .filter(|name| {
+                name.class == aterm_types::machine_name::Class::Chosen
+                    && name.migration != Some(crate::machine_name::file::Migration::Waiting)
+            })
+            .and_then(|name| name.num)
+        else {
+            return Ok(None);
+        };
+        let config = aterm_types::dirs::aterm_config_path().ok_or("no aterm configuration path")?;
+        let policy = crate::machine_name::publish::Policy::read(&config, number)?;
+        Ok::<_, String>(Some((config, policy)))
+    })();
+    let policy = match policy {
+        Ok(policy) => policy,
+        Err(why) => {
+            eprintln!("aterm name: {why}; no nickname changed");
+            return ExitCode::from(1);
+        }
+    };
     let vault = crate::machine_name::standing_vault();
     let kind = caller(session_status().as_deref());
     let roster = crate::machine_name::vault_roster_label;
@@ -420,6 +398,22 @@ fn nick(to: &Nick, dry_run: bool, json: bool) -> ExitCode {
         aterm_netplace::unix_ms_now(),
     ) {
         Ok((text, notes)) => {
+            if !dry_run && let Some((config, policy)) = &policy {
+                #[cfg(target_os = "macos")]
+                let system: Option<&dyn crate::machine_name::publish::SystemNames> =
+                    Some(&SystemNaming);
+                #[cfg(not(target_os = "macos"))]
+                let system: Option<&dyn crate::machine_name::publish::SystemNames> = None;
+                if let Err(pending) =
+                    crate::machine_name::publish::publish(&state, config, policy, system)
+                {
+                    eprintln!(
+                        "aterm name: the nickname was saved; name synchronization pending: {}",
+                        pending.why()
+                    );
+                    return ExitCode::from(1);
+                }
+            }
             for note in notes {
                 eprintln!("aterm name: {}", note.text(&state));
             }
@@ -568,7 +562,7 @@ mod unix {
             notes.push(Note::NameAlready);
         }
         if set.shared {
-            notes.push(Note::Shared(set.name.nick.display()));
+            notes.push(Note::Shared(set.name.display_nick()));
         }
         if dry_run {
             notes.push(Note::NameDryRun);
@@ -602,7 +596,7 @@ mod unix {
             .map_err(|e| e.to_string())?;
         let me = report_node(state);
         let mut notes: Vec<Note> = narrowed.into_iter().map(Note::Narrowed).collect();
-        let nick = set.name.nick.display();
+        let nick = set.name.display_nick();
         if !set.changed {
             notes.push(Note::Already(nick.clone()));
         }

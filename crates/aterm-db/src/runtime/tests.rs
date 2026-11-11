@@ -4,6 +4,28 @@
 use super::*;
 use aterm_secrets::fsx;
 
+/// A descriptor can become ready after the zero-time poll but before the pacing floor.
+/// The native wait's deadline is an upper bound, not a minimum sleep.
+#[test]
+fn a_notification_during_wait_preserves_the_tick_floor() {
+    let start = Instant::now();
+    for arrival in [Duration::ZERO, TICK / 2, TICK, TICK * 2] {
+        let now = std::cell::Cell::new(start);
+        rest_ready(
+            start + TICK,
+            start + POLL,
+            || Ok(false),
+            |_| {
+                now.set(start + arrival);
+                Ok(())
+            },
+            |duration| now.set(now.get() + duration),
+            || now.get(),
+        );
+        assert_eq!(now.get(), start + arrival.max(TICK));
+    }
+}
+
 #[test]
 fn a_later_expired_push_cannot_replace_a_pending_table_or_acknowledge_it() {
     for wait in [Duration::ZERO, Duration::from_millis(100)] {

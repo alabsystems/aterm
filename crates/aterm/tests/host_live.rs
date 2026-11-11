@@ -545,8 +545,7 @@ fn write_world(tmp: &Path) {
          # A fake Claude Code: draws each screen file given, reads ONE key after\n\
          # each into the key log ($1) -- one byte, or ESC and the two after it --\n\
          # as `od -c` spells it, a space as `space`; a read that returns no byte\n\
-         # is no key (noted in $log.noread, then made again, as a real program's\n\
-         # blocking read waits on); a *.hold screen is shown and nothing read, a\n\
+         # is a fixture failure, noted in $log.noread; a *.hold screen is shown and nothing read, a\n\
          # *.until one the same until $log.release exists (or for a bound), a\n\
          # *.gate one until it exists, a *.look one until $log.next exists\n\
          # (taken: the test makes one per look), a *.late one is that wait\n\
@@ -556,17 +555,26 @@ fn write_world(tmp: &Path) {
          # erasing each row's tail, as a real program moves its screen.\n\
          # It first clears what the shell printed between its fork and this\n\
          # exec, then writes a cell and erases it in place, as a real Claude\n\
-         # Code moves the screen as it starts (start_fake says why).\n\
+         # Code moves the screen as it starts (start_fake says why). Each scene\n\
+         # and its final cursor are published in one synchronized-output frame.\n\
+         [ \"$1\" = --version ] && exit 0\n\
+         # Read subprocesses stay in this fake's foreground process group.\n\
+         set +m\n\
          log=$1; shift\n\
          printf '\\033[2J\\033[H'\n\
          printf 'x\\b \\b'\n\
-         old=$(stty -g)\n\
-         stty -icanon -echo min 1\n\
+         if ! test -t 0 || ! old=$(stty -g 2>\"$log.dd\") || ! stty -icanon -echo min 1 time 0 2>>\"$log.dd\"; then\n\
+         \x20 printf 'terminal setup failed\\n' > \"$log.noread\"\n\
+         \x20 cat \"$log.dd\" >> \"$log.noread\"\n\
+         \x20 exit 74\n\
+         fi\n\
          for scene in \"$@\"; do\n\
          \x20 case \"$scene\" in *.late) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;; esac\n\
+         \x20 printf '\\033[?2026h'\n\
          \x20 case \"$scene\" in *.over) ;; *) printf '\\033[2J\\033[H' ;; esac\n\
          \x20 cat \"$scene\"\n\
          \x20 r=$(grep -n '^❯' \"$scene\" | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
+         \x20 printf '\\033[?2026l'\n\
          \x20 case \"$scene\" in\n\
          \x20 *.hold) sleep {HOLD_S}; continue ;;\n\
          \x20 *.until) n=0; while [ ! -e \"$log.release\" ] && [ $n -lt {UNTIL_MAX_TENTHS} ]; do sleep 0.1; n=$((n+1)); done; continue ;;\n\
@@ -574,11 +582,12 @@ fn write_world(tmp: &Path) {
          \x20 *.look|*.over) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;;\n\
          \x20 *.type) t=$(dd bs=4096 count=1 2>/dev/null); printf 'text:%s\\n' \"$t\" >> \"$log\"; continue ;;\n\
          \x20 esac\n\
-         \x20 while :; do\n\
-         \x20   k=$(dd bs=1 count=1 2>\"$log.dd\" | od -An -c | tr -d ' ')\n\
-         \x20   grep -q '^1+0 records in' \"$log.dd\" && break\n\
-         \x20   tr '\\n' ' ' < \"$log.dd\" >> \"$log.noread\"; echo >> \"$log.noread\"; sleep 0.05\n\
-         \x20 done\n\
+         \x20 k=$(dd bs=1 count=1 2>\"$log.dd\" | od -An -c | tr -d ' ')\n\
+         \x20 if ! grep -q '^1+0 records in' \"$log.dd\"; then\n\
+         \x20   tr '\\n' ' ' < \"$log.dd\" >> \"$log.noread\"; echo >> \"$log.noread\"\n\
+         \x20   ps -o pid=,ppid=,pgid=,tpgid= -p $$ >> \"$log.noread\"\n\
+         \x20   exit 74\n\
+         \x20 fi\n\
          \x20 [ -z \"$k\" ] && k=space\n\
          \x20 case \"$k\" in 033) k=\"$k$(dd bs=1 count=2 2>/dev/null | od -An -c | tr -d ' ')\" ;; esac\n\
          \x20 printf '%s\\n' \"$k\" >> \"$log\"\n\
@@ -791,6 +800,11 @@ fn start_fake_in(inst: &Instance, sid: &str, keys: &str, screens: &[&str]) {
 }
 
 fn keys(inst: &Instance, log: &str) -> Vec<String> {
+    let failed = no_reads(inst, log);
+    assert!(
+        failed.is_empty(),
+        "the fake's terminal read failed: {failed}"
+    );
     std::fs::read_to_string(inst.tmp.join(log))
         .unwrap_or_default()
         .lines()
@@ -859,7 +873,7 @@ fn ledger_rows(inst: &Instance, rule: &str, decision: &str) -> Vec<String> {
         .collect()
 }
 
-/// What the fake's reads that returned no byte said (its `$log.noread`): none is a key.
+/// What the fake reported when terminal setup or an input read failed: none is a key.
 fn no_reads(inst: &Instance, log: &str) -> String {
     std::fs::read_to_string(inst.tmp.join(format!("{log}.noread"))).unwrap_or_default()
 }

@@ -89,48 +89,5 @@ impl<T: Copy + Serialize> Serialize for Checked<T> {
 
 #[cfg(all(test, feature = "serde"))]
 #[allow(clippy::unwrap_used)]
-mod tests {
-
-    use crate::{Checked, U64};
-    use subtle::{Choice, ConstantTimeEq, CtOption};
-
-    #[test]
-    fn serde() {
-        let test = Checked::new(U64::from_u64(0x0011223344556677));
-
-        let serialized = bincode::serialize(&test).unwrap();
-        let deserialized: Checked<U64> = bincode::deserialize(&serialized).unwrap();
-
-        assert!(bool::from(test.ct_eq(&deserialized)));
-
-        let test = Checked::new(U64::ZERO) - Checked::new(U64::ONE);
-        assert!(bool::from(
-            test.ct_eq(&Checked(CtOption::new(U64::ZERO, Choice::from(0))))
-        ));
-
-        let serialized = bincode::serialize(&test).unwrap();
-        let deserialized: Checked<U64> = bincode::deserialize(&serialized).unwrap();
-
-        assert!(bool::from(test.ct_eq(&deserialized)));
-    }
-
-    #[test]
-    fn serde_owned() {
-        let test = Checked::new(U64::from_u64(0x0011223344556677));
-
-        let serialized = bincode::serialize(&test).unwrap();
-        let deserialized: Checked<U64> = bincode::deserialize_from(serialized.as_slice()).unwrap();
-
-        assert!(bool::from(test.ct_eq(&deserialized)));
-
-        let test = Checked::new(U64::ZERO) - Checked::new(U64::ONE);
-        assert!(bool::from(
-            test.ct_eq(&Checked(CtOption::new(U64::ZERO, Choice::from(0))))
-        ));
-
-        let serialized = bincode::serialize(&test).unwrap();
-        let deserialized: Checked<U64> = bincode::deserialize_from(serialized.as_slice()).unwrap();
-
-        assert!(bool::from(test.ct_eq(&deserialized)));
-    }
-}
+#[path = "checked_tests.rs"]
+mod tests;

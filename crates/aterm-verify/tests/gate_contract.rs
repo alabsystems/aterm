@@ -73,7 +73,13 @@ impl FakeRepo {
     }
 
     fn driver_stub(&self, rel: &str, code: i32) -> &Self {
-        self.driver_script(rel, &format!("echo '{rel}: stub'; exit {code}"))
+        self.driver_script(
+            rel,
+            &format!(
+                "echo '{rel}: stub'; echo '{}'; exit {code}",
+                stages::OBJC_VERDICT_HEADER
+            ),
+        )
     }
 
     fn driver_script(&self, rel: &str, body: &str) -> &Self {
@@ -544,6 +550,54 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
         assert!(t.could_not_run.is_empty(), "a crash is a finding: {t:?}");
         repo.driver_stub(&stub, 0);
     }
+}
+
+/// NEGATIVE CONTROL (KI-1110-3), through the stage's real runner: a driver that exits `0` before
+/// its verdict, or after printing a finding, is a red row, while the stub beside it stays green.
+#[test]
+fn an_objc_drive_that_exits_0_without_its_verdict_or_after_a_finding_is_red() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let ctx = repo.ctx_with_windows(&land(), Scope::workspace());
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::ObjcDrives)
+        .expect("planned");
+    let audit = objc_stub(stages::OBJC_DRIVES[0].example);
+    for body in [
+        "echo '=== C. LIVE SENDS ==='; exit 0".to_owned(),
+        format!(
+            "echo '  FINDING: applicationShouldTerminate: answered 0x0'; echo '{}'; exit 0",
+            stages::OBJC_VERDICT_HEADER
+        ),
+    ] {
+        repo.driver_script(&audit, &body);
+        let r = stages::run_stage(&ctx, &spec);
+        let t = tally(std::slice::from_ref(&r));
+        let ladder = r.render();
+        assert_eq!(t.gate_failures.len(), 1, "{body}: {ladder}");
+        assert!(
+            !labels_with(&ladder, "ok")
+                .iter()
+                .any(|l| l.starts_with(stages::OBJC_DRIVES[0].example)),
+            "{body}: {ladder}"
+        );
+        assert_eq!(
+            labels_with(&ladder, "ok").len(),
+            stages::OBJC_DRIVES.len() - 1,
+            "{body}: {ladder}"
+        );
+    }
+    repo.driver_stub(&audit, 0);
+    let r = stages::run_stage(&ctx, &spec);
+    assert!(
+        tally(std::slice::from_ref(&r)).gate_failures.is_empty(),
+        "{}",
+        r.render()
+    );
 }
 
 #[test]
@@ -1406,7 +1460,7 @@ fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
     );
 }
 
-/// The first test binary that fails ends a run whose halt is armed (`release`, `--fail-fast`): no
+/// The first test binary that fails ends a run whose halt is armed (a release or `--fail-fast`): no
 /// binary starts after it, the row is decided from the binaries that ran, and those it stopped are
 /// one NOT RUN row with the halt's words. CONTROLS: a binary its machine refused (NOT RUN) is no
 /// red, though its `test … FAILED` line was read while it ran, so every other binary runs; and a
@@ -1718,57 +1772,6 @@ fn a_probe_a_crash_leaves_unanswered_asks_the_next_binary() {
         "{block}"
     );
     assert!(!block.contains("libtest refused JSON"), "{block}");
-}
-
-/// A BINARY THE CEILING ENDED KEEPS ITS SAMPLE, AND ONE IT LEFT NO TIME TO START KEEPS NONE: one
-/// binary at a time under a 3 s ceiling, the first runs until the ceiling ends it, which spends
-/// the run's ceiling, so the second is not started. The first's row has its one sample, a FAIL
-/// at the one thread it ran at; the second, said not started as before, has no row, where a
-/// wall of about 0 ms would have pushed a measured sample out of it.
-#[cfg(unix)]
-#[test]
-fn a_binary_the_ceiling_left_no_time_to_start_keeps_no_history() {
-    let repo = FakeRepo::new();
-    let bins = [("fixture", "--test a", "a"), ("fixture", "--test b", "b")];
-    with_recording_cargo(&repo, &bins, "");
-    let deps = repo.root.join("target/debug/deps");
-    common::standin_body(
-        &deps.join("a-1"),
-        "printf '\\nrunning 1 test\\n'\nwhile :; do sleep 1; done",
-    );
-    common::standin_body(&deps.join("b-1"), "echo 'b ran'\nexit 0");
-    let mut ctx = repo.ctx(&land(), Scope::workspace());
-    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-    // A share of one core: one binary at a time, the second only after the first.
-    ctx.env.build_slot_held = Some("1".into());
-    ctx.env.cargo_build_jobs = Some("1".into());
-    ctx.test_threads = Some(1);
-    ctx.child_ceiling = Some(std::time::Duration::from_secs(3));
-    let history = repo.scratch.join("verify/test-binaries.json");
-    ctx.test_history = Some(history.clone());
-    let spec = plan::plan(&ctx)
-        .into_iter()
-        .find(|s| s.id == StageId::Test)
-        .expect("the test stage");
-    let block = stages::run_stage(&ctx, &spec).render();
-
-    assert!(
-        block.contains("not started: the test run's 3.0s wall-clock ceiling was spent")
-            && !block.contains("b ran"),
-        "{block}"
-    );
-    let kept = aterm_verify::test_history::load(&history);
-    assert_eq!(
-        kept.rows()
-            .iter()
-            .map(|row| {
-                let outcomes = row.samples.iter().map(|s| (s.width, s.outcome.clone()));
-                (row.test.as_str(), outcomes.collect::<Vec<_>>())
-            })
-            .collect::<Vec<_>>(),
-        [("-p fixture --test a", vec![(1, "FAIL".to_owned())])],
-        "{block}"
-    );
 }
 
 #[test]

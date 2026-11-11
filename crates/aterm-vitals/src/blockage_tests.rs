@@ -212,9 +212,22 @@ fn the_census_stands_for_now_only_while_fresh() {
     assert_eq!(d.held(), 1, "held: two passes running");
     assert_eq!(d.age_ms, 500);
     assert_eq!(d.procs[0].threads, Some(1));
-    // Readings with no new pass keep it, dated, until it is three periods old.
+    // Readings with no new pass keep it, dated, until it is three periods (90 s) old: it stands
+    // at exactly 90 s, and is gone past them.
     let s = v.absorb(&reading(60, None, DStateRead::Census(None)));
     assert!(matches!(&s.facts.dstate, DState::Read(d) if d.age_ms == 29_500));
+    let at_three = Sample {
+        at_ns: 120_500_000_000,
+        mono_ms: 120_500,
+        at_unix_ms: T0 + 120_500,
+        ..reading(120, None, DStateRead::Census(None))
+    };
+    let s = v.absorb(&at_three);
+    assert!(
+        matches!(&s.facts.dstate, DState::Read(d) if d.age_ms == 90_000),
+        "{:?}",
+        s.facts.dstate
+    );
     let s = v.absorb(&reading(121, None, DStateRead::Census(None)));
     assert_eq!(s.facts.dstate, DState::Unread(Unread::NotSampled), "stale");
 
@@ -258,8 +271,23 @@ fn linux_holds_a_d_state_seen_ten_seconds_and_counts_procs_blocked() {
         matches!(&s.facts.dstate, DState::Read(d) if d.held() == 1),
         "10 s"
     );
+    // Its pid taken by another process (another start), in D too: a clock of its own.
+    let mut reused = sweep(0, 0);
+    reused.push(ProcSample {
+        start: Some(1),
+        ..proc(700, 1, "rsync", ProcState::Uninterruptible)
+    });
+    let s = v.absorb(&reading(
+        13,
+        Some(reused),
+        DStateRead::Sweep { blocked: Some(3) },
+    ));
+    assert!(
+        matches!(&s.facts.dstate, DState::Read(d) if d.held() == 0),
+        "a reused pid"
+    );
     // Out of D and back: its clock starts again.
-    let _ = v.absorb(&swept(13, false));
-    let s = v.absorb(&swept(14, true));
+    let _ = v.absorb(&swept(14, false));
+    let s = v.absorb(&swept(15, true));
     assert!(matches!(&s.facts.dstate, DState::Read(d) if d.held() == 0));
 }

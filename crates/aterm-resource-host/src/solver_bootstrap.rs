@@ -24,6 +24,10 @@ enum State {
     Authorized,
     Failed,
 }
+enum StopSource {
+    Initial,
+    Prepared(crate::metadata_prelude::PreparedTarget),
+}
 
 pub(super) struct Owner {
     channel: CtlStream,
@@ -31,6 +35,8 @@ pub(super) struct Owner {
     offer: Frame,
     original: Option<process::Lineage>,
     state: State,
+    stop: StopSource,
+    retirement: Option<crate::metadata_prelude::NoForkTarget>,
     output: [u8; LEN],
     written: usize,
     input: [u8; LEN],
@@ -97,6 +103,8 @@ impl Owner {
             },
             original: None,
             state: State::Offer,
+            stop: StopSource::Initial,
+            retirement: None,
             output: [0; LEN],
             written: 0,
             input: [0; LEN],
@@ -110,6 +118,34 @@ impl Owner {
             return Err(invalid());
         }
         Ok((self.child_channel.take().ok_or_else(invalid)?, target))
+    }
+
+    pub fn bind_prepared(
+        &mut self,
+        target: crate::metadata_prelude::PreparedTarget,
+    ) -> io::Result<()> {
+        if !matches!(self.state, State::Offer)
+            || !matches!(self.stop, StopSource::Initial)
+            || self.original.is_some()
+            || self.written != 0
+            || self.read != 0
+            || self.child_channel.is_some()
+            || target.configured_footprint_mib() != self.offer.footprint_mib
+        {
+            self.state = State::Failed;
+            return Err(invalid());
+        }
+        let original = target.lineage();
+        self.offer.pid = original.identity.pid as u32;
+        self.offer.birth = original.identity.birth.0;
+        self.output = self.offer.encode();
+        self.original = Some(original);
+        self.stop = StopSource::Prepared(target);
+        Ok(())
+    }
+
+    pub fn take_retirement(&mut self) -> Option<crate::metadata_prelude::NoForkTarget> {
+        self.retirement.take()
     }
 
     fn validate(
@@ -173,22 +209,27 @@ impl Owner {
             if !self.write_pending()? {
                 return Ok(false);
             }
-            let stop = child.try_job_event()?.ok_or_else(invalid)?;
-            if !matches!(
-                stop.notice(),
-                spawnfd::ChildNotice::Stopped(spawnfd::ChildStop::SuspendedStart)
-            ) || !matches!(
-                stop.acknowledge()?,
-                Some(spawnfd::ChildEvent::Stopped(
-                    spawnfd::ChildStop::SuspendedStart
-                ))
-            ) {
-                return Err(invalid());
-            }
             self.validate(child, image)?;
             // Only the trusted early bootstrap runs after this owned resume.
             self.state = State::Bootstrap;
-            child.resume()?;
+            match &mut self.stop {
+                StopSource::Initial => {
+                    let stop = child.try_job_event()?.ok_or_else(invalid)?;
+                    if !matches!(
+                        stop.notice(),
+                        spawnfd::ChildNotice::Stopped(spawnfd::ChildStop::SuspendedStart)
+                    ) || !matches!(
+                        stop.acknowledge()?,
+                        Some(spawnfd::ChildEvent::Stopped(
+                            spawnfd::ChildStop::SuspendedStart
+                        ))
+                    ) {
+                        return Err(invalid());
+                    }
+                    child.resume()?;
+                }
+                StopSource::Prepared(target) => target.resume(child)?,
+            }
         }
         while self.read < LEN {
             match (&self.channel).read(&mut self.input[self.read..]) {
@@ -212,6 +253,10 @@ impl Owner {
         self.validate(child, image)?;
         if !trust_exec_policy::fork_denied(child.id())? {
             return Err(invalid());
+        }
+        if let StopSource::Prepared(target) = std::mem::replace(&mut self.stop, StopSource::Initial)
+        {
+            self.retirement = Some(target.sealed(child)?);
         }
         self.state = State::Ready;
         Ok(true)

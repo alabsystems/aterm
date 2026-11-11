@@ -411,6 +411,105 @@ fn store_entries_mut(pairs: &mut StorePairs, kind: TrustType) -> &mut Vec<aterm_
     }
 }
 
+/// The facts one tap presents for an auto-trust decision.
+struct AutoTrustFacts {
+    official: bool,
+    /// Canonical formula spelling (`tap_formula_name`);
+    /// `None` when the caller forced casks.
+    canonical_formula: Option<String>,
+    /// A formula file exists under the canonical spelling.
+    formula_file: bool,
+    /// A cask file exists under the typed token.
+    cask_file: bool,
+}
+
+/// Which kind one explicitly qualified name auto-trusts as:
+/// never for official taps, never under an alias/renamed
+/// spelling (the canonical form must be what was typed),
+/// forced by `only` when given, formula before cask.
+fn auto_trust_kind(
+    only: Option<TrustType>,
+    item: &str,
+    facts: &AutoTrustFacts,
+) -> Option<TrustType> {
+    if facts.official {
+        return None;
+    }
+    let has_formula = facts.formula_file
+        && facts
+            .canonical_formula
+            .as_deref()
+            .is_some_and(|canonical| canonical == item.to_lowercase());
+    match only {
+        Some(TrustType::Formula) => has_formula.then_some(TrustType::Formula),
+        Some(TrustType::Cask) => facts.cask_file.then_some(TrustType::Cask),
+        Some(_) => None,
+        None if has_formula => Some(TrustType::Formula),
+        None if facts.cask_file => Some(TrustType::Cask),
+        None => None,
+    }
+}
+
+/// Brew's `Trust.trust_fully_qualified_items!`: install-class
+/// commands (install/reinstall/upgrade, bundle add) grant item
+/// trust for each explicitly fully-qualified `user/tap/item`
+/// name in a non-official tap whose file exists, announcing
+/// each new grant on stderr. `only` is brew's `type:` from
+/// `--formula`/`--cask`; untyped, a formula file wins over a
+/// cask file. An alias or renamed spelling never auto-trusts:
+/// brew's canonical-name guard leaves the factory refusal to
+/// name the canonical item (measured at 7.0.13-33).
+pub fn trust_fully_qualified_items(
+    prefix: &Prefix,
+    api: &super::api::Api,
+    names: &[String],
+    only: Option<TrustType>,
+) -> Result<(), String> {
+    let taps = super::tap::list(prefix);
+    for name in names {
+        if name.matches('/').count() != 2 {
+            continue;
+        }
+        let mut parts = name.splitn(3, '/');
+        let (Some(user), Some(repo), Some(item)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(tap_ref) = TapRef::fetch(prefix, &format!("{user}/{repo}")) else {
+            continue;
+        };
+        if tap_ref.official() {
+            continue;
+        }
+        let tap = taps.iter().find(|t| t.name() == tap_ref.name());
+        let canonical =
+            (only != Some(TrustType::Cask)).then(|| tap_formula_name(api, &tap_ref, item));
+        let facts = AutoTrustFacts {
+            official: tap_ref.official(),
+            formula_file: canonical.as_deref().is_some_and(|canonical| {
+                tap.is_some_and(|t| super::tap::formula_file(t, canonical).is_some())
+            }),
+            cask_file: tap.is_some_and(|t| super::tap::cask_file(t, item).is_some()),
+            canonical_formula: canonical,
+        };
+        if let Some(kind) = auto_trust_kind(only, item, &facts) {
+            let stored = trust_name(prefix, api, kind, name, false, None)?;
+            if trust_add(kind, &stored)? {
+                eprintln!(
+                    "{}",
+                    super::tty::ohai_err(&format!(
+                        "Trusted {} {}/{}",
+                        kind.singular(),
+                        tap_ref.name(),
+                        item
+                    ))
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// brew `Trust.trust!`: true when newly added.
 pub fn trust_add(kind: TrustType, name: &str) -> Result<bool, String> {
     let name = name.to_lowercase();
@@ -1346,6 +1445,67 @@ mod tests {
         drop(first);
         aterm_update_core::FileLock::acquire_within(&path, std::time::Duration::from_secs(1))
             .expect("dropping the holder releases the flock");
+    }
+
+    #[test]
+    fn auto_trust_kind_mirrors_brew_qualified_rules() {
+        let facts = |official, canonical: Option<&str>, formula_file, cask_file| AutoTrustFacts {
+            official,
+            canonical_formula: canonical.map(str::to_owned),
+            formula_file,
+            cask_file,
+        };
+        // Direct canonical spelling with both files: formula wins
+        // untyped; --cask forces the cask; --formula the formula.
+        let both = facts(false, Some("custool"), true, true);
+        assert_eq!(
+            auto_trust_kind(None, "custool", &both),
+            Some(TrustType::Formula)
+        );
+        assert_eq!(
+            auto_trust_kind(Some(TrustType::Cask), "custool", &both),
+            Some(TrustType::Cask)
+        );
+        assert_eq!(
+            auto_trust_kind(Some(TrustType::Formula), "custool", &both),
+            Some(TrustType::Formula)
+        );
+        // Cask-only tap entry under an untyped name.
+        let cask_only = facts(false, Some("custapp"), false, true);
+        assert_eq!(
+            auto_trust_kind(None, "custapp", &cask_only),
+            Some(TrustType::Cask)
+        );
+        assert_eq!(
+            auto_trust_kind(Some(TrustType::Formula), "custapp", &cask_only),
+            None
+        );
+        // Official taps and missing files never auto-trust; case
+        // in the typed spelling still counts as canonical.
+        assert_eq!(
+            auto_trust_kind(None, "custool", &facts(true, Some("custool"), true, true)),
+            None
+        );
+        assert_eq!(
+            auto_trust_kind(
+                None,
+                "custool",
+                &facts(false, Some("custool"), false, false)
+            ),
+            None
+        );
+        assert_eq!(
+            auto_trust_kind(None, "CusTool", &both),
+            Some(TrustType::Formula)
+        );
+        // Alias/rename spellings never auto-trust (brew measured:
+        // the factory refusal names the canonical item instead).
+        let alias = facts(false, Some("custool"), true, false);
+        assert_eq!(auto_trust_kind(None, "custalias", &alias), None);
+        assert_eq!(
+            auto_trust_kind(Some(TrustType::Formula), "custold", &alias),
+            None
+        );
     }
 
     #[test]

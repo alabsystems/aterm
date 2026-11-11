@@ -3,80 +3,6 @@
 
 # aterm-http: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 18 tests it
-> deleted and 1 spec whose functions it deleted are gone, and the spec rows no longer cite those
-> tests. Since then the strict PEM decoder is deleted, and with it the spec relating it to the
-> lossy one, and the 2 tests §4 marked **delete** are deleted with their rows. 33 specs remain and
-> §2 maps 88 tests: the result line, the kind table, the gap histogram and §3 count those. The
-> per-file census of the 106 tests read was taken before.
-
-> Status 2026-10-20, agh milestone 1 (WP1): nine specs join for the methods, streamed bodies,
-> header iteration, phases, idle deadlines, bounded DNS and secret headers of the agh design §5
-> (`method-head-framing`, `bodiless-no-content-length`, `caller-accept`, `header-iteration`,
-> `streamed-body-framing`, `phase-classification`, `idle-deadline`, `dns-bounded`,
-> `secret-header-scrub`), added with 47 tests (`tests/golden_post.rs`, `tests/methods.rs`,
-> `tests/streaming.rs`, one in `tests/tls_stream.rs`, seven in `src/stream.rs` and four in
-> `src/client.rs`). All but six map to the nine: three map to `render-request-exact`; two,
-> `src/stream.rs`'s `an_answer_sent_before_a_reset_is_read_and_then_the_reset` and
-> `tls_stream::an_answer_sent_before_the_peer_closed_over_a_failed_write_is_read`, to
-> `stream-admit-before-every-syscall`; and one,
-> `streaming::an_answer_sent_while_the_body_was_still_going_out_is_read`, to
-> `send-pipeline-order`.
-> Five older tests that no row named are mapped too: the three in `src/connect.rs` (to
-> `idle-deadline`, which now states `connect::connect_timeout`'s contract),
-> `tls_stream::a_dribbled_handshake_cannot_outlive_the_global_deadline` and
-> `pem::the_lossy_parser_skips_an_aux_info_block`. **42 specs** now cover **140 tests**, every test
-> the crate runs: the result line, the kind table, the gap histogram and §3 count those.
-
-> Status 2026-10-21, main merged into agh: main's GET and PUT builders (2026-10-20) are
-> `Client::get` and `Client::put` over agh's `Client::request`, and its two tests join.
-> `loopback::a_get_and_a_put_put_their_methods_on_the_wire` maps to `send-pipeline-order`, and
-> `a_peer_that_closes_unanswered_is_a_transport_failure` (`src/client.rs`) to
-> `read-head-skips-interim`, whose statement now names the EOF before a first byte. Main's
-> `a_bodiless_get_names_no_length_and_every_other_request_does` is deleted with its row: it drove
-> the old `render_request(…, body_len)` and asserted that a GET handed a body frames it, where agh
-> refuses that body before any connection (`bodiless-no-content-length`), and
-> `methods::get_and_head_carry_no_content_length` and
-> `methods::post_patch_and_put_carry_a_zero_length_when_empty` hold the rest of it. **42 specs**
-> cover **142 tests**.
-
-> Status 2026-10-23: `dns-local-refusal` joins. macOS refuses an app its person answered *Don't
-> Allow* every mDNS query (`kDNSServiceErr_PolicyDenied`), which `getaddrinfo` reports as a
-> definite "no such name" (measured from a denied app's own process on a macOS 27.0 VM), so
-> `TcpConnector::connect` asks mDNSResponder after a failed lookup of a `.local` name and names a
-> refusal `HostUnreachable`, the kind macOS gives the same app's refused connect. The query runs on
-> a helper thread, so the caller waits at most the time it gave. Its 6 tests (three in
-> `src/stream.rs`, three in the new `src/local_network.rs`) map to it: **43 specs** cover **148
-> tests**.
-
-> Status 2026-11-05: `dns-local-refusal` goes. aterm's own `.local` lookups go through the root
-> LAN broker on macOS (`aterm_uds::lan::resolve`, `docs/DESIGN-lan-broker-2026-11-05.md`), which
-> macOS's Local Network privacy exempts, so the connector no longer asks mDNSResponder whether it
-> refuses a name, and the in-crate resolver thread goes too (`aterm_uds::lan::resolve` bounds its
-> own). `dns-bounded` now states `connect_with` and `lookup`, and takes the Linux mDNS note and
-> the local-name test: **42 specs** cover **143 tests**.
-
-> Status 2026-10-27: four duplicate tests are deleted with their §2 rows: `src/client.rs`'s
-> `content_length_framing` and `both_framings_together_is_refused_as_smuggling`, `src/tls.rs`'s
-> `init_crypto_is_idempotent` and `loopback::a_refused_port_is_an_error_not_a_panic`.
-> `error-is-revoked` and `init-crypto-installs-provider` are now only secondary specs: **43 specs**
-> cover **144 tests**; four unit tests added since (`connect::a_connect_the_partition_cuts_reaches_no_listener_until_the_cut_heals`,
-> `stream::each_address_gets_its_share_of_the_deadline_and_the_last_the_rest`,
-> `stream::a_failed_connect_names_the_address_it_went_to`, and
-> `stream::a_local_name_linux_cannot_resolve_names_what_it_lacks`) bring the total to **148 tests**.
-
-> Status 2026-11-05: `dns-bounded` coalesces lookups. While macOS's Local Network question stands
-> unanswered, mDNSResponder holds an app's own `.local` lookups with no end, so each
-> `resolve_within` that timed out left its helper behind: E3's first-launch guest (macOS 27, an
-> unanswered question) sampled dozens of `aterm-http-dns` threads parked in `mdns_addrinfo`, about
-> two more each second. A lookup of a host and port whose helper still runs now waits on that
-> helper instead of starting another. Two tests join (`stream::a_lookup_behind_one_still_running_starts_no_second_helper`,
-> `stream::a_resolver_that_unwinds_leaves_no_flight_under_way`), bringing the total to **150 tests**.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 33 specs of that date
-> (43 now) is proved through Trust/Clean about the compiled Rust fn, and then the tests it
-> subsumes are deleted. The 4 tests §4 listed outside any spec are all deleted.
-
 Source: `crates/aterm-http` (read only). I read every `#[test]` (src/client.rs 28, src/pem.rs 11,
 src/proxy.rs 16, src/stream.rs 4, src/tls.rs 2, src/uri.rs 10, src/verifier/tests.rs 10,
 src/verifier/unix.rs 7, tests/loopback.rs 11, tests/signature_methods.rs 3, tests/tls_stream.rs 2,
@@ -121,7 +47,7 @@ Function paths are relative to the crate (`uri::Uri::parse` is `aterm_http::uri:
   signatures, the validity window, SAN name/IP match, CA basic constraints, serverAuth EKU). It is
   authored on the Lean side and has no Rust counterpart today.
 - `blocking_gaps` uses the numbers of the gap table in
-  `AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit)
+  `docs/TRUST-LANE.md` (Blocking gaps)
   §7. Gap 0 (admitting a seal that publishes Clean rows to the machine's `trust` channel) is a
   prerequisite for every row, so it is listed on all 43. 1 is non-scalar carriers, 2 is `&self`/`&mut`
   views, 3 is E6 body widening, 4 is callee-ensures composition, 5 is quantified clauses, 7 is loops,
@@ -132,7 +58,7 @@ Function paths are relative to the crate (`uri::Uri::parse` is `aterm_http::uri:
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; `-` or "secondary only"
 when §2 names it only under `also`), `difficulty` (Rust features the proof must handle), and
-`blocking_gaps`: rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. 0 is
+`blocking_gaps`: rows of the gap table in `docs/TRUST-LANE.md` (Blocking gaps). 0 is
 the seal upgrade (every row), 1 non-scalar carriers, 2 `&self`/`&mut` views, 3 E6 body widening, 4
 callee-ensures composition, 5 quantified clauses, 7 loops, 8 effects/FFI, 10 model→code refinement, 11
 generics, 12 cross-crate citation (`aterm_codec`, rustls, webpki, ring), 13 closures, threads and
@@ -190,51 +116,6 @@ Unqualified test names in `subsumes` are in the file that holds the spec's funct
 `streaming::` prefix is the file under `tests/`; `connect::` is `src/connect.rs`, `local_network::` is
 `src/local_network.rs`, and
 `verifier::tests::` and `verifier::unix::` are `src/verifier/tests.rs` and `src/verifier/unix.rs`.
-
-### Distribution by kind (42)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 32 | uri-parse-accept-set, uri-parse-fields, uri-render, pem-lossy, proxy-resolve-selection, proxy-parse, proxy-refusal-names-variable-never-value, proxy-target-debug-redacts, no-proxy-match, header-validation-grammar, response-header-fields, http-number-grammar, status-line-grammar, read-head-skips-interim, response-accessors, render-request-exact, connect-tunnel-exchange, tls-config-lazy-and-shared, error-is-revoked, deadline-remaining, init-crypto-installs-provider, client-config-roots-fail-closed, verifier-accepts-only-through-arm, provider-advertises-modern-schemes, unix-store-fail-closed, unix-cert-path-selection, bodiless-no-content-length, caller-accept, header-iteration, phase-classification, idle-deadline, dns-bounded |
-| equivalence | 1 | verifier-delegates-signatures |
-| refinement | 4 | response-body-framing, send-pipeline-order, platform-verifier-conformance, streamed-body-framing |
-| table-property | 2 | decide-framing-table, method-head-framing |
-| invariant | 2 | stream-admit-before-every-syscall, secret-header-scrub |
-| no-panic | 1 | response-parse-no-panic |
-
-### Blocking-gap histogram (specs blocked by each gap)
-
-| gap | specs | gap | specs |
-|---|---|---|---|
-| 0 seal admission | 42 | 7 loops | 18 |
-| 1 non-scalar carriers | 36 | 8 effects/FFI | 17 |
-| 2 `&self`/`&mut` views | 21 | 10 model→code refinement | 1 |
-| 3 E6 body widening | 17 | 11 generics | 8 |
-| 4 callee-ensures composition | 12 | 12 cross-crate citation | 11 |
-| 5 quantified clauses | 17 | 13 closures/threads/`OnceLock` | 18 |
-
-No spec is blocked by gap 0 alone. Gap 1 is the crate's bottleneck: only 6 specs avoid it
-(`tls-config-lazy-and-shared`, `stream-admit-before-every-syscall`, `deadline-remaining`,
-`init-crypto-installs-provider`, `verifier-delegates-signatures`, `dns-bounded`), and every one of
-those needs gap 8 or 12 instead.
-
-### Proof dependency order
-
-`http-number-grammar`, `uri-render` and `error-is-revoked` → `uri-parse-accept-set` /
-`uri-parse-fields` → `proxy-parse`, `proxy-refusal-names-variable-never-value`, `no-proxy-match` →
-`proxy-resolve-selection`. Separately: aterm_codec base64/pct specs → `pem-lossy` →
-`client-config-roots-fail-closed`, `unix-cert-path-selection` →
-`unix-store-fail-closed`. On the wire: `header-validation-grammar`, `response-header-fields`,
-`status-line-grammar` → `read-head-skips-interim` + `decide-framing-table` → `response-body-framing`,
-`response-parse-no-panic` → `render-request-exact`, `connect-tunnel-exchange` → `deadline-remaining`,
-`stream-admit-before-every-syscall` → `send-pipeline-order`. The verifier specs
-(`verifier-delegates-signatures`, `verifier-accepts-only-through-arm`, `platform-verifier-conformance`)
-come last; the conformance spec needs the X.509 model `V`. The agh rows (2026-10-20):
-`decide-framing-table` → `method-head-framing`; `response-body-framing` → `streamed-body-framing`;
-`render-request-exact` → `bodiless-no-content-length`, `caller-accept`; `response-accessors` →
-`header-iteration`; `deadline-remaining` → `idle-deadline` and `dns-bounded` →
-`phase-classification`; `header-validation-grammar` and aterm-uds's `Secret` →
-`secret-header-scrub`.
 
 ## 2. Test → spec map (TSV)
 
@@ -389,46 +270,6 @@ tests/tls_stream.rs	an_answer_sent_before_the_peer_closed_over_a_failed_write_is
 tests/tls_stream.rs	authority_revoked_during_a_tls_read_stops_it	stream-admit-before-every-syscall	
 ```
 
-## 3. Coverage
-
-- 106 tests originally read. 102 mapped to one of the 35 specs and 4 were not spec samples (§4). After the
-  deletions since, 88 map to one of the 33 specs; five more (the three in `src/connect.rs`, one in
-  `tests/tls_stream.rs` and one in `src/pem.rs`) had no row until 2026-10-20. The 47 tests agh's
-  WP1 added (2026-10-20) map to the 9 specs it added, to `render-request-exact` (3), to
-  `stream-admit-before-every-syscall` (2: the Apple-platform reset test in `src/stream.rs` and the
-  TLS early answer in `tests/tls_stream.rs`), or to `send-pipeline-order` (1: the plain early
-  answer), so with the five, 140 tests map to one of 42 specs. Main's merge (2026-10-21) adds
-  two: one to `send-pipeline-order`, one to `read-head-skips-interim`: 142. `dns-local-refusal`
-  (2026-10-23) adds 6 and one spec: 148 tests map to one of 43 specs. Four duplicates deleted
-  (2026-10-27) left 144, and five unit tests added since (`idle-deadline` +3, `dns-local-refusal` +1,
-  `stream-admit-before-every-syscall` +1) bring the total to 149 live tests. `dns-local-refusal`
-  goes (2026-11-05) with the 7 tests of the lookups the LAN broker replaced, its two left join
-  `dns-bounded` and one joins it: 143 live tests map to one of 42 specs, all in §2.
-- The biggest collapses: `idle-deadline` (13, 4 of them `src/connect.rs`'s),
-  `stream-admit-before-every-syscall` (11, across three test files),
-  `streamed-body-framing` (10),
-  `phase-classification` (9), `render-request-exact` (8 primary, 3 of them the golden and method
-  tests), `proxy-resolve-selection` (7), `response-body-framing` (6),
-  `uri-parse-fields` (6), then `no-proxy-match` and `platform-verifier-conformance` (5 each).
-- `http-number-grammar`, `uri-render`, `proxy-target-debug-redacts` and `response-accessors` retire
-  no test alone, but the larger specs cite them as lemmas, and they are a secondary spec of 11
-  tests.
-- Dependencies: `http-number-grammar`, `uri-render` and `error-is-revoked` → `uri-parse-accept-set` /
-  `uri-parse-fields` → `proxy-parse`, `proxy-refusal-names-variable-never-value`, `no-proxy-match` →
-  `proxy-resolve-selection`. `aterm_codec::base64`'s specs → `pem-lossy` → `client-config-roots-fail-closed`,
-  `unix-cert-path-selection` → `unix-store-fail-closed`. On the wire: `header-validation-grammar`,
-  `response-header-fields`, `status-line-grammar` → `read-head-skips-interim` + `decide-framing-table` →
-  `response-body-framing`, `response-parse-no-panic` → `render-request-exact`, `connect-tunnel-exchange`
-  → `deadline-remaining`, `stream-admit-before-every-syscall` → `send-pipeline-order`. Then
-  `decide-framing-table` → `method-head-framing`; `response-body-framing` → `streamed-body-framing`;
-  `render-request-exact` → `bodiless-no-content-length`, `caller-accept`; `response-accessors` →
-  `header-iteration`; `deadline-remaining` → `idle-deadline`, `dns-bounded` → `phase-classification`;
-  `header-validation-grammar` and aterm-uds's `Secret` → `secret-header-scrub`. The verifier specs come
-  last; `platform-verifier-conformance` needs the model `V`.
-- A test leaves the suite only when **every** spec in its row (primary and `also`) is proved. For
-  example, `framing_refuses_every_response_whose_end_is_ambiguous` waits on both
-  `decide-framing-table` and `http-number-grammar`.
-
 ## 4. Tests that are not spec samples
 
 None: no test is a pure regression of a removed bug with no general property; every regression-shaped test (header smuggling, the usize chunk-size wrap, the dribbling
@@ -460,26 +301,3 @@ TLS peer) is an instance of a spec above.
    (`let _ = error`) and bounded only the elapsed time. It now asserts the `TimedOut` Io error the
    spec requires, and no clock. Its stub holds the connection for the 60 s hang detector, so a
    client that ignored its deadline sees the close a minute later as `UnexpectedEof` and fails.
-
-## 6. Proof order (easiest high-value first)
-
-No spec here is blocked by gap 0 alone, so the order prefers the smallest remaining gap sets.
-
-1. **`error-is-revoked`** (gaps 0, 1, 2). An enum match with a guard on `io::ErrorKind`, plus the
-   `From` wrap. It is a small first use of enum carriers and `&self` views, is sampled by
-   `streaming::a_refused_connect_was_not_sent`, and is the error vocabulary that
-   `stream-admit-before-every-syscall` and `send-pipeline-order` cite.
-2. **`deadline-remaining`** (gaps 0, 8). Pure `Duration` arithmetic once `Instant::now` is a clock
-   effect. It is the timeout half of the stream invariant.
-3. **`http-number-grammar`** (gaps 0, 1, 3, 5, 7). A single `chars().all` loop and a `from_str_radix`
-   std spec over `&str`. It is the lemma under `status-line-grammar`, `decide-framing-table` and the
-   chunk sizes of `response-body-framing`, which together hold 11 primary tests.
-4. **`uri-render`** and **`proxy-refusal-names-variable-never-value`** (gaps 0, 1, 2, 3 and 0, 1, 3, 5).
-   Straight-line string building with no loops. They are the first `&str`/`String` content specs and
-   unblock `render-request-exact` and the `proxy` chain.
-5. **`decide-framing-table`** (gaps 0, 1, 3, 5, 7, 13). A finite rule table over the header list. It
-   retires 3 tests, including the smuggling cases, and with `http-number-grammar` is the core of
-   `response-body-framing`.
-
-Runner-up: `verifier-delegates-signatures` (gaps 0, 2, 12). It is three one-line delegations, so it is
-almost free once cross-crate citation of rustls lands, and it retires 3 tests.

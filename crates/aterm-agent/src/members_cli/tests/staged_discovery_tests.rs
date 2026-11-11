@@ -57,7 +57,25 @@ impl CachedMember {
         numeric: bool,
         note: std::sync::Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
-        use aterm_net::fleet::{FleetOp, FleetScope, Listening, NodeIdentity};
+        Self::listen_preparing(
+            secret,
+            event,
+            numeric,
+            note,
+            aterm_net::fleet::NodeIdentity::from_seed(&"22".repeat(16), &[22; 32]),
+            std::sync::Arc::new(|| Ok(())),
+        )
+    }
+
+    fn listen_preparing(
+        secret: &aterm_net::fleet::FleetSecret,
+        event: mpsc::Sender<&'static str>,
+        numeric: bool,
+        note: std::sync::Arc<dyn Fn() + Send + Sync>,
+        node: Option<aterm_net::fleet::NodeIdentity>,
+        before_greeting: std::sync::Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>,
+    ) -> Self {
+        use aterm_net::fleet::{FleetOp, FleetScope, Listening};
         use std::sync::Arc;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -66,7 +84,7 @@ impl CachedMember {
         let listening = Listening {
             secret: secret.clone(),
             scope: FleetScope::Facts,
-            node: NodeIdentity::from_seed(&"22".repeat(16), &[22; 32]),
+            node,
             serves: &[FleetOp::VaultJoin],
             slots: 1,
             per_source: 1,
@@ -79,7 +97,9 @@ impl CachedMember {
                 let ask: Option<aterm_net::fleet::AskHandler> = numeric.then(|| {
                     let wire = Arc::clone(&wire);
                     let event = event.clone();
+                    let before_greeting = Arc::clone(&before_greeting);
                     Arc::new(move |stream: &mut dyn aterm_net::fleet::Duplex, _| {
+                        before_greeting()?;
                         writeln!(stream,
                             "ALAB member=1 key={} network={} authority={} genesis={} name=numeric allow=1 invite=0 challenge={}",
                             "09".repeat(32), "01".repeat(16), "02".repeat(32),
@@ -108,10 +128,15 @@ impl CachedMember {
                             served.peer_node().is_some(),
                             "the cached route proves its node"
                         );
-                        let (wire, event) = (Arc::clone(&wire), event.clone());
+                        let (wire, event, before_greeting) = (
+                            Arc::clone(&wire),
+                            event.clone(),
+                            Arc::clone(&before_greeting),
+                        );
                         served.answer(move |stream| {
                             stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
                             stream.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
+                            before_greeting()?;
                             writeln!(stream,
                                 "ALAB member=1 key={} network={} authority={} genesis={} name=cached allow=1 invite=0 challenge={}",
                                 "09".repeat(32), "01".repeat(16), "02".repeat(32),
@@ -374,11 +399,12 @@ impl Drop for CachedMember {
 /// Empty numeric discovery must not leave an authenticated cached route behind DNS.
 /// Both a source-free recovery and a configured pending join use the actual runner,
 /// saved fleet book, fleet TLS handshake and guarded authority request.
+/// A cached peer held after TLS, before its greeting, must not hide a healthy cached peer.
 #[test]
 fn automatic_fallback_proves_a_cached_member_before_waiting_for_dns() {
     use aterm_net::fleet::{FleetSecret, NodeIdentity};
     use aterm_net::fleet_member::{self, Began, JoinCode, Peer, Via};
-    for pending in [false, true] {
+    for (pending, stalled) in [(false, false), (true, false), (false, true)] {
         let root = aterm_tempfile::tempdir().unwrap();
         let mut mac = me(root.path(), "restored");
         let state = root.path().join("fleet");
@@ -391,7 +417,50 @@ fn automatic_fallback_proves_a_cached_member_before_waiting_for_dns() {
         };
         let secret = FleetSecret::new(&code.secret).unwrap();
         let (event, events) = mpsc::channel();
-        let cached = CachedMember::listen(&secret, event.clone());
+        let greeting_entered = std::sync::Arc::new(aterm_uds::stop::Stop::new());
+        let release_greeting = std::sync::Arc::new(aterm_uds::stop::Stop::new());
+        let stalled_member = stalled.then(|| {
+            let entered = std::sync::Arc::clone(&greeting_entered);
+            let release = std::sync::Arc::clone(&release_greeting);
+            CachedMember::listen_preparing(
+                &secret,
+                event.clone(),
+                false,
+                std::sync::Arc::new(|| {}),
+                NodeIdentity::from_seed(&"11".repeat(16), &[11; 32]),
+                std::sync::Arc::new(move || {
+                    entered.set();
+                    if release.sleep(aterm_spec::wait::MUST_HAPPEN) {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "the controller did not release the held greeting",
+                        ))
+                    }
+                }),
+            )
+        });
+        let cached = {
+            let entered = std::sync::Arc::clone(&greeting_entered);
+            CachedMember::listen_preparing(
+                &secret,
+                event.clone(),
+                false,
+                std::sync::Arc::new(|| {}),
+                NodeIdentity::from_seed(&"22".repeat(16), &[22; 32]),
+                std::sync::Arc::new(move || {
+                    if !stalled || entered.sleep(aterm_spec::wait::MUST_HAPPEN) {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "the held peer never reached its greeting",
+                        ))
+                    }
+                }),
+            )
+        };
         fleet_member::write_held(&state, Began::Here, |book| {
             book.write_key(&code.secret).unwrap();
         })
@@ -414,6 +483,21 @@ fn automatic_fallback_proves_a_cached_member_before_waiting_for_dns() {
                 fleet: Some(secret.mark()),
                 signed: None,
             });
+            if let Some(stalled) = &stalled_member {
+                book.push(Peer {
+                    node: Some("11".repeat(16)),
+                    key: None,
+                    key_from: None,
+                    host: "aaa-retained.invalid".into(),
+                    addr: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                    port: stalled.port,
+                    version: None,
+                    seen_ms: None,
+                    via: Via::Joined,
+                    fleet: Some(secret.mark()),
+                    signed: None,
+                });
+            }
             Ok(())
         })
         .unwrap();
@@ -463,15 +547,22 @@ fn automatic_fallback_proves_a_cached_member_before_waiting_for_dns() {
             join_vault: &no_vault,
             follow: &|_| Follows::Runs,
         };
-        let first = std::thread::scope(|threads| {
+        let (entered, first) = std::thread::scope(|threads| {
             let worker = threads.spawn(|| joined(&mac, &JoinArgs::default(), &reach));
-            let first = events.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+            let entered = !stalled || greeting_entered.sleep(aterm_spec::wait::MUST_HAPPEN);
+            let first = events.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
             // Clean up the held source before asserting, including the red path.
+            release_greeting.set();
             release.send(()).unwrap();
             let _ = worker.join().unwrap();
-            first
+            (entered, first)
         });
-        assert_eq!(first, "proof", "pending={pending}");
+        assert!(entered, "the first cached peer reached its held greeting");
+        assert_eq!(
+            first.expect("proof or DNS completed after cleanup"),
+            "proof",
+            "a stalled greeting cannot hide another cached member: pending={pending} stalled={stalled}"
+        );
         let wire = cached.wire.lock().unwrap();
         assert_eq!(wire.len(), 1);
         assert!(wire[0].starts_with("prove ") && wire[0].contains(" authority="));

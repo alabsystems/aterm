@@ -414,7 +414,8 @@ pub enum Pick {
     Wait {
         /// The model asked for.
         model: String,
-        /// The earliest refill of a candidate's pool.
+        /// When it can run: from [`pick`], the earliest refill of a candidate's pool; from
+        /// [`pick_at_wall`], the refill of the asked model's own pool.
         until: Option<i64>,
     },
     /// The quota names no pool for the model asked for; it runs unchanged.
@@ -527,13 +528,15 @@ pub fn pick(quota: &Quota, asked: &str, named: bool, rotation: &Rotation) -> Pic
     }
 }
 
-/// Choose the model for a running `agy` session stopped at a quota wall on screen on `asked`
-/// under `quota`.
+/// What `quota` says of a running `agy` session stopped at a quota wall on screen on `asked`; its
+/// reader is the wall-reset read (`upgrade_drive::agy_limit_reset`), which takes from it when
+/// `asked`'s own pool refills.
 ///
 /// Unlike [`pick`], a named model at a low pool (or a model stopped at a per-model quota wall
-/// after spending part of its pool) rotates to the first candidate in an open pool, else to the
-/// candidate in a low pool with the most left, else waits for the earliest refill. When `asked`'s
-/// pool has refilled to 100% (`Open`), `asked` is kept so the supervisor resumes it in place.
+/// after spending part of its pool) answers [`Pick::Rotate`] onto the first candidate in an open
+/// pool, else onto the candidate in a low pool with the most left, else waits for the refill of
+/// `asked`'s own pool. When `asked`'s pool has refilled to 100% (`Open`), `asked` is kept so the
+/// supervisor resumes it in place.
 #[must_use]
 pub fn pick_at_wall(quota: &Quota, asked: &str, rotation: &Rotation) -> Pick {
     let Some(group) = quota.group_of(asked) else {
@@ -585,10 +588,7 @@ pub fn pick_at_wall(quota: &Quota, asked: &str, rotation: &Rotation) -> Pick {
         None if standing != Standing::Spent && bucket_full => keep,
         None => Pick::Wait {
             model: asked.to_owned(),
-            until: std::iter::once(group.wall_refills_at())
-                .chain(candidates.iter().map(|(_, g)| g.unblocks_at()))
-                .flatten()
-                .min(),
+            until: group.wall_refills_at(),
         },
     }
 }

@@ -4,10 +4,11 @@
 //! `targo --unverified verify land` (design B10, `docs/DESIGN-fast-build-release-2026-11-05.md`
 //! §4.6): land this checkout's branch on main, judged.
 //!
-//! 1. Fetch main and merge it (M1), stopping on a conflict. A `CHANGELOG.md` entry the branch
-//!    adds that the merge leaves under a released version (a release cut on main after it was
-//!    written) goes back under `## [Unreleased]` ([`changelog`]), in the tool's own merge, else
-//!    in a commit of its own; so does one each re-judge's merge (step 4) leaves there.
+//! 1. Fetch main and merge it (M1), stopping on a conflict. Divergent `CHANGELOG.md` changes
+//!    use complete original entries before Git's union driver combines lines ([`changelog`]):
+//!    preserve main's shipped text and keep branch replacements Unreleased, refusing ambiguous
+//!    edits. Already-committed hand merges and one-sided changes retain historical rehoming.
+//!    The same entry decision applies to each re-judge's merge (step 4).
 //! 2. Run the dev set over the cone since M1 (`verify --base M1`, B7's export scan included),
 //!    on the committed checkout: one that changes during the run pushes nothing.
 //! 3. A red main's lane verdict on the merged main commit names (B8's journal,
@@ -19,7 +20,8 @@
 //!    meanwhile, compose the pass onto M2 when AGENTS.md's rule holds: a clean merge and
 //!    disjoint endpoint changes after discarding only shared paths with identical mode,
 //!    type and object (or all absent) in checked, new main and merge, including parent trees.
-//!    Unavailable entry evidence keeps the original overlap. A sole remaining shared
+//!    A semantic CHANGELOG merge requires rejudgment. Unavailable entry evidence keeps the
+//!    original overlap. A sole remaining shared
 //!    `Cargo.lock` may instead carry an isolated local product-version move
 //!    ([`version::independent_lock`]). The four immutable trees retain every other lock
 //!    byte and the source-proven binary-leaf identity boundary. That
@@ -281,10 +283,17 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
         return Ok(exit::PASS);
     }
     let merged_here = !git.is_ancestor(&merged, &start)?;
-    if merged_here && let Merge::Conflict(paths) = git.merge(&merged, &subject)? {
-        return Ok(conflicted(seams, &merged, &paths));
+    let entry_merged = if merged_here {
+        match git.merge(&merged, &subject)? {
+            Merge::Conflict(paths) => return Ok(conflicted(seams, &merged, &paths)),
+            Merge::Clean { entries } => entries,
+        }
+    } else {
+        false
+    };
+    if !entry_merged {
+        rehome_changelog(git, seams, &merged, merged_here.then_some(subject.as_str()))?;
     }
-    rehome_changelog(git, seams, &merged, merged_here.then_some(subject.as_str()))?;
     let mut judged_at = git.head()?;
     let branch = (seams.branch)(git.root, &merged);
     say(
@@ -344,12 +353,13 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
             seams,
             format!("verify land: {REMOTE}/{MAIN} moved to {tip} before the push"),
         );
-        let tree = if git.is_ancestor(&merged, &tip)? {
-            git.merge_tree(&tip, &judged_at)?
+        let compose = if git.is_ancestor(&merged, &tip)? {
+            Some(git.merge_tree(&tip, &judged_at)?)
         } else {
             None
         };
-        let overlap = match &tree {
+        let tree = compose.as_ref().and_then(Compose::tree);
+        let overlap = match tree {
             Some(_) => {
                 let theirs = git.files(&merged, &tip)?;
                 let ours = git.files(&merged, &judged_at)?;
@@ -358,11 +368,10 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
             None => Vec::new(),
         };
         let composition = tree
-            .as_ref()
             .map(|tree| git.independent_changes(&merged, &tip, &judged_at, tree))
             .transpose()?
             .flatten();
-        if let (Some(tree), Some(why)) = (&tree, composition) {
+        if let (Some(tree), Some(why)) = (tree, composition) {
             if composes == COMPOSES {
                 say(
                     seams,
@@ -376,25 +385,30 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
             }
             composes += 1;
             say(seams, format!("verify land: composing onto {tip}: {why}"));
-            composed_tree = Some(tree.clone());
+            composed_tree = Some(tree.to_owned());
             onto = tip;
             continue;
         }
-        say(
-            seams,
-            if tree.is_none() {
-                format!("verify land: {tip} does not compose: the merge is not clean")
-            } else {
-                format!(
-                    "verify land: {tip} does not compose: its new commits touch the branch's {}",
-                    overlap
-                        .iter()
-                        .map(|path| display_git_path(path))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            },
-        );
+        let why = match &compose {
+            None => format!("it does not descend from {merged}, the main the branch merged"),
+            Some(Compose::Tree(_)) => format!(
+                "its new commits touch the branch's {}",
+                overlap
+                    .iter()
+                    .map(|path| display_git_path(path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some(Compose::Entries) => format!(
+                "it and the branch both change {}, whose entries the worktree merge combines",
+                changelog::PATH
+            ),
+            Some(Compose::Refused(why)) => {
+                format!("its {} entry merge stops: {why}", changelog::PATH)
+            }
+            Some(Compose::Conflict) => "the merge is not clean".to_owned(),
+        };
+        say(seams, format!("verify land: {tip} does not compose: {why}"));
         if let Some(why) = git.moved_from(&judged_at)? {
             say(
                 seams,
@@ -414,8 +428,10 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
         }
         match git.merge(&tip, &subject)? {
             Merge::Conflict(paths) => return Ok(conflicted(seams, &tip, &paths)),
-            Merge::Clean => {
-                rehome_changelog(git, seams, &tip, Some(&subject))?;
+            Merge::Clean { entries } => {
+                if !entries {
+                    rehome_changelog(git, seams, &tip, Some(&subject))?;
+                }
                 judged_at = git.head()?;
                 rejudges += 1;
                 composes = 0;
@@ -701,7 +717,7 @@ fn landed_line(landing: &str, stated: &Stated) -> String {
 /// How a merge of main into the checkout went.
 enum Merge {
     /// Merged and committed.
-    Clean,
+    Clean { entries: bool },
     /// Stopped on conflicts, left for the person: the conflicted paths.
     Conflict(Vec<Vec<u8>>),
 }
@@ -749,12 +765,37 @@ pub(crate) fn receipt_composition(
         return Ok(false);
     }
     let base = base.trim();
-    if git.merge_tree(checked, main)?.as_deref() != Some(tree) {
+    if git.merge_tree(main, checked)?.tree() != Some(tree) {
         return Ok(false);
     }
     Ok(git
         .independent_changes(base, main, checked, tree)?
         .is_some())
+}
+
+/// What composing a checked commit onto moving main makes ([`Git::merge_tree`]): its tree, or
+/// why an ordinary worktree merge and a re-judgment come instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Compose {
+    /// The clean merge's tree.
+    Tree(String),
+    /// Both sides changed the changelog's entries: the worktree merge combines them
+    /// ([`changelog`]), and the tree it makes is judged.
+    Entries,
+    /// The changelog entry merge stops, for this reason; the worktree merge stops on it too.
+    Refused(String),
+    /// Git's merge conflicts.
+    Conflict,
+}
+
+impl Compose {
+    /// The clean merge's tree, where there is one.
+    fn tree(&self) -> Option<&str> {
+        match self {
+            Compose::Tree(tree) => Some(tree),
+            Compose::Entries | Compose::Refused(_) | Compose::Conflict => None,
+        }
+    }
 }
 
 /// The checkout's git.
@@ -957,10 +998,21 @@ impl Git<'_> {
             .collect())
     }
 
-    /// The tree a clean merge of `ours` and `theirs` makes, or `None` where it conflicts.
-    fn merge_tree(&self, ours: &str, theirs: &str) -> Result<Option<String>, String> {
+    /// The tree composing `checked` onto moving `main` makes ([`Compose::Tree`]), or why entry
+    /// merging or a Git conflict requires an ordinary worktree merge and rejudgment.
+    fn merge_tree(&self, main: &str, checked: &str) -> Result<Compose, String> {
+        // Semantic entry merging is qualification work, not an independence exception. The
+        // ordinary worktree merge below will apply it and the caller will judge that tree.
+        // A refused entry merge composes nothing either: the writer's ordinary merge reruns
+        // it and stops on that refusal, and release input's historical reader counts such a
+        // receipt as not composed, so its commits are judged rather than the input unread.
+        match self.changelog_merge(checked, main) {
+            Ok(None) => {}
+            Ok(Some(_)) => return Ok(Compose::Entries),
+            Err(why) => return Ok(Compose::Refused(why)),
+        }
         let out = self.complete(
-            &["merge-tree", "--write-tree", "--no-messages", ours, theirs],
+            &["merge-tree", "--write-tree", "--no-messages", main, checked],
             LOCAL,
         )?;
         let first = String::from_utf8_lossy(&out.stdout)
@@ -969,10 +1021,10 @@ impl Git<'_> {
             .unwrap_or_default()
             .to_owned();
         match out.status.code() {
-            Some(0) if aterm_types::land_trailer::object_id(&first) => Ok(Some(first)),
-            Some(1) => Ok(None),
+            Some(0) if aterm_types::land_trailer::object_id(&first) => Ok(Compose::Tree(first)),
+            Some(1) => Ok(Compose::Conflict),
             _ => Err(format!(
-                "git merge-tree {ours} {theirs}: {}",
+                "git merge-tree {main} {checked}: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             )),
         }
@@ -980,6 +1032,7 @@ impl Git<'_> {
 
     /// Merge main commit `main` into the checkout and update its submodules.
     fn merge(&self, main: &str, subject: &str) -> Result<Merge, String> {
+        let changelog = self.changelog_merge(&self.head()?, main)?;
         let out = self.status(
             &[
                 "-c",
@@ -987,6 +1040,7 @@ impl Git<'_> {
                 "merge",
                 "--no-ff",
                 "--no-edit",
+                "--no-commit",
                 "--no-verify",
                 "-m",
                 subject,
@@ -994,18 +1048,158 @@ impl Git<'_> {
             ],
             NETWORK,
         )?;
+        let conflicts = self.paths(&["diff", "-z", "--name-only", "--diff-filter=U"])?;
+        let merge_head = self.complete(&["rev-parse", "--verify", "MERGE_HEAD"], LOCAL)?;
+        let actual_merge = merge_head.status.success()
+            && String::from_utf8_lossy(&merge_head.stdout).trim() == main;
+        if !out.status.success() && (conflicts.is_empty() || !actual_merge) {
+            return Err(format!(
+                "git merge {main}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        if !actual_merge {
+            if out.status.success() {
+                return Ok(Merge::Clean { entries: false });
+            }
+            return Err(format!(
+                "git merge {main} did not establish the expected merge state"
+            ));
+        }
+        if let Some(text) = &changelog {
+            std::fs::write(self.root.join(changelog::PATH), text)
+                .map_err(|error| format!("write merged CHANGELOG.md: {error}"))?;
+            self.local(&["add", "--", changelog::PATH])?;
+        }
         if !out.status.success() {
             let conflicted = self.paths(&["diff", "-z", "--name-only", "--diff-filter=U"])?;
-            if conflicted.is_empty() {
+            if conflicted.is_empty() && changelog.is_none() {
                 return Err(format!(
                     "git merge {main}: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
             }
-            return Ok(Merge::Conflict(conflicted.into_iter().collect()));
+            if !conflicted.is_empty() {
+                return Ok(Merge::Conflict(conflicted.into_iter().collect()));
+            }
         }
+        self.local(&["commit", "--no-verify", "-m", subject])?;
         self.update_submodules()?;
-        Ok(Merge::Clean)
+        Ok(Merge::Clean {
+            entries: changelog.is_some(),
+        })
+    }
+
+    /// Decide from original blobs, never the union driver's already combined lines. A missing
+    /// file or multiple merge bases is not permission to infer entry authorship.
+    fn changelog_merge(&self, branch: &str, main: &str) -> Result<Option<String>, String> {
+        if !self
+            .files(branch, main)?
+            .contains(changelog::PATH.as_bytes())
+        {
+            return Ok(None);
+        }
+        let bases = self.local(&["merge-base", "--all", branch, main])?;
+        let bases: Vec<_> = bases.lines().collect();
+        if bases.len() != 1 {
+            return Err("CHANGELOG entry merge needs one unambiguous merge base".into());
+        }
+        let base = bases[0];
+        let changed = |tip| {
+            self.files(base, tip)
+                .map(|paths| paths.contains(changelog::PATH.as_bytes()))
+        };
+        let divergent = changed(branch)? && changed(main)?;
+        if !divergent && self.changelog_blob(base)?.is_none() {
+            return Ok(None);
+        }
+        let read = |revision| {
+            self.changelog_blob(revision)?
+                .ok_or_else(|| "CHANGELOG entry merge needs every original file".to_owned())
+        };
+        let (old, ours, theirs) = (read(base)?, read(branch)?, read(main)?);
+        if ours == theirs {
+            return Ok(None);
+        }
+        for (tip, text, opposite) in [(main, &theirs, &ours), (branch, &ours, &theirs)] {
+            for (kind, body) in changelog::removed_entries(&old, opposite).map_err(str::to_owned)? {
+                if changelog::holds_entry(text, &kind, &body).map_err(str::to_owned)?
+                    && self.entry_written_since(base, tip, &kind, &body)?
+                {
+                    return Err("CHANGELOG entry conflict: one side explicitly restored an entry the other removes; resolve the intent explicitly".into());
+                }
+            }
+        }
+        if divergent {
+            let merged = changelog::merge_entries(&old, &ours, &theirs).map_err(|why| {
+                format!("CHANGELOG.md entry conflict: {why}; original commits are unchanged")
+            })?;
+            for (kind, body) in changelog::added_entries(&old, &ours).map_err(str::to_owned)? {
+                if changelog::holds_entry(&merged, &kind, &body).map_err(str::to_owned)?
+                    && !changelog::holds_entry(&theirs, &kind, &body).map_err(str::to_owned)?
+                    && !self.entry_written_since(base, branch, &kind, &body)?
+                {
+                    return Err("CHANGELOG entry conflict: an entry inherited from a merge has no exact authored addition since the base; resolve it explicitly".into());
+                }
+            }
+            return Ok(Some(merged));
+        }
+        Ok(None)
+    }
+
+    /// An authored introduction differs from every original parent's complete entry. A merge
+    /// importing another parent's content supplies no new authorship; failed reads stay errors.
+    fn entry_written_since(
+        &self,
+        base: &str,
+        tip: &str,
+        kind: &str,
+        body: &str,
+    ) -> Result<bool, String> {
+        let commits = self.local(&[
+            "rev-list",
+            "--full-history",
+            &format!("{base}..{tip}"),
+            "--",
+            changelog::PATH,
+        ])?;
+        for commit in commits.lines() {
+            let Some(child) = self.changelog_blob(commit)? else {
+                continue;
+            };
+            if !changelog::holds_entry(&child, kind, body).map_err(str::to_owned)? {
+                continue;
+            }
+            let mut inherited = false;
+            for parent in self.parents(commit)? {
+                if let Some(text) = self.changelog_blob(&parent)? {
+                    inherited |=
+                        changelog::holds_entry(&text, kind, body).map_err(str::to_owned)?;
+                }
+            }
+            if !inherited {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Absence is a successful tree query with no path, never a failed object read.
+    fn changelog_blob(&self, revision: &str) -> Result<Option<String>, String> {
+        let tree = self.local(&["ls-tree", "-z", revision, "--", changelog::PATH])?;
+        if tree.is_empty() {
+            return Ok(None);
+        }
+        let out = self.complete(&["show", &format!("{revision}:{}", changelog::PATH)], LOCAL)?;
+        if !out.status.success() {
+            return Err(format!(
+                "cannot read {revision}:CHANGELOG.md: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        String::from_utf8(out.stdout)
+            .map(Some)
+            .map_err(|_| "CHANGELOG entry merge needs UTF-8".into())
     }
 
     /// Checkout only already imported submodule objects. `--init` could clone through raw git,

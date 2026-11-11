@@ -25,6 +25,8 @@ libc = { workspace = true }
 jobserver_utils = { workspace = true }
 
 [dev-dependencies]
+ring = { workspace = true }
+aterm-update-core = { workspace = true }
 aterm-tempfile = { workspace = true }
 aterm-toolchain = { workspace = true }
 # The `kind=admission` rows the queue's memory admissions write, as its tests read them

@@ -2882,6 +2882,12 @@ fn stale_relay_file_with<T>(relay_dir: &Path, while_open: impl FnOnce() -> T) ->
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_stale_relay_listener_is_not_kept_alive_by_a_neighbours_fork() {
+    // A raw fork copies std's private exec-status pipes from concurrent spawns. Parking
+    // that copy can prevent spawn from returning while this test needs the spawn lock.
+    // Run alone so the witness retains only this test's deliberately inherited listener.
+    if !crate::test_alone::alone() {
+        return;
+    }
     struct Parked(Option<i32>);
     impl Drop for Parked {
         fn drop(&mut self) {

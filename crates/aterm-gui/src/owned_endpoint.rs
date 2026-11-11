@@ -447,7 +447,7 @@ mod tests {
         let (hold_rx, _hold_tx) = std::io::pipe().unwrap();
         let mut stand_in = crate::test_alone::StandIn::this_test();
         stand_in.command().env(STAND_IN_DIR, dir.as_os_str());
-        crate::test_alone::hand(stand_in.command(), STAND_IN_HOLD, hold_rx.as_raw_fd());
+        stand_in.hand(STAND_IN_HOLD, hold_rx.as_raw_fd());
         let mut child = stand_in.spawn();
         crate::test_alone::until_or_ended(
             "the stand-in published its endpoint",

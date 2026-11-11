@@ -3,82 +3,6 @@
 
 # aterm-ctl: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 109 tests it
-> deleted and 3 specs whose functions it deleted are gone, the rows no longer describe the deleted
-> `dial` route, and the spec rows no longer cite those tests. The §1 kind and gap tables count the
-> 87 specs left; other counts in this file were taken before.
->
-> 2026-10-17: §5 lost the six items whose tests are deleted, two more of its items are marked
-> fixed, and the rest are renumbered.
->
-> 2026-10-22: the census reads one kernel table (no `ps`) and knows aterm by its executable.
-> `census-join-ps` went with `join_ps`, `census-etime-and-age-words` became `census-age-words`
-> with `etime_secs` gone, `census-of` and `census-window-args` were restated, and
-> `census-program-name`, `census-live-table` and `foreign-parent-of` (launchd-started told from
-> adopted) were added; `foreign-facts-judge`, `foreign-note-text` and `foreign-facts-read-live`
-> read the `Parent` rule. The kind table counts 89 specs; the gap histogram predates this.
->
-> 2026-10-23: the census and `ForeignFacts` read one image reader (`census::image_of`: Linux's
-> ` (deleted)` mark taken off, nothing on disk stat'd), a held program's arguments are never read,
-> windows are routed as the front door routes them, and `kill` is offered only for an adopted
-> writer; `census-of`, `census-window-args`, `census-live-table`, `foreign-facts-judge` and
-> `foreign-facts-read-live` were restated, and the test rows follow the renamed and added tests.
->
-> 2026-10-23, later: the census reads an instance's standard input (`holders::fd_is_terminal` of
-> descriptor 0), the front door's own test, instead of its controlling terminal, and only where
-> no word or flag routes it; a first flag the front door answers (`--version`, `--help`,
-> `--completions`) is no window, and a name prints a verb only when it is a plain word.
-> `census-of`, `census-window-args`, `census-program-name`, `census-live-table` and
-> `foreign-parent-of` (its launcher-version guard stated, its duplicate parent test gone) were
-> restated; `lib-discovery-report` cites the Foreign hint's own test; `stat_terminal` and its test
-> went.
->
-> 2026-10-23, last: the census reads the front door's argv0 aliases (`FrontDoor::alias`, over
-> aterm-cli's `alias_route`, the table `main` dispatches by): an alias of another program
-> (`atpkg`, `aterm-askpass`) is no window and is named by itself, and an aterm image other than
-> `aterm` (a dev tool such as `aterm-verify`) is its own program. `alias_verb` went into
-> `alias_of`; `census-of`, `census-window-args` and `census-program-name` were restated.
->
-> 2026-10-23, the bridge list: the census's per-row step is `census::aterm_words` (the image, and
-> the words only of an unheld aterm), which `census_of` and the new `census-aterm-children`
-> (`Listing::aterm_children`, `aterm fabric`'s bridge list) share; `census-of` names it, and §2
-> gains the children's test.
->
-> 2026-10-23, the argument guard: `aterm_words` reads an aterm's words only once its one
-> thread has run (`Kernel::ran`, `thread_ran`, the guard of every argument read; the held
-> judgment's 20 s decides words, not this) and keeps them only while the kernel names the same
-> image after the read; `census-of`, `census-aterm-children` and `census-live-table` were
-> restated, and §2 gains two tests.
-
-> 2026-10-25: a read's session named after its verb (`text @s-…`, `status s-…`, `read` for
-> `text` on either side of a selector) is rewritten to the protocol's form before any other reader
-> (`verb-first-rewrite`, its nine tests in `src/verb_first_tests.rs` and the `--host` one in
-> `src/remote_tests.rs`); the two-word `status @sid` arm it replaces had no test.
-
-> 2026-10-31: `orphan_kill` went with the `kill <pid>` it printed. An instance launchd adopted is
-> pointed at `aterm ctl sys left scope=aterm`, which lists it with its proof and the token
-> `aterm ctl end` takes where the proof offers one (`lib::orphan_pointer`), and no pid is printed
-> to type. `foreign-note-text` and `lib-discovery-report` were restated, and the two tests that
-> named the `kill` were renamed for the pointer. The census's `Program` gains `unsupervised` and
-> `token` (`census::supervise`, `census-supervise`).
-
-> 2026-11-01: `foreign-facts-read-live` reads `Parent::Launchd` off a real process launchd started,
-> as it read `Adopted`; `census-of` says the argument read an exec into a held program can still
-> hang.
->
-> 2026-11-01, later: that process is a job the test submits to launchd, not an on-demand agent
-> launchd may have let exit; `census-live-table` cites the test and §2 maps it, and
-> `census-aterm-children` says the exec race `census-of` says.
->
-> 2026-11-07: `lib-fleet-sessions` names `lib::FleetListError` for `FleetListError::is_empty_fleet`,
-> which 727b024479 deleted with its last caller; the error's public `code`, EXIT_EMPTY_FLEET for
-> an empty fleet, is how a caller tells it apart.
-
-> Status 2026-10-16: this file is the crate's migration worklist. Each spec in §1 is proved
-> through Trust/Clean about the compiled Rust function, and the tests it subsumes are deleted in
-> the same commit. The 2 checks in §4 marked **delete** sample no spec and can go now; the one marked
-> **move-to-bench** is fixture code, not a check. No spec is proved yet.
-
 Source: `crates/aterm-ctl` (read only). Every `#[test]` was read, along with the code it reaches: `src/lib_tests.rs` 128, `src/redial_tests.rs` 51, `src/conn.rs` 15, `src/drift.rs` 9, `src/lib_foreign_facts_tests.rs` 8, `src/census.rs` 7, `src/graph_hygiene.rs` 6, `tests/inbox_metadata.rs` 6, `tests/terminal_output.rs` 3, `tests/verb_help_offline.rs` 3 = 236. Two of the `redial_tests.rs` tests are phase 3A's (the session log's consumer half, merged 2026-10-17); they were read when its `await log` and `log` stream cursor made the redial rows false and the rows were reworded. Nothing was compiled or run; the claims come from reading the code.
 
 Result: **89 specs**, covering **233 tests**. **3 tests are not spec samples** (§4).
@@ -107,7 +31,7 @@ Deduplication: no two rows state the same property. Where two files sample one p
   binary (`tests/terminal_output.rs`, `tests/verb_help_offline.rs`, `tests/inbox_metadata.rs`) has a
   pure half and a binary half; the binary half needs gap 8 and stays a test until then.
 - Test ids are relative to `crates/aterm-ctl/`.
-- Gaps are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7: 0 installed seal, 1
+- Gaps are the rows of `docs/TRUST-LANE.md` (Blocking gaps): 0 installed seal, 1
   non-scalar carriers, 2 `&self`/`&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5
   quantified clauses, 7 loops, 8 effects, 10 model refinement, 11 generics, 12 cross-crate citation, 13
   threads/closures. Gaps 6, 14, 16 and 17 apply to every proof and are not listed.
@@ -212,48 +136,6 @@ redial-ask-once	contract	redial::ask_once, lib::pending_status_line	For every su
 redial-relay-subscription	refinement	redial::relay_subscription, redial::pump, redial::Redial::arrival, redial::resume_lines, redial::after_refusal, redial::FrameTracker	relay_subscription refines this abstract relay: copy each leg's frames to stdout via FrameTracker (holding back a forward's host-gone marker); at a leg's end: exit 0 iff tracker.session_over() or the same server still serves (a deliberate end, at once, no successor wait). Otherwise classify with after_hangup against HangupAt.moment() (the kernel-watched exit where available, else the relay's read; each later leg judged against its own hang-up): Gone => exit 75 with gone_note (never 0); Successor(pid) => write 'GAP <local> replaced' for each target, ask resume_lines(original, last) [busy answers and silent closes by a successor that still answers are asked again within the wait; then exit 75 Busy]; on 'ERR no such session' to the pinned form, after_refusal(..., arrival) with arrival = Shared unless the path is a fixed --sock path only a relaunch binds, else arrival_of(process_started(pid of the process that answered), moment) — Fresh => ask the fallback once (a new leg of session Other carrying only that session's anchors); anything else => exit 75 with unresumed_note. A forwarded host-gone marker follows the host's successor through its republished graph entry. An explicit deadline bounds every successor wait (exit 75 naming it).	src/redial_tests.rs::a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_only, src/redial_tests.rs::a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_0, src/redial_tests.rs::a_busy_successor_is_asked_again_and_the_stream_resumes, src/redial_tests.rs::a_forwarded_stream_follows_its_hosts_successor_not_the_relay, src/redial_tests.rs::a_later_successor_is_judged_against_the_hangup_it_follows, src/redial_tests.rs::a_self_stream_moves_only_on_the_fixed_socket_the_call_named, src/redial_tests.rs::a_refusal_is_judged_by_the_process_that_gave_it, src/redial_tests.rs::a_relaunch_between_the_old_servers_exit_and_the_relays_read_is_fresh, src/redial_tests.rs::a_relaunch_after_a_later_legs_server_crashed_is_judged_by_that_exit, src/redial_tests.rs::a_stream_cut_for_an_exec_follows_the_same_pid_to_its_fresh_listener, src/redial_tests.rs::a_deliberate_end_by_a_live_server_is_still_exit_0_and_immediate, src/redial_tests.rs::an_explicit_timeout_bounds_the_wait_for_a_successor	~230-line loop over legs, sockets, kqueue/pidfd exit watches on threads, injected fn-pointer clocks, stdout writes	0,1,2,3,4,7,8,10,13
 redial-exchange-hangup-before-reply	refinement	lib::exchange_on, lib::replaced_before_reply, lib::answer_replacement, lib::turn_rows_cut_line, redial::retries_across_replacement, redial::reports_replacement, redial::Redial::after_host_gone	For a request cut (hang-up, or a forward's 'ERR gone pid=<host> sock=<s>') before its reply: if reports_replacement(p) is false the original connection error is returned (a forward-gone becomes UnexpectedEof 'server closed the connection without responding'); else with h = the hang-up classification (after_host_gone for a forward, following the host's successor through graph/<sid> beside its socket): StillServing => the original error; Successor and retries_across_replacement(p) => the request is asked exactly once of the successor and its answer is the result; Successor otherwise => exit 75 with not_asked_again_line; Gone => exit 75 with gone_request_note. A turn whose verdict ('OK <n> turn ...') arrived and whose rows then fail (a hang-up inside them, a stall past the deadline, a row past its bound; not stdout closed by its reader) => exit 75 with turn_rows_cut_line, never 1 or 124. A turn/post is never sent twice.	src/redial_tests.rs::a_blocking_read_is_asked_again_only_where_that_means_the_same_question, src/lib_tests.rs::a_forward_whose_host_went_away_is_a_replacement_not_a_refusal, src/lib_tests.rs::a_turn_cut_after_its_verdict_exits_75_never_1	sockets, graph-entry fs reads, the exchange state machine	0,1,3,4,8
 ```
-
-### Distribution by kind (89)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 75 | census-of, census-window-args, census-age-words, census-program-name, census-live-table, census-published-in, conn-direction-pair, conn-parse-pair-args, conn-selector-resolution, conn-parse-spawn-args, conn-sessions-lines, conn-kind-and-rows-render, conn-outcome-words, drift-parse-offline, drift-request-and-reply-shapes, drift-screen-rows, drift-offline-entry, graph-is-entry-writer, graph-writer-gone, graph-prune-guard, graph-read-entry, graph-foreign-token-miss, foreign-facts-judge, foreign-note-text, foreign-parent-of, foreign-probe-cause-row, foreign-facts-read-live, lib-header-counts, lib-search-incomplete-note, lib-frame-open-note, lib-copy-body, lib-stdout-failure-and-exit-code, lib-no-reply-wording, lib-help-rewrite, lib-client-help-reply, lib-validate-request-parts, lib-split-pattern-note, lib-resolve-path, lib-self-instance-sock, lib-request-targets, lib-parse-timeout, lib-reply-is-timeout, lib-selector-and-binary-frame, lib-expand-self-selector, lib-token-file-read, lib-discovery-targets, lib-real-main-early-refusals, lib-discovery-report, lib-classify-connect-error, lib-connect-error-naming, lib-probe-exchange, lib-enumerate-instances, lib-newest-instance, lib-flagless-target, lib-front-door, lib-mux-detect, lib-implicit-self-targeting, lib-mux-notes, lib-mux-notice-stamp, lib-mux-notice-claim, lib-fleet-sessions, lib-window-rows, lib-discovery-arguments, lib-connect-phase, lib-connect-then-read, lib-drain-refusal-tail, lib-guarded-artifact-ack, redial-resume-request, redial-after-refusal, redial-clock-order, redial-request-classes, redial-replacement-notes, redial-hangup-classification, redial-process-start-record, redial-ask-once |
-| refinement | 5 | drift-live-fallback, lib-bounded-line-reads, lib-exchange-reply-routing, redial-relay-subscription, redial-exchange-hangup-before-reply |
-| equivalence | 4 | lib-reply-framing-class, lib-terminal-safe-output, lib-token-name-mirror, lib-malformed-header-debug |
-| table-property | 2 | conn-subverbs-documented-and-completed, lib-help-and-completion-coverage |
-| invariant | 2 | lib-probe-connector-isolation, redial-frame-tracker |
-| round-trip | 1 | conn-flows-edges-json-roundtrip |
-
-### Blocking-gap histogram
-
-| gap | name | specs blocked |
-|---|---|---|
-| 0 | installed seal | 89 |
-| 1 | non-scalar carriers | 85 |
-| 2 | &self/&mut self views | 8 |
-| 3 | E6 body widening | 70 |
-| 4 | callee-ensures composition | 20 |
-| 5 | quantified clauses | 38 |
-| 7 | loops | 44 |
-| 8 | effects | 34 |
-| 10 | model refinement | 1 |
-| 11 | generics | 8 |
-| 12 | cross-crate citation | 19 |
-| 13 | threads/closures | 8 |
-
-Gaps 6, 14, 16 and 17 apply to every proof in the repository and are not listed per row. No row is blocked by gap 0 alone. With gap 0 closed, the cheapest further set is {1}, which unblocks 3 specs; {0, 1, 3} unblocks 10; {0, 1, 3, 5, 7} unblocks 36.
-
-### Proof dependency order
-
-Pure cores before the effectful specs that cite them:
-
-- `graph-is-entry-writer` → `graph-writer-gone`, `foreign-facts-judge` → `foreign-facts-read-live`, `foreign-note-text` → `lib-enumerate-instances`.
-- `lib-classify-connect-error`, `foreign-probe-cause-row`, `lib-connect-error-naming` → `lib-discovery-report` → `census-published-in`, `lib-discovery-targets`, `lib-fleet-sessions`.
-- `census-window-args`, `census-age-words`, `census-program-name`, `foreign-parent-of` → `census-of`; `foreign-parent-of` → `foreign-facts-judge`.
-- `lib-reply-framing-class`, `lib-header-counts`, `lib-bounded-line-reads`, `lib-copy-body`, `lib-no-reply-wording`, `lib-drain-refusal-tail` → `lib-connect-phase`, `lib-probe-exchange` → `lib-exchange-reply-routing`.
-- `drift-request-and-reply-shapes`, `drift-screen-rows`, `drift-parse-offline` → `drift-offline-entry`, `drift-live-fallback`.
-- `redial-clock-order`, `redial-after-refusal`, `redial-request-classes`, `redial-resume-request`, `redial-frame-tracker`, `redial-replacement-notes` → `redial-hangup-classification`, `redial-process-start-record`, `redial-ask-once` → `redial-exchange-hangup-before-reply`, `redial-relay-subscription`.
-- `lib-help-rewrite`, `lib-client-help-reply` (pure half) → the binary half of `lib-client-help-reply` (`tests/verb_help_offline.rs`).
 
 ## 2. Test → spec map (TSV)
 
@@ -436,36 +318,10 @@ src/verb_first_tests.rs	help_after_a_verb_first_read_is_its_entry_with_no_dial	v
 src/remote_tests.rs	a_drive_hears_a_reads_session_in_front_of_its_verb	verb-first-rewrite	
 ```
 
-## 3. Coverage
-
-- 236 tests originally read (233 mapped to one of 89 specs; 3 not spec samples in §4). After subsequent deletions and additions, §1–§2 hold 92 specs and 171 mapped test rows, and the crate currently has 355 live `#[test]` functions in the tree.
-- The biggest collapses: `redial-relay-subscription` (21), `lib-exchange-reply-routing` (12), `lib-connect-phase` (8), `redial-replacement-notes` (8), `lib-terminal-safe-output` (7), `lib-client-help-reply` (7), `lib-discovery-report` (7), `redial-resume-request` (7).
-- Two tests are sampled by two specs: `src/lib_tests.rs::stream_count_ignores_incomplete_marker` (primary `lib-header-counts`, also `lib-search-incomplete-note`) and `src/redial_tests.rs::a_cut_since_less_await_log_says_to_wait_again_from_status` (primary `redial-replacement-notes`, also `redial-request-classes`). Each is deleted only when both are proved.
-- Six tests drive the shipped binary on a pty or without a socket (`tests/terminal_output.rs`, `tests/verb_help_offline.rs`) and six drive it against a fake server (`tests/inbox_metadata.rs`). Their specs have a pure half and a binary half; the binary half needs gap 8 and stays a test until then.
-
 ## 4. Tests that are not spec samples
 
 None (`src/redial_tests.rs::serve_as_a_child_successor_if_asked` now enters as a plain helper from `a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_only`, not as a standalone `#[test]`).
 
 ## 5. Implied specs that look wrong, or tests that disagree with their names
 
-1. Fixed 2026-10-16: census::etime_secs uses checked multiplication and addition; the age regression covers overflowing fields and totals. It went on 2026-10-22 with `ps`: the census reads each start time from the kernel.
-2. Fixed 2026-10-28: `ForeignFacts::describe` now calls `census::age_words(up.as_secs())` and `lib::fmt_uptime` is removed, so `aterm doctor` and `aterm ctl instances` share one two-unit age formatter.
-3. Fixed 2026-10-16: the multiplexer guard classifies the verb after a leading selector; Meta verbs reach the server's own selector validation, with session verbs still guarded.
-4. Fixed 2026-10-16: src/lib_tests.rs::connector_deadline_bounds_one_stuck_worker_and_late_success no longer retries with growing budgets or holds a later caller to a stopwatch share; a later caller passes by having budget left when its connect returns, under a hang detector.
-5. Fixed 2026-10-28: `resolve_target_in` takes the socket directory explicitly (`Option<PathBuf>`), `lib-resolve-path` is stated over that injected directory, and `src/lib_tests.rs::resolve_target_pins_every_named_socket` asserts exact socket paths and `None` directory errors.
-6. Fixed 2026-10-16: src/redial_tests.rs::a_hangup_is_classified_by_who_serves_the_path_now no longer times its wait from below; its one clock check is that a call that follows nothing returns within the 60 s REACHED bound.
 7. src/lib_tests.rs::the_forward_target_pid_comes_from_the_socket_name_or_its_alias is #[cfg(windows)] and src/lib_foreign_facts_tests.rs::this_process_is_judged_by_its_real_birth and src/lib_tests.rs::discovery_skips_and_keeps_an_entry_whose_pid_now_names_a_younger_process are apple-only, so on the other hosts they never run; the specs they stand for are platform-indexed.
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone: every row needs at least one more gap, because aterm-ctl's functions take and return strings, slices and enums (gap 1), and gap 1 appears on 84 of the 87 rows. The order below therefore starts with what gap 0 plus one small gap unblocks, and weighs tests retired and the specs each proof feeds.
-
-1. **`lib-discovery-arguments`** (gaps 0, 1). A two-line function over a slice and a const array. It retires 3 duplicate tests (one per discovery verb) with one quantified statement.
-2. **`lib-selector-and-binary-frame`**, **`conn-direction-pair`** (gaps 0, 1). Straight-line slice and `String` code with no loops. Together they retire 3 tests and are the first users of the `&str`/`String`/`Option` carrier.
-3. **`lib-mux-detect`** (gaps 0, 1, 3). A struct of `Option<&str>` and a three-tier decision with no loops. It retires 4 tests and is the core `lib-implicit-self-targeting` and `lib-mux-notes` build on.
-4. **`conn-outcome-words`**, **`redial-after-refusal`**, **`redial-clock-order`**, **`lib-parse-timeout`**, **`foreign-fmt-uptime`**, **`foreign-probe-cause-row`** (gaps 0, 1, 3). Enum matches and `format!`, no loops. They retire 8 tests, and `redial-after-refusal` plus `redial-clock-order` are the decision core of the 21-test `redial-relay-subscription`.
-5. **`graph-is-entry-writer`** (gaps 0, 1, 3, 12), then **`foreign-facts-judge`** (adds gap 5). `SystemTime` arithmetic with `checked_add`. They retire 5 tests and are the pure half of every stale-entry decision (`graph-writer-gone`, `lib-enumerate-instances`, `lib-discovery-report`'s Foreign hint).
-6. **`lib-no-reply-wording`** and **`lib-stdout-failure-and-exit-code`** (adds gap 11 for `io::Error` downcasts). They retire 5 tests and fix the 124/0/1 exit-code contract every effectful spec cites.
-
-After these, the loop-bearing parsers (gap 7: `lib-split-pattern-note`, `lib-window-rows`, `redial-request-classes`, `redial-resume-request`, `lib-discovery-report`) carry the most tests per proof. The effectful refinements (`redial-relay-subscription` 20 tests, `lib-exchange-reply-routing` 9, `lib-connect-phase` 8) come last; they need gaps 4 and 8, and 13 for the relay's exit watches.

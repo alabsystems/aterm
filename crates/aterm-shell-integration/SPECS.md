@@ -38,34 +38,6 @@ sh-hook-order	contract	scripts::ZSH (__aterm_precmd, __aterm_end_command, __ater
 sh-bash-unheard-line	contract	scripts::BASH (__aterm_line_unheard, __aterm_end_command, __aterm_body_pc_open, __aterm_hist_mark_take, __aterm_history_numbered, __aterm_cmd_number, __aterm_history_line, __aterm_line_start, __aterm_rekey_take)	For an integrated interactive bash below 5.3 that has not joined bash-preexec, and a line L typed at a prompt that took its mark (`__aterm_hist_mark_take`: a scalar PROMPT_COMMAND that is the trampoline alone, or an array's trailer): if no DEBUG trap took the mark, because L runs no simple command at its top (a function's definition, `function` ones included, a line that starts with a subshell), and bash saved L as a new history entry, told by its number and never its text (bash 5.0 to 5.2: `$HISTCMD` at the next prompt differs from the mark, the next entry's number the last prompt read; below 5: the number `history 1` gives differs from the one it gave the last prompt; readline rewrites a recalled entry edited and left unsent in place, `5* …`, with no new entry), and bash's command number moved since the mark (`__aterm_cmd_mark`: the count a prompt's `\#` shows, which bash moves by one for a command it read and ran and for nothing else; bash 4.4 and later read it in process, `${p@P}`, earlier ones through xtrace's PS4 in the fork that reads the entry, `__aterm_history_numbered`), then at the next prompt, first of all, before the body check and before any user hook, the integration takes a pending re-key with builtins (so all three marks are signed with the key the host now holds) and writes L's E (the entry's text, `__aterm_encode_cmd`), its title and C, as the trap writes them, then D with the `$?` L left: one run, whose C follows whatever L printed. A shell whose trampoline predates its own call of __aterm_end_command does the same from the body's handler, which clears the mark only after that call. A line the trap heard writes its marks as before and no second run. An empty line, a line a Ctrl-C cancelled at the prompt and a line whose history expansion failed add no entry, ran nothing, and write nothing. A comment, a blank line, a syntax error and a line a Ctrl-C cancelled at the continuation prompt (PS2: history keeps its first line) add an entry but ran nothing: the command number stands still, and they write nothing either, where a run would carry the status of the line before. Not covered: a line bash saves no new entry for writes nothing (space-led under HISTCONTROL ignorespace or ignoreboth, a repeat under ignoredups or erasedups, one HISTIGNORE matches, history off or HISTSIZE=0); so does a line under a PROMPT_COMMAND at which the integration takes no mark (a scalar with more after the trampoline at its top level), under bash-preexec (sh-hook-order), whose own DEBUG trap misses these lines below 5.3 too (it hooks PS0 on 5.3 alone), under a bash below 5 on MSYS or Cygwin, whose `__aterm_history_line` reads no entry, or under a bash below 4.4 whose PS4 or BASH_XTRACEFD is readonly, where the fork reads no command number; bash 5.3 and later write what they wrote before this, byte for byte (PS0, sh-hook-order).	src/tests_tty.rs::an_integrated_bash_marks_a_line_that_runs_no_simple_command_at_its_top, src/tests_tty.rs::an_integrated_bash_under_functrace_marks_each_line_as_without_it	none (shell programs)	8, 10, SH
 ```
 
-### Distribution by kind (48)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 28 | wsl-cwd-env, typed-rekey-text, lf-only, merge-wslenv, cmd-prompt, augment-with-nonce, body-extract, script-set-address, injection-shape, prepare-into-unknown, ensure-scripts-writes-set, ensure-cached-memo, install-script-set, gc-policy, cache-dir, sh-osc7-report, sh-633e-and-frame, sh-marks, sh-bash-preexec-capture, sh-mux, sh-rekey-channel, sh-typed-rekey, sh-typed-upgrade, sh-pwsh-prompt, sh-pwsh-utf8, sh-pwsh-keys, sh-hook-order, sh-bash-unheard-line |
-| equivalence | 6 | path-env-value-lossy, sh-osc7-encoder, sh-fish-empty-is-unset, sh-prompt-render, sh-fish-user-prompt, sh-user-semantics-preserved |
-| invariant | 6 | content-address-isolation, scratch-suffix-unique, sh-nonce-capture, sh-bash-ps1-one-133b, sh-tty-sanity, sh-zsh-line-init-marks |
-| table-property | 2 | detect-shell, script-const-lints |
-| refinement | 2 | sh-body-pointer, sh-windows-launchers |
-| other | 4 | sh-load-completes, sh-wrappers, sh-path-front, sh-live-managed |
-
-### Blocking-gap histogram (specs blocked by each gap)
-
-| gap | specs | which |
-|---|---|---|
-| 1 (non-scalar carriers) | 15 | detect-shell, wsl-cwd-env, typed-rekey-text, lf-only, merge-wslenv, cmd-prompt, augment-with-nonce, body-extract, script-const-lints, path-env-value-lossy, script-set-address, injection-shape, ensure-scripts-writes-set, gc-policy, sh-body-pointer |
-| 2 (certified &self/&mut views) | 2 | augment-with-nonce, ensure-cached-memo |
-| 3 (E6 body widening) | 11 | detect-shell, wsl-cwd-env, typed-rekey-text, lf-only, merge-wslenv, cmd-prompt, body-extract, path-env-value-lossy, script-set-address, injection-shape, gc-policy |
-| 5 (quantified clauses) | 7 | detect-shell, wsl-cwd-env, merge-wslenv, cmd-prompt, augment-with-nonce, body-extract, script-const-lints |
-| 7 (loops) | 8 | lf-only, merge-wslenv, augment-with-nonce, script-const-lints, path-env-value-lossy, script-set-address, ensure-scripts-writes-set, gc-policy |
-| 8 (effects) | 38 | every sh-* spec (28), plus cmd-prompt, injection-shape, prepare-into-unknown, ensure-scripts-writes-set, ensure-cached-memo, install-script-set, content-address-isolation, gc-policy, scratch-suffix-unique, cache-dir |
-| 10 (model→code refinement) | 28 | every sh-* spec (28) |
-| 12 (cross-crate citation) | 2 | script-set-address, cache-dir |
-| 13 (threads, closures) | 6 | script-set-address, ensure-cached-memo, install-script-set, content-address-isolation, scratch-suffix-unique, sh-tty-sanity |
-| SH (shell-language semantics, proposed) | 28 | every sh-* spec (28) |
-
-Gaps 0, 4, 6, 9, 11 and 14–17 appear in no row. 4 (callee-ensures composition) and 14 (Clean elaborator) will still be met while the proofs are written.
-
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
@@ -165,36 +137,12 @@ src/tests_pwsh_keys.rs	test_powershell_readline_layer_honours_the_opt_out_and_st
 src/tests_pwsh_keys.rs	test_powershell_ctrl_e_accepts_a_suggestion_only_at_the_end_of_the_line	sh-pwsh-keys	
 ```
 
-## 3. Coverage
-
-- The biggest collapses are `sh-nonce-capture` (17 primary), `sh-live-managed` (12), `sh-typed-upgrade` (8),
-  `injection-shape` (7), `sh-body-pointer` (7), `sh-tty-sanity` (7), `script-const-lints` (6) and
-  `sh-osc7-report` (6).
-- Only `path-env-value-lossy` has no primary test. Its one sample,
-  `test_prepare_wsl_env_carries_path_translated_wslenv`, is retired by `injection-shape`, which
-  calls `pev`. The spec is kept because `injection-shape` is stated in terms of `pev`.
-- A test listed under both layers in §2 (such as `the_typed_rekey_sets_the_globals_the_marks_read`,
-  `test_wsl_launcher_starts_bash_on_the_rcfile_and_any_other_shell_plainly` or `every_posix_script_is_a_loader_around_one_body`)
-  is deleted only after **both** its Rust spec and its `sh-*` spec are proved. Until then, split it, so
-  that its Rust half goes with the Rust proof and its live-shell half stays.
-- Of the 160 covered tests, 40 can be retired by Rust proofs alone once their gaps close. The other 120
-  wait on SH.
-
 ## 4. Tests that are not spec samples
 
 Status 2026-10-16: deleted `test_scripts_contain_prompt_override`, `test_spawned_shells_never_read_the_developers_home`, `test_bash_fallback_unnonced_when_env_missing`, `test_powershell_script_references_shell_nonce_env`, `test_bash_prompt_command_guard_prevents_spurious_capture`, and `test_bash_default_mode_embeds_133b_in_ps1`; 0 non-spec tests remain.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **(Fixed 2026-10-28.) `test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd` depended on the
-   test process's `PROMPT`, and `prepare_into`/`prepare_cached` wrote scripts for `Cmd`.**
-   `prepare_cmd_with_prompt(inherited)` is factored out so the test checks `None` deterministically,
-   and `prepare_into`/`prepare_cached` skip `ensure_scripts`/`ensure_cached` for `Unknown` and `Cmd`.
-2. **(Resolved 2026-10-16.) Two memo tests compared against the wrong bytes.** Both were replaced
-   by `a_foreign_build_cannot_change_what_this_builds_tabs_source`, which checks `script_set_matches`
-   against `lf_only` output.
-3. **(Fixed 2026-10-28.) `lf_only` did not remove lone CR.** `lf_only` now normalizes both `"\r\n"`
-   and lone `'\r'` to `"\n"`, so no `'\r'` byte can survive on disk.
 4. **(Resolved.) Content-address isolation states its foreign-write precondition explicitly.**
    `a_foreign_build_cannot_change_what_this_builds_tabs_source` documents `content-address-isolation`'s
    precondition that foreign writes stay outside `root/<ADDR>` (as content-addressed foreign builds
@@ -221,37 +169,3 @@ Status 2026-10-16: deleted `test_scripts_contain_prompt_override`, `test_spawned
    about their `sh-*` specs. A port (`need_zsh()`, util-linux's `script -c` as the fish lanes use) would
    run on the Linux proof's shell row, which runs this crate's suite in the guest
    (`aterm-lab/src/linux_proof.rs`, `SHELLS`).
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone (§0). The order below starts with pure `&str`/`Option` functions
-that need only gap 1 (string carriers) and gap 3 (calls, enum matches), so the first work on Trust here
-is the non-scalar carrier.
-
-1. **`wsl-cwd-env`** (1,3,5). This is an enum compare, `Option ?` and two `starts_with` calls, with no
-   loop and no allocation beyond `to_string`. It is the smallest test of the `&str`/`Option<(String,String)>`
-   carrier, and it retires 1 test.
-2. **`typed-rekey-text`** (1,3). Each arm is a single `format!` with one interpolated `&str`, and the
-   statement is equality with a literal template. It retires the Rust half of
-   `the_typed_rekey_sets_the_globals_the_marks_read`, and it is the Rust half of `sh-typed-rekey` and
-   `sh-typed-upgrade` (16 tests downstream).
-3. **`detect-shell`** (1,3,5). It is a finite string table after `last_seg`/`lc`/`strip1`. It retires 3
-   tests and makes the stale cfg gate of §5.6 moot.
-4. **`script-set-address`, the `is_address`/`nibble_to_hex` half** (`nibble_to_hex` is a `u8` range
-   match, which seal `150efe4a` already admits, plus an `as char` cast, which is gap 3). Do this before
-   the SHA-256 half, which waits on gaps 12 and 13.
-5. **`cmd-prompt` pure half** (1,3,5) and **`augment-with-nonce`** (1,2,5,7). Together they retire 4 cmd
-   tests and the augment test, over `prepare_cmd_with_prompt` (§5.1).
-6. **`lf-only`**, **`body-extract`** and **`script-const-lints`** (1,3/5,7). These are const evaluation
-   over the `include_str!` constants. They retire 8 tests and give the static halves of five `sh-*`
-   specs. They need efficient kernel string reduction over tens of KB.
-7. **`merge-wslenv`** (1,3,5,7). This is a split/filter/join loop with an idempotence corollary.
-8. **`injection-shape`** after the gap-8 refactor in §0 (then 1,3 only). It retires 7 tests.
-9. Effectful Rust: `prepare-into-unknown`, `ensure-scripts-writes-set`, `gc-policy` (pure selector
-   first), `cache-dir`, then `ensure-cached-memo`, `install-script-set`, `scratch-suffix-unique` and
-   `content-address-isolation` (8, 13).
-10. `sh-*` specs once gap SH exists. Start with the pure encoders (`sh-osc7-encoder`, `sh-633e-and-frame`,
-    and `sh-marks`), which are byte functions in shell, then `sh-nonce-capture` (17 tests),
-    `sh-wrappers`, `sh-path-front`, and last the temporal, pty-bound specs (`sh-live-managed`,
-    `sh-body-pointer`, `sh-typed-upgrade`, `sh-tty-sanity`, `sh-zsh-line-init-marks`,
-    `sh-user-semantics-preserved`).

@@ -3,194 +3,9 @@
 
 # aterm-effects: spec recovery from unit tests
 
-> 2026-11-09, the pet traced across a change of display scale (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
-> §7 step 2): new row `regrid-keeps-rest`, and `no-teleport-law`'s give reads the art's width. New
-> cells under a caret that keeps its cell re-measure, through the art's width (`art_cols`: 5.61
-> columns on 7x14 px cells, 5.23 on 15x28), every station that reads it, and a resting body glided
-> the shift over about 120 frames, asleep or awake: a wall-side station's 0.374 columns, the seat
-> under Claude Code's composer 0.187. `PetBrain::keep_place_on_restation` moves a body on its station
-> with it on the tick that measures the new cells, in a hold too (a purr, a hide), and re-aims a
-> flight coming down on it. It measures against the last station a tick measured, on the cells the
-> tick before drew: a caret gone for a frame just before the change leaves its cat carried, a body
-> off glass across the change is placed by its first sighting on the new station (it has moved that
-> tick and is not carried as well), and new cells drawn on a tick with no caret leave the body to
-> the locomotion. *Revised 2026-11-09 after review:* the
-> first version measured against the station of the last tick that reached the walk, however old,
-> and only at the walk: a body seen again after an unseen change came back a whole width change past
-> its station and glided back, and a body in a hold jumped the change in one frame when the hold
-> let go, outside `no-teleport-law`'s bound at 120 Hz or for a larger change of aspect; it also
-> refused a change of the grid's columns, which a window dragged between displays makes, since it
-> keeps its size in points (100 columns of 15 px cells become 107 of 7; the headless gui's drag,
-> aterm-gui's `pet_display_drag_tests`). A re-grid of unchanged cells lands a body resting under a
-> pixel off its station on it (0.03 columns, 0.2 px on 7 px cells), as before. Still the
-> locomotion's: a re-grid that changes the columns can change the side the wall's law stands a body
-> on (100 to 120 columns under a caret on column 96 sends a sleeping cat across the caret, 7.6
-> columns; 100 to 93 under one on column 88, the drag to a 2x display, too), and a flight that has
-> flown more than `REAIM_MAX_U` of its way at the change comes down on the old station and glides
-> the rest. The rows' tests ran with their negative controls (see the commit).
-> 2026-11-07, the glass's words (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` S8): `glass-inks`
-> said the gui's meter law calls `day_vivid_floor`; the weekly meter left the glass in S5, and the
-> laws that hold Day vivid now are the gui's `footer-outlook-inks` (line D's `⎆`, the card's levels
-> and line), through `day_vivid`. The row says so; its statement is otherwise unchanged and its
-> tests ran (see the S8 commit).
-> 2026-11-07, the qualified-path pass: rows whose symbols put a function on a type or module that
-> does not hold it name its holder. `reanchor-guard-equivalence` names `CursorGlow::classify_move`
-> (in `cursor_glow::seam` since the split 7b62e2e449, never in `spawn`), and says the frames agree for
-> a bridged move to another row outside the rainbow kitty style, since a typed hint also re-anchors a
-> flushed park's short step back and makes an echo run of a forward move along one row;
-> `os-amplitude` names `OutputStreak::{emit,push_cell_alpha}`, the clamp and the cell writer that
-> `push_cell` became (074e0549e1); `custom-colorway-parse` names `spec::{parse_hex_bytes,parse_hex_6}`,
-> which `parse_hex` became (b5083ae929), and says each field's whitespace is trimmed.
-> `glow-no-licence-no-light` and `jump-morphology` likewise name `CursorGlow::classify_move`, not
-> `spawn::classify_move`.
-> 2026-11-07, spec symbol scan: rows that named a function the code no longer has, or never had, name
-> what holds the behaviour now, and each statement holds of it. `exit-fx-sinks` names
-> `effect_util::push_fx_rect`, the shared helper that replaced its copy `kitty_cursor::push_fx` (23c88107a6); `ember-seen-floor`
-> names `ribbon::seen_floor_with_bg_lin`, which `seen_floor` became (3a2ecd2e86, 95ac7acbc3);
-> `toy-pack-validation` drops `toy_dispatch_hashes`, inlined into `compile_toy_pack_toml` (455f06614b), and
-> says the source must fit `MAX_TOY_PACK_BYTES`; `sd-caret-light-ceiling` names `fit_lay_add`,
-> `fit_stacked_centre` and `settle_under_ceiling`'s `fit_settle_byte`, the const searches `fit_byte` became
-> (d14e88e605, c71ca1235c), and `under_ceil_with`, which `under_ceil` became (da318864ec). Three names the code never had
-> (since the recovery, 78587da206) go: `rb-typed-continuity` names `Ribbon::restore_releases` and
-> `Witness::restored_runs` for `restore_abandoned`, `rb-hand-return` names `Ribbon::{hold,abandon_row,translate_run}`
-> for `clear_seam`, and `torn-read-restore` names `Witness::moved` for `moved_text`.
-> 2026-11-05, the harness glass rainbow's S4 (tokens, `docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
-> §4.1): `glass-inks` (§19) is a new row, the one token set lines B, D and E wear, and
-> `card-hero-on` names `CardPalette::hero_on`; `up-ring`'s ring now takes the rule's own tint at
-> its column (`RingHue::Rule`), so `RingHue::Arc` and `Accent` and `RingKey::rule` are gone; the
-> tests named in them ran.
-> 2026-11-04, ATERM-KI-1025-1's D12 (the person's grant to record keys aterm cannot see echoed):
-> `momentum-unseen-key` is a new row (a key logged unseen, schema v3), and `aos-key-hold`,
-> `aos-key-hold-refines-model`, `aos-registry-lines`, `momentum-vivid-recorded` and
-> `momentum-chosen-recorded` now say what the grant adds or that the pins stand under v3, each
-> written with the code it states; the tests named in them ran.
-> 2026-10-26: the harness switch is words alone on the rule (`● on` / `○ off`, the owner: "make
-> the harness on/off switch more subtle"), so its capsule sprite is gone: `harness_switch` became
-> `up_ring`, the ⬆️'s hover ring alone, and §10's row is `up-ring` (it was `harness-switch-capsule`:
-> a recessed track, a ring and a gem knob). Written with the code it states; the tests named in it
-> ran.
-> 2026-10-26 (r23 K6): the leap ahead of a coming wrap is gone. The cat leaves the margin when the
-> line has wrapped, never on a guess of when it will: a pause at the margin, or typing that stopped
-> short of the wrap, kept the guessed leap in the air 1.34 to 1.81 s and brought it down on the next
-> line's start, 70 cells from a caret that had not wrapped (looks8 round 3's early leave, as the
-> typing neared the cat at the wall, and its paths over and under the line went with it: on main it
-> flew 1.71 to 2.03 s for a held key stopped short of the wrap). `show-door` (§1): every crossing after
-> the writing's wrap is the brisk bound, mid-screen too (1.04 to 1.55 s in the air before, 0.46 to
-> 0.53 s now); `new-line-law` lets the crossing after a typed wrap (the typed margin wrap, and an
-> Enter typed at the margin that no key tells from one) move the brisk bound's step. The margin is
-> taken while the hand writes into it (the rhythm open, or its last key a letter within
-> `SIT_AFTER`) and held while the caret stays at it: taken only with the rhythm open, the first
-> keys typed on after a pause found it untaken, the wall side crossed the stand to the caret's
-> left, onto the line's words, and the rhythm's opening brought it back (a hop up, a hop back, then
-> the wrap's crossing, three flights at one line end). Once the console rests (no
-> key and no caret move for `SIT_AFTER`, the cat's sit) a wall seat among letters is left for the
-> nearest seat by the caret that keeps the head law with no rule across it
-> (`PetBrain::margin_rest_seat`: one or two rows over the caret's or under it, two over only past
-> the line's own letters and never across a rule, within `HEAD_SEAT_REACH`), held until the wrap
-> (`WrapAhead::Rest`, which the head law's seat under the caret's line does not let go); where
-> there is none (a composer between its rules) or the letter reader certifies nothing, the wall
-> holds. A hop in the air as the writing wraps (that rest hop, the hand typing on just after the
-> sit) comes down on its own seat and the wrap's brisk bound follows: drawn out to the next line's
-> start at a hop's pace it was 1.30 to 1.55 s in the air, gliding low over the line it left.
-> `ink-eviction-behavior`'s `the_wall_side_stand_takes_the_blank_row_below` holds that typing
-> stopped short of the wrap costs no flight.
-
-> 2026-10-26: `show-door` (§1) now says the bound that crosses after the writing's wrap (or back
-> across it under a held delete) flies at the animal's own pace, `BIG_HOP_SPEED_MAX` (half its
-> body a 60 Hz frame), on the big bound's own arc for its span (`PetBrain::brisk_shape`), and that
-> the cat the wrap left at the margin goes for it with no notice beat (the word a composer's word
-> wrap carries down with the caret, a step on along the new line, still belongs to the wrap; only
-> a change of row or a jump back ends it; a wrap the hand's own key made is the writing's with its
-> rhythm open or not, and a cat in the air for anything but the leap ahead of the wrap still makes
-> the brisk crossing once down); every other bound, the leap ahead of a coming wrap
-> among them (timed to land with it), is still paced at `quiet_speed_max`
-> (r21 K5-1: paced as a quiet crossing, each of Claude Code's composer word wraps took 1.06 to
-> 1.17 s, floating over the line as the writing ran 25 cells on). Two motion laws follow it: the
-> frame law (`lawful_tick`) holds every flight to its own pace (`PetBrain::flight_cap`), and
-> `every_new_line_reaction_is_lawful_and_brief` lets the crossing after a scrolled wrap move the
-> brisk bound's 2.3 cells a frame at 80 columns. The head law takes the nearest seat for a stand
-> among letters by a caret at rest, the hand away, under the box before the far margin, and goes
-> there at once from a cat that must travel anyway; an eviction off the letters while the stream
-> watch is still up, the caret already at rest after a program's jump, goes to that seat (r21
-> K5-2: the long insert's cat rose from the far margin and came down where it stood). The effects
-> suite's `a_repaint_that_walks_the_caret_is_one_flight_to_where_it_settles` reads the cat's
-> actions on the ground from the walk's first move (before it, the cat walks with the writing the
-> brisk wrap brought it down by).
-
-> 2026-10-25: `rewrap-carries-word`, `glow-park`, and `typed-columns-owned` (§1) gain five
-> rendered-pixel continuity tests in `tests/rainbow_pixel_continuity.rs` (§2): clean word-boundary
-> (`width == 0`) wraps and 4-sided box-bordered / guttered composer wraps relay immediately without
-> bleeding onto borders or indents or stalling in a cross-row park, and a flushed park's v2 events
-> precede post-park typed events banked at the same `Instant`.
-
-> 2026-10-25: `glow-landing-ring-raster` (§1) now says a veiled style lands a round rim about the
-> caret (r17 CA4: on dark the bound veil alone lifted the ground some 70 levels over about 150 px, so
-> "Ring on jumps" read as broken for Lumen, Comet, Sparkle, Phaser and Laser), and the classic wake's
-> light ring lays its square in the accent's ink; `the_dark_landing_ring_is_a_soft_bloom_in_its_row`
-> is now `the_dark_landing_ring_is_a_round_rim_over_a_soft_bloom_in_its_row` (§2).
-
-> 2026-10-25: `host-line-head-law` (§1) now says how the stand on top of the host's line is taken
-> while the person types: as a perch, its soles clear of the line by the clearance a hold asks of a
-> body (with the soles on the line the stand passed and the hold did not, and a cat watching a
-> deletion there stepped and sat by turns); its slide past the letters over it within 12 columns of
-> the caret's column (a 29-column slide at a turn's end launched a hop short of where the caret
-> settled: two flights), unless the cat already stands where the slide goes (resting past the
-> letters, the first key would have flown it back to the caret); and never in a rule
-> (`PetWorld::rule_line`: a row, in a pane at least eight columns wide, whose cells are at least four
-> fifths `─`), so over a reserved first line of the composer the ladder seats the cat as before. Two
-> tests retire to it (§2), and the escort-grace test now ends on that perch (row 18.85, not 19). The
-> effects suite's
-> `a_repaint_that_walks_the_caret_is_one_flight_to_where_it_settles` now wants the turn-end bound,
-> with the harness on, on the top of the composer's upper rule, two rows over the caret, not on the
-> caret's line under the rule. Two motion laws the resident's runs to its rest seat reached:
-> `chase-convergence-and-facing` keeps a skid once drawn on glass `STILL_SECS` (a run crossing its
-> seat at 9.3 cells a second had shown it one 16 ms frame), and `flight-choreography` holds a stand
-> that ends a stride `STAND_MIN` before a leap leaves it, as it already held it against every other
-> pose (a stream watch's stop under a long insert, then the wrap's leap, left it 3 ms short). One
-> test each (§2).
-
-> 2026-10-25: `pw-reading-kept` (§1) lets the pet keep its console reading of a redraw whose fill
-> consumed the terminal's damage when nothing that reading was read from moved, so an idle or typing
-> frame that reused its snapshot, or refilled it without re-extracting a row (a split's focused pane, a
-> window with chrome rows), classifies no cell; its three tests are in §2. The counts elsewhere in this
-> file were taken before it.
-
-> 2026-10-24: `host-line-head-law` (§1, new) is the resident pet's rule at the host's line: no stand
-> or seat puts its body under a line whose reserved cells would cover its head (aterm's footer now holds
-> the top rule it repaints with its lockup and switch whole, strokes and all); while the person types
-> the escort's stand there is taken on top of the line, its head off the letters over that row; the
-> line coming up onto that stand carries the cat up (`protected-surface-yield` now names that ride);
-> the pet's cell windows ignore f32 noise at an edge, which had refused the caret's line at some rows
-> (10, 12, 13) and not others. Four tests retire to it (§2): one new, three whose contract it changed
-> (the label and switch tests renamed: the cat walks on top of the line, no longer under it; the
-> escort-grace test now ends over the line). `idle-frame-laws` gains
-> `a_tail_flick_a_seat_comes_into_never_shows_its_last_present`: a seat that comes into a tail beat
-> with under two frames of its pose left does not begin it. Three agent-pane fixtures now hold the top
-> rule from the first frame (`AgentPane::hosted`): their "home under the footer" premise had come from
-> the rounding noise.
-
-> 2026-10-24: `wd-kitty-cursor-emission` (§1) now also says the flying head never starts above the grid
-> top (row 0 and the row-1 sky seat used to put a fifth of it above the first row, where a top pane's open
-> edge let it reach the pad or the tab strip and a lower pane's divider cut it), and `wd-pet-sprite-in-grid`
-> holds both companions whole in a top pane and a lower pane on the first two rows; one new §2 test each.
-> `custom_kitty_footprint_matches_emission_at_interior_right_and_top_edges` now requires row-zero custom art
-> to land whole beside its row; it pinned the old partial clip.
-
-> 2026-10-30, ATERM-KI-1025-1: `aos-key-hold` and `aos-key-hold-refines-model` (§1) are the
-> momentum host's hold on typed keys that wait for their echo and its refinement of
-> `aterm_models_aos::aos_key_hold_model`, with their 14 tests in `src/aos_momentum/hold_tests.rs`
-> and `src/aos_momentum/hold_conformance_tests.rs` (§2), written with the code and run. The counts
-> elsewhere in this file were taken before them.
-> 2026-11-04: a fifteenth, `a_held_glow_holds_still_on_the_caret_the_echo_moves`, binds the held
-> tick's frame (the code's own at the latest admitted instant, on the tick's caret).
-
-> 2026-10-24: §8 adds the seven specs of Aos M5a's aterm-effects half (`int_bag_mlp`, `tone_int`)
-> with their 50 tests. `tone-asset-decoder-fail-closed` (§1) now also names `tone::raw`, the verified
-> raw view `ToneModel::from_bytes` is rebuilt on. §3's counts were taken before §7 and §8.
-
 No row can be Certified yet: a strict `targo trust check -p aterm-effects` refuses the unit under
 Trust PM-1 before any obligation runs, because the crate derives through `serde`
-(`aterm-serde-derive`). Stage 2 of `docs/PLAN-pm1-proc-macro-reach-2026-10-16.md` moves the derives
+(`aterm-serde-derive`). PM-1's stage 2 (`docs/TRUST-LANE.md`) moves the derives
 out.
 
 ## 0. Notation
@@ -198,7 +13,7 @@ out.
 - Paths in §2 and §4 are relative to `crates/aterm-effects/`. Function names are relative to the
   crate (`cursor_glow::seam::…`, `rainbow_kitty::ribbon::…`); `mod::` is `rainbow_kitty/mod.rs`.
 - **Gaps** (`blocking_gaps`) are rows of the gap table in
-  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7: 0 a seal that publishes Clean rows (on
+  `docs/TRUST-LANE.md` (Blocking gaps): 0 a seal that publishes Clean rows (on
   every row), 1 non-scalar carriers (Vec, String, Option, structs), 2 `&mut self` two-state
   reasoning, 3 body widening, 4 callee-ensures composition, 5 quantified clauses, 6 publishing
   SMT-proved clauses, 7 loops, 8 effects, 9 the proc-macro boundary, 10 `ty_model!` refinement
@@ -3308,14 +3123,6 @@ src/aos_momentum/hold_conformance_tests.rs	a_release_logs_exactly_the_keys_it_na
 ```
 
 
-## 3. Coverage
-
-- 3027 tests in the crate (`#[test]` count at `ab02e1da7`). 2935 map to one of the 855 specs as primary. 93 are not spec samples (§4).
-- 9 specs subsume no test today (they are the real-code statements their test-local model tests should become, or are corollaries only).
-- Biggest collapses (primary tests): `glow-exact-payment` (29), `rb-walk-continuity` (29), `rb-follow-witness` (29), `typed-columns-owned` (27), `glow-no-licence-no-light` (25), `copy-is-not-arrival` (23), `rewrap-carries-word` (23), `glow-park` (22), `insert-licence` (21), `output-streak-attribution` (17), `echo-ledger-refinement` (16), `pet-surface-seam-refines-model` (16).
-- Gap histogram (audit §7 row → specs blocked by it): 0 → 854, 1 → 775, 2 → 586, 3 → 564, 4 → 213, 5 → 391, 6 → 162, 7 → 443, 8 → 12, 9 → 11, 10 → 78, 11 → 10, 12 → 95, 13 → 38, 14 → 17, 16 → 3.
-- Non-spec tests by action: becomes-spec-after-fix 10, delete 51, move-to-bench 30.
-
 ## 4. Tests that are not spec samples
 
 Status 2026-10-15: the 30 rows marked **deleted** below were removed from the crate (spec recovery plus a skeptic confirmed they sample no property of shipped code). The `web_binding_parity` rows went with their test file: the six web binding modules and the shared facade are one source each in `crates/aterm-wasm/src`, which aterm-gpu-web mounts, so the two surfaces cannot drift. On 2026-10-17 the twinkle's photosensitivity bound, constant arithmetic, became two const assertions beside its constants, and its row went. On 2026-10-28 `dog_baker::host_ids_are_stable_distinct_and_namespaced` and `dog_cameo::resummons_parade_distinct_breeds` dropped their FNV/statistical halves and joined §2 under `dog-baker-contract` and `dog-cameo-envelope`. On 2026-11-04 `rainbow_occupied_coverage_derived_model_proves_and_catches_regression` and `rainbow_retract_rearm_model_proves_and_catches_brightness_snap` joined §2 under `ribbon-occupied-cov-cap` and `ribbon-retract-rearm`.
@@ -3418,60 +3225,11 @@ Status 2026-10-15: the 30 rows marked **deleted** below were removed from the cr
 70. `zsh_isearch_band.rs::a_hidden_caret_s_echo_is_judged_alike_on_every_path`: the equivalence holds only because the arm checks caret_hidden, and seam.rs documents that a visible parked caret with a fake cursor goes dark by design; the spec keeps that exclusion.
 71. `zsh_isearch_band.rs::whole_reads_lay_no_band_on_the_match_row_or_under_zle_s_fake_cursor`'s oracle accepts any status cell whose glyph is among the typed chars, weaker than cell identity.
 
-## 6. Proof order (easiest high-value first)
-
-Specs blocked only by gap 0 first, then those adding only gap 1 or 3, then table properties
-decidable by evaluation, then small state machines, and the large engines last.
-
-1. **Gap 0 only**: `momentum-glow-allowed` (`u && h && !r`), `mo-load-shed-exempt` (a two-variant
-   enum match), `mo-serious` (`!serious` for every effect), `rkc-heroes` (`Delight → 1`). Each is a
-   seal smoke test with an obvious negative control.
-2. **Pure scalar and small-carrier laws** (gaps 0 plus 1 or 3): `companion-gates` (seven bool/f32
-   predicates), `caret-style-law`, `companion-precedence`, `shed-companion-alpha`, `head-dx`,
-   `catbaker-slot-count` (with the `cell_h <= 256` precondition of §5), `evict-step`,
-   `os-clipped-span`, `pl-chrome-geom`, `wd-cat-stacked-on`, `wd-peek-timing`,
-   `kr-canonical-app-id`, `mo-parse`, `ksum-merge`, `config-from-glow`, `engine-fresh-state`,
-   `toy-pack-source-cap`, and the matrix-rain field kernels `rf-hash`, `rf-bits`, `rf-stammer`,
-   `rf-trail-level`, `rf-quad-cap`, `rf-quanta`, then `rf-col-params` (with the WCAG flash floor).
-3. **Small contracts with a real payoff**: `caret-delta-fold` (the pet's wrap/new-line classifier,
-   the cheapest behavioural kernel in kitty_pet), `station-wall`, `quiet-pace-law`,
-   `flight-pose-schedule`, `pet-geometry-maps`, `wrap-fact-edge`, `erase-poof-drive`,
-   `classic-ring-grade`, `fold-register`, `tt-back-chars-arith`, `mix-nonzero`,
-   `ks-song-signature-bijective` (a bijection on u32, decidable by bit-vector), `walk-t-def` and
-   `tri-triangle-wave` (the ribbon's colour walk; they unlock the bit-for-bit landing specs),
-   `spark-cull-exact`, `bridge-reach-contract`, `sweep-physical-margin-fold`.
-4. **Table properties decidable by evaluating constant data**: `outline-contrast`,
-   `color-key-quantize`, `kr-coat-distance`, `dog-skin-table`, `spectrum-lut-table-properties`,
-   `spectrum-lut-is-generated`, `rail-ink-band`, `bed-luma-budget-def`, `glyph-rank-table`,
-   `glyph-class-table`, `theme-form-tables`, `song-pulse-table`, `rom-classic-table`,
-   `bf-table-lookup`, `seat-deal-arithmetic` (all 256 seeds).
-5. **Small state machines** (gaps 1 and 2): `tenure-gate` and `roster-rate-law` (companion_look),
-   `claim-cache`, `exact-tile-baker-lru` (generic over `ExactTileKey`, so also gap 11),
-   `catbaker-atlas-lru`, `typing-rate-value`, `momentum-read-and-decay`,
-   `momentum-advance-credit-law`, `momentum-delete-kill-drain`, `ks-arm-threshold`, `tt-*` (the
-   typed-trick listener; `tt-fire-licence-safety` is the master safety law), `ps-stroke-contract`,
-   `wd-ignition-limiter` (the WCAG 2.3.1 limiter), `wd-done-mark-lru`, `spine-*` (the rainbow kitty
-   spine).
-6. **The model refinements** wait on gap 10; each has a model with a negative control:
-   `glow-licence-refines-model`, `echo-ledger-refinement`, `witness-follow-refines-twin-model`,
-   `witness-arrival-evidence-refines-model`, `mr-*-refinement`, `output-streak-attribution`,
-   `wd-identity-model`, `wd-alignment-cardinality`, `console-life-episode-refines-model`,
-   `pet-surface-seam-refines-model`.
-7. **The big engines last**: the CursorGlow seam (`glow-no-licence-no-light`, `glow-exact-payment`,
-   `glow-park`, `insert-licence`, …), the ribbon (`cohort-walk-invariant` first, since
-   `landing-walk-is-band-field` and the walk specs are its corollaries), the PetBrain trace specs
-   (`no-teleport-law` and `pet-idle-to-zero` first), the synth, and the host-seam laws
-   (`copy-is-not-arrival`, `move-is-followed`, `typed-columns-owned`), which need nearly every gap
-   at once. Factoring the reduced-motion arm, the settle ladder and `settle_gaze` out of
-   `PetBrain::tick` as pure functions would move `reduced-motion-static`, `settle-ladder`,
-   `idle-frame-laws` and `sleeper-gaze-brakes` into step 3.
-
 ## 7. A search's spread
 
 `m4::Spread`, which runs a round's jobs on any threads, in the formats of §1 and §2. This section
 held the distributed search until 2026-11-04 (aos M5b: `aos_momentum::dist`, `aos_momentum::lease`,
-`m4::Distributed` and the model `AosWorkerLease`; `docs/DESIGN-aos-hosted-execution-2026-10-21.md`
-§11), which was removed: it gains no speed on one Mac that threads do not gain better (measured: 26.25 s on eight workers, 18.52 s on eight threads, 46.80 s serial, `docs/measured/aos-m5b-workers-2026-10-23.md`), and git history is the way back.
+`m4::Distributed` and the model `AosWorkerLease`), which was removed: it gains no speed on one Mac that threads do not gain better (measured: 26.25 s on eight workers, 18.52 s on eight threads, 46.80 s serial, `docs/measured/aos-m5b-workers-2026-10-23.md`), and git history is the way back.
 
 ```tsv
 id	kind	functions	statement	blocking_gaps	primary_tests
@@ -3483,12 +3241,11 @@ file	test	primary	also
 src/aos_momentum/m4_tests.rs	select_spread_equals_select	aos-spread-equals-local	
 ```
 
-## 8. Added 2026-10-24: shared-buffer inference (aos M5a)
+## 8. Shared-buffer inference (aos M5a)
 
 `int_bag_mlp` (the `int32-exact/v1` job kind: its layout, params builder and checker, packer and
 CPU reference) and `tone_int` (tone-int v1, derived from the shipped tone asset) are new since the
-recovery, and their tests are read the same way as §1. Design of record:
-`docs/DESIGN-aos-hosted-execution-2026-10-21.md` §12. Both modules are gated `any(test,
+recovery, and their tests are read the same way as §1. Both modules are gated `any(test,
 debug_assertions, feature = "int-bag-mlp")`, so no release binary compiles them. aterm-gpu's Metal job
 reads the same bytes; its rows (`int-bag-mlp-equals-cpu-reference` and the job typestate's) belong to
 aterm-gpu's SPECS (design §12.7) and cite `int-bag-mlp-forward-bounds`, so no row here waits on gap 8.
@@ -3561,15 +3318,14 @@ src/tone_int/tests.rs	fidelity_to_the_f32_path_is_pinned	tone-int-workload-pins
 src/tone_int/tests.rs	the_session_pins_reproduce	tone-int-workload-pins	
 ```
 
-## 9. Added 2026-10-24: effects history and repair off the main thread (Rewind R2)
+## 9. Effects history and repair off the main thread (Rewind R2)
 
 `aos_momentum::watch` (the online watcher's judgement of one retired log epoch), the off-main repair
 (`RepairJob`, `PreparedRepair`, `MomentumHost::{aos_repair_job,aos_commit,aos_take_retired}`),
 `MomentumCode::Safe`, `MomentumTrace::check` and the host's refusal to record the vivid light-page ink are new since the recovery, and their tests are read
 the same way as §1. aterm-aos keeps no SPECS.md of its own, so the substrate's two R2 rows (the
 retired ring and the pure registry) sit here beside their one host; their tests are aterm-aos's
-`tests/publish_retired.rs`. Design of record: `docs/DESIGN-aos-hosted-execution-2026-10-21.md`
-§14.4.4 and §14.5 R2.
+`tests/publish_retired.rs`.
 
 ```tsv
 id	kind	functions	statement	blocking_gaps	primary_tests
@@ -3606,7 +3362,7 @@ src/aos_momentum/trace_tests.rs	a_trace_file_round_trips_and_replays_on_another_
 src/aos_momentum/contract_tests.rs	replay_judged_equals_judge_over_run_across_every_law_and_refusal	momentum-trace-check-identity	
 ```
 
-## 10. Added 2026-10-26: the ⬆️'s hover ring
+## 10. The ⬆️'s hover ring
 
 `up_ring` builds the hairline ring the gui lays under a top rule's ⬆️ (a newer CLI build) while the
 pointer is on it (design of record: `crates/aterm-gui/SPECS.md`'s `top-rule-harness-switch`; the
@@ -3626,7 +3382,7 @@ src/up_ring.rs	the_rim_clears_the_small_emojis_rows_by_a_pixel	up-ring
 src/up_ring.rs	every_ring_reads_on_its_ground	up-ring	
 ```
 
-## 11. Added 2026-10-27: the light latch (Prism Glass 1.2)
+## 11. The light latch (Prism Glass 1.2)
 
 `host::light_latch` decides whether a window's frame may draw by the light rules (design of
 record: `docs/design/PRISM-GLASS.md` §2.1 and §15.2 1.2). Its tests are read the same way as §1;
@@ -3650,7 +3406,7 @@ tests/light_latch_conformance.rs	the_latch_refines_its_model_on_every_reachable_
 tests/light_latch_conformance.rs	negative_control_every_buggy_latch_is_left_on_some_frame	light-latch	
 ```
 
-## 12. Added 2026-10-27: the Prism Glass solver (Prism Glass 1.4)
+## 12. The Prism Glass solver (Prism Glass 1.4)
 
 `rainbow_kitty::prism_glass` solves a light page's tables: the glass behind text, the deep lip
 under it, the caret, and a lip-forward page's own lip (design of record:
@@ -3690,7 +3446,7 @@ src/rainbow_kitty/prism_glass/tests.rs	the_palette_cache_holds_at_most_eight_pai
 src/rainbow_kitty/prism_glass/tests.rs	a_request_for_another_pair_drops_the_solve_in_progress	palette-solve-budget	
 ```
 
-## 13. Added 2026-10-28: the bed's glass arm (Prism Glass 1.5)
+## 13. The bed's glass arm (Prism Glass 1.5)
 
 The bed's ink table gains Prism Glass's glass (design of record: `docs/design/PRISM-GLASS.md`
 §15.2 1.5): under `glass_lit` the bed draws by the page's solved glass129, with main's table built
@@ -3715,7 +3471,7 @@ src/rainbow_kitty/ribbon.rs	a_glass_frame_lays_the_glass_in_the_glass_ink	bed-gl
 src/pipeline_native.rs	a_glass_step_reports_the_glass_arm_and_main_none	bed-glass-arm	
 ```
 
-## 14. Added 2026-10-28: the glass geometry (Prism Glass 1.7)
+## 14. The glass geometry (Prism Glass 1.7)
 
 A frame the bed draws by its glass (§13) lays the glass's own geometry (design of record:
 `docs/design/PRISM-GLASS.md` §2.2 and §15.2 1.7): standing on its row's bottom with nothing below
@@ -3742,7 +3498,7 @@ src/host/trail_ground.rs	a_see_through_page_draws_no_glass	light-glass-geometry
 src/host/trail_ground.rs	a_page_whose_face_lays_no_full_ink_draws_no_glass	light-glass-geometry	
 ```
 
-## 15. Added 2026-10-28: the glass's exits, price and cadence (Prism Glass 1.8)
+## 15. The glass's exits, price and cadence (Prism Glass 1.8)
 
 A frame the bed draws by its glass (§13, §14) leaves by its height (design of record:
 `docs/design/PRISM-GLASS.md` §2.2 Exits by height and Quad budget, §15.2 1.8): the glass's opacity
@@ -3768,7 +3524,7 @@ src/rainbow_kitty/ribbon.rs	a_glass_frame_stays_within_the_ribbon_quad_budget	gl
 src/rainbow_kitty/ribbon.rs	dark_slabs_for_is_mains	glass-quad-price	ribbon-quad-budget
 ```
 
-## 16. Added 2026-10-28: the yield (Prism Glass 1.9)
+## 16. The yield (Prism Glass 1.9)
 
 On a frame whose cursor step laid the light glass (§13, §14), the glass yields to the frame's
 words (design of record: `docs/design/PRISM-GLASS.md` §4 and §15.2 1.9): every host's word
@@ -3823,7 +3579,7 @@ src/pipeline_native.rs	a_glass_frame_the_guard_judged_reports_the_guard_arm	lett
 tests/letter_guard_reuse.rs	the_guarded_streams_fold_as_at_the_parent	letter-guard-light-owned	
 ```
 
-## 17. Added 2026-10-29: the wrap sink and the hand-row inset (Prism Glass 1.10)
+## 17. The wrap sink and the hand-row inset (Prism Glass 1.10)
 
 A frame the bed draws by its glass (§13, §14, §15) on a wrapped composer (design of record:
 `docs/design/PRISM-GLASS.md` §2.4 and §15.2 1.10) sinks each row the hand has left to a low glass by
@@ -3849,7 +3605,7 @@ src/rainbow_kitty/ribbon.rs	a_scroll_keeps_each_sink_on_its_row	ribbon-translate
 src/rainbow_kitty/ribbon.rs	a_carry_moves_each_sink_with_its_row	ribbon-translate	glass-wrap-sink
 ```
 
-## 18. Added 2026-11-01: the letter's ring (round 27)
+## 18. The letter's ring (round 27)
 
 The letter guard and the trail judges read a letter by one model, what a reader sees round each
 stroke. The judges (`aterm-lab trail-contrast`'s `local_contrast`, which its thresholds judge, and
@@ -3885,7 +3641,7 @@ src/cursor_glow/ink_ledger/letter_guard.rs	a_letter_on_a_dim_page_keeps_a_level_
 tests/letter_guard_reuse.rs	a_share_lowered_on_its_frame_is_that_frame_s_alone	letter-guard-ring	
 ```
 
-## 19. Added 2026-11-05: the glass's tokens (harness glass rainbow S4)
+## 19. The glass's tokens (harness glass rainbow S4)
 
 `glass_inks` is the one token set the harness glass's lines B, D and E wear (design of record:
 `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1; the gui's rows are `crates/aterm-gui/SPECS.md`'s

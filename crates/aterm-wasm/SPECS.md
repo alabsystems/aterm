@@ -68,7 +68,7 @@ the engine's function"), which wait on gap 12 (cross-crate citation). A small se
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests, `module::test`; the full
 map is §2), `difficulty` (the Rust features the proof must handle), `blocking_gaps` (rows of the gap
-table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7). Gap 0 (the installed seal publishes
+table in `docs/TRUST-LANE.md` (Blocking gaps)). Gap 0 (the installed seal publishes
 no Lean-discharged row) blocks every spec and is not repeated in the column; no spec is blocked by gap
 0 alone. Rows are in proof order (§6).
 
@@ -153,51 +153,6 @@ render-history-independence	refinement	AtermTerminal::{render,set_theme,set_chro
 web-band-native-golden	refinement	messages_api::AtermTerminal::{notice_at,messages_tick_at}, AtermTerminal::render, messages_api::WebBand::compose	∀ 16 scenes in crates/aterm-wasm/tests/fixtures/band_native.tsv × 4 themes × widths {60,80,120} × looks {moving, still}: the web module's frame after replaying the scene's notice lines and ticks equals the recorded native band frame (per band row the cells, chrome rasters and pixels, the bleed, the pixels above the grid: every golden digest). The golden is the native band's frames as last written, now a frozen reference: its writer went on 2026-11-01 (the test in 1a7cad3eb5, its file in d76dc5fed2), and aterm-gui has had no band host since band removal S3. So the general form is the finite one: web band compose ∘ rasterizer = that recorded frame set, over its scenes.	messages_api::the_web_band_is_the_native_golden	HARD: a rasterizer model, then a fixture conformance over FNV digests against the frozen recording; with no aterm-gui band host since band removal S3, no cross-host refinement is left to state	1,2,4,7,10,12
 binding-no-panic	no-panic	AtermTerminal::* (every export), Drop for AtermTerminal, ScrollInputState::add_rows, registered_font	∀ T∈Reach and all argument values of every exported method (u16::MAX dims, u32::MAX handles, NaN/±inf/1e18 floats, out-of-range rows and cols, junk strings): no call panics. Dropping T in any state (a stashed or half-stepped reflow job included) does not panic and drops the detached history with it.	-	HARD in aggregate: every slice index and as-cast, Mutex lock().expect (no poisoning: single-threaded), RefCell borrow_mut (no reentrancy), Drop glue of cross-crate types	1,2,4,7,12,13
 ```
-
-### Distribution by kind (78)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 47 | band-row-arith, scroll-edge-clamp, scroll-accumulator, scroll-frac-px, utc-offset-seconds, streak-polarity, tier-capabilities-json, dirty-rows-to-bands, log-journal-cursor, read-kept-bounded, selection-range-projection, cell-under-geometry, scroll-stamp, frame-geometry, present-band-classification, frame-gate-doors, selection-extend-bumps-iff-moved, theme-reset-baseline, web-theme-resolve, web-theme-register, web-theme-install, web-theme-appearance-follow, web-contrast-floor, frame-scratch-live-colors, mouse-report-encoding, console-input-admission, link-at-cell-span, hyperlink-scheme-gate, last-command-output, row-range-json, word-and-line-selection, search-scroll-into-view, scrollback-retention-limit, tiered-ctor-staging, flood-one-marker, scrollback-budget, reflow-offload-contract, notification-queue, predict-off-inert, predict-no-echo-contexts, band-next-wake, band-hover-and-press, forced-colors-inks, quit-record, restore-log, spill-export-coherence, font-registry-interning |
-| equivalence | 15 | pct-encode-equals-control, needs-frame-is-gate, encode-key-stateless-equals-instance, paste-sanitize-then-wrap, display-relative-reads, display-row-cache-transparent, search-exports-agree, search-is-fresh, notice-is-wire, messages-read-is-wire, band-press-semantics, band-is-translation, effects-off-identity, effects-deterministic, scoped-refill-equals-full |
-| refinement | 7 | scroll-input-export, mode-getters-delegate, search-budgeted-refines-one-shot, predict-binding-refines-predictor, messages-page-is-engine-page, render-history-independence, web-band-native-golden |
-| invariant | 2 | dims-clamped, present-buffer-coherence |
-| round-trip | 2 | json-string-escape, serialize-replay-roundtrip |
-| table-property | 2 | tick-bits, dom-key-encoding |
-| no-panic | 1 | binding-no-panic |
-| other | 2 | reflow-safety-nets, effects-self-terminate |
-
-### Gap histogram (specs blocked by each §7 row)
-
-| gap | specs | meaning |
-|---|---|---|
-| 0 | 78 | installed seal publishes no Lean-discharged row (implicit in every row) |
-| 1 | 68 | non-scalar carriers and content models |
-| 2 | 58 | certified `&self`/`&mut self` views, two-state `x'` |
-| 3 | 12 | E6 body widening (casts, shifts, bit ops, loops, min/max, matches) |
-| 4 | 60 | callee-ensures to caller-assert composition |
-| 5 | 4 | quantified clauses |
-| 7 | 33 | loops |
-| 8 | 4 | effects (clock, fs, thread_local) |
-| 10 | 3 | model-to-code refinement beyond scalars |
-| 11 | 3 | generics |
-| 12 | 69 | cross-crate theorem citation |
-| 13 | 8 | threads, async, closures |
-| 14 | 5 | Clean elaborator coverage (here: no IEEE f64 model) |
-
-Gaps 6, 9, 15, 16 and 17 block no statement here, though 6 and 17 gate publishing and running any proof.
-
-### Proof dependency order
-
-`band-row-arith` → `cell-under-geometry` → `band-press-semantics` → `band-hover-and-press`.
-`scroll-accumulator`, `scroll-frac-px`, `scroll-edge-clamp` → `scroll-stamp` → `scroll-input-export`.
-`json-string-escape` → `row-range-json`, `notification-queue`. `log-journal-cursor` → `quit-record`;
-`read-kept-bounded` → `restore-log`. `utc-offset-seconds` → `messages-page-is-engine-page`.
-`dirty-rows-to-bands` + the `expand_rgba_band`/`shift_rgba_band` lemmas → `present-buffer-coherence`,
-`present-band-classification` → `needs-frame-is-gate` → `frame-gate-doors`, `selection-extend-bumps-iff-moved`.
-`reflow-offload-contract` → `reflow-safety-nets`. `search-exports-agree` → `search-budgeted-refines-one-shot`.
-Everything pixel-level (`band-is-translation`, `effects-off-identity`, `render-history-independence`,
-`web-band-native-golden`) waits for an aterm-render rasterizer model.
 
 ## 2. Test → spec map (TSV)
 
@@ -349,13 +304,6 @@ src/theme_api.rs	unregister_refuses_the_drawn_theme	web-theme-register	web-theme
 src/theme_api.rs	web_translucency_raises_the_effective_floor	web-contrast-floor	
 ```
 
-## 3. Coverage
-
-- 141 live tests mapped across the 78 specs in §2 (plus 1 deleted timing test noted in §5.8).
-- The biggest collapses: `predict-binding-refines-predictor` (10), `scroll-accumulator` (6), `band-next-wake` (6), `band-is-translation` (5), `web-theme-install` (5).
-- `scroll-navigation` is clause (c) of `scroll-input-export`. `theme_api::cursor_color_follows_osc12_and_resets_on_112`
-  is the export-level view of `theme-reset-baseline` and maps there.
-
 ## 4. Tests missing from §2
 
 None: all 141 live `#[test]` functions across `src/` are mapped in §2.
@@ -390,27 +338,3 @@ None: all 141 live `#[test]` functions across `src/` are mapped in §2.
    `conformance_shared_budget`, in a binary of its own; `scrollback-budget` states it here.
 9. `effects_api.rs`'s test module (`#[cfg(all(test, not(target_arch = "wasm32")))]`) is covered by
    `streak-polarity`.
-
-## 6. Proof order (easiest high-value first)
-
-§1 lists the rows in this order: the smallest gap set first, then the most tests retired. The
-dependencies:
-
-- `band-row-arith` → `cell-under-geometry` → `band-press-semantics` → `band-hover-and-press`.
-- `scroll-accumulator`, `scroll-frac-px`, `scroll-edge-clamp` → `scroll-stamp` → `scroll-input-export`.
-- `json-string-escape` → `row-range-json`, `notification-queue`.
-- `log-journal-cursor` → `quit-record`; `read-kept-bounded` → `restore-log`; `utc-offset-seconds` →
-  `messages-page-is-engine-page`.
-- `dirty-rows-to-bands` and `present-buffer-coherence`'s lemmas (a) `expand_rgba_band` and
-  (b) `shift_rgba_band` → `present-buffer-coherence`, `present-band-classification` →
-  `needs-frame-is-gate` → `frame-gate-doors`, `selection-extend-bumps-iff-moved`.
-- `reflow-offload-contract` → `reflow-safety-nets`; `search-exports-agree` →
-  `search-budgeted-refines-one-shot`.
-
-`tick-bits` needs only gap 3 (E6 admitting shifts and bitwise OR). `scroll-accumulator`,
-`scroll-frac-px` and `utc-offset-seconds` are the first users of a Clean IEEE f64 model, so they
-force gap 14. Lemma (c) of `present-buffer-coherence` is the first step that needs an aterm-render
-`ensures`. The engine-delegation rows go in order of how little engine model they need. The
-pixel-level and whole-pipeline rows (`band-is-translation`, `effects-*`, `spill-export-coherence`,
-`render-history-independence`, `web-band-native-golden`) wait for an aterm-render rasterizer model,
-and `binding-no-panic`, the conjunction of every other proof's bounds, goes last.

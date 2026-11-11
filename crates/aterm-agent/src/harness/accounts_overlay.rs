@@ -161,7 +161,7 @@ pub fn disable_feedback_survey(home: &Path) -> io::Result<()> {
         ));
     }
     if text != edited {
-        super::upgrade_models::write_atomic_mode(&target, &edited, None)?;
+        super::atomic_write::write_atomic_mode(&target, &edited, None)?;
     }
     Ok(())
 }

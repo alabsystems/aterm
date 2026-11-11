@@ -2,14 +2,14 @@
 // Copyright 2026 Andrew Yates
 use super::*;
 use std::io::Write;
-fn limits() -> Limits {
+pub(super) fn limits() -> Limits {
     Limits {
         records: 8,
         bytes: 8192,
         record_bytes: 1024,
     }
 }
-fn open(dir: &Path) -> Log {
+pub(super) fn open(dir: &Path) -> Log {
     {
         let mut log = Log::open(dir, "test", b"pinned", false, limits()).unwrap();
         log.finish_open().unwrap();

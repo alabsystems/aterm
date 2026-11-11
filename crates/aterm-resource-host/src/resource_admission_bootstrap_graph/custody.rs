@@ -18,8 +18,86 @@ struct Attempt {
     active: Arc<AtomicBool>,
     gnu: Option<[OwnedFd; 2]>,
     control: Option<OwnedFd>,
+    source_requested: Option<wire::SourceAttachment>,
+    source: Option<Arc<OriginalSource>>,
     output_requested: Option<wire::OutputAttachment>,
     output: Option<Arc<[OwnedFd; 2]>>,
+}
+
+/// Close-only originals accepted from this enrolled graph's actual source
+/// producer. These descriptions never construct a Manager or release permit.
+pub(in crate::actor::owner) struct OriginalSource {
+    request: wire::SourceAttachment,
+    path: PathBuf,
+    descriptions: [OwnedFd; 4],
+    // Use eligibility is distinct from the receiving handler's live barrier.
+    revoked: AtomicBool,
+    active: Arc<AtomicBool>,
+    deadline: Instant,
+}
+impl OriginalSource {
+    pub(in crate::actor::owner) fn check_current(&self, deadline: Instant) -> io::Result<()> {
+        let result = (|| {
+            let deadline = deadline.min(self.deadline);
+            time(deadline)?;
+            if self.revoked.load(Ordering::Acquire) || !self.active.load(Ordering::Acquire) {
+                return Err(refused("original source enrollment is no longer active"));
+            }
+            wire::transport::check_source(
+                &self.request,
+                &self.descriptions.each_ref().map(AsFd::as_fd),
+                deadline,
+            )?;
+            let named = std::fs::symlink_metadata(&self.path)?;
+            if !named.is_dir()
+                || self.path.canonicalize()? != self.path
+                || (named.dev(), named.ino())
+                    != (
+                        self.request.source_directory.device,
+                        self.request.source_directory.inode,
+                    )
+            {
+                return Err(refused("original enrolled source directory changed"));
+            }
+            time(deadline)?;
+            if self.revoked.load(Ordering::Acquire) || !self.active.load(Ordering::Acquire) {
+                return Err(refused("original source revoked during observation"));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // Eligibility is monotone. Refusal cannot end the actual handler's
+            // custody barrier or retire its retained descriptions.
+            self.revoked.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    pub(in crate::actor::owner) fn matches(
+        &self,
+        key: &wire::Key,
+        path: &[u8],
+        directory: trust_resource_controller::FileIdentity,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        if &self.request.key != key
+            || self.path.as_os_str().as_bytes() != path
+            || self.request.source_directory != directory
+        {
+            return Err(refused(
+                "object source differs from accepted original offer",
+            ));
+        }
+        self.check_current(deadline)
+    }
+
+    pub(in crate::actor::owner) fn directory(
+        &self,
+        deadline: Instant,
+    ) -> io::Result<std::os::fd::BorrowedFd<'_>> {
+        self.check_current(deadline)?;
+        Ok(self.descriptions[0].as_fd())
+    }
 }
 
 /// Only State's already accepted original output offer creates this borrow.
@@ -93,6 +171,7 @@ pub(crate) struct Preparing {
     active: Arc<AtomicBool>,
     deadline: Instant,
     submitted: bool,
+    source_submitted: bool,
     output_submitted: bool,
 }
 pub(crate) struct EnrollmentAttachment {
@@ -103,6 +182,12 @@ pub(crate) struct EnrollmentAttachment {
 }
 pub(crate) struct OutputTransfer {
     request: wire::OutputAttachment,
+    context: trust_resource_controller::ContextReply,
+    peer: Peer,
+    active: Arc<AtomicBool>,
+}
+pub(crate) struct SourceTransfer {
+    request: wire::SourceAttachment,
     context: trust_resource_controller::ContextReply,
     peer: Peer,
     active: Arc<AtomicBool>,
@@ -139,6 +224,7 @@ impl Preparing {
     ) -> io::Result<OutputTransfer> {
         request.encode()?;
         if !self.submitted
+            || !self.source_submitted
             || self.output_submitted
             || request.key != self.request.key
             || !self.active.load(Ordering::Acquire)
@@ -153,6 +239,33 @@ impl Preparing {
             active: Arc::clone(&self.active),
         })
     }
+
+    pub(crate) fn source_transfer(
+        &mut self,
+        request: wire::SourceAttachment,
+    ) -> io::Result<SourceTransfer> {
+        request.validate()?;
+        if !self.submitted
+            || self.source_submitted
+            || self.output_submitted
+            || request.key != self.request.key
+            || !self.active.load(Ordering::Acquire)
+        {
+            return Err(refused("Bootstrap source offer is foreign or repeated"));
+        }
+        self.source_submitted = true;
+        Ok(SourceTransfer {
+            request,
+            context: self.context.clone(),
+            peer: self.peer,
+            active: Arc::clone(&self.active),
+        })
+    }
+}
+impl SourceTransfer {
+    pub(crate) fn context(&self) -> &trust_resource_controller::ContextReply {
+        &self.context
+    }
 }
 impl OutputTransfer {
     pub(crate) fn context(&self) -> &trust_resource_controller::ContextReply {
@@ -160,6 +273,20 @@ impl OutputTransfer {
     }
 }
 impl State {
+    pub(super) fn original_source(
+        &self,
+        key: &wire::Key,
+        deadline: Instant,
+    ) -> io::Result<Arc<OriginalSource>> {
+        self.enrolled(key)?;
+        let source = self
+            .attempt
+            .as_ref()
+            .and_then(|attempt| attempt.source.as_ref())
+            .ok_or_else(|| refused("object has no accepted original source offer"))?;
+        source.check_current(deadline)?;
+        Ok(Arc::clone(source))
+    }
     pub(super) fn enrolled(&self, key: &wire::Key) -> io::Result<&wire::Enrollment> {
         let attempt = self
             .attempt
@@ -289,6 +416,8 @@ impl Owner {
             active: Arc::clone(&active),
             gnu: None,
             control: None,
+            source_requested: None,
+            source: None,
             output_requested: None,
             output: None,
         });
@@ -299,6 +428,7 @@ impl Owner {
             active,
             deadline: root.deadline(),
             submitted: false,
+            source_submitted: false,
             output_submitted: false,
         })
     }
@@ -341,6 +471,104 @@ impl Owner {
         attempt.control = Some(control);
         Ok(context)
     }
+    pub(in crate::actor) fn bootstrap_graph_source_begin(
+        &mut self,
+        token: SourceTransfer,
+    ) -> io::Result<SourceTransfer> {
+        self.refresh_bootstrap_query(token.peer, &token.request.key)?;
+        let context = self.bootstrap_graph_context(token.peer, &token.request.key)?;
+        if context != token.context {
+            return Err(refused(
+                "Bootstrap live context changed before source offer",
+            ));
+        }
+        let root = self
+            .jobs
+            .get_mut(&(
+                token.request.key.query.binding.session.clone(),
+                token.request.key.query.binding.root_attempt,
+            ))
+            .and_then(|job| job.bootstrap_graph.as_mut())
+            .ok_or_else(|| refused("Bootstrap source has no original Root"))?;
+        time(root.deadline())?;
+        let attempt = root
+            .inputs
+            .attempt
+            .as_mut()
+            .ok_or_else(|| refused("Bootstrap source has no enrolled original graph"))?;
+        if attempt.request.key != token.request.key
+            || !Arc::ptr_eq(&attempt.active, &token.active)
+            || !attempt.active.load(Ordering::Acquire)
+            || attempt.gnu.is_none()
+            || attempt.control.is_none()
+            || attempt.source_requested.is_some()
+            || attempt.source.is_some()
+            || attempt.output_requested.is_some()
+        {
+            return Err(refused(
+                "Bootstrap source is foreign, unprepared or repeated",
+            ));
+        }
+        token.request.validate()?;
+        attempt.source_requested = Some(token.request.clone());
+        Ok(token)
+    }
+    pub(in crate::actor) fn bootstrap_graph_source_retain(
+        &mut self,
+        token: SourceTransfer,
+        descriptions: [OwnedFd; 4],
+    ) -> io::Result<trust_resource_controller::ContextReply> {
+        // Even a failed context recheck must not discard an already delivered
+        // original population. The matching one-use slot stores it first.
+        let context = self.bootstrap_graph_context(token.peer, &token.request.key);
+        let root = self
+            .jobs
+            .get_mut(&(
+                token.request.key.query.binding.session.clone(),
+                token.request.key.query.binding.root_attempt,
+            ))
+            .and_then(|job| job.bootstrap_graph.as_mut());
+        let Some(root) = root else {
+            std::mem::forget(descriptions);
+            return Err(refused("delivered Bootstrap source lost its original Root"));
+        };
+        let deadline = root.deadline();
+        let Some(attempt) = root.inputs.attempt.as_mut() else {
+            std::mem::forget(descriptions);
+            return Err(refused(
+                "delivered Bootstrap source lost its original enrollment",
+            ));
+        };
+        if attempt.source_requested.as_ref() != Some(&token.request)
+            || !Arc::ptr_eq(&attempt.active, &token.active)
+            || attempt.source.is_some()
+        {
+            return Err(refused("Bootstrap source transfer is foreign or repeated"));
+        }
+        let original = Arc::new(OriginalSource {
+            request: token.request,
+            path: PathBuf::from(OsStr::from_bytes(&attempt.request.source)),
+            descriptions,
+            revoked: AtomicBool::new(false),
+            active: Arc::clone(&attempt.active),
+            deadline,
+        });
+        attempt.source = Some(Arc::clone(&original));
+        let result = (|| {
+            original.check_current(deadline)?;
+            let context = context?;
+            if context != token.context {
+                return Err(refused(
+                    "Bootstrap live context changed during source offer",
+                ));
+            }
+            Ok(context)
+        })();
+        if result.is_err() {
+            original.revoked.store(true, Ordering::Release);
+        }
+        result
+    }
     pub(in crate::actor) fn bootstrap_graph_output_begin(
         &mut self,
         token: OutputTransfer,
@@ -366,6 +594,7 @@ impl Owner {
             || !attempt.active.load(Ordering::Acquire)
             || attempt.gnu.is_none()
             || attempt.control.is_none()
+            || attempt.source.is_none()
             || attempt.output_requested.is_some()
             || attempt.output.is_some()
         {
@@ -373,6 +602,11 @@ impl Owner {
                 "Bootstrap output is foreign, unprepared or repeated",
             ));
         }
+        let source = attempt
+            .source
+            .as_ref()
+            .expect("accepted source checked above");
+        source.check_current(source.deadline)?;
         attempt.output_requested = Some(token.request.clone());
         Ok(token)
     }
@@ -420,3 +654,7 @@ impl Owner {
         Ok(context)
     }
 }
+
+#[cfg(test)]
+#[path = "custody_tests.rs"]
+mod tests;

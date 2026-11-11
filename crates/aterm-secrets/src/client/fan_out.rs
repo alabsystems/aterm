@@ -17,7 +17,7 @@ use crate::crossing::RecordsBound;
 use crate::server::{ENVELOPE_PEEK, ENVELOPE_PULLS_AT_ONCE, PullSlots, RECORDS_PULLS_AT_ONCE};
 use crate::transport::Pulled;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 /// The most threads one [`each_at_once`] runs, its caller's among them: one per item, up to eight

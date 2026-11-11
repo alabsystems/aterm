@@ -189,11 +189,10 @@ fn probe(
 
 /// A signed executable does not qualify code introduced by its caller's loader.
 pub(super) fn no_loader_overrides(environment: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
-    if environment.iter().any(|(key, value)| {
-        !value.is_empty()
-            && atpkg::shim_env::NEVER_SET_PREFIXES
-                .iter()
-                .any(|prefix| key.starts_with(prefix.as_bytes()))
+    if environment.iter().any(|(key, _)| {
+        atpkg::shim_env::NEVER_SET_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix.as_bytes()))
     }) {
         return Err(refused(
             "native resource recipe refuses dynamic loader overrides",
@@ -282,7 +281,7 @@ mod tests {
             b"DYLD_LIBRARY_PATH",
         ] {
             assert!(no_loader_overrides(&[(key.to_vec(), b"/foreign/code".to_vec())]).is_err());
-            assert!(no_loader_overrides(&[(key.to_vec(), Vec::new())]).is_ok());
+            assert!(no_loader_overrides(&[(key.to_vec(), Vec::new())]).is_err());
         }
         assert!(no_loader_overrides(&[(b"ORDINARY_PATH".to_vec(), b"/ordinary".to_vec())]).is_ok());
     }

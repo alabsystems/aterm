@@ -245,6 +245,115 @@ fn wait(child: &mut Child) -> std::process::ExitStatus {
 }
 
 #[test]
+fn final_setexec_hold_transfers_once_before_the_single_combined_seal() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "solver_bootstrap::tests::final_setexec_hold_transfers_once_before_the_single_combined_seal",
+    ) {
+        return;
+    }
+    crate::runtime::test_endpoint().unwrap();
+    for mib in [512, 64] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let limit = spawnfd::FootprintLimit::new(mib).unwrap();
+        let deadline = crate::fixture_deadline(Instant::now());
+        let mut owner = Owner::new([21; 16], 3, limit, deadline).unwrap();
+        let mut selected = spawnfd::command(std::env::current_exe().unwrap());
+        selected
+            .env_clear()
+            .env(ROLE, "allocate")
+            .env("ATERM_TEST_SOLVER_FD", "9")
+            .env("ATERM_TEST_SOLVER_WORK", root.path().join("work"))
+            .env("ATERM_TEST_SOLVER_JOURNAL", root.path().join("journal"))
+            .current_dir(root.path())
+            .footprint_limit(limit);
+        let (mut prelude, mut command) =
+            crate::metadata_prelude::Owner::new_for_child_seal(&selected, &[9], deadline).unwrap();
+        command
+            .stdout(spawnfd::Stdio::null())
+            .stderr(spawnfd::Stdio::piped());
+        command
+            .inherit_guards_at(vec![owner.extra(9).unwrap(), prelude.extra().unwrap()])
+            .unwrap();
+        prelude.configured(&mut command).unwrap();
+        assert!(
+            command.get_footprint_limit().is_none(),
+            "intermediate remains uncapped"
+        );
+        let mut child = Child(command.spawn().unwrap());
+        let original = process::read_lineage(child.0.id() as i32).unwrap();
+        while !prelude.poll(&mut child.0, validate_image).unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let executed = process::read_lineage(child.0.id() as i32).unwrap();
+        assert_eq!(
+            (
+                executed.identity.pid,
+                executed.identity.birth,
+                executed.uniqueid,
+                executed.parent,
+                executed.pgid
+            ),
+            (
+                original.identity.pid,
+                original.identity.birth,
+                original.uniqueid,
+                original.parent,
+                original.pgid
+            ),
+        );
+        assert!(original.identity.idversion.is_some() && executed.identity.idversion.is_some());
+        assert_ne!(
+            executed.identity.idversion, original.identity.idversion,
+            "actual SETEXEC changes the image version without replacing its lifetime"
+        );
+        assert!(!crate::metadata_prelude::no_fork(child.0.id()).unwrap());
+        assert!(
+            prelude.take_retirement().is_none(),
+            "unsealed target is not contained"
+        );
+        let target = prelude.take_prepared_target().unwrap();
+        assert!(
+            prelude.take_prepared_target().is_err(),
+            "hold transfers only once"
+        );
+        owner.bind_prepared(target).unwrap();
+        ready(&mut owner, &mut child);
+        assert!(!root.path().join("work").exists());
+        let contained = owner.take_retirement().unwrap();
+        assert!(contained.matches(child.0.id(), original.identity.birth.0, child.0.id() as i32));
+        assert!(owner.take_retirement().is_none());
+        while !owner
+            .poll_run(
+                &mut child.0,
+                validate_image,
+                || false,
+                |intent| persist(root.path(), intent),
+            )
+            .unwrap()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let status = wait(&mut child);
+        let mut error = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut error)
+            .unwrap();
+        assert!(root.path().join("work").exists(), "{status:?}: {error}");
+        if mib == 512 {
+            assert!(status.success(), "{status:?}: {error}");
+        } else {
+            assert_eq!(status.signal(), Some(libc::SIGKILL), "{error}");
+        }
+    }
+}
+
+#[test]
 fn actual_sealed_child_waits_for_durable_run_and_retains_final_limit() {
     if !aterm_uds::test_binary::isolated_lifecycle(
         "solver_bootstrap::tests::actual_sealed_child_waits_for_durable_run_and_retains_final_limit",

@@ -3580,41 +3580,63 @@ pub fn fetch_only(prefix: &Prefix, f: &Formula) -> Result<PathBuf, InstallError>
     Ok(dest)
 }
 
-/// Loads runtime dependency lists for all installed formulae.
-pub(super) fn dependency_books(
-    installed: &[Installed],
-    mut read: impl FnMut(&str) -> Result<Formula, String>,
-) -> Result<Vec<(Installed, Formula)>, String> {
-    installed.iter().map(|i| {
-        let formula = read(&i.name)?;
-        if formula.name != i.name {
-            return Err(format!("abrew: dependency metadata does not name {}", i.name));
-        }
-        if !super::valid_cask_version(&formula.version) {
-            return Err("abrew: invalid formula version".to_string());
-        }
-        let version = keg_version(&formula);
-        if i.versions.is_empty() || i.versions.iter().any(|installed| *installed != version) {
-            return Err(format!("abrew: dependency metadata for {} covers {version}, not every installed version; automatic deletion refused (explicit uninstall --ignore-dependencies is separate)", i.name));
-        }
-        Ok((i.clone(), formula))
-    }).collect()
-}
-
-/// Returns installed formulae that declare `name` as a runtime dependency.
+/// Returns installed formulae whose runtime closure
+/// contains `name`. The closure is the keg receipt's
+/// recorded tab deps first (exact for the installed keg, as
+/// brew reads tabs); a receipt without one falls back to
+/// the declared closure of current metadata, like
+/// autoremove. Version skew between an installed keg and
+/// current metadata is normal (outdated and multi-version
+/// kegs) and blocks nothing; refusing happens only when
+/// neither the receipt nor metadata can answer.
 pub fn dependents(api: &Api, prefix: &Prefix, name: &str) -> Result<Vec<String>, InstallError> {
-    let mut installed = prefix.installed_checked(Kind::Formula)?;
-    installed.retain(|inst| inst.name != name);
-    let books = dependency_books(&installed, |n| api.dependency_formula(n))?;
-    Ok(books
-        .into_iter()
-        .filter(|(_, f)| {
-            f.dependencies
+    let installed_all = prefix.installed_checked(Kind::Formula)?;
+    let installed_names: std::collections::BTreeSet<String> =
+        installed_all.iter().map(|i| i.name.clone()).collect();
+    let mut out = Vec::new();
+    for inst in installed_all.iter().filter(|i| i.name != name) {
+        let keg = prefix.keg(&inst.name, &inst.version);
+        let closure: std::collections::BTreeSet<String> = match super::prefix::receipt_runtime_deps(
+            &keg,
+        ) {
+            Some(tab) => tab
                 .iter()
-                .any(|d| Formula::short_name(d) == name)
-        })
-        .map(|(inst, _)| inst.name)
-        .collect())
+                .map(|d| Formula::short_name(d).to_string())
+                .collect(),
+            None => {
+                let root = api.dependency_formula(&inst.name).map_err(|_| {
+                        format!(
+                            "abrew: dependency metadata for {} is unavailable and its receipt records no runtime closure; uninstall refused (explicit uninstall --ignore-dependencies is separate)",
+                            inst.name
+                        )
+                    })?;
+                let mut set = std::collections::BTreeSet::new();
+                let mut queue: Vec<String> = root
+                    .dependencies
+                    .iter()
+                    .map(|d| Formula::short_name(d).to_string())
+                    .collect();
+                while let Some(cur) = queue.pop() {
+                    if cur == inst.name || !set.insert(cur.clone()) {
+                        continue;
+                    }
+                    if let Ok(dep) = api.dependency_formula(&cur) {
+                        queue.extend(
+                            dep.dependencies
+                                .iter()
+                                .map(|d| Formula::short_name(d).to_string()),
+                        );
+                    }
+                }
+                set.retain(|n| installed_names.contains(n));
+                set
+            }
+        };
+        if closure.contains(name) {
+            out.push(inst.name.clone());
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -3622,6 +3644,40 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::extract::fixtures::{gzip_bytes, tar_bytes};
+
+    #[test]
+    fn dependents_read_receipt_closures_not_metadata_versions() {
+        // Uninstall protection reads each keg's recorded tab
+        // closure: a multi-version neighbour keg (whose
+        // versions current metadata cannot all cover) must
+        // not make every uninstall refuse, and protection
+        // follows the tab even where metadata would differ.
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        let keg = |name: &str, version: &str, closure: &str| {
+            let dir = prefix.keg(name, version);
+            std::fs::create_dir_all(&dir).unwrap();
+            prefix
+                .write_receipt_raw(
+                    &dir,
+                    &[
+                        ("installed_by", "abrew"),
+                        ("name", name),
+                        ("version", version),
+                    ],
+                    &[("runtime_dependencies", closure)],
+                )
+                .unwrap();
+        };
+        keg("app", "1", r#"[{"full_name":"dep","version":"1"}]"#);
+        keg("dep", "1", "[]");
+        keg("multi", "1", "[]");
+        keg("multi", "2", "[]");
+        let api = Api::new(prefix.clone());
+        assert_eq!(dependents(&api, &prefix, "dep").unwrap(), ["app"]);
+        assert!(dependents(&api, &prefix, "multi").unwrap().is_empty());
+        assert!(dependents(&api, &prefix, "app").unwrap().is_empty());
+    }
 
     #[test]
     #[cfg(unix)]

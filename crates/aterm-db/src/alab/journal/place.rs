@@ -54,7 +54,7 @@ impl Why {
     }
 }
 
-/// One account this Mac holds a row of that no preference here names, as the harness decides
+/// One account this Mac holds a login of that no preference here names, as the harness decides
 /// it: the base reason ([`Why::Fill`], [`Why::Borrow`] or [`Why::Stranded`]); the flusher says
 /// [`Why::Probation`] instead while its own book shows the account never ran or signed in here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -3964,9 +3964,7 @@ fn serve_one_node_generation(
                     }
                     // A round still out takes no move: the move waits for the round after it.
                     if let Some(woke) = heartbeat
-                        .due_when_free(Instant::now(), hb_in_flight.load(Ordering::Acquire))
-                    {
-                        super::say_heartbeat_woke("node job", woke);
+                        .dispatch_when_free(Instant::now(), hb_in_flight.load(Ordering::Acquire), || {
                         // A record of the vault the fleet state is of, adopted where an older
                         // build left none.
                         aterm_agent::fleet_vault::keep(&state_dir, vault_paths.as_ref());
@@ -3994,9 +3992,12 @@ fn serve_one_node_generation(
                                 (denied, log, browse_watch.clone()),
                             ),
                             None => {
-                                aterm_log::debug!("node job heartbeat skipped: {DENY_LIST_UNREAD}")
+                                aterm_log::debug!("node job heartbeat skipped: {DENY_LIST_UNREAD}");
+                                false
                             }
                         }
+                    }) {
+                        super::say_heartbeat_woke("node job", woke);
                     }
                     next_tick = Instant::now() + tick_every;
                 }

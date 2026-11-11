@@ -667,7 +667,7 @@ impl Used {
                 .filter(|line| line.contains("\"timestamp\""))
                 .find_map(|line| {
                     let v = aterm_json::from_str::<aterm_json::Value>(line).ok()?;
-                    super::upgrade_models::parse_utc(v.get("timestamp")?.as_str()?)
+                    super::unix_time::parse_utc(v.get("timestamp")?.as_str()?)
                 })
         });
         Self {
@@ -1344,23 +1344,47 @@ fn work_status(
     table: &aterm_sysprobe::volumes::Table,
     reads: &Reads<'_>,
 ) -> Option<(String, Option<String>)> {
-    work_status_in(root, table, None, None, reads)
+    work_status_in(root, table, RepoExcludes::Probe, None, reads)
 }
 
-/// [`work_status`] with `own_excludes_known` and `index_source` supplied where the caller has
-/// already read the repository's local configuration and verified its `.git` directory.
+/// How [`work_status_in`] resolves `core.excludesFile`.
+#[derive(Clone, Copy)]
+pub(super) enum RepoExcludes {
+    /// Query [`own_excludes`] and, when unset, [`global_excludes`] (`probe` and `read_work`).
+    Probe,
+    /// The repository's own local or worktree configuration sets a non-empty `core.excludesFile`.
+    Own,
+    /// Neither local nor global configuration sets `core.excludesFile`; resolve the default
+    /// `~/.config/git/ignore` (or `$XDG_CONFIG_HOME/git/ignore`) path directly without spawning a
+    /// second `git config --global` process.
+    DefaultGlobal,
+    /// Global configuration sets `core.excludesFile`; resolve it through [`global_excludes`] so
+    /// Git's `--path` expansion applies.
+    ConfiguredGlobal,
+}
+
+/// [`work_status`] with `excludes_mode` and `index_source` supplied where the caller has already
+/// read the repository's configuration and verified its `.git` directory.
 fn work_status_in(
     root: &Path,
     table: &aterm_sysprobe::volumes::Table,
-    own_excludes_known: Option<bool>,
+    excludes_mode: RepoExcludes,
     index_source: Option<&Path>,
     reads: &Reads<'_>,
 ) -> Option<(String, Option<String>)> {
-    let has_own = own_excludes_known.unwrap_or_else(|| own_excludes(root, reads));
-    let excludes = (!has_own)
-        .then(|| global_excludes(root, table, reads))
-        .flatten()
-        .and_then(|p| p.to_str().map(|p| format!("core.excludesFile={p}")));
+    let excludes_path = match excludes_mode {
+        RepoExcludes::Probe => {
+            if own_excludes(root, reads) {
+                None
+            } else {
+                global_excludes(root, table, reads)
+            }
+        }
+        RepoExcludes::Own => None,
+        RepoExcludes::DefaultGlobal => default_global_excludes(reads.home, reads.xdg, table),
+        RepoExcludes::ConfiguredGlobal => global_excludes(root, table, reads),
+    };
+    let excludes = excludes_path.and_then(|p| p.to_str().map(|p| format!("core.excludesFile={p}")));
     let mut status_args: Vec<&str> = vec!["-c", "status.renames=false"];
     if let Some(flag) = &excludes {
         status_args.extend(["-c", flag]);
@@ -2782,18 +2806,36 @@ fn global_excludes(
     .map(|p| p.trim_end_matches(['\n', '\r']).to_string())
     .filter(|p| !p.is_empty())
     .map(PathBuf::from);
-    let path = set.unwrap_or_else(|| {
-        xdg.map_or_else(|| home.join(".config"), Path::to_path_buf)
-            .join("git")
-            .join("ignore")
-    });
+    match set {
+        Some(path) => admit_global_excludes_path(&path, home, table),
+        None => default_global_excludes(home, xdg, table),
+    }
+}
+
+fn default_global_excludes(
+    home: &Path,
+    xdg: Option<&Path>,
+    table: &aterm_sysprobe::volumes::Table,
+) -> Option<PathBuf> {
+    let path = xdg
+        .map_or_else(|| home.join(".config"), Path::to_path_buf)
+        .join("git")
+        .join("ignore");
+    admit_global_excludes_path(&path, home, table)
+}
+
+fn admit_global_excludes_path(
+    path: &Path,
+    home: &Path,
+    table: &aterm_sysprobe::volumes::Table,
+) -> Option<PathBuf> {
     if !path.is_absolute()
         || path.components().any(|c| c == Component::ParentDir)
-        || atpkg::protected::under_protected_root(home, &path)
+        || atpkg::protected::under_protected_root(home, path)
     {
         return None;
     }
-    let real = super::disk::idle::resolve_local(&path, table)?;
+    let real = super::disk::idle::resolve_local(path, table)?;
     if atpkg::protected::under_protected_root(home, &real) {
         return None;
     }

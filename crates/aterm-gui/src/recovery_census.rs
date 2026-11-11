@@ -381,12 +381,7 @@ fn panic_report_time(path: &Path) -> Option<u64> {
     let file = crate::logging::open_regular_nonblock(path).ok()?;
     let mut first = String::new();
     BufReader::new(file.take(512)).read_line(&mut first).ok()?;
-    let at = first.split("crashed at unix ").nth(1)?;
-    let secs = at.split(['.', ' ', '\n']).next()?;
-    secs.bytes()
-        .all(|b| b.is_ascii_digit())
-        .then(|| secs.parse().ok())
-        .flatten()
+    crate::logging::panic_report_timestamp(&first).map(|at| at.as_secs())
 }
 
 fn marker_signal(path: &Path) -> Option<u8> {

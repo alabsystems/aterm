@@ -50,7 +50,7 @@ fn actual_cargo_compiler_errors_are_persisted_and_shown_by_the_failed_pack() {
         "pub fn mismatch() { let _: u32 = \"not a number\"; }\n",
     )
     .unwrap();
-    std::fs::copy(
+    aterm_tempfile::copy_to_new_file(
         aterm_tempfile::manifest_dir().join("../../trust.lock"),
         work.path().join("trust.lock"),
     )

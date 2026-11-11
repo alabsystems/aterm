@@ -4,7 +4,7 @@
 //! One Keeper and the actual accepted source/output descriptions. Input metadata
 //! is an expectation only; none of these checks constructs a Manager or SDK.
 use super::{alive, capture::Capture, output, refused, sdk, spawnfd, wire};
-use crate::actor::owner::bootstrap_graph::OriginalOutput;
+use crate::actor::owner::bootstrap_graph::{OriginalOutput, OriginalSource};
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
@@ -155,6 +155,7 @@ pub(super) struct RetainedInputs {
     _sdk: Arc<sdk::Keeper>,
     _held: Arc<HeldProgram>,
     _gnu: Arc<[OwnedFd; 2]>,
+    _original_source: Arc<OriginalSource>,
     _source: Option<Source>,
     _pending: Option<output::Pending>,
     _artifact: Option<output::Published>,
@@ -182,6 +183,7 @@ pub(super) struct Prepared {
     pub(super) handoff: jobserver_utils::ScopedHandoff,
     pub(super) stdout: Capture,
     pub(super) stderr: Capture,
+    original_source: Arc<OriginalSource>,
     source: Option<Source>,
     pub(super) pending: Option<output::Pending>,
     pub(super) artifact: Option<output::Published>,
@@ -235,6 +237,7 @@ impl Prepared {
         request: wire::Request,
         sdk: Arc<sdk::Keeper>,
         gnu: Arc<[OwnedFd; 2]>,
+        original_source: Arc<OriginalSource>,
         output: OriginalOutput,
         environment: &BTreeMap<Vec<u8>, Vec<u8>>,
         deadline: Instant,
@@ -252,6 +255,12 @@ impl Prepared {
             return Err(refused("object SDK differs from original Keeper"));
         }
         check_gnu(&gnu, &request.gnu)?;
+        original_source.matches(
+            &request.key.graph,
+            &request.source_root,
+            request.source_directory,
+            deadline,
+        )?;
         let held = sdk.bootstrap_object_program(deadline)?;
         let compiler = sdk.bootstrap_query_program(
             trust_resource_controller::bootstrap_graph::query::Tool::Compiler,
@@ -364,6 +373,7 @@ impl Prepared {
             handoff,
             stdout,
             stderr,
+            original_source,
             source: None,
             pending: Some(pending),
             artifact: None,
@@ -376,6 +386,12 @@ impl Prepared {
         self.sdk.validate()?;
         self.held.validate(self.deadline)?;
         check_gnu(&self.gnu, &self.request.gnu)?;
+        self.original_source.matches(
+            &self.request.key.graph,
+            &self.request.source_root,
+            self.request.source_directory,
+            self.deadline,
+        )?;
         if let Some(pending) = &self.pending {
             pending.validate()?;
         }
@@ -424,7 +440,14 @@ impl Prepared {
             (self.gnu[0].try_clone()?, 3),
             (self.gnu[1].try_clone()?, 4),
             (self.sdk.descriptor()?, sdk::TARGET),
-            (source.descriptions[0].try_clone()?, 6),
+            (
+                aterm_uds::kept_out(|| {
+                    self.original_source
+                        .directory(self.deadline)?
+                        .try_clone_to_owned()
+                })?,
+                6,
+            ),
             (source.descriptions[1].try_clone()?, 7),
             (out_dir, 8),
             (out_lock, 9),
@@ -455,6 +478,7 @@ impl Prepared {
             sdk,
             held,
             gnu,
+            original_source,
             source,
             pending,
             artifact,
@@ -487,6 +511,7 @@ impl Prepared {
                 _sdk: sdk,
                 _held: held,
                 _gnu: gnu,
+                _original_source: original_source,
                 _source: source,
                 _pending: pending,
                 _artifact: artifact,

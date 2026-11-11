@@ -460,6 +460,7 @@ impl Owner {
             .take()
             .or_else(|| pending.claim.take().map(Custody::Cooperative));
         self.failed.push(Failed {
+            _ay: pending.recipe.as_ref().and_then(|recipe| recipe.ay.clone()),
             _primary: pending.primary.take(),
             _compiler: pending
                 .recipe
@@ -481,6 +482,7 @@ impl Owner {
     fn retain_unlaunched(&mut self, pending: &mut Pending) -> bool {
         if let Some(custody) = pending.admitted.take() {
             self.failed.push(Failed {
+                _ay: pending.recipe.as_ref().and_then(|recipe| recipe.ay.clone()),
                 _primary: pending.primary.take(),
                 _compiler: pending
                     .recipe

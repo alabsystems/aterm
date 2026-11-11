@@ -10036,6 +10036,84 @@ fn a_heartbeat_adopts_the_seed_a_members_book_relays_once_it_binds_the_minter() 
         Some(by_c.words()),
         "C's seed, relayed by A"
     );
+
+    // A current deny prunes the issuer before seed admission. A key held only in
+    // that issuer's old copy must not remain authoritative after the pruning.
+    // A still-admitted relay can carry the seed without carrying its minter's row.
+    let pruned = State::new("relay-pruned-issuer");
+    write_key(pruned.dir(), &secret_bytes).unwrap();
+    keep_identity(pruned.dir(), &b, 0x12);
+    assert!(
+        read_join_code(pruned.dir()).is_err(),
+        "the recipient is not a root"
+    );
+    write_book(
+        pruned.dir(),
+        &[
+            Peer {
+                node: Some(x.node().to_owned()),
+                host: "127.0.0.1".to_owned(),
+                via: Via::Issuer,
+                seen_ms: Some(now),
+                ..keyed(0, x.key(), [127, 0, 0, 1], 1)
+            },
+            Peer {
+                node: Some(a.node().to_owned()),
+                host: "127.0.0.1".to_owned(),
+                via: Via::Joined,
+                seen_ms: Some(now),
+                ..keyed(0, a.key(), [127, 0, 0, 1], a_port)
+            },
+        ],
+    );
+    let copy = Peer {
+        via: Via::IssuerBook,
+        key_from: None,
+        fleet: None,
+        ..Peer::own(&c, ("127.0.0.1", 7311, "0.146.0"), 1_760_000_000_001)
+    };
+    assert!(
+        keep_issuer_book(
+            pruned.dir(),
+            &secret,
+            Some((x.node(), std::slice::from_ref(&copy))),
+        )
+        .unwrap()
+    );
+    assert_eq!(Keyring::read(pruned.dir()).bound(c.node()), Some(c.key()));
+    assert_eq!(seed_words(pruned.dir()), None);
+    // The real relay still holds C's seed, but no row for C can enter the own
+    // book through this round's signed merge and obscure the copied-key premise.
+    write_book(a_state.dir(), &[]);
+    assert_eq!(seed_words(a_state.dir()), Some(by_c.words()));
+    let denied = vec![x.node().to_owned()];
+    let answered = heartbeat_members_with_denied(
+        pruned.dir(),
+        (&secret, &b),
+        &reg,
+        HANG,
+        (None, &denied, &Vec::new),
+    )
+    .unwrap();
+    assert_eq!(answered.len(), 1, "the admitted relay answered");
+    assert!(
+        read_peers(pruned.dir())
+            .unwrap()
+            .iter()
+            .all(|peer| peer.via != Via::Issuer)
+    );
+    assert!(
+        read_issuer_book(pruned.dir(), x.node())
+            .iter()
+            .any(|peer| { peer.node.as_deref() == Some(c.node()) }),
+        "the old copy remains stored but has no current issuer"
+    );
+    assert_eq!(Keyring::read(pruned.dir()).bound(c.node()), None);
+    assert_eq!(
+        seed_words(pruned.dir()),
+        None,
+        "a pruned issuer's copy cannot bind the relayed seed's minter"
+    );
 }
 
 /// With no membership log yet, a Mac that joined at a member, not at the Mac that minted the
@@ -12787,5 +12865,51 @@ fn header_only_pushed_facts_admission_and_batched_slice_pruning_match_full_admis
     assert_eq!(
         known_nodes_and_peer(state.dir(), &node_of(0x99)),
         (known_nodes(state.dir()), None)
+    );
+
+    // `recheck_driver_and_peer` and `vault_join_driver_and_book` match `recheck_driver`,
+    // `known_nodes`, `peer_of`, `Keyring::read`, and `read_peers` across admitted, unlisted,
+    // rekeyed, and missing-proof cases.
+    let proof1 = NodeProof {
+        node: n1.clone(),
+        key: k1,
+    };
+    let grant1 = [DriveGrant {
+        node: n1.clone(),
+        key: k1,
+    }];
+    assert_eq!(
+        recheck_driver_and_peer(Some(&proof1), state.dir(), &grant1, None),
+        (
+            Ok((n1.clone(), peer_of(state.dir(), &n1))),
+            known_nodes(state.dir())
+        )
+    );
+    assert_eq!(
+        recheck_driver_and_peer(Some(&proof1), state.dir(), &[], None),
+        (
+            Err(recheck_driver(&proof1, state.dir(), &[], None).unwrap_err()),
+            known_nodes(state.dir())
+        )
+    );
+    assert_eq!(
+        recheck_driver_and_peer(None, state.dir(), &grant1, None),
+        (Err(Undriven::Unproven(Unproven::NoProof)), Vec::new())
+    );
+    assert_eq!(
+        vault_join_driver_and_book(&proof1, state.dir(), &grant1, None),
+        (
+            true,
+            Keyring::read(state.dir()).bound(&n1),
+            read_peers(state.dir()).ok()
+        )
+    );
+    assert_eq!(
+        vault_join_driver_and_book(&proof1, state.dir(), &[], None),
+        (
+            false,
+            Keyring::read(state.dir()).bound(&n1),
+            read_peers(state.dir()).ok()
+        )
     );
 }

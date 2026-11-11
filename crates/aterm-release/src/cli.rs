@@ -18,12 +18,20 @@ USAGE
   targo --unverified ship input-check --base COMMIT
       Judge unreceipted source inputs with the release's per-check records.
       No release, credentials, build of the product or publication.
-  targo --unverified ship qualify-pilot --verify PATH --mode alone|shared|chain|tree|series|qualify-before|qualify-after|qualify-series
+  targo --unverified ship qualify-pilot --verify PATH --mode alone|shared|chain|tree|series|matched|export \
+      [--tree-work compile-lint|release] [--export-seconds N | --export-work real]
       Cold concurrent release slices, optionally beside test compilation and lint,
-      with one Release jobserver and one-second descendant CPU/QoS/core samples.
-      chain lowers tree CPU priority; tree inverts priority as a negative control.
+      in one bounded Release allocation partitioned into private build/tree FIFOs
+      plus an export reservation, with one-second descendant CPU/QoS/core samples.
+      tree-work=release runs the full release tree and holds the measured export share
+      for 763 seconds without publishing; export-seconds overrides that surrogate wall.
+      chain lowers tree CPU priority; tree starts the tree child first as an ordering probe.
+      The retained pre-change binary, not tree mode, is the old-memory-order control.
       series requires --before-verify PATH and runs alone/shared/chain/chain/shared/tree
       with one fixed grant; shared and tree use the before verifier.
+      matched requires --before-verify PATH and runs A/B/B/A under one grant and the
+      same priority. export runs only the full local export. export-work=real includes
+      the actual export guards and public-clone check, with no staging push.
   targo --unverified ship qualify-summary RETAINED-TAKE-DIRECTORY
   targo --unverified ship slice-memory [--takes 1|2]
       Measure native release links alone (default two), learning footprint peaks and
@@ -39,6 +47,7 @@ USAGE
       inputs, preserving incomplete takes separately before rebuilding the missing rows.
       --jobs N and --compat-jobs N fix native and x86 slice build jobs; admission waits
       for that grant. Resume retains unmatched-job rows separately as exploratory evidence.
+      --native-only omits the compatibility slice for a native-host experiment.
       Two takes run in forward/reverse order (ABBA for two arms).
       Each take retains Cargo's unit timeline in cargo-timings/ and one-second
       process-group observations in build-resources.jsonl (sampled, not accounting).
@@ -97,7 +106,9 @@ USAGE
                            while this clone holds an unpublished line at another
         --supersede        with --commit REV, explicitly replace an unpublished
                            fleet line with a newer main base of the same version;
-                           records its retirement on main, after taking its claim
+                           records its retirement on main, after taking its claim.
+                           A staged, unpublished line can be replaced. The new base
+                           qualifies again and appends its own staging snapshot
         --fix COMMIT...    carry these landed, non-merge main commits onto this
                            clone's unpublished line, one hop each (its patch onto
                            the head, never main's movement), record the new head
@@ -112,7 +123,7 @@ USAGE
                            ~/.aterm/release-ring/release-credentials.toml)
         --engine DIRECTORY the publication engine whose origin the release
                            clones its own engine from, into the clone's
-                           .git/aterm-release/engine, which it alone runs and
+                           .git/aterm-release/.ubd/engine, which it alone runs and
                            moves (default $PUBLICATION_ENGINE, else
                            ~/publication; nothing writes that checkout)
         --dry-run          the plan, the ETA, and every refusal a real run would

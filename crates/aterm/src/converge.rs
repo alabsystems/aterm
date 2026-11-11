@@ -37,6 +37,7 @@ use aterm_machines::sync::{
     StewardLeaseRead, StewardRevokeRead, StewardStandbyServerRead, VaultRead,
 };
 use aterm_secrets::client::{Foundable, NotFounded};
+use aterm_types::machine_name::{GeneratedNames, Number};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -906,33 +907,6 @@ struct IdentityOwed {
 
 type IdentityTarget = (String, Option<String>);
 
-/// The name `sync.identity` gives this Mac at `config_path` (its chosen machine number, else
-/// `[identity] name`, else the vault roster's label) and its projected number, or `None`
-/// where no name applies (swarm off, `[identity] name = false`, no label).
-#[cfg(target_os = "macos")]
-fn identity_target(
-    config_path: &Path,
-    state: Option<&Path>,
-    paths: &aterm_secrets::client::Paths,
-    hostnames: &[String],
-    roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
-) -> Result<Option<IdentityTarget>, String> {
-    let snapshot =
-        aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
-    let Some(mut config) = read_enabled_identity_snapshot(&snapshot)? else {
-        return Ok(None);
-    };
-    if config.name == NameChoice::Off {
-        return Ok(None);
-    }
-    let label = projected_machine_label(
-        state,
-        &mut config.name,
-        name_label(paths, roster, hostnames)?,
-    )?;
-    Ok(identity_target_from(&config.name, label))
-}
-
 /// A number explicitly chosen through the machine-name editor is the local naming source.
 /// Older, automatically assigned names remain evidence for ownership of existing projections.
 /// Reading an absent file never creates a name or consults the vault. Callers inject the state
@@ -964,6 +938,34 @@ fn chosen_machine_number(
         .and_then(|name| name.num))
 }
 
+/// Generate OS targets only from the canonical local identity, or a provisional
+/// roster number before that record exists. An unread or mismatched record is no fallback.
+fn generated_os_names(
+    state: Option<&Path>,
+    target: &str,
+    label: Option<&str>,
+) -> Result<Option<GeneratedNames>, String> {
+    let Some(label) = label.filter(|label| *label == target) else {
+        return Ok(None);
+    };
+    let Ok(number) = Number::parse(label) else {
+        return Ok(None);
+    };
+    if number.to_string() != label {
+        return Ok(None);
+    }
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let name = aterm_agent::machine_name::file::read(state)
+        .map_err(|why| format!("this machine's name is unread: {why}"))?;
+    match name {
+        None => Ok(Some(GeneratedNames::number_only(number))),
+        Some(name) if name.num == Some(number) => Ok(Some(GeneratedNames::new(number, &name.nick))),
+        Some(_) => Err("the canonical machine number differs from the OS naming source".into()),
+    }
+}
+
 fn projected_label(
     choice: &mut NameChoice,
     chosen: Option<aterm_types::machine_name::Number>,
@@ -986,14 +988,15 @@ fn identity_target_from(choice: &NameChoice, label: Option<String>) -> Option<Id
 }
 
 /// The naming source a pass may project. Comparing only its resolved target would miss a
-/// person's newer policy that happens to resolve to the same name. Nicknames and unrelated
-/// configuration are absent, so their edits leave this work admitted.
+/// person's newer policy that happens to resolve to the same name. Generated OS targets
+/// include the saved nickname; unrelated configuration leaves this work admitted.
 #[derive(Debug, PartialEq, Eq)]
 struct IdentityProjection {
     target: IdentityTarget,
     choice: NameChoice,
     machines: [Option<String>; 2],
     chosen: Option<aterm_types::machine_name::Number>,
+    names: Option<GeneratedNames>,
 }
 
 impl IdentityProjection {
@@ -1011,6 +1014,95 @@ impl IdentityProjection {
             Err("this machine's naming choice changed during synchronization".to_owned())
         }
     }
+}
+
+/// Ordinary explicit init's saved identity, read only after its root work returned.
+/// This is OS-only: no roster lookup, policy write, fleet publication or fallback number.
+#[cfg(any(target_os = "macos", test))]
+fn init_name_with(
+    sys: &dyn aterm_machines::port::System,
+    state: &Path,
+    config: &Path,
+    current: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    use aterm_agent::machine_name::{file, publish};
+    use aterm_machines::{model::Read, port::Cmd};
+    current()?;
+    let Some(saved) = file::read(state).map_err(|why| why.to_string())? else {
+        return Ok(None);
+    };
+    let Some(number) = saved
+        .num
+        .filter(|_| saved.migration != Some(file::Migration::Waiting))
+    else {
+        return Ok(None);
+    };
+    let word = number.to_string();
+    let names = GeneratedNames::new(number, &saved.nick);
+    let Some(projection) = projection_target_now(config, Some(state), Some(word.clone()))? else {
+        return Ok(None);
+    };
+    if projection.names.is_none() {
+        return Ok(None);
+    }
+    if projection.names.as_ref() != Some(&names) {
+        return Err("the saved machine number is not the current OS naming source".into());
+    }
+    let check = || {
+        current()?;
+        let now = file::read(state).map_err(|why| why.to_string())?;
+        if !now.as_ref().is_some_and(|now| {
+            now.num == Some(number)
+                && now.nick == saved.nick
+                && now.migration != Some(file::Migration::Waiting)
+        }) {
+            return Err("this machine's saved naming choice changed during init".into());
+        }
+        projection.check_current(config, Some(state), Some(word.clone()))
+    };
+    struct Names<'a> {
+        sys: &'a dyn aterm_machines::port::System,
+        current: &'a dyn Fn() -> Result<(), String>,
+    }
+    impl publish::SystemNames for Names<'_> {
+        fn read(&self) -> [Option<String>; 3] {
+            aterm_machines::root_steps::NAME_PREFS.map(|pref| {
+                self.sys
+                    .run(&Cmd::new(aterm_machines::items::names::SCUTIL).args(["--get", pref]))
+                    .ok()
+                    .and_then(
+                        |ran| match aterm_machines::items::names::read_scutil(&ran) {
+                            Read::Value(name) => Some(name),
+                            _ => None,
+                        },
+                    )
+            })
+        }
+        fn apply(
+            &self,
+            _state: &Path,
+            _config: &Path,
+            names: &GeneratedNames,
+        ) -> Result<(), String> {
+            aterm_machines::root_steps::name_by_rule(self.sys, names, self.current).map(|_| ())
+        }
+    }
+    publish::synchronize_system_names(
+        state,
+        config,
+        &names,
+        &Names {
+            sys,
+            current: &check,
+        },
+        &|| check().map_err(publish::Pending::Policy),
+    )
+    .map_err(|why| why.phrase())?;
+    Ok(Some(format!(
+        "macOS names match {} / {}",
+        names.computer_name(),
+        names.host_name()
+    )))
 }
 
 /// Read the naming source after the config write, retaining its semantic policy and chosen
@@ -1031,14 +1123,17 @@ fn projection_target_now(
     let choice = identity.name.clone();
     let chosen = chosen_machine_number(state)?;
     let label = projected_label(&mut identity.name, chosen, roster_label);
-    Ok(
-        identity_target_from(&identity.name, label).map(|target| IdentityProjection {
-            target,
-            choice,
-            machines: identity.machines,
-            chosen,
-        }),
-    )
+    let Some(target) = identity_target_from(&identity.name, label) else {
+        return Ok(None);
+    };
+    let names = generated_os_names(state, &target.0, target.1.as_deref())?;
+    Ok(Some(IdentityProjection {
+        target,
+        choice,
+        machines: identity.machines,
+        chosen,
+        names,
+    }))
 }
 
 fn name_label(
@@ -1060,27 +1155,6 @@ fn name_label(
         .map_err(|why| why.to_string())
 }
 
-/// The number the root half of the one password names the Mac by
-/// ([`aterm_machines::init_clt::CommandLineTools::with_name`]): its chosen machine number, else
-/// the roster's label (no hostname fallback), unless identity naming is off or names this Mac
-/// separately. `None` while neither source names a number.
-#[cfg(target_os = "macos")]
-pub(crate) fn mac_name_label() -> Option<String> {
-    let config = aterm_types::dirs::aterm_config_path()?;
-    let paths = vault_paths().ok()?;
-    let roster = read_name_roster(&paths).ok()?;
-    match identity_target(
-        &config,
-        aterm_types::dirs::account_state_dir().as_deref(),
-        &paths,
-        &[],
-        roster.as_ref(),
-    ) {
-        Ok(Some((target, Some(label)))) if target == label => Some(label),
-        _ => None,
-    }
-}
-
 /// A Mac name still to set, with the repair path the existing naming-rule reading admits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MacNamePending {
@@ -1090,6 +1164,8 @@ pub(crate) enum MacNamePending {
     Elevation(String),
     /// Naming-rule metadata could not be read; no additional password is justified.
     Unread(String),
+    /// Bonjour assigned a collision alias; retrying the same setter cannot resolve it.
+    Collision(String),
 }
 
 impl MacNamePending {
@@ -1153,15 +1229,28 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
     let fleet = aterm_agent::fleet_name_for(&target, &|word| {
         roster_gives(roster.as_ref(), roster_label.as_deref(), word)
     })?;
-    let pending = label
-        .as_deref()
-        .filter(|label| cfg!(target_os = "macos") && *label == target)
-        .and_then(|label| own_name_pending(&target, Some(label), own.get_or_insert_with(own_names)))
-        .map(|why| {
-            MacNamePending::with_rule(
-                why,
-                aterm_machines::root_steps::rule_in_place(&aterm_machines::port::Live::new()),
-            )
+    let generated = generated_os_names(
+        aterm_types::dirs::account_state_dir().as_deref(),
+        &target,
+        label.as_deref(),
+    )?;
+    let pending = generated
+        .as_ref()
+        .filter(|_| cfg!(target_os = "macos"))
+        .and_then(|names| {
+            let own = own.get_or_insert_with(own_names);
+            own_name_pending(&target, Some(names), own).map(|why| {
+                if own_name_repairable(&target, Some(names), own) {
+                    MacNamePending::with_rule(
+                        why,
+                        aterm_machines::root_steps::rule_in_place(
+                            &aterm_machines::port::Live::new(),
+                        ),
+                    )
+                } else {
+                    MacNamePending::Collision(why)
+                }
+            })
         });
     Ok(MacName::Named {
         target,
@@ -1172,25 +1261,45 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
 
 /// Where any of the Mac's own names (`ComputerName`, `LocalHostName` or `HostName`) does not
 /// accept the projected `label` and `target` is that number: what names it. macOS lets only root
-/// set them: setup's one early Mac password
-/// sets them where a number was known by then (its argv carries it), and otherwise leaves the
-/// narrow rule through which `sync.identity` sets them with no password once admission gives the
-/// number ([`aterm_machines::root_steps::name_by_rule`], [`own_name_by_rule`]). `None` where all
+/// set them: setup's one early Mac password leaves the narrow rule, then the
+/// ordinary init completion or `sync.identity` reads its current source and sets them
+/// without another password once admission gives the number ([`aterm_machines::root_steps::name_by_rule`], [`own_name_by_rule`]). `None` where all
 /// match, or a separate `[identity] name` differs from the projected number.
 pub(crate) fn own_name_pending(
     target: &str,
-    label: Option<&str>,
+    names: Option<&GeneratedNames>,
     own: &OwnNames,
 ) -> Option<String> {
-    let label = label.filter(|label| *label == target)?;
-    let (which, _, now) = own
-        .each()
+    let names = names.filter(|names| names.number().to_string() == target)?;
+    let each = own.each();
+    let (which, slot, now) = each
         .into_iter()
-        .find(|(_, slot, name)| name.is_none_or(|name| !slot.accepts_projection(label, name)))?;
+        .find(|(_, slot, name)| name.is_none_or(|name| !names.accepts(*slot, name)))
+        .or_else(|| {
+            each.into_iter()
+                .find(|(_, slot, name)| name.is_some_and(|name| names.collision(*slot, name)))
+        })?;
+    let expected = names.for_slot(slot)?;
     let now = now.unwrap_or("unread");
-    Some(format!(
-        "this Mac's own name is {now} ({which}), not {label}"
-    ))
+    if names.collision(slot, now) {
+        Some(format!(
+            "Bonjour reports {now} instead of {expected}; a name collision remains, so automatic setup leaves that alias in place"
+        ))
+    } else {
+        Some(format!(
+            "this Mac's own name is {now} ({which}), not {expected}"
+        ))
+    }
+}
+
+fn own_name_repairable(target: &str, names: Option<&GeneratedNames>, own: &OwnNames) -> bool {
+    names
+        .filter(|names| names.number().to_string() == target)
+        .is_some_and(|names| {
+            own.each()
+                .into_iter()
+                .any(|(_, slot, now)| now.is_none_or(|now| !names.accepts(slot, now)))
+        })
 }
 
 /// `read` where the Mac's own names are still owed `label` and the rule that sets them with no
@@ -1212,15 +1321,20 @@ fn own_name_due(read: IdentityRead, label: Option<&str>, by_rule: bool) -> Ident
 #[cfg(any(target_os = "macos", test))]
 fn own_name_by_rule(
     sys: &dyn aterm_machines::port::System,
-    label: &str,
+    names: &GeneratedNames,
     current: &dyn Fn() -> Result<(), String>,
 ) -> Option<String> {
     if aterm_machines::root_steps::rule_in_place(sys) != Some(true) {
         return None;
     }
-    match aterm_machines::root_steps::name_by_rule(sys, label, current) {
+    match aterm_machines::root_steps::name_by_rule(sys, names, current) {
         Ok(set) if set.is_empty() => None,
-        Ok(set) => Some(format!("this Mac's {} now {label}", set.join(", "))),
+        Ok(set) => Some(format!(
+            "this Mac's {} now follow {} / {}",
+            set.join(", "),
+            names.computer_name(),
+            names.host_name()
+        )),
         Err(why) => Some(format!("this Mac's own names left as they are: {why}")),
     }
 }
@@ -1232,7 +1346,7 @@ fn own_name_by_rule(
 fn with_fleet_name(
     read: IdentityRead,
     target: &str,
-    label: Option<&str>,
+    label: Option<&GeneratedNames>,
     fleet: &aterm_agent::FleetName,
     own: &OwnNames,
 ) -> IdentityRead {
@@ -1839,8 +1953,9 @@ impl Ports for Live {
         })?;
         // Only a Mac's own names are aterm's to align (the root half is macOS's): elsewhere
         // the record names none.
-        let own = label.as_deref().filter(|_| cfg!(target_os = "macos"));
-        let names = if own == Some(target.as_str()) {
+        let generated = generated_os_names(self.state_dir().as_deref(), &target, label.as_deref())?;
+        let own = generated.as_ref().filter(|_| cfg!(target_os = "macos"));
+        let names = if own.is_some() {
             names.get_or_insert_with(own_names)
         } else {
             names.get_or_insert_with(OwnNames::default)
@@ -1848,7 +1963,10 @@ impl Ports for Live {
         let read = with_fleet_name(read, &target, own, &fleet, names);
         // An admission after setup's one password: the rule it left names the Mac, so the
         // pass is due while the Mac's own names are not yet the label.
-        let pending = own_name_pending(&target, own, names).and(own);
+        let pending = own_name_repairable(&target, own, names)
+            .then_some(own)
+            .flatten()
+            .map(GeneratedNames::computer_name);
         #[cfg(target_os = "macos")]
         let by_rule = pending.is_some()
             && aterm_machines::root_steps::rule_in_place(&aterm_machines::port::Live::new())
@@ -1856,6 +1974,31 @@ impl Ports for Live {
         #[cfg(not(target_os = "macos"))]
         let by_rule = false;
         Ok(own_name_due(read, pending, by_rule))
+    }
+
+    fn init_name(
+        &self,
+        current: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Option<String>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            use aterm_machines::port::System as _;
+            let sys = aterm_machines::port::Live::new();
+            if sys.euid() == 0 || aterm_machines::console::remote(&sys) {
+                return Err("macOS naming waits for this Mac's console account".into());
+            }
+            let state = self
+                .state_dir()
+                .ok_or("no current account state directory")?;
+            let config =
+                aterm_types::dirs::aterm_config_path().ok_or("no current account configuration")?;
+            init_name_with(&sys, &state, &config, current)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = current;
+            Ok(None)
+        }
     }
 
     fn sync_identity(&self) -> Result<String, String> {
@@ -1900,9 +2043,9 @@ impl Ports for Live {
             return Ok(keys);
         };
         let current = || projection.check_current(&config, state.as_deref(), roster_label.clone());
-        let (target, os_label) = &projection.target;
+        let target = &projection.target.0;
         #[cfg(not(target_os = "macos"))]
-        let _ = (&mut names, os_label);
+        let _ = &mut names;
         let fleet = aterm_agent::follow_fleet_name(
             target,
             &|word| roster_gives(roster.as_ref(), roster_label.as_deref(), word),
@@ -1910,15 +2053,10 @@ impl Ports for Live {
         )?;
         current()?;
         #[cfg(target_os = "macos")]
-        if let Some(label) = os_label
-            .as_deref()
-            .filter(|label| *label == target.as_str())
-            .and_then(|label| {
-                own_name_pending(target, Some(label), names.get_or_insert_with(own_names))
-                    .and(Some(label))
-            })
-            && let Some(named) =
-                own_name_by_rule(&aterm_machines::port::Live::new(), label, &current)
+        if let Some(generated) = projection.names.as_ref().filter(|generated| {
+            own_name_repairable(target, Some(generated), names.get_or_insert_with(own_names))
+        }) && let Some(named) =
+            own_name_by_rule(&aterm_machines::port::Live::new(), generated, &current)
         {
             return Ok(format!("{keys}; {fleet}; {named}"));
         }
@@ -2198,6 +2336,17 @@ impl Ports for Live {
         }
     }
 
+    fn owed_clone_control(&self) -> Result<Option<String>, String> {
+        let state = self
+            .state_dir()
+            .ok_or("no state directory holds the clone aterm init owes")?;
+        aterm_machines::init::owed_clone_control(
+            &aterm_machines::port::Live::new(),
+            &state,
+            &setup_holds(),
+        )
+    }
+
     fn clone_owed(
         &self,
         work: aterm_secrets::converge::RepositoryWork,
@@ -2209,9 +2358,8 @@ impl Ports for Live {
         let sys = aterm_machines::port::Live::new();
         let ctx = repository_context(&sys)?;
         let paths = vault_paths()?;
-        if setup_holds().holds(aterm_types::macos_setup::Setting::Repositories) {
-            return Err(setup_holds().why(aterm_types::macos_setup::Setting::Repositories));
-        }
+        let intent = aterm_machines::init::OwedCloneIntent::capture(&sys, &state, &setup_holds())?;
+        let current_state = state.clone();
         if let Some(withdrawal) =
             aterm_machines::init_github::RepositoryCredentialWithdrawal::capture(&sys, &ctx)?
         {
@@ -2219,7 +2367,17 @@ impl Ports for Live {
                 &sys,
                 &state,
                 withdrawal,
-                || Ok(!setup_holds().holds(aterm_types::macos_setup::Setting::Repositories)),
+                move || {
+                    let holds = setup_holds();
+                    Ok(
+                        !holds.holds(aterm_types::macos_setup::Setting::Repositories)
+                            && intent.current(
+                                &aterm_machines::port::Live::new(),
+                                &current_state,
+                                &holds,
+                            )?,
+                    )
+                },
             )
             .map(|said| aterm_machines::init::CloneOwedOutcome {
                 said,
@@ -2227,18 +2385,28 @@ impl Ports for Live {
             });
         }
         let Some(config) = repository_vault(&paths, &sys, &ctx)? else {
-            return aterm_machines::init::clone_owed_in_pass_with_withdrawal_guard(
+            let inputs =
+                aterm_machines::init_github::InitialRepositoryInputs::capture_ready(&sys, &ctx)?
+                    .with_repository_execution(execution);
+            let current_inputs = inputs.clone();
+            return aterm_machines::init::clone_owed_captured(
                 &sys,
                 &state,
                 work,
-                execution,
-                Some(Box::new(|| {
-                    Ok(!setup_holds().holds(aterm_types::macos_setup::Setting::Repositories))
-                })),
+                inputs,
+                move || {
+                    intent.current_inputs(
+                        &aterm_machines::port::Live::new(),
+                        &current_state,
+                        &setup_holds(),
+                        &current_inputs,
+                    )
+                },
             );
         };
         let captured =
             repository_inputs(&paths, &config, &sys, &ctx)?.ok_or(REPOSITORIES_SYNCING)?;
+        let current_inputs = captured.inputs.clone();
         aterm_machines::init::clone_owed_captured(
             &sys,
             &state,
@@ -2247,12 +2415,15 @@ impl Ports for Live {
             move || {
                 // A first clone may take a long time. The person's Stop, repository switch or
                 // profile change must hold every later effect, not just the next sync pass.
-                if setup_holds().holds(aterm_types::macos_setup::Setting::Repositories)
-                    || !aterm_machines::init_github::uses_vault_inventory(
-                        &aterm_machines::port::Live::new(),
-                        &ctx,
-                    )?
-                {
+                if !intent.current_inputs(
+                    &aterm_machines::port::Live::new(),
+                    &current_state,
+                    &setup_holds(),
+                    &current_inputs,
+                )? || !aterm_machines::init_github::uses_vault_inventory(
+                    &aterm_machines::port::Live::new(),
+                    &ctx,
+                )? {
                     return Ok(false);
                 }
                 captured
@@ -2561,6 +2732,7 @@ mod tests {
     #[test]
     fn the_identity_row_reads_the_fleet_name_and_records_the_macs_own_name() {
         use aterm_agent::FleetName;
+        let names = GeneratedNames::number_only(Number::parse("m42").unwrap());
         let keys = || IdentityRead::Current("label m42 in [ai] and [fleet] machine".to_owned());
         let named_as = |local_host: &str, computer: &str| OwnNames {
             computer: Some(computer.to_owned()),
@@ -2571,7 +2743,7 @@ mod tests {
         let due = FleetName::Due {
             from: "node-3fa2".to_owned(),
         };
-        match with_fleet_name(keys(), "m42", Some("m42"), &due, &own) {
+        match with_fleet_name(keys(), "m42", Some(&names), &due, &own) {
             IdentityRead::Due { from, to } => {
                 assert_eq!(from, "fleet name node-3fa2");
                 assert!(to.contains("fleet name m42"), "{to}");
@@ -2579,7 +2751,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        match with_fleet_name(keys(), "m42", Some("m42"), &FleetName::Current, &own) {
+        match with_fleet_name(keys(), "m42", Some(&names), &FleetName::Current, &own) {
             IdentityRead::Current(now) => {
                 assert!(now.contains("fleet name m42"), "{now}");
                 assert!(
@@ -2602,7 +2774,7 @@ mod tests {
                 host: Some("m42".to_owned()),
             },
         ] {
-            match with_fleet_name(keys(), "m42", Some("m42"), &FleetName::Current, &half) {
+            match with_fleet_name(keys(), "m42", Some(&names), &FleetName::Current, &half) {
                 IdentityRead::Current(now) => {
                     assert!(now.contains("own name is"), "{half:?}: {now}");
                 }
@@ -2610,11 +2782,11 @@ mod tests {
             }
         }
         let named = named_as("m42", "m42");
-        match with_fleet_name(keys(), "m42", Some("m42"), &FleetName::Current, &named) {
+        match with_fleet_name(keys(), "m42", Some(&names), &FleetName::Current, &named) {
             IdentityRead::Current(now) => assert!(!now.contains("own name"), "{now}"),
             other => panic!("{other:?}"),
         }
-        match with_fleet_name(keys(), "studio", Some("m42"), &FleetName::Current, &own) {
+        match with_fleet_name(keys(), "studio", Some(&names), &FleetName::Current, &own) {
             IdentityRead::Current(now) => assert!(!now.contains("own name"), "{now}"),
             other => panic!("{other:?}"),
         }
@@ -2622,7 +2794,7 @@ mod tests {
             from: "[ai] machine = unset".to_owned(),
             to: "label m42 in [ai] machine".to_owned(),
         };
-        match with_fleet_name(keys_due, "m42", Some("m42"), &due, &named) {
+        match with_fleet_name(keys_due, "m42", Some(&names), &due, &named) {
             IdentityRead::Due { from, .. } => {
                 assert_eq!(from, "[ai] machine = unset, fleet name node-3fa2");
             }
@@ -2630,15 +2802,15 @@ mod tests {
         }
         let taken = FleetName::Taken("node-77".to_owned());
         assert!(matches!(
-            with_fleet_name(keys(), "m42", Some("m42"), &taken, &named),
+            with_fleet_name(keys(), "m42", Some(&names), &taken, &named),
             IdentityRead::Current(_)
         ));
         let off = IdentityRead::NotApplicable("off: [identity] name = false".to_owned());
         assert_eq!(
-            with_fleet_name(off.clone(), "m42", Some("m42"), &due, &own),
+            with_fleet_name(off.clone(), "m42", Some(&names), &due, &own),
             off
         );
-        let current = with_fleet_name(keys(), "m42", Some("m42"), &FleetName::Current, &own);
+        let current = with_fleet_name(keys(), "m42", Some(&names), &FleetName::Current, &own);
         match own_name_due(current.clone(), Some("m42"), true) {
             IdentityRead::Due { from, to } => {
                 assert_eq!(from, "this Mac's own names");
@@ -2657,6 +2829,9 @@ mod tests {
     #[test]
     fn hostname_only_drift_is_visible_and_makes_the_identity_repair_due() {
         use aterm_agent::FleetName;
+        let names86 = GeneratedNames::number_only(Number::parse("m86").unwrap());
+        let names183 = GeneratedNames::number_only(Number::parse("m183").unwrap());
+        let names184 = GeneratedNames::number_only(Number::parse("m184").unwrap());
 
         let keys = IdentityRead::Current("label m86 in [ai] and [fleet] machine".to_owned());
         for host in [Some("m184"), None] {
@@ -2665,18 +2840,24 @@ mod tests {
                 local_host: Some("m86".to_owned()),
                 host: host.map(str::to_owned),
             };
-            let pending = own_name_pending("m86", Some("m86"), &own)
+            let pending = own_name_pending("m86", Some(&names86), &own)
                 .expect("HostName still needs repair while the other two names match");
             assert!(pending.contains("(Hostname)"), "{pending}");
             assert!(pending.contains(host.unwrap_or("unread")), "{pending}");
-            let row = with_fleet_name(keys.clone(), "m86", Some("m86"), &FleetName::Current, &own);
+            let row = with_fleet_name(
+                keys.clone(),
+                "m86",
+                Some(&names86),
+                &FleetName::Current,
+                &own,
+            );
             assert!(matches!(&row, IdentityRead::Current(words) if words.contains(&pending)));
             assert!(matches!(
                 own_name_due(row, Some("m86"), true),
                 IdentityRead::Due { .. }
             ));
             assert_eq!(
-                own_name_pending("studio", Some("m86"), &own),
+                own_name_pending("studio", Some(&names86), &own),
                 None,
                 "a separate identity name still leaves OS naming alone"
             );
@@ -2686,7 +2867,7 @@ mod tests {
             local_host: Some("m86".to_owned()),
             host: Some("m86".to_owned()),
         };
-        assert_eq!(own_name_pending("m86", Some("m86"), &repaired), None);
+        assert_eq!(own_name_pending("m86", Some(&names86), &repaired), None);
         assert_eq!(
             own_name_due(keys.clone(), None, true),
             keys,
@@ -2698,15 +2879,19 @@ mod tests {
             local_host: Some("m183-2".to_owned()),
             host: Some("m183".to_owned()),
         };
-        assert_eq!(
-            own_name_pending("m183", Some("m183"), &aliased),
-            None,
-            "a numbered Bonjour alias retains the admitted machine number"
+        assert!(
+            own_name_pending("m183", Some(&names183), &aliased)
+                .unwrap()
+                .contains("collision")
+        );
+        assert!(
+            !own_name_repairable("m183", Some(&names183), &aliased),
+            "a Bonjour collision stays visible without retrying its setter"
         );
         for name in ["m183-x", "m183-02", "m183-1", "m183-2-extra", "m184-2"] {
             aliased.local_host = Some(name.to_owned());
             assert!(
-                own_name_pending("m183", Some("m183"), &aliased).is_some(),
+                own_name_pending("m183", Some(&names183), &aliased).is_some(),
                 "{name} is not the accepted local projection of m183"
             );
         }
@@ -2714,7 +2899,7 @@ mod tests {
         aliased.host = Some("m184".to_owned());
         aliased.local_host = Some("m183-2".to_owned());
         assert!(
-            own_name_pending("m184", Some("m184"), &aliased).is_some(),
+            own_name_pending("m184", Some(&names184), &aliased).is_some(),
             "an earlier number's alias cannot fulfill a new naming intent"
         );
     }
@@ -3489,18 +3674,23 @@ mod tests {
         .unwrap();
         assert_eq!(machines(&config), [Some("m86".into()), Some("m86".into())]);
         let (target, os_label) = identity_target_from(&NameChoice::Roster, label.clone()).unwrap();
+        let generated = generated_os_names(Some(&state), &target, os_label.as_deref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(generated.computer_name(), "m86 MissBunny");
+        assert_eq!(generated.host_name(), "m86-missbunny");
         let old = OwnNames {
             computer: Some("m184".into()),
             local_host: Some("m184".into()),
             host: Some("m184".into()),
         };
-        assert!(own_name_pending(&target, os_label.as_deref(), &old).is_some());
+        assert!(own_name_pending(&target, Some(&generated), &old).is_some());
         let current = OwnNames {
-            computer: Some(target.clone()),
-            local_host: Some(target.clone()),
-            host: Some(target),
+            computer: Some(generated.computer_name().into()),
+            local_host: Some(generated.host_name().into()),
+            host: Some(generated.host_name().into()),
         };
-        assert!(own_name_pending("m86", os_label.as_deref(), &current).is_none());
+        assert!(own_name_pending("m86", Some(&generated), &current).is_none());
         // A newer Rename supersedes the earlier identity string, including the runtime guard
         // an older installed build needed. Turning naming off remains a hold.
         file::replace(&state, |name| {
@@ -3520,7 +3710,10 @@ mod tests {
         let (target, os_label) = identity_target_from(&choice, label.clone()).unwrap();
         assert_eq!(target, "m87");
         assert_eq!(os_label.as_deref(), Some("m87"));
-        assert!(own_name_pending(&target, os_label.as_deref(), &current).is_some());
+        let generated = generated_os_names(Some(&state), &target, os_label.as_deref())
+            .unwrap()
+            .unwrap();
+        assert!(own_name_pending(&target, Some(&generated), &current).is_some());
         write_identity_after_read(
             &config,
             Some(&state),
@@ -3534,6 +3727,119 @@ mod tests {
         let mut off = NameChoice::Off;
         let label = projected_machine_label(Some(&state), &mut off, None).unwrap();
         assert!(identity_target_from(&off, label).is_none());
+
+        // The post-init port reads the saved source after root returned, without
+        // forcing Auto/Seeded records through the person's policy-writing publisher.
+        for class in [Class::Auto, Class::Seeded, Class::Chosen] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let state = scratch.path().join("state");
+            aterm_uds::private_file::create_private_dir(&state).unwrap();
+            let mut saved = MachineName::unnumbered(Nickname::parse("dog").unwrap(), 1);
+            saved.num = Number::new(85);
+            saved.class = class;
+            file::read_or_create(&state, || Ok(saved)).unwrap();
+            let config = scratch.path().join("aterm.toml");
+            aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+            let before = std::fs::read(state.join(file::FILE)).unwrap();
+            let sys = aterm_machines::port::Fake::root();
+            sys.stat_of(
+                aterm_machines::root_steps::ADMITTED_NAME_RULE,
+                aterm_machines::port::Stat {
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o440,
+                    dir: false,
+                    symlink: false,
+                    len: 1,
+                },
+            );
+            let observed = std::sync::Arc::new(std::sync::Mutex::new([
+                "old".to_owned(),
+                "old".to_owned(),
+                "old".to_owned(),
+            ]));
+            let sets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (values, writes) = (
+                std::sync::Arc::clone(&observed),
+                std::sync::Arc::clone(&sets),
+            );
+            sys.simulate(move |_, cmd| {
+                use aterm_machines::port::Ran;
+                let args: Vec<_> = cmd.args.iter().map(|arg| arg.to_str().unwrap()).collect();
+                if cmd.program == Path::new(aterm_machines::items::names::SCUTIL)
+                    && args.first() == Some(&"--get")
+                {
+                    let index = aterm_machines::root_steps::NAME_PREFS
+                        .iter()
+                        .position(|pref| Some(pref) == args.get(1))
+                        .unwrap();
+                    return Some(Ran::ok(&values.lock().unwrap()[index]));
+                }
+                if cmd.program == Path::new(aterm_machines::root_steps::SUDO)
+                    && args.first() == Some(&"-n")
+                {
+                    let index = aterm_machines::root_steps::NAME_PREFS
+                        .iter()
+                        .position(|pref| Some(pref) == args.get(3))
+                        .unwrap();
+                    values.lock().unwrap()[index] = args[4].to_owned();
+                    writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Some(Ran::ok(""));
+                }
+                None
+            });
+            assert!(
+                init_name_with(&sys, &state, &config, &|| Ok(()))
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(*observed.lock().unwrap(), ["m85 Dog", "m85-dog", "m85-dog"]);
+            assert_eq!(sets.load(std::sync::atomic::Ordering::SeqCst), 3);
+            init_name_with(&sys, &state, &config, &|| Ok(())).unwrap();
+            assert_eq!(
+                sets.load(std::sync::atomic::Ordering::SeqCst),
+                3,
+                "already-current names have no setters"
+            );
+            observed.lock().unwrap()[1] = "m85-dog-2".into();
+            assert!(init_name_with(&sys, &state, &config, &|| Ok(())).is_err());
+            assert_eq!(
+                sets.load(std::sync::atomic::Ordering::SeqCst),
+                3,
+                "collision remains pending without rename"
+            );
+            assert_eq!(
+                std::fs::read(&config).unwrap(),
+                b"",
+                "OS-only projection writes no policy"
+            );
+            assert_eq!(
+                std::fs::read(state.join(file::FILE)).unwrap(),
+                before,
+                "no class promotion or canonical edit"
+            );
+            if class != Class::Chosen {
+                aterm_uds::atomic_file::write(&config, b"[identity]\nname = \"studio\"\n", 0o600)
+                    .unwrap();
+                assert!(
+                    init_name_with(&sys, &state, &config, &|| Ok(()))
+                        .unwrap()
+                        .is_none(),
+                    "a separate explicit identity source admits no OS projection"
+                );
+                assert_eq!(sets.load(std::sync::atomic::Ordering::SeqCst), 3);
+            }
+            aterm_uds::atomic_file::write(&config, b"[identity]\nname = false\n", 0o600).unwrap();
+            assert!(
+                init_name_with(&sys, &state, &config, &|| Ok(()))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                init_name_with(&sys, &state, &config, &|| Err("setup stopped".into())).is_err()
+            );
+            assert_eq!(sets.load(std::sync::atomic::Ordering::SeqCst), 3);
+        }
     }
 
     #[test]
@@ -3543,6 +3849,11 @@ mod tests {
 
         let scratch = aterm_tempfile::tempdir().unwrap();
         let state = scratch.path();
+        let config = scratch.path().join("aterm.toml");
+        aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+        let initial = projection_target_now(&config, Some(state), Some("m184".into()))
+            .unwrap()
+            .unwrap();
         let fallback = || Some("m184".to_owned());
         let mut choice = NameChoice::Roster;
         assert_eq!(
@@ -3552,6 +3863,13 @@ mod tests {
         assert_eq!(
             projected_machine_label(Some(state), &mut choice, fallback()).unwrap(),
             fallback()
+        );
+        let provisional = generated_os_names(Some(state), "m184", Some("m184"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            provisional,
+            GeneratedNames::number_only(Number::parse("m184").unwrap())
         );
         let mut name = MachineName::unnumbered(Nickname::parse("Heron").unwrap(), 1);
         name.num = Some(Number::parse("m8").unwrap());
@@ -3566,7 +3884,34 @@ mod tests {
                 projected_machine_label(Some(state), &mut choice, fallback()).unwrap(),
                 fallback()
             );
+            assert!(
+                generated_os_names(Some(state), "m184", Some("m184")).is_err(),
+                "a mismatched canonical record must not fall back to a bare roster number"
+            );
+            let generated = generated_os_names(Some(state), "m8", Some("m8"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(generated.computer_name(), "m8 Heron");
+            assert_eq!(generated.host_name(), "m8-heron");
+            assert!(own_name_repairable(
+                "m8",
+                Some(&generated),
+                &OwnNames::default()
+            ));
+            let admitted = projection_target_now(&config, Some(state), Some("m8".into()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(admitted.names.as_ref(), Some(&generated));
+            assert!(
+                initial
+                    .check_current(&config, Some(state), Some("m8".into()))
+                    .is_err(),
+                "arrival of the canonical automatic name retires the provisional projection"
+            );
         }
+        aterm_uds::private_file::write_private(state, file::FILE, b"unread canonical name")
+            .unwrap();
+        assert!(generated_os_names(Some(state), "m184", Some("m184")).is_err());
     }
 
     #[test]
@@ -3580,6 +3925,7 @@ mod tests {
             Number,
             UnreadName,
             NicknameAndUnrelated,
+            Unrelated,
             None,
         }
 
@@ -3623,8 +3969,9 @@ mod tests {
                 "nickname-and-unrelated",
                 "LocalHostName",
                 Change::NicknameAndUnrelated,
-                3,
+                1,
             ),
+            ("unrelated", "ComputerName", Change::Unrelated, 3),
             ("unchanged", "ComputerName", Change::None, 3),
         ] {
             let dir = scratch.path().join(case);
@@ -3713,6 +4060,18 @@ mod tests {
                             )
                             .unwrap();
                         }
+                        Change::Unrelated => {
+                            let mut text = std::fs::read_to_string(&config_to_change).unwrap();
+                            text.push_str(
+                                "\n[harness]\naccounts = \"wall\"\n[identity]\ngit = false\n",
+                            );
+                            aterm_uds::atomic_file::write(
+                                &config_to_change,
+                                text.as_bytes(),
+                                0o600,
+                            )
+                            .unwrap();
+                        }
                         Change::None => {}
                     }
                 }
@@ -3725,7 +4084,8 @@ mod tests {
                 }
             });
             let current = || projection.check_current(&config, Some(&state), Some("m184".into()));
-            let said = own_name_by_rule(&sys, &projection.target.0, &current);
+            let generated = projection.names.as_ref().unwrap();
+            let said = own_name_by_rule(&sys, generated, &current);
             let calls = sys.calls();
             assert!(calls.contains(&read), "{case}: the source change must run");
             let writes: Vec<_> = calls
@@ -3736,7 +4096,19 @@ mod tests {
             let expected: Vec<_> = aterm_machines::root_steps::NAME_PREFS
                 .into_iter()
                 .take(completed)
-                .map(|field| format!("/usr/bin/sudo -n /usr/sbin/scutil --set {field} m86"))
+                .map(|field| {
+                    let slot =
+                        aterm_types::machine_name::OsSlot::from_macos_preference(field).unwrap();
+                    aterm_machines::port::Cmd::new(aterm_machines::root_steps::SUDO)
+                        .args([
+                            "-n",
+                            aterm_machines::items::names::SCUTIL,
+                            "--set",
+                            field,
+                            generated.for_slot(slot).unwrap(),
+                        ])
+                        .display()
+                })
                 .collect();
             assert_eq!(
                 writes, expected,

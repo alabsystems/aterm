@@ -186,6 +186,7 @@ mod macos {
         if let Err(code) = rename::rounds(windowed, &mut findings, snapshots) {
             return code;
         }
+        println!("\n=== VERDICT ===");
         if findings.is_empty() {
             println!(
                 "objc-confirm-drive: PASS — {}",
@@ -441,6 +442,8 @@ mod macos {
             fields: usize,
             /// What the editable fields hold, in view order.
             values: Vec<String>,
+            /// The native status document fits its measured text and remains scrollable if capped.
+            status_readable: Option<bool>,
         }
 
         /// One step the helper takes once the alert is up.
@@ -450,6 +453,10 @@ mod macos {
             Type(usize, String),
             /// Hand the alert the read.
             Deliver,
+            /// Deliver only optional fleet status, retaining edits and first responder.
+            Discover(Result<bool, String>),
+            /// The status text contains this phrase.
+            Status(&'static str),
             /// The Number and Nickname fields hold these.
             Fields(String, String),
             /// The field at this index is being edited, the caret in it.
@@ -473,7 +480,15 @@ mod macos {
             fn read(&self) -> [Option<String>; 3] {
                 self.values.clone()
             }
-            fn apply(&self, _: Number) -> Result<(), String> {
+            fn authorization(&self, _: &Path, _: &Path) -> Result<bool, String> {
+                Ok(false) // Display-only old permission: the driver never launches authorization.
+            }
+            fn apply(
+                &self,
+                _: &std::path::Path,
+                _: &std::path::Path,
+                _: &aterm_types::machine_name::GeneratedNames,
+            ) -> Result<(), String> {
                 Err("the display fixture never renames macOS".to_owned())
             }
         }
@@ -482,7 +497,8 @@ mod macos {
             fn snapshot(&self, preview: &RenamePreview) -> Snapshot {
                 Snapshot::named(
                     preview.clone(),
-                    NamingStatus::read(&self.state, &self.config, preview.name(), self),
+                    NamingStatus::read(&self.state, &self.config, preview.name(), self)
+                        .with_fleet_membership(InFleet::Out),
                 )
             }
         }
@@ -505,12 +521,12 @@ mod macos {
             std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))
                 .map_err(|e| e.to_string())?;
             let config = root.path().join("aterm.toml");
-            let number = Number::new(7).ok_or("m7 is no number")?;
+            let number = Number::new(85).ok_or("m85 is no number")?;
             set_name(
                 &state,
                 &NameTo {
                     num: number,
-                    nick: None,
+                    nick: Some(Nickname::parse("dog").map_err(|why| why.to_string())?),
                 },
                 || Ok(LabLabels::default()),
                 ByKind::Person,
@@ -535,8 +551,14 @@ mod macos {
             }
             let preview = rename_preview(&state, || Ok(LabLabels::default()), || Ok(None), now)
                 .map_err(|e| e.to_string())?;
+            let generated =
+                aterm_types::machine_name::GeneratedNames::new(number, &preview.name().nick);
             let synchronized = NamingCase {
-                values: std::array::from_fn(|_| Some(number.to_string())),
+                values: [
+                    Some(generated.computer_name().to_owned()),
+                    Some(generated.host_name().to_owned()),
+                    Some(generated.host_name().to_owned()),
+                ],
                 ..pending.clone()
             };
             Ok((root, preview, pending, synchronized))
@@ -618,8 +640,8 @@ mod macos {
                 Class::Seeded,
                 "the native unchanged-Save control must start with a real seeded name"
             );
-            let word = preview.name().nick.as_str().to_owned();
-            let waiting_word = waiting.name().nick.as_str().to_owned();
+            let word = preview.name().display_nick();
+            let waiting_word = waiting.name().display_nick();
             // A nickname the read does not hold, for a view a change pressed before outdated.
             let other = if word == "Heron" { "Otter" } else { "Heron" };
             let view = |name: &str, word: &str| MachineView {
@@ -662,7 +684,7 @@ mod macos {
                 Vec<Step>,
                 Answer,
             );
-            let rounds: [Round<'_>; 10] = [
+            let rounds: [Round<'_>; 11] = [
                 (
                     "a number the vault holds",
                     &preview,
@@ -719,10 +741,10 @@ mod macos {
                     view("m5", other),
                     (None, None),
                     vec![
-                        Step::Fields(s("m5"), s(other)),
+                        Step::Fields(s("5"), s(other)),
                         Step::Editing(0),
                         Step::Deliver,
-                        Step::Fields(s("m7"), w()),
+                        Step::Fields(s("7"), w()),
                         Step::Editing(0),
                         Step::Expect(None, None, true),
                         Step::Keys(&[RETURN]),
@@ -739,7 +761,7 @@ mod macos {
                     vec![
                         Step::Type(1, s("Marigold")),
                         Step::Deliver,
-                        Step::Fields(s("m7"), s("Marigold")),
+                        Step::Fields(s("7"), s("Marigold")),
                         Step::Editing(1),
                         Step::Expect(None, typed("Marigold"), true),
                         Step::Keys(&[RETURN]),
@@ -787,7 +809,7 @@ mod macos {
                     view("m7", &waiting_word),
                     (None, None),
                     vec![
-                        Step::Fields(s("m7"), waiting_word.clone()),
+                        Step::Fields(s("7"), waiting_word.clone()),
                         Step::Deliver,
                         Step::Fields(String::new(), waiting_word.clone()),
                         Step::Expect(None, None, true),
@@ -805,8 +827,8 @@ mod macos {
                     "saved number with pending macOS publication",
                     &named_preview,
                     Some(&pending),
-                    "Retry Sync",
-                    view("m7", named_preview.name().nick.as_str()),
+                    "Authorize & Sync",
+                    view("m85", named_preview.name().nick.as_str()),
                     (None, None),
                     vec![
                         Step::Deliver,
@@ -816,9 +838,7 @@ mod macos {
                     Answer::Rename {
                         number: None,
                         nick: None,
-                        requested: Ok(sheet::RenameTo::Synchronize(
-                            Number::new(7).expect("a fixture number"),
-                        )),
+                        requested: Ok(sheet::RenameTo::Authorize),
                     },
                 ),
                 (
@@ -826,10 +846,18 @@ mod macos {
                     &named_preview,
                     Some(&synchronized),
                     "Save",
-                    view("m7", named_preview.name().nick.as_str()),
+                    view("m85", named_preview.name().nick.as_str()),
                     (None, None),
                     vec![
                         Step::Deliver,
+                        Step::Expect(None, None, true),
+                        Step::Type(1, s("研究室研究室研究室研究室研究室研究室研究室")),
+                        Step::Expect(
+                            None,
+                            typed("研究室研究室研究室研究室研究室研究室研究室"),
+                            true,
+                        ),
+                        Step::Type(1, s("dog")),
                         Step::Expect(None, None, true),
                         Step::Keys(&[RETURN]),
                     ],
@@ -838,6 +866,31 @@ mod macos {
                         nick: None,
                         requested: Ok(sheet::RenameTo::Keep),
                     },
+                ),
+                (
+                    "fleet discovery preserves typed fields and focus",
+                    &named_preview,
+                    Some(&synchronized),
+                    "Save",
+                    view("m85", named_preview.name().nick.as_str()),
+                    (None, None),
+                    vec![
+                        Step::Deliver,
+                        Step::Status("discovering"),
+                        Step::Type(0, s("86")),
+                        Step::Type(1, s("Blue Heron")),
+                        Step::Editing(1),
+                        Step::Discover(Ok(true)),
+                        Step::Status("Available fleets: ALab"),
+                        Step::Fields(s("86"), s("Blue Heron")),
+                        Step::Editing(1),
+                        Step::Discover(Err("offline".into())),
+                        Step::Status("discovery unavailable"),
+                        Step::Fields(s("86"), s("Blue Heron")),
+                        Step::Editing(1),
+                        Step::Keys(&[ESCAPE]),
+                    ],
+                    Answer::Cancel,
                 ),
             ];
             for (index, (name, preview, naming, primary, view, (number, nick), steps, want)) in
@@ -986,6 +1039,21 @@ mod macos {
                             ));
                         }
                     }
+                    Step::Discover(available) => {
+                        aterm_objc::run_on_main(move |_| {
+                            sheet::deliver_discovery(press, available)
+                        });
+                    }
+                    Step::Status(phrase) => {
+                        let seen =
+                            aterm_objc::run_on_main(|_| look(windowed, None)).unwrap_or_default();
+                        if !seen.texts.iter().any(|text| text.contains(phrase)) {
+                            findings.push(format!(
+                                "status did not contain {phrase:?}: {:?}",
+                                seen.texts
+                            ));
+                        }
+                    }
                     Step::Editing(field) => {
                         if !aterm_objc::run_on_main(move |_| editing(windowed, field)) {
                             findings.push(format!("field {field} was not being edited"));
@@ -1036,9 +1104,16 @@ mod macos {
                         if seen.fields != 2 {
                             findings.push(format!("{} editable fields, not 2", seen.fields));
                         }
+                        if want.text.starts_with("ID: ") && seen.status_readable != Some(true) {
+                            findings.push(
+                                "the native naming status is clipped or cannot be scrolled".into(),
+                            );
+                        }
                         let mut buttons = seen.buttons.clone();
                         buttons.sort_unstable();
-                        if buttons != ["Cancel", if delivered { primary } else { "Save" }] {
+                        let mut expected = ["Cancel", if delivered { primary } else { "Save" }];
+                        expected.sort_unstable();
+                        if buttons != expected {
                             findings.push(format!("its buttons were {:?}", seen.buttons));
                         }
                         if !seen.texts.iter().any(|text| text == sheet::TITLE) {
@@ -1217,7 +1292,10 @@ mod macos {
             unsafe {
                 if appkit::send_bool_cls(view, sel!(isKindOfClass:), class(c"NSButton")) {
                     let title = appkit::nsstring_to_rust(appkit::send_id(view, sel!(title)));
-                    if title == sheet::BUTTONS[0] || title == "Retry Sync" {
+                    if title == sheet::BUTTONS[0]
+                        || title == "Retry Sync"
+                        || title == "Authorize & Sync"
+                    {
                         look.renames = Some(appkit::send_bool(view, sel!(isEnabled)));
                     }
                     look.buttons.push(title);
@@ -1226,6 +1304,32 @@ mod macos {
                         editable.push(view);
                     }
                     let text = appkit::nsstring_to_rust(appkit::send_id(view, sel!(stringValue)));
+                    if text.starts_with("ID: ") {
+                        let frame = appkit::send_rect(view, sel!(frame));
+                        let cell = appkit::send_id(view, sel!(cell));
+                        let scroll = appkit::send_id(view, sel!(enclosingScrollView));
+                        look.status_readable = Some(
+                            !cell.is_null() && !scroll.is_null() && {
+                                let need = appkit::send_size_rect(
+                                    cell,
+                                    sel!(cellSizeForBounds:),
+                                    aterm_objc::CGRect {
+                                        origin: Default::default(),
+                                        size: aterm_objc::CGSize {
+                                            width: frame.size.width,
+                                            height: f64::from(u16::MAX),
+                                        },
+                                    },
+                                );
+                                let clip = appkit::send_id(scroll, sel!(contentView));
+                                !clip.is_null()
+                                    && need.height <= frame.size.height + 0.5
+                                    && (frame.size.height
+                                        <= appkit::send_rect(clip, sel!(bounds)).size.height + 0.5
+                                        || appkit::send_bool(scroll, sel!(hasVerticalScroller)))
+                            },
+                        );
+                    }
                     if !text.is_empty() {
                         look.texts.push(text);
                     }

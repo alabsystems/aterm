@@ -620,6 +620,7 @@ impl RowView {
         match &self.value {
             RowValue::Change { now, .. } => Some(now),
             RowValue::One(value) | RowValue::Muted(value) => Some(value),
+            RowValue::LastKnown(_) => None,
         }
     }
 }
@@ -820,8 +821,12 @@ fn line_state(
             format!("Needs you: {}{more}", first.subject.name()),
         ));
     }
+    let has_history = managed
+        .iter()
+        .any(|row| matches!(row.value, RowValue::LastKnown(_)));
     // Nothing of it read yet: its scope, calm, and the headline says Checking once.
-    if !managed.is_empty() && managed.iter().all(|row| unread(row)) {
+    // Past readings instead keep their own explicitly historical group presentation below.
+    if !has_history && !managed.is_empty() && managed.iter().all(|row| unread(row)) {
         return LineState::checking(line);
     }
     // The Secrets line's own words (§4.3): looking, joining, joined, or no vault here.
@@ -833,7 +838,7 @@ fn line_state(
         if app.phrase_asked() {
             return with_lead(LineState::new(Mark::Working, JOINING_ALAB));
         }
-        if unread(vault) {
+        if unread(vault) && !has_history {
             let running = status.running.contains(&Setting::Secrets);
             let state = if running {
                 LineState::new(Mark::Working, "Looking for your other Macs…")
@@ -905,6 +910,43 @@ fn line_state(
             waiting_for(first)
         };
         return with_lead(LineState::new(Mark::Waiting, why));
+    }
+    if has_history
+        && !managed
+            .iter()
+            .any(|row| matches!(row.value, RowValue::Muted(_)))
+    {
+        let observing = managed
+            .iter()
+            .filter_map(|row| {
+                status.observation_progress(row.subject, Some(app.plan.vault_url.as_str()))
+            })
+            .reduce(|a, b| a && b);
+        if managed
+            .iter()
+            .all(|row| row.settled() || row.chip == Some(super::Chip::LastKnown))
+        {
+            let phase = match observing {
+                Some(true) => " · waiting to read",
+                Some(false) => " · checking",
+                None => "",
+            };
+            // The check is past presentation only; progress still counts current readings.
+            return with_lead(
+                LineState::new(Mark::Done, format!("In place as last read{phase}"))
+                    .word("as last read"),
+            );
+        }
+        if observing.is_none() {
+            return with_lead(
+                LineState::new(
+                    Mark::Pending,
+                    "Some results as last read · current reading unavailable",
+                )
+                .word("as last read")
+                .quiet(),
+            );
+        }
     }
     if managed.iter().any(|row| unread(row)) {
         return with_lead(LineState::checking(line));
@@ -1114,6 +1156,12 @@ pub(crate) fn progress(
 pub(crate) fn hero(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) -> Hero {
     let mut hero = hero_words(app, rows, card);
     hero.phase = phase_words(app, &hero, card);
+    if rows
+        .iter()
+        .any(|row| matches!(row.value, RowValue::LastKnown(_)))
+    {
+        hero.sub = "Showing last useful results".into();
+    }
     hero
 }
 

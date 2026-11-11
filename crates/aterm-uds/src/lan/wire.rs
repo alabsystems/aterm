@@ -891,6 +891,43 @@ pub fn took(stream: &CtlStream) -> io::Result<()> {
     (&*stream).write_all(&[TOOK])
 }
 
+/// Send a bounded request header or ownership acknowledgement without blocking a stop.
+pub(crate) fn write_cancelled(
+    stream: &CtlStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+    cancel: Option<BorrowedFd<'_>>,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        crate::ready::until_cancelled(
+            stream.as_fd(),
+            crate::ready::Interest::Write,
+            deadline,
+            cancel,
+        )?;
+        let wrote = crate::ready::with_nonblocking(stream.as_fd(), || (&*stream).write(bytes));
+        match wrote {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    crate::ready::check_cancelled(cancel)
+}
+
+pub(crate) fn took_cancelled(
+    stream: &CtlStream,
+    deadline: Instant,
+    cancel: Option<BorrowedFd<'_>>,
+) -> io::Result<()> {
+    write_cancelled(stream, &[TOOK], deadline, cancel)
+}
+
 /// The descriptors one receive took in: what [`crate::kept_out`] marks.
 struct Took(crate::fdpass::Received);
 
@@ -946,13 +983,27 @@ impl Reader {
         stream: &CtlStream,
         deadline: Option<Instant>,
     ) -> io::Result<Option<Frame>> {
+        self.frame_cancelled(stream, deadline, None)
+    }
+
+    pub(crate) fn frame_cancelled(
+        &mut self,
+        stream: &CtlStream,
+        deadline: Option<Instant>,
+        cancel: Option<BorrowedFd<'_>>,
+    ) -> io::Result<Option<Frame>> {
         loop {
             if let Some(frame) = self.complete()? {
                 return Ok(Some(frame));
             }
             match deadline {
                 Some(deadline) => {
-                    crate::ready::until(stream.as_fd(), crate::ready::Interest::Read, deadline)?;
+                    crate::ready::until_cancelled(
+                        stream.as_fd(),
+                        crate::ready::Interest::Read,
+                        deadline,
+                        cancel,
+                    )?;
                 }
                 None => crate::ready::one(stream.as_fd())?,
             }

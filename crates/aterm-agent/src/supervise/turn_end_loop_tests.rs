@@ -5887,96 +5887,6 @@ fn a_handed_over_idle_escalation_survives_the_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Seeds a model-switch ledger entry at `path` and returns its recorded unix timestamp.
-pub(super) fn seed_switch(
-    path: &std::path::Path,
-    sid: Option<&str>,
-    back_at_unix: i64,
-    restored: bool,
-    legacy: bool,
-) -> i64 {
-    use crate::supervise::approvals::{Outcome, Row, model_switch_reason};
-    use crate::supervise::policy::turn_end::{RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE};
-    let now = crate::supervise::journal::unix_ms();
-    let (written, made) = (now - 30 * 60_000, (now - 31 * 60_000).div_euclid(1000));
-    let mut reason = model_switch_reason(Some("fable"), Some(back_at_unix), made);
-    if legacy {
-        reason = reason.replace(&format!(" made={made}"), "");
-    }
-    let mut rows = vec![
-        Row {
-            rule_id: RULE_MODEL_FALLBACK,
-            outcome: Outcome::Typed,
-            command: if legacy {
-                "/model opus"
-            } else {
-                "relaunch --model opus"
-            },
-            reason: &reason,
-            box_seq: 90,
-        }
-        .to_json(written, sid),
-        Row {
-            rule_id: RULE_MODEL_FALLBACK,
-            outcome: Outcome::Typed,
-            command: "keep going",
-            reason: "the turn-end policy",
-            box_seq: 91,
-        }
-        .to_json(now - 29 * 60_000, sid),
-    ];
-    if restored {
-        rows.push(
-            Row {
-                rule_id: RULE_MODEL_RESTORE,
-                outcome: Outcome::Typed,
-                command: if legacy {
-                    "/model fable"
-                } else {
-                    "relaunch --model fable"
-                },
-                reason: "the turn-end policy",
-                box_seq: 95,
-            }
-            .to_json(now - 10 * 60_000, sid),
-        );
-    }
-    std::fs::write(path, rows.join("\n") + "\n").expect("the ledger");
-    if legacy {
-        written.div_euclid(1000)
-    } else {
-        made
-    }
-}
-
-#[test]
-fn a_model_switch_is_read_back_by_a_loop_that_starts_after_it() {
-    use crate::supervise::approvals::{OpenSwitch, open_model_switch};
-    for legacy in [false, true] {
-        for (tag, back_at, restored) in [
-            ("due", TEST_NOW - 60, false),
-            ("undone", TEST_NOW - 60, true),
-        ] {
-            let (dir, ledger) = ledger_at(&format!("switch-{tag}-{legacy}"));
-            let made = seed_switch(&ledger, None, back_at, restored, legacy);
-            let open = open_model_switch(&ledger, None);
-            let _ = std::fs::remove_dir_all(&dir);
-            assert_eq!(
-                open,
-                (!restored).then(|| OpenSwitch {
-                    from: Some("fable".to_string()),
-                    to: "opus".to_string(),
-                    back_at_unix: Some(back_at),
-                    asked: true,
-                    made_unix: made,
-                    proc: None,
-                }),
-                "{tag} {legacy}"
-            );
-        }
-    }
-}
-
 #[test]
 fn a_persons_keystroke_holds_the_loop_for_the_grace() {
     let full = SuperviseOpts {
@@ -8987,7 +8897,7 @@ fn a_turn_its_transcript_says_ended_waiting_is_not_continued() {
 }
 
 fn transcript_at(t: &str) -> i64 {
-    crate::harness::upgrade_models::parse_utc(&format!("2026-10-07T{t}Z"))
+    crate::harness::unix_time::parse_utc(&format!("2026-10-07T{t}Z"))
         .and_then(|s| i64::try_from(s).ok())
         .expect("a time")
 }
@@ -17222,20 +17132,21 @@ fn a_move_ahead_its_host_puts_off_is_asked_again_on_its_back_off_not_on_its_own_
 }
 
 /// A move ahead its host puts off, at a point that goes on with a restart the host puts off too (a
-/// model's move onto its fallback; `wait:conversation-in-other-tab` to both): each acts on its own
-/// run (`Session::restart_aside`), so at the next point each is the same ask a step further on its
+/// memory restart; `wait:conversation-in-other-tab` to both): each acts on its own run
+/// (`Session::restart_aside`), so at the next point each is the same ask a step further on its
 /// back-off, and the point's wait with them. The point's restart minting a run of its own at every
 /// point would hold that wait, and the move's asks, at the ladder's first step. The run set aside
 /// is that restart's wherever it is asked next: on its own (the move no longer advised), as the
-/// fallback of a move whose run is new, or after the move is refused.
+/// otherwise of a move whose run is new, or after the move is refused.
 ///
 /// NEGATIVE CONTROL: an act that is no restart between two points (a wait, or an escalation after
-/// the move is refused) ends the model's run, which outlives no act, and not the move's, which is
-/// put off: the model's next ask is another ask, its wait back on the ladder's first step. Another
-/// restart asked on its own ends both runs.
+/// the move is refused) ends the memory restart's run, which outlives no act, and not the move's,
+/// which is put off: the memory restart's next ask is another ask, its wait back on the ladder's
+/// first step. Another restart asked on its own ends both runs.
 #[test]
 fn a_move_ahead_put_off_and_the_restart_its_point_goes_on_with_back_off_each_on_its_own_run() {
-    use crate::supervise::policy::turn_end::RULE_MODEL_FALLBACK;
+    use crate::supervise::policy::turn_end::{PermissionTo, RULE_MEMORY_RESTART};
+    const RULE_UNDER_TEST: &str = "restart-under-test@v0";
     let host = AccountHost::moving("work-2", "wait:conversation-in-other-tab");
     let opts = account_opts(&host);
     let mut m = Mock::new(vec![ended("Stage 3 done; the suite is green.")]);
@@ -17256,11 +17167,9 @@ fn a_move_ahead_put_off_and_the_restart_its_point_goes_on_with_back_off_each_on_
         why: "the usage credits lift".to_string(),
         wait: WaitKind::Other,
     };
-    let fallback = |s: &Session<'_, Mock>| TurnEndAction::Restart {
-        why: Restart::Model {
-            to: "sonnet".to_string(),
-        },
-        rule_id: RULE_MODEL_FALLBACK,
+    let restart = |s: &Session<'_, Mock>| TurnEndAction::Restart {
+        why: Restart::Memory,
+        rule_id: RULE_MEMORY_RESTART,
         otherwise: Box::new(held(s)),
     };
     let act = |s: &mut Session<'_, Mock>, action| {
@@ -17273,16 +17182,16 @@ fn a_move_ahead_put_off_and_the_restart_its_point_goes_on_with_back_off_each_on_
         let action = TurnEndAction::Restart {
             why: why.clone(),
             rule_id,
-            otherwise: Box::new(fallback(s)),
+            otherwise: Box::new(restart(s)),
         };
         act(s, action)
     };
     let asks = || host.asks.lock().unwrap().clone();
     let said = || host.said("restart");
-    let (ahead, model) = ("restart:account-ahead:work-2", "restart:model");
+    let (ahead, memory) = ("restart:account-ahead:work-2", "restart:memory");
     let first = point(&mut s);
     let second = point(&mut s);
-    assert_eq!(said(), [ahead, model, ahead, model], "{:?}", host.all());
+    assert_eq!(said(), [ahead, memory, ahead, memory], "{:?}", host.all());
     assert!(first <= Duration::from_secs(10), "{first:?}");
     assert!(
         second > Duration::from_secs(10) && second <= Duration::from_secs(60),
@@ -17293,9 +17202,9 @@ fn a_move_ahead_put_off_and_the_restart_its_point_goes_on_with_back_off_each_on_
     assert_eq!(asked[3], asked[1], "so is the point's restart");
 
     // The point's restart asked on its own, the move no longer advised: its run, on its own step.
-    let alone = fallback(&s);
+    let alone = restart(&s);
     let third = act(&mut s, alone);
-    assert_eq!(said()[4], model);
+    assert_eq!(said()[4], memory);
     assert_eq!(asks()[4], asked[1], "the restart set aside takes the slot");
     assert!(
         third > Duration::from_secs(60) && third <= Duration::from_secs(300),
@@ -17304,7 +17213,7 @@ fn a_move_ahead_put_off_and_the_restart_its_point_goes_on_with_back_off_each_on_
     // The move asked again on a run of its own sets that run aside, for its point's restart.
     let fourth = point(&mut s);
     let asked = asks();
-    assert_eq!(said()[5..], [ahead, model]);
+    assert_eq!(said()[5..], [ahead, memory]);
     assert_ne!(
         asked[5], asked[0],
         "the move's run ended at another restart's"
@@ -17321,7 +17230,7 @@ fn a_move_ahead_put_off_and_the_restart_its_point_goes_on_with_back_off_each_on_
     let fifth = point(&mut s);
     let asked = asks();
     assert_eq!(asked[7], asked[5], "the move put off outlives the act");
-    assert_ne!(asked[8], asked[1], "the model's run ends at it");
+    assert_ne!(asked[8], asked[1], "the memory restart's run ends at it");
     assert!(
         fifth <= Duration::from_secs(10),
         "back on the first step: {fifth:?}"
@@ -17329,16 +17238,19 @@ fn a_move_ahead_put_off_and_the_restart_its_point_goes_on_with_back_off_each_on_
 
     // Another restart asked on its own takes the place of the move's run, and of the run set
     // aside with it: the next point's asks are both new.
-    let memory = TurnEndAction::Restart {
-        why: Restart::Memory,
-        rule_id: "memory-restart@v1",
+    let other = TurnEndAction::Restart {
+        why: Restart::Permission {
+            to: PermissionTo::Settings,
+            conversation: "conv-1".to_string(),
+        },
+        rule_id: RULE_UNDER_TEST,
         otherwise: Box::new(held(&s)),
     };
-    s.turn_end_execute(&end, memory, &opts, &[], &mut Alone)
+    s.turn_end_execute(&end, other, &opts, &[], &mut Alone)
         .expect("the restart waits");
     let _ = point(&mut s);
     let asked = asks();
-    assert_eq!(said()[9], "restart:memory", "{:?}", host.all());
+    assert_eq!(said()[9], "restart:permission", "{:?}", host.all());
     assert_ne!(asked[10], asked[7], "the move's run ended");
     assert_ne!(asked[11], asked[8], "and the one set aside");
 
@@ -17349,7 +17261,7 @@ fn a_move_ahead_put_off_and_the_restart_its_point_goes_on_with_back_off_each_on_
         .extend(["refused:no-room", "wait:conversation-in-other-tab"]);
     let _ = point(&mut s);
     let asked = asks();
-    assert_eq!(said()[12..], [ahead, model], "{:?}", host.all());
+    assert_eq!(said()[12..], [ahead, memory], "{:?}", host.all());
     assert_eq!(asked[12], asked[10], "the move's own ask, refused");
     assert_eq!(asked[13], asked[11], "the point's restart, on its own run");
 
@@ -17370,7 +17282,7 @@ fn a_move_ahead_put_off_and_the_restart_its_point_goes_on_with_back_off_each_on_
         .expect("the point escalates");
     let _ = point(&mut s);
     let asked = asks();
-    assert_eq!(said()[14..], [ahead, ahead, model], "{:?}", host.all());
+    assert_eq!(said()[14..], [ahead, ahead, memory], "{:?}", host.all());
     assert_ne!(
         asked[16], asked[13],
         "the escalation ended the run set aside"
@@ -20537,355 +20449,6 @@ fn the_ledger_reads_a_sessions_account_moves_back() {
 }
 
 #[test]
-fn an_account_move_made_closes_the_model_switch_for_the_loop_after_it() {
-    use crate::supervise::approvals::{
-        ACCOUNT_MOVE_COMMAND, Outcome, Row, account_switch_reason, account_unmade_reason,
-        model_switch_reason, open_model_switch,
-    };
-    use crate::supervise::policy::turn_end::RULE_MODEL_FALLBACK;
-    let (dir, ledger) = ledger_at("account-closes-switch");
-    let me = Some("s-1");
-    let back_at = 1_789_700_000;
-    let row = |rule: &str, outcome: Outcome, command: &str, reason: &str, ts: i64, sid| {
-        Row {
-            rule_id: rule,
-            outcome,
-            command,
-            reason,
-            box_seq: 1,
-        }
-        .to_json(ts, sid)
-    };
-    let switch = |ts: i64| {
-        row(
-            RULE_MODEL_FALLBACK,
-            Outcome::Typed,
-            "relaunch --model opus",
-            &model_switch_reason(Some("fable"), Some(back_at), 1),
-            ts,
-            me,
-        )
-    };
-    let to = format!("{ACCOUNT_MOVE_COMMAND}work-2");
-    let moved = |ts: i64, sid| {
-        row(
-            RULE_ACCOUNT,
-            Outcome::Typed,
-            &to,
-            &account_switch_reason("work-2", AccountAt::Wall),
-            ts,
-            sid,
-        )
-    };
-    let write = |rows: &[String]| std::fs::write(&ledger, rows.join("\n") + "\n").expect("ledger");
-    let open = || open_model_switch(&ledger, Some("@s-1")).map(|o| (o.to, o.back_at_unix));
-    let standing = Some(("opus".to_string(), Some(back_at)));
-    write(&[switch(1_000)]);
-    assert_eq!(open(), standing);
-    write(&[switch(1_000), moved(2_000, me)]);
-    assert_eq!(open(), None, "the move let the switch go");
-    let unmade = row(
-        RULE_ACCOUNT,
-        Outcome::Skipped,
-        &to,
-        &account_unmade_reason("work-2", AccountAt::Wall, Some("refused:line")),
-        2_000,
-        me,
-    );
-    let draft = row(
-        RULE_ACCOUNT,
-        Outcome::Typed,
-        "my own words",
-        "the turn-end policy",
-        2_000,
-        me,
-    );
-    for (what, after) in [
-        ("a move not made", unmade),
-        ("another session's move", moved(2_000, Some("s-2"))),
-        ("a draft under the rule", draft),
-    ] {
-        write(&[switch(1_000), after]);
-        assert_eq!(open(), standing, "{what}");
-    }
-    write(&[switch(1_000), moved(2_000, me), switch(3_000)]);
-    assert_eq!(open(), standing);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The agent process a test host names: its pid, start (unix seconds) and conversation.
-type NamedAgent = (Option<u32>, Option<i64>, Option<&'static str>);
-
-/// What one point decides of a model switch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SwitchAt {
-    /// Its return to the model it left is made (`model-restore@v1`).
-    Restores,
-    /// Its return waits for the point the process is named on a conversation; the switch stands.
-    Holds,
-    /// The switch is over: a closing row, and nothing restored.
-    Closes,
-}
-
-#[test]
-fn a_model_switch_is_its_relaunched_process_and_another_program_in_the_tab_closes_it() {
-    use crate::supervise::approvals::{Ledger, Outcome, Row, model_switch_reason};
-    use crate::supervise::policy::turn_end::{RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE};
-    use SwitchAt::{Closes, Holds, Restores};
-    const SID: &str = "@s-1";
-    let back_at = ACCOUNT_NOW - 600;
-    let p1: NamedAgent = (Some(4100), Some(ACCOUNT_NOW - 7_100), Some("conv-a"));
-    let b: NamedAgent = (Some(4200), Some(ACCOUNT_NOW - 300), Some("conv-b"));
-    let restores = |a: &TurnEndAction| {
-        matches!(
-            a,
-            TurnEndAction::Restart {
-                why: Restart::ModelBack { .. },
-                rule_id: RULE_MODEL_RESTORE,
-                ..
-            }
-        )
-    };
-    let named = |host: &AccountHost, (pid, started, conversation): NamedAgent| {
-        *host.pid.lock().unwrap() = pid;
-        *host.started.lock().unwrap() = started;
-        *host.conversation.lock().unwrap() = conversation.map(str::to_string);
-    };
-    let at = |s: &mut Session<'_, Mock>, opts: &SuperviseOpts, seq: u64| {
-        let point = point_at(s, ended("Fixed the parser."), seq);
-        s.turn_end_at_point(&point, Some(Duration::from_secs(300)), opts)
-            .expect("a decision")
-    };
-    let closed = |ledger: &std::path::Path| {
-        std::fs::read_to_string(ledger)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| l.contains(RULE_MODEL_RESTORE) && l.contains("\"decision\":\"waiting\""))
-            .count()
-    };
-    // A loop on the session, seeded from the ledger, whose host owes a relaunch's continuation
-    // (`owed`) and, where `step` names one, first takes a step of its own at a point of `p1`'s
-    // with that word (the harness's own relaunch, or a typed line). Then each process in
-    // `agents` is named at a point of its own: what each point decides of the switch. Under
-    // `late` each is named only once its point asks the host whether it resumes, the reading
-    // there naming none ([`AccountHost::late_agent`]).
-    let run = |ledger: &std::path::Path,
-               agents: &[NamedAgent],
-               owed: bool,
-               step: Option<&'static str>,
-               late: bool| {
-        let host = AccountHost::scripted(&[], &[]);
-        host.relaunch_owed.store(owed, Ordering::SeqCst);
-        let opts = account_opts(&host);
-        let mut m = Mock::new(vec![ended("Fixed the parser.")]);
-        let mut s = session(&mut m, Some(SID.to_string()));
-        s.set_clock(ACCOUNT_NOW, PDT);
-        s.set_zone_lookup(test_zones);
-        s.ledger = Ledger::open(Some(ledger), Some(SID), &mut Vec::new());
-        s.seed_model_switch(ledger);
-        if let Some(word) = step {
-            named(&host, p1);
-            *host.step.lock().unwrap() = Some(word);
-            host.carry.store(true, Ordering::SeqCst);
-            let rows = ended("Fixed the parser.");
-            let mut point = point_at(&s, rows.clone(), 101);
-            point.screen.cursor_row = rows
-                .iter()
-                .rposition(|r| r.starts_with('❯'))
-                .expect("caret");
-            point.screen.cursor_col = 2;
-            s.host_steps_here(&point, &opts, &mut false, &mut Alone)
-                .expect("the host's step");
-            assert_eq!(
-                host.said("carry-on").len(),
-                1,
-                "the step {word} was taken: {:?}",
-                s.withheld
-            );
-        }
-        let mut decided = Vec::new();
-        for (n, agent) in agents.iter().enumerate() {
-            if late {
-                named(&host, (None, None, None));
-                let (Some(pid), Some(started), conversation) = *agent else {
-                    panic!("a process named at its point has a pid and a start: {agent:?}");
-                };
-                *host.late_agent.lock().unwrap() = Some((pid, started, conversation));
-            } else {
-                named(&host, *agent);
-            }
-            let before = closed(ledger);
-            let a = at(&mut s, &opts, 102 + n as u64);
-            decided.push(match (restores(&a), closed(ledger) > before) {
-                (true, false) => Restores,
-                (false, false) => Holds,
-                (false, true) => Closes,
-                (true, true) => panic!("restored and closed at one point: {a:?}"),
-            });
-        }
-        decided
-    };
-    // The ledger an earlier loop left: the fallback's relaunch onto opus, back at a reset now
-    // past, and (`stamped`) a point the relaunched process `p1` had since, A's.
-    let switched = |tag: &str, stamped: bool| {
-        let (dir, ledger) = ledger_at(&format!("switch-process-{tag}"));
-        let made = ACCOUNT_NOW - 7_200;
-        let row = Row {
-            rule_id: RULE_MODEL_FALLBACK,
-            outcome: Outcome::Typed,
-            command: "relaunch --model opus",
-            reason: &model_switch_reason(Some("sonnet"), Some(back_at), made),
-            box_seq: 90,
-        }
-        .to_json(made * 1000, Some(SID));
-        std::fs::write(&ledger, row + "\n").expect("the ledger");
-        if stamped {
-            let first = run(&ledger, &[p1], false, None, false);
-            assert_eq!(first, [Restores], "its own process restores");
-        }
-        (dir, ledger)
-    };
-    let unnamed: NamedAgent = (Some(4300), Some(ACCOUNT_NOW - 200), None);
-    let resumed_a: NamedAgent = (Some(4300), Some(ACCOUNT_NOW - 200), Some("conv-a"));
-    let elsewhere: NamedAgent = (Some(4300), Some(ACCOUNT_NOW - 200), Some("conv-z"));
-    let mut wrong = Vec::new();
-    for (n, (case, agents, owed, step, want)) in [
-        (
-            "the person's fresh program, B",
-            vec![b],
-            false,
-            None,
-            vec![Closes],
-        ),
-        (
-            "B, after a step of the host's that typed a line and started nothing",
-            vec![b],
-            false,
-            Some("continued"),
-            vec![Closes],
-        ),
-        (
-            "control: the relaunched process",
-            vec![p1],
-            false,
-            None,
-            vec![Restores],
-        ),
-        (
-            "control: the relaunched process after a /clear",
-            vec![(p1.0, p1.1, Some("conv-a2"))],
-            false,
-            None,
-            vec![Restores],
-        ),
-        (
-            "control: a relaunch that resumed A",
-            vec![resumed_a],
-            false,
-            None,
-            vec![Restores],
-        ),
-        (
-            "another process whose conversation the host does not name yet, then A's",
-            vec![unnamed, resumed_a],
-            false,
-            None,
-            vec![Holds, Restores],
-        ),
-        (
-            "another process whose conversation the host does not name yet, then another's",
-            vec![unnamed, (unnamed.0, unnamed.1, Some("conv-b"))],
-            false,
-            None,
-            vec![Holds, Closes],
-        ),
-        (
-            "a relaunch the host still owes, on a conversation the switch's process never named",
-            vec![elsewhere],
-            true,
-            None,
-            vec![Restores],
-        ),
-        (
-            "a relaunch the host's own step started afresh, on a new conversation",
-            vec![(Some(4300), Some(ACCOUNT_NOW - 200), Some("conv-n"))],
-            false,
-            Some("done:fresh"),
-            vec![Restores],
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (dir, ledger) = switched(&format!("case-{n}"), true);
-        let got = run(&ledger, &agents, owed, step, false);
-        let keeps = !want.contains(&Closes);
-        let rows = closed(&ledger);
-        let open = crate::supervise::approvals::open_model_switch(&ledger, Some(SID)).is_some();
-        let _ = std::fs::remove_dir_all(&dir);
-        if got != want || rows != usize::from(!keeps) || open != keeps {
-            wrong.push(format!(
-                "{case}: {got:?}, closing rows {rows}, open for the loop after {open}"
-            ));
-        }
-    }
-    // THE PROCESS NAMED ONLY AT ITS POINT: a window's host forgets an exited agent's snapshot, so
-    // the reading at a new program's first point names no process, and the host reads it only
-    // when the point asks whether it resumes (`IdleHost::agent_resumed`). The switch is scoped
-    // there too, before the point is decided.
-    for (n, (case, agents, want)) in [
-        (
-            "the person's fresh program, B, named only at its point",
-            vec![b],
-            vec![Closes],
-        ),
-        (
-            "control: a relaunch that resumed A, named only at its point",
-            vec![resumed_a],
-            vec![Restores],
-        ),
-        (
-            "another process whose conversation the host does not name yet, then A's, each named \
-             only at its point",
-            vec![unnamed, resumed_a],
-            vec![Holds, Restores],
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (dir, ledger) = switched(&format!("late-{n}"), true);
-        let got = run(&ledger, &agents, false, None, true);
-        let keeps = !want.contains(&Closes);
-        let rows = closed(&ledger);
-        let open = crate::supervise::approvals::open_model_switch(&ledger, Some(SID)).is_some();
-        let _ = std::fs::remove_dir_all(&dir);
-        if got != want || rows != usize::from(!keeps) || open != keeps {
-            wrong.push(format!(
-                "{case}: {got:?}, closing rows {rows}, open for the loop after {open}"
-            ));
-        }
-    }
-    let (dir, ledger) = switched("legacy", false);
-    let got = run(&ledger, &[b], false, None, false);
-    if got != [Restores] || closed(&ledger) != 0 {
-        wrong.push(format!(
-            "control: a switch no loop scoped to a process, as an older build wrote it: {got:?}"
-        ));
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    let (dir, ledger) = switched("same-loop", false);
-    let got = run(&ledger, &[p1, b], false, None, false);
-    if got != [Restores, Closes] {
-        wrong.push(format!(
-            "the loop that saw the relaunched process, at B's point: {got:?}"
-        ));
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-#[test]
 fn a_finished_task_opened_again_is_asked_about_at_the_limit_its_turn_ends_on() {
     let limited = || Phase::Limited {
         message: String::new(),
@@ -23440,10 +23003,7 @@ fn a_loop_at_a_buckets_open_wall_waits_on_its_reset_beside_the_act_it_takes_up()
     const RESET: i64 = 1_792_279_200;
     let now = RESET - 2 * 86_400;
     let opts = SuperviseOpts {
-        policy: SupervisorConfig {
-            model_fallback: None,
-            ..owners_policy()
-        },
+        policy: owners_policy(),
         ..auto(30)
     };
     let armed = fx::screen(fx::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
@@ -23572,10 +23132,7 @@ fn a_limit_its_own_try_met_again_stays_open_for_a_loop_that_follows() {
     const WINDOW_RESET: i64 = TEST_NOW + 6 * 3600 + 40 * 60;
     const BUCKET_RESET: i64 = 1_792_279_200;
     let opts = SuperviseOpts {
-        policy: SupervisorConfig {
-            model_fallback: None,
-            ..owners_policy()
-        },
+        policy: owners_policy(),
         ..auto(30)
     };
     let resumed = fx::screen(fx::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300);
@@ -23753,10 +23310,7 @@ fn a_buckets_notice_cancelled_before_the_loops_first_read_answers_its_try() {
     use aterm_phase::prompt::fixtures as fx;
     const RESET: i64 = 1_792_279_200;
     let opts = SuperviseOpts {
-        policy: SupervisorConfig {
-            model_fallback: None,
-            ..owners_policy()
-        },
+        policy: owners_policy(),
         ..auto(30)
     };
     let armed = fx::screen(fx::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
@@ -23954,10 +23508,7 @@ fn the_end_of_a_wall_its_try_closed_is_written_for_the_refused_moves_latch() {
     };
     const RESET: i64 = TEST_NOW + 6 * 3600 + 40 * 60;
     let opts = SuperviseOpts {
-        policy: SupervisorConfig {
-            model_fallback: None,
-            ..owners_policy()
-        },
+        policy: owners_policy(),
         ..auto(30)
     };
     let armed = auto_continue_wall_at("3:35pm");
@@ -24051,7 +23602,6 @@ fn a_limits_try_the_workers_work_answered_is_no_seed_of_a_loop_that_follows() {
     use crate::supervise::policy::turn_end::{RULE_LIMIT_RESUME, decide_turn_end};
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
-            model_fallback: None,
             usage_credits: true,
             ..owners_policy()
         },
@@ -24291,7 +23841,6 @@ fn a_limits_track_dropped_with_no_work_ends_its_try_for_a_loop_that_follows() {
     use crate::supervise::policy::turn_end::{RULE_LIMIT_RESUME, decide_turn_end};
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
-            model_fallback: None,
             usage_credits: true,
             ..owners_policy()
         },
@@ -24495,7 +24044,6 @@ fn a_wall_read_inside_a_tries_take_window_is_no_try_met_again_where_it_is_taken(
     use crate::supervise::policy::turn_end::{RULE_LIMIT_RESUME, decide_turn_end};
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
-            model_fallback: None,
             usage_credits: true,
             ..owners_policy()
         },
@@ -24696,645 +24244,6 @@ fn a_wall_read_inside_a_tries_take_window_is_no_try_met_again_where_it_is_taken(
 }
 
 #[test]
-fn a_bucket_the_fallbacks_relaunch_left_is_no_wall_of_the_relaunched_session() {
-    use crate::supervise::approvals::{Ledger, Outcome, model_switch_reason, open_wall};
-    use crate::supervise::policy::turn_end::{
-        RULE_CONTINUE, RULE_MODEL_FALLBACK, Restart, decide_turn_end,
-    };
-    use aterm_phase::prompt::fixtures as fx;
-    const RESET: i64 = 1_792_279_200;
-    let now = RESET - 2 * 86_400;
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(30)
-    };
-    assert_eq!(opts.policy.model_fallback.as_deref(), Some("opus"));
-    let armed = fx::screen(fx::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
-    let redraw = |model: &str| -> Vec<String> {
-        armed
-            .iter()
-            .filter(|r| {
-                ![
-                    "Usage limit reached",
-                    "Continuing automatically",
-                    "/rate-limit-options",
-                    "Claude Code will continue automatically",
-                    "to cancel the wait",
-                ]
-                .iter()
-                .any(|g| r.contains(g))
-            })
-            .map(|r| {
-                r.replace("Sonnet 5.5 · Claude API", "Opus 5.5 · Claude API")
-                    .replace("your Sonnet limit", &format!("your {model} limit"))
-            })
-            .collect()
-    };
-    let redrawn = redraw("Sonnet");
-    let met = {
-        let mut rows = redrawn.clone();
-        let top = rows
-            .iter()
-            .position(|r| r.starts_with('─'))
-            .expect("the composer's frame");
-        rows.splice(
-            top..top,
-            [
-                "❯ keep going",
-                "  ⎿  You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles)",
-                "",
-                "✻ Churned for 0s · done 8:49 AM",
-                "",
-            ]
-            .map(str::to_string),
-        );
-        rows
-    };
-    type Decided = Option<(i64, Option<&'static str>)>;
-    let decided = |s: &mut Session<'_, Mock>, rows: &[String], seq: u64| -> Decided {
-        let point = point_at(s, rows.to_vec(), seq);
-        match s
-            .turn_end_at_point(&point, None, &opts)
-            .expect("a decision")
-        {
-            TurnEndAction::WaitUntil { until, .. } => {
-                let r = s.turn_end_reading(&point.screen, None, &opts);
-                Some((
-                    s.unix_of(until),
-                    decide_turn_end(&s.turn_end, &r, &opts.policy, until).rule_id(),
-                ))
-            }
-            other => Some((s.now_unix(), other.rule_id())),
-        }
-    };
-    let successor = |ledger: &std::path::Path, at: i64, rows: &[String]| -> Decided {
-        let mut m = Mock::new(vec![rows.to_vec()]);
-        let mut s = session(&mut m, Some("@s-1".to_string()));
-        s.set_clock(at, PDT);
-        s.set_zone_lookup(test_zones);
-        s.ledger = Ledger::open(Some(ledger), Some("@s-1"), &mut Vec::new());
-        s.seed_model_switch(ledger);
-        s.seed_wall_memory(open_wall(ledger, Some("@s-1")));
-        decided(&mut s, rows, 101)
-    };
-    let short_turn = |d: Decided, from: i64| d == Some((from + 120, Some(RULE_CONTINUE)));
-    let waits_out = |d: Decided| d.is_some_and(|(until, _)| until >= RESET);
-    let mut wrong = Vec::new();
-    for (case, model) in [
-        ("the bucket the relaunch left", "Sonnet"),
-        ("control: another model's bucket", "Opus"),
-        ("control: a point since the relaunch", "Sonnet"),
-    ] {
-        let moved_on = case.ends_with("since the relaunch");
-        let (dir, ledger) = ledger_at(&format!("bucket-left-{model}-{moved_on}"));
-        let mut m = Mock::new(vec![armed.clone()]);
-        let mut s = session(&mut m, Some("@s-1".to_string()));
-        s.set_zone_lookup(test_zones);
-        s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
-        s.set_turn_end_timing(TurnEndTiming {
-            take_within: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-        s.set_clock(now, PDT);
-        let _ = decided(&mut s, &armed, 100);
-        let p = point_at(&s, armed.clone(), 101);
-        let r = s.turn_end_reread(&p.screen, &opts);
-        s.turn_end.restarted(
-            &Restart::Model {
-                to: "opus".to_string(),
-            },
-            true,
-            &r,
-            Instant::now(),
-        );
-        s.ledger_row(
-            RULE_MODEL_FALLBACK,
-            Outcome::Typed,
-            "relaunch --model opus",
-            &model_switch_reason(Some("sonnet"), Some(RESET), now),
-            101,
-        );
-        let screen = redraw(model);
-        if moved_on {
-            s.set_clock(now + 20, PDT);
-            let _ = decided(&mut s, &ended("Here is the summary you asked for."), 102);
-            s.set_clock(now + 30, PDT);
-            let again = decided(&mut s, &met, 103);
-            drop(s);
-            let _ = std::fs::remove_dir_all(&dir);
-            if !waits_out(again) {
-                wrong.push(format!("{case}: {again:?}"));
-            }
-            continue;
-        }
-        s.set_clock(now + 30, PDT);
-        let first = decided(&mut s, &screen, 102);
-        let open = open_wall(&ledger, Some("@s-1")).is_some();
-        let next = successor(&ledger, now + 60, &screen);
-        if model == "Opus" {
-            if !waits_out(first) || !waits_out(next) || !open {
-                wrong.push(format!(
-                    "{case}: first loop {first:?}, open wall {open}, successor {next:?}"
-                ));
-            }
-            drop(s);
-            let _ = std::fs::remove_dir_all(&dir);
-            continue;
-        }
-        if !short_turn(first, now + 30) || open || !short_turn(next, now + 60) {
-            wrong.push(format!(
-                "{case}: first loop {first:?}, open wall {open}, successor {next:?}"
-            ));
-        }
-        s.set_clock(now + 150, PDT);
-        let p = point_at(&s, screen.clone(), 103);
-        let a = s
-            .turn_end_at_point(&p, None, &opts)
-            .expect("the continuation");
-        assert_eq!(a.rule_id(), Some(RULE_CONTINUE), "{case}");
-        s.pass_wake_settle();
-        s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
-            .expect("typed");
-        let early = successor(&ledger, now + 160, &met);
-        s.set_clock(now + 180, PDT);
-        let again = decided(&mut s, &met, 104);
-        drop(s);
-        let after = successor(&ledger, now + 240, &met);
-        let _ = std::fs::remove_dir_all(&dir);
-        if !waits_out(early) || !waits_out(again) || !waits_out(after) {
-            wrong.push(format!(
-                "{case}, the continuation met the bucket: a successor before its read \
-                 {early:?}, first loop {again:?}, a successor after {after:?}"
-            ));
-        }
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-fn bucket_notice_transcript(prompt: &str, notice: &str, at: i64) -> String {
-    let stamp = crate::harness::usage::rfc3339_utc(at);
-    include_str!("fixtures/claude-2.1.294-transcript-session-limit.jsonl")
-        .lines()
-        .skip(1)
-        .filter(|l| !l.contains("\"subtype\":\"informational\""))
-        .map(|l| {
-            let mut row = l
-                .replace("seventh try", prompt)
-                .replace(
-                    "You've hit your session limit · resets 11:33am (America/Los_Angeles)",
-                    notice,
-                )
-                .replace("\"five_hour\"", "\"seven_day_sonnet\"");
-            for ms in ["921", "951", "952", "953"] {
-                row = row.replace(
-                    &format!("\"2026-10-08T16:34:58.{ms}Z\""),
-                    &format!("\"{stamp}\""),
-                );
-            }
-            row
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
-}
-
-#[test]
-fn a_turn_asked_on_the_fallback_is_written_for_a_loop_that_follows() {
-    use crate::supervise::approvals::{Ledger, open_wall};
-    use crate::supervise::policy::turn_end::{HostTurn, RULE_CONTINUE, decide_turn_end};
-    use aterm_phase::prompt::fixtures as fx;
-    const RESET: i64 = 1_792_279_200;
-    let now = RESET - 2 * 86_400;
-    let armed = fx::screen(fx::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
-    let redrawn: Vec<String> = armed
-        .iter()
-        .filter(|r| {
-            ![
-                "Usage limit reached",
-                "Continuing automatically",
-                "/rate-limit-options",
-                "Claude Code will continue automatically",
-                "to cancel the wait",
-            ]
-            .iter()
-            .any(|g| r.contains(g))
-        })
-        .map(|r| r.replace("Sonnet 5.5 · Claude API", "Opus 5.5 · Claude API"))
-        .collect();
-    let above_composer = |base: &[String], add: &[&str]| -> Vec<String> {
-        let mut rows = base.to_vec();
-        let top = rows
-            .iter()
-            .position(|r| r.starts_with('─'))
-            .expect("the composer's frame");
-        rows.splice(top..top, add.iter().map(|s| (*s).to_string()));
-        rows
-    };
-    let to_sonnet = above_composer(
-        &redrawn,
-        &["❯ /model sonnet", "  ⎿  Set model to Sonnet 5.5", ""],
-    );
-    let met = |prompt: &str, base: &[String]| {
-        above_composer(
-            base,
-            &[
-                &format!("❯ {prompt}"),
-                "  ⎿  You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles)",
-                "",
-                "✻ Churned for 0s · done 8:49 AM",
-                "",
-            ],
-        )
-    };
-    type Decided = Option<(i64, Option<&'static str>)>;
-    let decided = |s: &mut Session<'_, Mock>,
-                   rows: &[String],
-                   seq: u64,
-                   worked: Option<Duration>,
-                   opts: &SuperviseOpts|
-     -> Decided {
-        let point = point_at(s, rows.to_vec(), seq);
-        match s
-            .turn_end_at_point(&point, worked, opts)
-            .expect("a decision")
-        {
-            TurnEndAction::WaitUntil { until, .. } => {
-                let r = s.turn_end_reading(&point.screen, None, opts);
-                Some((
-                    s.unix_of(until),
-                    decide_turn_end(&s.turn_end, &r, &opts.policy, until).rule_id(),
-                ))
-            }
-            other => Some((s.now_unix(), other.rule_id())),
-        }
-    };
-    let before = bucket_notice_transcript(
-        "carry on with the task",
-        "You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles)",
-        now - 600,
-    );
-    let successor_host = AccountHost::scripted(&[None], &[]);
-    *successor_host.tail.lock().unwrap() = Some(before.clone());
-    let plain = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(30)
-    };
-    let known_plain = SuperviseOpts {
-        idle_host: Some(successor_host as Arc<dyn IdleHost>),
-        ..plain.clone()
-    };
-    let successor =
-        |ledger: &std::path::Path, at: i64, rows: &[String], opts: &SuperviseOpts| -> Decided {
-            let mut m = Mock::new(vec![rows.to_vec()]);
-            let mut s = session(&mut m, Some("@s-1".to_string()));
-            s.set_mono_standing();
-            s.set_clock(at, PDT);
-            s.set_zone_lookup(test_zones);
-            s.ledger = Ledger::open(Some(ledger), Some("@s-1"), &mut Vec::new());
-            s.seed_model_switch(ledger);
-            s.seed_wall_memory(open_wall(ledger, Some("@s-1")));
-            decided(&mut s, rows, 101, None, opts)
-        };
-    let waits_out = |d: Decided| d.is_some_and(|(until, _)| until >= RESET);
-    let mut wrong = Vec::new();
-    for known in [false, true] {
-        let plain = if known {
-            known_plain.clone()
-        } else {
-            plain.clone()
-        };
-        for (n, case) in [
-            "a person's /model sonnet, then their prompt met by the bucket",
-            "a person's exchange, then their prompt met by the bucket",
-            "the host's carry-on typed inside the relaunch, met by the bucket",
-            "control: the redraw, nothing between",
-            "the host's carry-on typed at its own step, met by the bucket",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let carried = n == 2;
-            let (dir, ledger) = ledger_at(&format!("fallback-asked-{known}-{n}"));
-            let host =
-                AccountHost::scripted(&[None], &[if carried { "continued" } else { "relaunched" }]);
-            if known {
-                *host.tail.lock().unwrap() = Some(before.clone());
-            }
-            let opts = SuperviseOpts {
-                idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-                ..plain.clone()
-            };
-            let mut m = Mock::new(vec![armed.clone()]);
-            let mut s = session(&mut m, Some("@s-1".to_string()));
-            s.set_mono_standing();
-            s.set_zone_lookup(test_zones);
-            s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
-            s.set_turn_end_timing(TurnEndTiming {
-                take_within: Duration::ZERO,
-                ..TurnEndTiming::default()
-            });
-            s.set_clock(now, PDT);
-            let p = point_at(&s, armed.clone(), 100);
-            let a = s.turn_end_at_point(&p, None, &opts).expect("the fallback");
-            assert!(
-                matches!(&a, TurnEndAction::Restart { why: Restart::Model { to }, .. } if to == "opus"),
-                "{case}: {a:?}"
-            );
-            s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
-                .expect("relaunched");
-            assert_eq!(host.said("restart"), ["restart:model"], "{case}");
-            let (last, early) = match n {
-                0 | 1 => {
-                    s.set_clock(now + 30, PDT);
-                    let _ = decided(&mut s, &redrawn, 102, None, &opts);
-                    s.set_clock(now + 60, PDT);
-                    let last = if n == 0 {
-                        let _ = decided(&mut s, &to_sonnet, 103, None, &opts);
-                        met("please run the integration tests", &to_sonnet)
-                    } else {
-                        let _ = decided(
-                            &mut s,
-                            &ended("Here is the summary you asked for."),
-                            103,
-                            Some(Duration::from_secs(20)),
-                            &opts,
-                        );
-                        met("now do it on sonnet", &to_sonnet)
-                    };
-                    let early = successor(&ledger, now + 85, &last, &plain);
-                    s.set_clock(now + 90, PDT);
-                    (last, early)
-                }
-                2 | 4 => {
-                    if n == 4 {
-                        s.host_turn(HostTurn::CarryOn, 102);
-                    }
-                    let last = met("Continue from where you left off.", &redrawn);
-                    let early = successor(&ledger, now + 25, &last, &plain);
-                    s.set_clock(now + 30, PDT);
-                    (last, early)
-                }
-                _ => {
-                    let early = successor(&ledger, now + 25, &redrawn, &plain);
-                    s.set_clock(now + 30, PDT);
-                    (redrawn.clone(), early)
-                }
-            };
-            let first = decided(
-                &mut s,
-                &last,
-                104,
-                n.lt(&2).then(|| Duration::from_secs(1)),
-                &opts,
-            );
-            drop(s);
-            let after = successor(&ledger, now + 120, &last, &plain);
-            let third = successor(&ledger, now + 600, &last, &plain);
-            let _ = std::fs::remove_dir_all(&dir);
-            let ok = if n != 3 {
-                [early, first, after, third].into_iter().all(waits_out)
-            } else {
-                let first_ok = first == Some((now + 30 + 120, Some(RULE_CONTINUE)));
-                early == Some((now + 25 + 120, Some(RULE_CONTINUE)))
-                    && first_ok
-                    && after == Some((now + 120 + 120, Some(RULE_CONTINUE)))
-            };
-            if !ok {
-                wrong.push(format!(
-                    "{case}, known={known}: a successor before the first loop's read {early:?}, the first loop \
-                 {first:?}, a successor after {after:?}, one after that {third:?}"
-                ));
-            }
-        }
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-#[test]
-fn a_buckets_notice_the_transcript_wrote_after_the_relaunch_is_the_wall() {
-    use crate::supervise::approvals::{Ledger, open_model_switch, open_wall};
-    use crate::supervise::policy::turn_end::{RULE_CONTINUE, decide_turn_end};
-    use aterm_phase::prompt::fixtures as fx;
-    const RESET: i64 = 1_792_279_200;
-    let now = RESET - 2 * 86_400;
-    let armed = fx::screen(fx::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
-    let redrawn: Vec<String> = armed
-        .iter()
-        .filter(|r| {
-            ![
-                "Usage limit reached",
-                "Continuing automatically",
-                "/rate-limit-options",
-                "Claude Code will continue automatically",
-                "to cancel the wait",
-            ]
-            .iter()
-            .any(|g| r.contains(g))
-        })
-        .map(|r| r.replace("Sonnet 5.5 · Claude API", "Opus 5.5 · Claude API"))
-        .collect();
-    let notice = "You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles)";
-    let met = {
-        let mut rows = redrawn.clone();
-        let top = rows
-            .iter()
-            .position(|r| r.starts_with('─'))
-            .expect("the composer's frame");
-        rows.splice(
-            top..top,
-            [
-                "❯ please run the integration tests".to_string(),
-                format!("  ⎿  {notice}"),
-                String::new(),
-                "✻ Churned for 0s · done 8:49 AM".to_string(),
-                String::new(),
-            ],
-        );
-        rows
-    };
-    let tail = |prompt: &str, at: i64| bucket_notice_transcript(prompt, notice, at);
-    let before = tail("carry on with the task", now - 600);
-    let after = tail("please run the integration tests", now + 85);
-    type Decided = Option<(i64, Option<&'static str>)>;
-    let decided = |s: &mut Session<'_, Mock>,
-                   rows: &[String],
-                   seq: u64,
-                   worked: Option<Duration>,
-                   opts: &SuperviseOpts|
-     -> Decided {
-        let point = point_at(s, rows.to_vec(), seq);
-        match s
-            .turn_end_at_point(&point, worked, opts)
-            .expect("a decision")
-        {
-            TurnEndAction::WaitUntil { until, .. } => {
-                let r = s.turn_end_reading(&point.screen, None, opts);
-                Some((
-                    s.unix_of(until),
-                    decide_turn_end(&s.turn_end, &r, &opts.policy, until).rule_id(),
-                ))
-            }
-            other => Some((s.now_unix(), other.rule_id())),
-        }
-    };
-    let hosted = |transcript: &str, answers: &[&'static str]| {
-        let host = AccountHost::scripted(&[None], answers);
-        *host.tail.lock().unwrap() = Some(transcript.to_string());
-        let opts = SuperviseOpts {
-            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            policy: owners_policy(),
-            ..auto(30)
-        };
-        (host, opts)
-    };
-    let successor =
-        |ledger: &std::path::Path, at: i64, rows: &[String], transcript: &str| -> Decided {
-            let (_host, opts) = hosted(transcript, &["relaunched"]);
-            let mut m = Mock::new(vec![rows.to_vec()]);
-            let mut s = session(&mut m, Some("@s-1".to_string()));
-            s.set_clock(at, PDT);
-            s.set_mono_standing();
-            s.set_zone_lookup(test_zones);
-            s.ledger = Ledger::open(Some(ledger), Some("@s-1"), &mut Vec::new());
-            s.seed_model_switch(ledger);
-            s.seed_wall_memory(open_wall(ledger, Some("@s-1")));
-            decided(&mut s, rows, 101, None, &opts)
-        };
-    let waits_out = |d: Decided| d.is_some_and(|(until, _)| until >= RESET);
-    let short_turn = |d: Decided, from: i64| d == Some((from + 120, Some(RULE_CONTINUE)));
-    let mut wrong = Vec::new();
-    for (n, case) in [
-        "a person's prompt answered by the bucket, no point between",
-        "control: the redraw",
-        "the relaunch adopted at the next ask, a person's prompt answered by the bucket before it",
-        "control: the relaunch adopted at the next ask, the redraw",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let answered = !case.ends_with("the redraw");
-        let adopted_later = case.contains("the next ask");
-        let answers: &[&'static str] = if adopted_later {
-            &["wait:resume", "relaunched"]
-        } else {
-            &["relaunched"]
-        };
-        let (dir, ledger) = ledger_at(&format!("bucket-written-after-{n}"));
-        let (host, opts) = hosted(&before, answers);
-        let mut m = Mock::new(vec![armed.clone()]);
-        let mut s = session(&mut m, Some("@s-1".to_string()));
-        s.set_zone_lookup(test_zones);
-        s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
-        s.set_turn_end_timing(TurnEndTiming {
-            take_within: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-        s.set_clock(now, PDT);
-        s.set_mono_standing();
-        let p = point_at(&s, armed.clone(), 100);
-        let a = s.turn_end_at_point(&p, None, &opts).expect("the fallback");
-        assert!(
-            matches!(&a, TurnEndAction::Restart { why: Restart::Model { to }, .. } if to == "opus"),
-            "{case}: {a:?}"
-        );
-        s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
-            .expect("relaunched");
-        assert_eq!(host.said("restart"), ["restart:model"], "{case}");
-        if adopted_later {
-            let screen = if answered {
-                *host.tail.lock().unwrap() =
-                    Some(tail("please run the integration tests", now + 60));
-                met.clone()
-            } else {
-                redrawn.clone()
-            };
-            s.set_clock(now + 90, PDT);
-            let p = point_at(&s, screen, 101);
-            let a = s
-                .turn_end_at_point(&p, None, &opts)
-                .expect("the fallback again");
-            assert!(
-                matches!(
-                    &a,
-                    TurnEndAction::Restart {
-                        why: Restart::Model { .. },
-                        ..
-                    }
-                ),
-                "{case}: {a:?}"
-            );
-            s.pass_wake_settle();
-            s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
-                .expect("adopted");
-            assert_eq!(
-                host.said("restart"),
-                ["restart:model", "restart:model"],
-                "{case}"
-            );
-            assert!(
-                open_model_switch(&ledger, Some("@s-1")).is_some_and(|o| o.made_unix == now),
-                "{case}: the relaunch made at the run's first ask"
-            );
-            if answered {
-                s.set_clock(now + 100, PDT);
-                s.pass_wake_settle();
-                let first = decided(&mut s, &met, 102, None, &opts);
-                drop(s);
-                let after_60 = tail("please run the integration tests", now + 60);
-                let later = successor(&ledger, now + 120, &met, &after_60);
-                let third = successor(&ledger, now + 600, &met, &after_60);
-                let _ = std::fs::remove_dir_all(&dir);
-                if ![first, later, third].into_iter().all(waits_out) {
-                    wrong.push(format!(
-                        "{case}: the first loop {first:?}, a successor {later:?}, one after \
-                         that {third:?}"
-                    ));
-                }
-                continue;
-            }
-        }
-        let redraw_at = if adopted_later { now + 120 } else { now + 30 };
-        s.set_clock(redraw_at, PDT);
-        s.pass_wake_settle();
-        let redraw = decided(&mut s, &redrawn, 102, None, &opts);
-        if !answered {
-            drop(s);
-            let next = successor(&ledger, redraw_at + 30, &redrawn, &before);
-            let _ = std::fs::remove_dir_all(&dir);
-            let continues = |d: Decided| matches!(d, Some((at, Some(RULE_CONTINUE))) if at < RESET);
-            let first_ok = if adopted_later {
-                continues(redraw)
-            } else {
-                short_turn(redraw, redraw_at)
-            };
-            if !first_ok || !short_turn(next, redraw_at + 30) {
-                wrong.push(format!(
-                    "{case}: the first loop {redraw:?}, a successor {next:?}"
-                ));
-            }
-            continue;
-        }
-        *host.tail.lock().unwrap() = Some(after.clone());
-        let early = successor(&ledger, now + 88, &met, &after);
-        s.set_clock(now + 90, PDT);
-        let first = decided(&mut s, &met, 103, Some(Duration::from_secs(1)), &opts);
-        drop(s);
-        let later = successor(&ledger, now + 120, &met, &after);
-        let third = successor(&ledger, now + 600, &met, &after);
-        let _ = std::fs::remove_dir_all(&dir);
-        if !short_turn(redraw, now + 30) || ![early, first, later, third].into_iter().all(waits_out)
-        {
-            wrong.push(format!(
-                "{case}: the redraw {redraw:?}; a successor before the first loop's read \
-                 {early:?}, the first loop {first:?}, a successor after {later:?}, one after \
-                 that {third:?}"
-            ));
-        }
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-#[test]
 fn a_limits_try_at_a_bucket_is_the_try_a_successor_backs_off_from() {
     use crate::supervise::approvals::{Ledger, OpenWall, Outcome, Row};
     use crate::supervise::policy::turn_end::{RULE_LIMIT_RESUME, decide_turn_end};
@@ -25344,10 +24253,7 @@ fn a_limits_try_at_a_bucket_is_the_try_a_successor_backs_off_from() {
     let now = RESET + 20 * 60;
     let bucket = WallKind::ModelBucket { consent: false };
     let opts = SuperviseOpts {
-        policy: SupervisorConfig {
-            model_fallback: None,
-            ..owners_policy()
-        },
+        policy: owners_policy(),
         ..auto(30)
     };
     let done = "All done: the change is committed and pushed, and every suite passes.";
@@ -30828,7 +29734,6 @@ fn a_tries_own_short_turn_ending_on_its_limit_is_where_its_next_rung_counts_from
     use crate::supervise::policy::turn_end::{RULE_LIMIT_RESUME, decide_turn_end};
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
-            model_fallback: None,
             usage_credits: true,
             ..owners_policy()
         },
@@ -31023,7 +29928,6 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
     use crate::supervise::policy::turn_end::{RULE_LIMIT_RESUME, decide_turn_end};
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
-            model_fallback: None,
             usage_credits: true,
             ..owners_policy()
         },
@@ -31276,160 +30180,62 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A RESTART OF ANOTHER KIND BEGINS A RUN OF ITS OWN: after a restart of one kind the host put
+/// off, whether its run still stands or another decision ended it, a memory restart decided at a
+/// later point is asked at its own second, as a run of its own, never as the earlier run's ask;
+/// with no restart before it, it is asked at that same second.
 #[test]
 fn a_restart_of_another_kind_begins_a_run_of_its_own() {
-    use crate::supervise::approvals::{Ledger, open_model_switch};
-    use crate::supervise::policy::turn_end::{RULE_CONTINUE, Restart};
+    use crate::supervise::policy::turn_end::{PermissionTo, Restart};
     use aterm_phase::prompt::fixtures as fx;
-    const RESET: i64 = 1_792_279_200;
-    let now = RESET - 2 * 86_400;
-    let armed = fx::screen(fx::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
-    let redrawn: Vec<String> = armed
-        .iter()
-        .filter(|r| {
-            ![
-                "Usage limit reached",
-                "Continuing automatically",
-                "/rate-limit-options",
-                "Claude Code will continue automatically",
-                "to cancel the wait",
-            ]
-            .iter()
-            .any(|g| r.contains(g))
-        })
-        .map(|r| r.replace("Sonnet 5.5 · Claude API", "Opus 5.5 · Claude API"))
-        .collect();
-    let notice = "You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles)";
-    let tail = |prompt: &str, at: i64| -> String {
-        let stamp = crate::harness::usage::rfc3339_utc(at);
-        include_str!("fixtures/claude-2.1.294-transcript-session-limit.jsonl")
-            .lines()
-            .skip(1)
-            .filter(|l| !l.contains("\"subtype\":\"informational\""))
-            .map(|l| {
-                let mut row = l
-                    .replace("seventh try", prompt)
-                    .replace(
-                        "You've hit your session limit · resets 11:33am (America/Los_Angeles)",
-                        notice,
-                    )
-                    .replace("\"five_hour\"", "\"seven_day_sonnet\"");
-                for ms in ["921", "951", "952", "953"] {
-                    row = row.replace(
-                        &format!("\"2026-10-08T16:34:58.{ms}Z\""),
-                        &format!("\"{stamp}\""),
-                    );
-                }
-                row
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n"
-    };
-    let met = tail("please run the integration tests", now - 300);
-    let served = {
-        let mut r = rows(&[
-            "❯ please run the integration tests",
-            "",
-            "⏺ Ran them: all green.",
-            "",
-            "✻ Worked for 4m 0s · done 8:40 AM",
-            "",
-        ]);
-        r.extend(composer("  ? for shortcuts"));
-        r
-    };
+    const RULE_UNDER_TEST: &str = "restart-under-test@v0";
+    let now = TEST_NOW + 3600;
     let mut wrong = Vec::new();
-    for (n, before) in [
-        "a memory restart's run",
-        "a fallback's run another decision ended",
+    for before in [
+        "a click's run",
+        "a click's run another decision ended",
         "none",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let memory_first = before == "a memory restart's run";
-        let fallback_first = before.starts_with("a fallback's");
-        let answers: &[&'static str] = if before == "none" {
-            &["relaunched"]
-        } else {
-            &["wait:held", "relaunched"]
-        };
-        let host = AccountHost::scripted(&[None], answers);
-        *host.tail.lock().unwrap() = Some(met.clone());
+    ] {
+        let host = AccountHost::scripted(&[None], &["wait:held", "wait:held"]);
         let opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             policy: owners_policy(),
             ..auto(30)
         };
-        let (dir, ledger) = ledger_at(&format!("restart-kinds-{n}"));
-        let mut m = Mock::new(vec![armed.clone()]);
+        let banner = fx::screen(fx::MEMORY_BANNER_IDLE);
+        let mut m = Mock::new(vec![banner.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_zone_lookup(test_zones);
-        s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
-        s.set_turn_end_timing(TurnEndTiming {
-            take_within: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-        if memory_first {
+        if before != "none" {
             s.set_clock(now - 900, PDT);
-            let p = point_at(&s, fx::screen(fx::MEMORY_BANNER_IDLE), 90);
-            let a = s
-                .turn_end_at_point(&p, None, &opts)
-                .expect("the memory restart");
-            assert!(
-                matches!(
-                    &a,
-                    TurnEndAction::Restart {
-                        why: Restart::Memory,
-                        ..
-                    }
-                ),
-                "{a:?}"
-            );
+            let p = point_at(&s, banner.clone(), 90);
+            let click = TurnEndAction::Restart {
+                why: Restart::Permission {
+                    to: PermissionTo::Settings,
+                    conversation: "conv-1".to_string(),
+                },
+                rule_id: RULE_UNDER_TEST,
+                otherwise: Box::new(TurnEndAction::Nothing),
+            };
             s.pass_wake_settle();
-            s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
+            s.turn_end_execute(&p, click, &opts, &[], &mut Alone)
                 .expect("waits");
-        }
-        if fallback_first {
-            s.set_clock(now - 900, PDT);
-            let p = point_at(&s, armed.clone(), 90);
-            let a = s
-                .turn_end_at_point(&p, Some(Duration::from_secs(60)), &opts)
-                .expect("the fallback");
-            assert!(
-                matches!(
-                    &a,
-                    TurnEndAction::Restart {
-                        why: Restart::Model { .. },
-                        ..
-                    }
-                ),
-                "{a:?}"
-            );
-            s.pass_wake_settle();
-            s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
-                .expect("waits");
-            s.set_clock(now - 600, PDT);
-            let p = point_at(&s, served.clone(), 91);
-            let a = s
-                .turn_end_at_point(&p, Some(Duration::from_secs(240)), &opts)
-                .expect("the served turn");
-            assert!(!matches!(&a, TurnEndAction::Restart { .. }), "{a:?}");
-            s.pass_wake_settle();
-            s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
-                .expect("decided");
+            if before.ends_with("ended") {
+                s.set_clock(now - 600, PDT);
+                s.turn_end_execute(&p, TurnEndAction::Nothing, &opts, &[], &mut Alone)
+                    .expect("another act");
+            }
         }
         s.set_clock(now, PDT);
-        let p = point_at(&s, armed.clone(), 100);
+        let p = point_at(&s, banner.clone(), 100);
         let a = s
-            .turn_end_at_point(&p, Some(Duration::from_secs(60)), &opts)
-            .expect("the fallback");
+            .turn_end_at_point(&p, None, &opts)
+            .expect("the memory restart");
         assert!(
             matches!(
                 &a,
                 TurnEndAction::Restart {
-                    why: Restart::Model { .. },
+                    why: Restart::Memory,
                     ..
                 }
             ),
@@ -31437,256 +30243,17 @@ fn a_restart_of_another_kind_begins_a_run_of_its_own() {
         );
         s.pass_wake_settle();
         s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
-            .expect("relaunched");
-        let made = open_model_switch(&ledger, Some("@s-1")).map(|o| o.made_unix);
-        s.set_clock(now + 30, PDT);
-        s.pass_wake_settle();
-        let point = point_at(&s, redrawn.clone(), 102);
-        let redraw = s
-            .turn_end_at_point(&point, None, &opts)
-            .expect("a decision");
-        let redraw = match redraw {
-            TurnEndAction::WaitUntil { until, .. } => {
-                let r = s.turn_end_reading(&point.screen, None, &opts);
-                (
-                    s.unix_of(until),
-                    crate::supervise::policy::turn_end::decide_turn_end(
-                        &s.turn_end,
-                        &r,
-                        &opts.policy,
-                        until,
-                    )
-                    .rule_id(),
-                )
-            }
-            other => (s.now_unix(), other.rule_id()),
-        };
-        drop(s);
-        let _ = std::fs::remove_dir_all(&dir);
-        if made != Some(now) || redraw.1 != Some(RULE_CONTINUE) || redraw.0 > now + 30 + 120 {
-            wrong.push(format!(
-                "{before} before: made={:?}, the redraw decides {:?} (now{:+}s)",
-                made.map(|m| m - now),
-                redraw.1,
-                redraw.0 - now
-            ));
-        }
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-/// A FALLBACK'S RELAUNCH IN FLIGHT WHEN ITS LOOP ENDS IS MADE AT ITS FIRST ASK: the loop's move
-/// onto the fallback answered a wait once its ask had claimed the conversation's record
-/// (`wait:resume`, claimed), and the loop ended there. The journal's restart note says the claim
-/// (`claimed=<second>`, [`super::super::turn_end_loop::journaled_open_moves`]), so the next loop
-/// restores the run (`Session::seed_open_move_in`) and asks the move as the first loop asked
-/// it: the relaunch is booked made at that first ask, and once booked, no run is left open. With a
-/// person's prompt answered on the fallback, the wall it moved off waits for its reset; with the
-/// redraw alone (CONTROL), the turn end is continued before it.
-#[test]
-fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() {
-    use super::super::turn_end_loop::journaled_open_moves;
-    use crate::supervise::approvals::{Ledger, open_model_switch, open_wall};
-    use crate::supervise::journal::JournalRecord;
-    use crate::supervise::policy::turn_end::{RULE_CONTINUE, Restart, decide_turn_end};
-    use aterm_phase::prompt::fixtures as fx;
-    const RESET: i64 = 1_792_279_200;
-    let now = RESET - 2 * 86_400;
-    let armed = fx::screen(fx::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
-    let redrawn: Vec<String> = armed
-        .iter()
-        .filter(|r| {
-            ![
-                "Usage limit reached",
-                "Continuing automatically",
-                "/rate-limit-options",
-                "Claude Code will continue automatically",
-                "to cancel the wait",
-            ]
-            .iter()
-            .any(|g| r.contains(g))
-        })
-        .map(|r| r.replace("Sonnet 5.5 · Claude API", "Opus 5.5 · Claude API"))
-        .collect();
-    let notice = "You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles)";
-    let met = {
-        let mut rows = redrawn.clone();
-        let top = rows
-            .iter()
-            .position(|r| r.starts_with('─'))
-            .expect("the composer's frame");
-        rows.splice(
-            top..top,
-            [
-                "❯ please run the integration tests".to_string(),
-                format!("  ⎿  {notice}"),
-                String::new(),
-                "✻ Churned for 0s · done 8:49 AM".to_string(),
-                String::new(),
-            ],
-        );
-        rows
-    };
-    let tail = |prompt: &str, at: i64| -> String {
-        let stamp = crate::harness::usage::rfc3339_utc(at);
-        include_str!("fixtures/claude-2.1.294-transcript-session-limit.jsonl")
-            .lines()
-            .skip(1)
-            .filter(|l| !l.contains("\"subtype\":\"informational\""))
-            .map(|l| {
-                let mut row = l
-                    .replace("seventh try", prompt)
-                    .replace(
-                        "You've hit your session limit · resets 11:33am (America/Los_Angeles)",
-                        notice,
-                    )
-                    .replace("\"five_hour\"", "\"seven_day_sonnet\"");
-                for ms in ["921", "951", "952", "953"] {
-                    row = row.replace(
-                        &format!("\"2026-10-08T16:34:58.{ms}Z\""),
-                        &format!("\"{stamp}\""),
-                    );
-                }
-                row
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n"
-    };
-    let before = tail("carry on with the task", now - 600);
-    let journaled = |heard: &Heard| -> String {
-        heard
-            .noted
-            .iter()
-            .map(|line| {
-                JournalRecord::of_line(now * 1000 + 400, Some("@s-1"), line, None).to_json() + "\n"
-            })
-            .collect()
-    };
-    let hosted = |transcript: &str, answers: &[&'static str], claim: RestartClaim| {
-        let host = AccountHost::claiming(&[None], answers, &[claim]);
-        *host.tail.lock().unwrap() = Some(transcript.to_string());
-        let opts = SuperviseOpts {
-            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            policy: owners_policy(),
-            ..auto(30)
-        };
-        (host, opts)
-    };
-    let mut wrong = Vec::new();
-    for (n, answered) in [true, false].into_iter().enumerate() {
-        let (dir, ledger) = ledger_at(&format!("relaunch-in-flight-{n}"));
-        let (host, opts) = hosted(&before, &["wait:resume"], RestartClaim::Taken);
-        let mut m = Mock::new(vec![armed.clone()]);
-        let mut s = session(&mut m, Some("@s-1".to_string()));
-        s.set_zone_lookup(test_zones);
-        s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
-        s.set_turn_end_timing(TurnEndTiming {
-            take_within: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-        s.set_clock(now, PDT);
-        let p = point_at(&s, armed.clone(), 100);
-        let a = s.turn_end_at_point(&p, None, &opts).expect("the fallback");
-        assert!(
-            matches!(
-                &a,
-                TurnEndAction::Restart {
-                    why: Restart::Model { .. },
-                    ..
-                }
-            ),
-            "{a:?}"
-        );
-        let mut heard = Heard::default();
-        s.turn_end_execute(&p, a, &opts, &[], &mut heard)
             .expect("waits");
-        assert_eq!(host.said("restart"), ["restart:model"]);
         drop(s);
-        let journal = journaled(&heard);
-        let run = journaled_open_moves(&journal, Some("@s-1"))
-            .0
-            .and_then(|run| run.claimed.map(|claimed| (run.kind, run.at, claimed)));
-        let (screen, transcript) = if answered {
-            (
-                met.clone(),
-                tail("please run the integration tests", now + 55),
-            )
-        } else {
-            (redrawn.clone(), before.clone())
-        };
-        let (_host2, opts2) = hosted(&transcript, &["relaunched"], RestartClaim::Held);
-        let mut m2 = Mock::new(vec![screen.clone()]);
-        let mut s2 = session(&mut m2, Some("@s-1".to_string()));
-        s2.set_clock(now + 61, PDT);
-        s2.set_zone_lookup(test_zones);
-        s2.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
-        s2.set_turn_end_timing(TurnEndTiming {
-            take_within: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-        s2.seed_model_switch(&ledger);
-        s2.seed_open_move_in(&journal);
-        s2.seed_wall_memory(open_wall(&ledger, Some("@s-1")));
-        let p = point_at(&s2, screen.clone(), 101);
-        let a = s2
-            .turn_end_at_point(&p, None, &opts2)
-            .expect("the relaunch");
-        let asked = matches!(
-            &a,
-            TurnEndAction::Restart {
-                why: Restart::Model { .. },
-                ..
-            }
-        );
-        s2.pass_wake_settle();
-        let mut heard2 = Heard::default();
-        s2.turn_end_execute(&p, a, &opts2, &[], &mut heard2)
-            .expect("relaunched");
-        let made = open_model_switch(&ledger, Some("@s-1")).map(|o| o.made_unix - now);
-        let ended = journaled_open_moves(&(journal.clone() + &journaled(&heard2)), Some("@s-1"))
-            == (None, None);
-        s2.set_clock(now + 70, PDT);
-        s2.pass_wake_settle();
-        let point = point_at(&s2, screen, 102);
-        let decided = match s2
-            .turn_end_at_point(&point, None, &opts2)
-            .expect("a decision")
-        {
-            TurnEndAction::WaitUntil { until, .. } => {
-                let r = s2.turn_end_reading(&point.screen, None, &opts2);
-                (
-                    s2.unix_of(until),
-                    decide_turn_end(&s2.turn_end, &r, &opts2.policy, until).rule_id(),
-                )
-            }
-            other => (s2.now_unix(), other.rule_id()),
-        };
-        drop(s2);
-        let _ = std::fs::remove_dir_all(&dir);
-        let ok = run == Some((Restart::MODEL, now, now))
-            && asked
-            && made == Some(0)
-            && ended
-            && if answered {
-                decided.0 >= RESET
-            } else {
-                decided.1 == Some(RULE_CONTINUE) && decided.0 < RESET
-            };
-        if !ok {
-            wrong.push(format!(
-                "{}: the journal's claimed run {:?}, the successor asked the relaunch {asked}, made=now{:+?} \
-                 (the run ended {ended}), then {:?} at now{:+}s",
-                if answered {
-                    "a person's prompt answered"
-                } else {
-                    "control: the redraw"
-                },
-                run.map(|(kind, at, claimed)| (kind, at - now, claimed - now)),
-                made,
-                decided.1,
-                decided.0 - now
-            ));
+        let asked: Vec<String> = host
+            .asks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| a.word().to_string())
+            .collect();
+        if asked.last() != Some(&format!("memory@{now}")) {
+            wrong.push(format!("{before} before: asked {asked:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -32690,12 +31257,9 @@ fn the_loop_keeps_a_reset_ahead_and_a_models_credits_where_the_screen_draws_none
     };
     let quiet = drawn("");
     let nine_43 = TEST_NOW + 48 * 60;
-    let run = |reads: Vec<Vec<String>>, passed: bool, fallback: bool, bound: Duration| {
+    let run = |reads: Vec<Vec<String>>, passed: bool, bound: Duration| {
         let mut m = Mock::new(reads.clone());
-        let mut opts = hosted(30);
-        if !fallback {
-            opts.policy.model_fallback = None;
-        }
+        let opts = hosted(30);
         let mut heard = Heard::default();
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_clock(TEST_NOW, PDT);
@@ -32719,8 +31283,7 @@ fn the_loop_keeps_a_reset_ahead_and_a_models_credits_where_the_screen_draws_none
         let typed = count(&m, "@s-1 turn") + count(&m, "@s-1 send");
         (heard_lines(&heard), action, typed, kept)
     };
-    let (lines, action, typed, kept) =
-        run(vec![started.clone(), quiet.clone()], false, true, bound);
+    let (lines, action, typed, kept) = run(vec![started.clone(), quiet.clone()], false, bound);
     assert_eq!(typed, 0, "{lines:#?}");
     assert_eq!(
         kept.and_then(|k| k.reset).and_then(|r| r.unix),
@@ -32730,7 +31293,7 @@ fn the_loop_keeps_a_reset_ahead_and_a_models_credits_where_the_screen_draws_none
         matches!(&action, TurnEndAction::WaitUntil { why, .. } if why.contains(RULE_CREDITS_HOLD)),
         "{action:#?}"
     );
-    let (lines, _, typed, kept) = run(vec![started, quiet.clone()], true, true, bound);
+    let (lines, _, typed, kept) = run(vec![started, quiet.clone()], true, bound);
     assert_eq!(kept, None);
     assert!(continued(&lines, RULE_CONTINUE), "{lines:#?}");
     assert_eq!(typed, 1, "{lines:#?}");
@@ -32742,8 +31305,7 @@ fn the_loop_keeps_a_reset_ahead_and_a_models_credits_where_the_screen_draws_none
         ),
     ] {
         let rows = drawn(notice);
-        let (lines, action, typed, kept) =
-            run(vec![rows.clone(), quiet.clone()], false, true, bound);
+        let (lines, action, typed, kept) = run(vec![rows.clone(), quiet.clone()], false, bound);
         assert_eq!(typed, 0, "{notice}: {lines:#?}");
         let kept = kept.expect("the account's known credits");
         assert_eq!(kept.model, None);
@@ -32753,13 +31315,13 @@ fn the_loop_keeps_a_reset_ahead_and_a_models_credits_where_the_screen_draws_none
             matches!(&action, TurnEndAction::Escalate { reason } if reason == CREDITS_HOLD_TOLD),
             "{notice}: {action:#?}"
         );
-        let (lines, _, typed, kept) = run(vec![rows, quiet.clone()], false, true, Duration::ZERO);
+        let (lines, _, typed, kept) = run(vec![rows, quiet.clone()], false, Duration::ZERO);
         assert_eq!(kept, None, "{notice}");
         assert!(continued(&lines, RULE_CONTINUE), "{notice}: {lines:#?}");
         assert_eq!(typed, 1, "{notice}: {lines:#?}");
     }
     let model = drawn("Fable 5.1 is drawing from usage credits");
-    let (lines, action, typed, kept) = run(vec![model.clone(), quiet.clone()], false, false, bound);
+    let (lines, action, typed, kept) = run(vec![model.clone(), quiet.clone()], false, bound);
     assert_eq!(typed, 0, "{lines:#?}");
     assert_eq!(kept.and_then(|k| k.model).as_deref(), Some("fable"));
     assert!(
@@ -34120,8 +32682,8 @@ fn a_host_step_that_moved_the_session_spends_the_count_on_the_harness() {
 /// made, and the next run of that cause, asked within the same Unix second, minted the same
 /// `memory@<second>`, so the relaunch took its ask for the first run's and carried that run's
 /// record (`relaunch::its_own`), answering `adopted` with nothing signalled. Each run's ask is
-/// now its own, and a run asked again after a deferral keeps its ask (the restore by the second
-/// a later loop makes is `a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask`).
+/// its own, and a run asked again after a deferral keeps its ask (a later loop's restore of it by
+/// its second is `a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second`).
 #[test]
 fn two_restart_runs_of_one_cause_asked_in_one_second_are_two_asks() {
     let host = AccountHost::scripted(&[None], &["adopted", "adopted", "wait:changed", "adopted"]);
@@ -34176,8 +32738,9 @@ fn two_restart_runs_of_one_cause_asked_in_one_second_are_two_asks() {
 /// next loop restores no run for it (`turn_end_loop::journaled_open_moves`), and its ask is a
 /// run of its own, past the second that note's ask names (`turn_end_loop::journaled_restart_floor`
 /// reads that alike). A note this build wrote with its claim's second restores the run, holding
-/// that claim. NEGATIVE CONTROL by mutation: a note with no `claimed=` read as holding a claim
-/// restores the older build's deferral.
+/// that claim. A note of a kind that is no move ([`Restart::MOVES`]) restores no run, claimed or
+/// not, and its second still bounds the floor. NEGATIVE CONTROL by mutation: a note with no
+/// `claimed=` read as holding a claim restores the older build's deferral.
 #[test]
 fn a_restart_note_an_older_build_wrote_restores_no_claimed_run() {
     use super::super::turn_end_loop::{RestartRun, journaled_open_moves, journaled_restart_floor};
@@ -34186,7 +32749,7 @@ fn a_restart_note_an_older_build_wrote_restores_no_claimed_run() {
         JournalRecord::of_line(TEST_NOW * 1000 + 400, Some("@s-1"), line, None).to_json() + "\n"
     };
     let older = note(&format!(
-        "HOST seq=2 restart:model-back ask=model-back@{TEST_NOW} step=wait:resume"
+        "HOST seq=2 restart:route-token ask=route-token@{TEST_NOW} step=wait:resume"
     ));
     assert_eq!(journaled_open_moves(&older, Some("@s-1")), (None, None));
     assert_eq!(
@@ -34194,14 +32757,14 @@ fn a_restart_note_an_older_build_wrote_restores_no_claimed_run() {
         Some(TEST_NOW)
     );
     let claimed = note(&format!(
-        "HOST seq=2 restart:model-back ask=model-back@{TEST_NOW} claimed={} step=wait:resume",
+        "HOST seq=2 restart:route-token ask=route-token@{TEST_NOW} claimed={} step=wait:resume",
         TEST_NOW + 3
     ));
     assert_eq!(
         journaled_open_moves(&claimed, Some("@s-1")),
         (
             Some(RestartRun {
-                kind: Restart::MODEL_BACK,
+                kind: Restart::ROUTE_TOKEN,
                 at: TEST_NOW,
                 claimed: Some(TEST_NOW + 3),
             }),
@@ -34209,9 +32772,18 @@ fn a_restart_note_an_older_build_wrote_restores_no_claimed_run() {
         )
     );
     let unclaimed = note(&format!(
-        "HOST seq=2 restart:model-back ask=model-back@{TEST_NOW} claimed=no step=wait:resume"
+        "HOST seq=2 restart:route-token ask=route-token@{TEST_NOW} claimed=no step=wait:resume"
     ));
     assert_eq!(journaled_open_moves(&unclaimed, Some("@s-1")), (None, None));
+    let no_move = note(&format!(
+        "HOST seq=2 restart:model ask=model@{TEST_NOW} claimed={} step=wait:resume",
+        TEST_NOW + 3
+    ));
+    assert_eq!(journaled_open_moves(&no_move, Some("@s-1")), (None, None));
+    assert_eq!(
+        journaled_restart_floor(&no_move, Some("@s-1")),
+        Some(TEST_NOW)
+    );
 }
 
 /// A LOOP'S FIRST RESTART RUN IS PAST EVERY RUN ITS JOURNAL SHOWS ASKED: a loop that starts in the
@@ -34233,7 +32805,7 @@ fn a_loops_first_restart_run_is_past_every_run_its_journal_shows_asked() {
         let journal = note(
             TEST_NOW - 5,
             &format!(
-                "HOST seq=2 restart:model ask=model@{} step=wait:resume",
+                "HOST seq=2 restart:route-token ask=route-token@{} step=wait:resume",
                 TEST_NOW - 5
             ),
         ) + &note(
@@ -34292,7 +32864,7 @@ fn a_loops_first_restart_run_is_past_every_run_its_journal_shows_asked() {
 }
 
 /// A MOVE WHOSE ASK CLAIMED THE RECORD IS ASKED AS ITSELF WHATEVER ACTS COME BEFORE ITS NEXT ASK
-/// (ATERM-KI-1101-3): a model's way back answered a wait after its ask claimed the conversation's
+/// (ATERM-KI-1101-3): a route move answered a wait after its ask claimed the conversation's
 /// record (`wait:resume`, [`RestartAnswer::claim`]) is deferred, and the point goes on. While
 /// the relaunch that ask landed is owed its carry-on, the window host owns the turn ends that come
 /// and the policy decides nothing at them (`upgrading`): acts that are no restart, each of which
@@ -34301,18 +32873,18 @@ fn a_loops_first_restart_run_is_past_every_run_its_journal_shows_asked() {
 /// restarted the process that ask had landed: two relaunches for one move. The run of a move
 /// whose ask claimed now keeps its ask, whatever acts the loop decides, until the move is made or
 /// refused, and the relaunch's word for its own record carried on (`relaunch::ALREADY_MADE`) books
-/// it, which closes the model switch; one `RESTARTED`. An account move ahead, whose record is never
+/// it; one `RESTARTED`. An account move ahead, whose record is never
 /// its own (`relaunch::its_own`) and whose answers so claim nothing, keeps its run past the acts by
 /// its kind, so its back-off stays apart from the restart its point goes on with
 /// (`Session::restart_aside`), and the word of its record carried in flight (`adopted`,
 /// `relaunch::carried_word`, whatever its ask) books it once. CONTROLS: a move refused, and a move
-/// made, ends its run, so the ask after it is another; a way back whose answers claimed nothing
+/// made, ends its run, so the ask after it is another; a route move whose answers claimed nothing
 /// ends its run at the act as any restart does, so each of its asks is another run's.
 #[test]
 fn a_move_put_off_after_its_claim_is_asked_as_itself_whatever_acts_come_between() {
     use crate::harness::relaunch::ALREADY_MADE;
-    use crate::supervise::policy::turn_end::{ModelSwitch, RULE_ACCOUNT, RULE_MODEL_RESTORE};
-    let back = Restart::ModelBack { to: None };
+    use crate::supervise::policy::turn_end::{RULE_ACCOUNT, RULE_TOKEN_ROUTE, RouteTo};
+    let back = Restart::Route { to: RouteTo::Token };
     let ahead = Restart::Account {
         to: "work".to_string(),
         at: AccountAt::Ahead,
@@ -34320,7 +32892,7 @@ fn a_move_put_off_after_its_claim_is_asked_as_itself_whatever_acts_come_between(
     for (why, rule, made, claims, keeps) in [
         (
             &back,
-            RULE_MODEL_RESTORE,
+            RULE_TOKEN_ROUTE,
             ALREADY_MADE,
             &[
                 RestartClaim::Taken,
@@ -34340,7 +32912,7 @@ fn a_move_put_off_after_its_claim_is_asked_as_itself_whatever_acts_come_between(
         ),
         (
             &back,
-            RULE_MODEL_RESTORE,
+            RULE_TOKEN_ROUTE,
             ALREADY_MADE,
             &[RestartClaim::Unclaimed][..],
             false,
@@ -34370,14 +32942,6 @@ fn a_move_put_off_after_its_claim_is_asked_as_itself_whatever_acts_come_between(
         let _ = s
             .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
             .expect("the decision");
-        let now = s.fx.mono();
-        s.turn_end.seed_model(ModelSwitch {
-            from: Some("claude-opus-5-5".to_string()),
-            to: "claude-sonnet-5-5".to_string(),
-            back_at: Some(now),
-            proc: None,
-            unproven: false,
-        });
         let mut heard = Heard::default();
         for acts in [2, 1, 2, 1, 0] {
             s.restart_agent(
@@ -34427,12 +32991,6 @@ fn a_move_put_off_after_its_claim_is_asked_as_itself_whatever_acts_come_between(
             assert_eq!(
                 distinct, asks,
                 "{case}: CONTROL: a move that claimed nothing ends its run at the act: {asks:?}"
-            );
-        }
-        if matches!(why, Restart::ModelBack { .. }) {
-            assert!(
-                s.turn_end.model_switch().is_none(),
-                "{case}: the way back booked made closes the switch"
             );
         }
         let restarted: Vec<&String> = heard
@@ -34530,19 +33088,18 @@ fn a_held_line_keeps_only_its_own_restarts_run_past_another_act() {
 
 /// A RUN A LATER LOOP READS FROM THE JOURNAL IS READ AT ITS OWN SECOND: a run minted past the
 /// wall clock (`Session::restart_floor`: a second run in one second) was journaled at the second
-/// the host answered it, and a later loop read that second back as the run's. The fallback's move
-/// it restored, its ask's claim deferred, was asked `model@<the note's second>` where the record
-/// its run's ask claimed keeps `model@<the run's>` (`St::ask`), so `relaunch::its_own` missed it
-/// and the landed relaunch was superseded; and the later loop's floor fell short of the run minted
-/// ahead, so its next run of that cause shared that run's ask. The note carries the ask
+/// the host answered it, and a later loop read that second back as the run's. The route move it
+/// restored, its ask's claim deferred, was asked `route-token@<the note's second>` where the record
+/// its run's ask claimed keeps `route-token@<the run's>` (`St::ask`), so `relaunch::its_own`
+/// missed it and the landed relaunch was superseded; and the later loop's floor fell short of the
+/// run minted ahead, so its next run of that cause shared that run's ask. The note carries the ask
 /// (`HOST … restart:<kind> ask=<ask> claimed=<second|no> step=…`), and both readers take the run's
 /// second from it.
 #[test]
 fn a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second() {
     use crate::supervise::journal::JournalRecord;
-    let model = Restart::Model {
-        to: "sonnet".to_string(),
-    };
+    use crate::supervise::policy::turn_end::RouteTo;
+    let route = Restart::Route { to: RouteTo::Token };
     let ask_words = |host: &AccountHost| {
         host.asks
             .lock()
@@ -34575,7 +33132,7 @@ fn a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second() {
         let _ = s
             .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
             .expect("the decision");
-        for why in [&Restart::Memory, &Restart::Memory, &model] {
+        for why in [&Restart::Memory, &Restart::Memory, &route] {
             s.restart_agent(
                 &point,
                 why,
@@ -34595,7 +33152,7 @@ fn a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second() {
         [
             format!("memory@{TEST_NOW}"),
             format!("memory@{}", TEST_NOW + 1),
-            format!("model@{}", TEST_NOW + 2),
+            format!("route-token@{}", TEST_NOW + 2),
         ],
         "the earlier loop's runs, two minted ahead"
     );
@@ -34629,7 +33186,7 @@ fn a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second() {
         let _ = s
             .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
             .expect("the decision");
-        for why in [&model, &Restart::Memory] {
+        for why in [&route, &Restart::Memory] {
             s.restart_agent(
                 &point,
                 why,
@@ -34655,15 +33212,14 @@ fn a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second() {
 }
 
 /// A MOVE PUT OFF WHEN ITS LOOP ENDS IS ASKED BY THE NEXT LOOP AS ITS FIRST ASK
-/// (ATERM-KI-1101-3): a loop's way back answered a wait after its ask claimed the conversation's
+/// (ATERM-KI-1101-3): a loop's route move answered a wait after its ask claimed the conversation's
 /// record (`wait:resume`, [`RestartAnswer::claim`]) is deferred, and the loop ends before the
-/// move is booked (the harness loop restarts, or aterm does). The next loop restores the model
-/// switch from the ledger and asks the way back again; had it minted a new run past the journal's
-/// floor, its ask would miss the record the first ask claimed, and the relaunch would restart the
-/// process that ask had landed (superseded in flight, or restarted over once carried on), two
+/// move is booked (the harness loop restarts, or aterm does). The next loop asks the route move
+/// again; had it minted a new run past the journal's floor, its ask would miss the record the
+/// first ask claimed, and the relaunch would restart the process that ask had landed (superseded in flight, or restarted over once carried on), two
 /// relaunches for one move. The next loop restores the run of a move its journal shows deferred
-/// last in a run that outlives the loop's acts (`turn_end_loop::journaled_open_moves`): the way
-/// back's, its record claimed, and an account move ahead's, whose answers claim nothing (its
+/// last in a run that outlives the loop's acts (`turn_end_loop::journaled_open_moves`): the route
+/// move's, its record claimed, and an account move ahead's, whose answers claim nothing (its
 /// record is never its own, `relaunch::its_own`) and whose run outlives the acts by its kind. Its
 /// ask, past the act its first turn end decides (the carry hold's nothing), is the first ask.
 /// CONTROLS: a move the journal shows refused or made after its deferral, or followed by another
@@ -34673,15 +33229,15 @@ fn a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second() {
 fn a_move_put_off_when_its_loop_ends_is_asked_by_the_next_as_its_first_ask() {
     use crate::harness::relaunch::ALREADY_MADE;
     use crate::supervise::journal::JournalRecord;
-    use crate::supervise::policy::turn_end::{RULE_ACCOUNT, RULE_MODEL_RESTORE};
-    let back = Restart::ModelBack { to: None };
+    use crate::supervise::policy::turn_end::{RULE_ACCOUNT, RULE_TOKEN_ROUTE, RouteTo};
+    let back = Restart::Route { to: RouteTo::Token };
     let ahead = Restart::Account {
         to: "work".to_string(),
         at: AccountAt::Ahead,
     };
     let mut wrong = Vec::new();
-    for (why, rule) in [(&back, RULE_MODEL_RESTORE), (&ahead, RULE_ACCOUNT)] {
-        let claims = matches!(why, Restart::ModelBack { .. });
+    for (why, rule) in [(&back, RULE_TOKEN_ROUTE), (&ahead, RULE_ACCOUNT)] {
+        let claims = matches!(why, Restart::Route { .. });
         let (taken, held) = if claims {
             (RestartClaim::Taken, RestartClaim::Held)
         } else {
@@ -34814,15 +33370,15 @@ fn a_move_put_off_when_its_loop_ends_is_asked_by_the_next_as_its_first_ask() {
 /// A LATER LOOP RESTORES AN ACCOUNT MOVE PUT OFF WITH THE RUN SET ASIDE BESIDE IT
 /// (`Session::seed_open_move_in`, `turn_end_loop::journaled_open_moves`): its journal reads its
 /// runs back as the earlier loop moved them. An account move ahead the host put off took the slot
-/// and set aside the model's move standing there, which held a live claim of the conversation's
+/// and set aside the route move standing there, which held a live claim of the conversation's
 /// record (`claimed=<second>`), as that move's ask would (`Session::aside_for`): the later loop
-/// restores both, the model's run holding its claim, so the model's move asked there is asked as
-/// the earlier loop asked it, meets the record it claimed and backs off on its own run. An account
-/// move ahead holds no claim, and is restored by its kind. A restart noted after it, the one its
-/// point went on with or one asked on its own, takes the place of both, restored only where its
-/// run holds a claim; a model's move set aside with no claim is not restored, nor either once the
-/// account move is made. CONTROL: a model's way back restored, claimed, takes the slot with
-/// nothing set aside, as any restart but an account move's does.
+/// restores both, the route move's run holding its claim, so the route move asked there is asked
+/// as the earlier loop asked it, meets the record it claimed and backs off on its own run. An
+/// account move ahead holds no claim, and is restored by its kind. A restart noted after it, the
+/// one its point went on with or one asked on its own, takes the place of both, restored only
+/// where its run holds a claim; a route move set aside with no claim is not restored, nor either
+/// once the account move is made. CONTROL: a route move onto the stored login restored, claimed,
+/// takes the slot with nothing set aside, as any restart but an account move's does.
 #[test]
 fn a_later_loop_restoring_an_account_move_sets_aside_the_run_its_ledger_restored() {
     use super::super::turn_end_loop::RestartRun;
@@ -34834,7 +33390,13 @@ fn a_later_loop_restoring_an_account_move_sets_aside_the_run_its_ledger_restored
         JournalRecord::of_line(TEST_NOW * 1000 + 5000, Some("@s-1"), &line, None).to_json() + "\n"
     };
     let run = |kind: &'static str, at: i64, claimed: Option<i64>| RestartRun { kind, at, claimed };
-    let fallback = note(6, "model", TEST_NOW, Some(TEST_NOW + 1), "wait:resume");
+    let token = note(
+        6,
+        "route-token",
+        TEST_NOW,
+        Some(TEST_NOW + 1),
+        "wait:resume",
+    );
     let ahead = |seq| {
         note(
             seq,
@@ -34844,54 +33406,52 @@ fn a_later_loop_restoring_an_account_move_sets_aside_the_run_its_ledger_restored
             "wait:conversation-in-other-tab",
         )
     };
-    let model = run(Restart::MODEL, TEST_NOW, Some(TEST_NOW + 1));
+    let route = run(Restart::ROUTE_TOKEN, TEST_NOW, Some(TEST_NOW + 1));
     let account = run(Restart::ACCOUNT_AHEAD, TEST_NOW + 5, None);
     let cases: [(&str, String, Option<RestartRun>, Option<RestartRun>); 6] = [
         (
-            "an account move ahead over a claimed model's move",
-            fallback.clone() + &ahead(7),
+            "an account move ahead over a claimed route move",
+            token.clone() + &ahead(7),
             Some(account),
-            Some(model),
+            Some(route),
         ),
         (
-            "the model's move noted after it, still claimed",
-            fallback.clone()
+            "the route move noted after it, still claimed",
+            token.clone()
                 + &ahead(7)
-                + &note(7, "model", TEST_NOW, Some(TEST_NOW + 1), "wait:held"),
-            Some(model),
+                + &note(7, "route-token", TEST_NOW, Some(TEST_NOW + 1), "wait:held"),
+            Some(route),
             None,
         ),
         (
-            "the model's move noted after it, its claim lapsed",
-            fallback.clone() + &ahead(7) + &note(9, "model", TEST_NOW, None, "wait:changed"),
+            "the route move noted after it, its claim lapsed",
+            token.clone() + &ahead(7) + &note(9, "route-token", TEST_NOW, None, "wait:changed"),
             None,
             None,
         ),
         (
             "the account move made",
-            fallback.clone()
-                + &ahead(7)
-                + &note(8, "account-ahead", TEST_NOW + 5, None, "done:made"),
+            token.clone() + &ahead(7) + &note(8, "account-ahead", TEST_NOW + 5, None, "done:made"),
             None,
             None,
         ),
         (
-            "an account move ahead over an unclaimed model's move",
-            note(6, "model", TEST_NOW, None, "wait:changed") + &ahead(7),
+            "an account move ahead over an unclaimed route move",
+            note(6, "route-token", TEST_NOW, None, "wait:changed") + &ahead(7),
             Some(account),
             None,
         ),
         (
-            "CONTROL: a model's way back, claimed",
-            fallback.clone()
+            "CONTROL: a route move onto the stored login, claimed",
+            token.clone()
                 + &note(
                     7,
-                    "model-back",
+                    "route-stored",
                     TEST_NOW + 5,
                     Some(TEST_NOW + 6),
                     "wait:conversation-in-other-tab",
                 ),
-            Some(run(Restart::MODEL_BACK, TEST_NOW + 5, Some(TEST_NOW + 6))),
+            Some(run(Restart::ROUTE_STORED, TEST_NOW + 5, Some(TEST_NOW + 6))),
             None,
         ),
     ];

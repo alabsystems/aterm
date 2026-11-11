@@ -461,7 +461,7 @@ fn a_conversation_id_is_a_uuid_v4() {
 }
 
 #[test]
-fn the_model_flag_is_read_and_replaced_in_every_spelling() {
+fn the_model_flag_is_read_in_every_spelling() {
     let w = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
     assert_eq!(
         argv_model(&w("agy --model gemini-4-argon-high")).as_deref(),
@@ -478,35 +478,30 @@ fn the_model_flag_is_read_and_replaced_in_every_spelling() {
         None,
         "past `--` is no flag"
     );
-    assert_eq!(
-        with_model(
-            &w("agy --dangerously-skip-permissions --model gemini-4-argon-high --effort high"),
-            "claude-opus-5-5-medium"
+    for (launch, relaunch) in [
+        (
+            "agy --gemini_dir=/x --model a",
+            "--gemini_dir=/x --model a --conversation=96671fc5-6d69-4754-a501-2bdcc6566785",
         ),
-        w("agy --model=claude-opus-5-5-medium --dangerously-skip-permissions --effort high")
-    );
-    assert_eq!(
-        with_model(&w("agy -model=a --sandbox"), "b"),
-        w("agy --model=b --sandbox")
-    );
-    assert_eq!(with_model(&w("agy"), "b"), w("agy --model=b"));
-    let moved = with_model(&w("agy --gemini_dir=/x --model a"), "b");
-    assert_eq!(argv_model(&moved).as_deref(), Some("b"));
-    assert_eq!(
-        rewrite_argv(&moved, Some("96671fc5-6d69-4754-a501-2bdcc6566785")).unwrap(),
-        w("--model=b --gemini_dir=/x --conversation=96671fc5-6d69-4754-a501-2bdcc6566785"),
-        "the relaunch carries the new model"
-    );
-    assert!(with_model(&[], "b").is_empty());
+        (
+            "agy -model=a --sandbox",
+            "-model=a --sandbox --conversation=96671fc5-6d69-4754-a501-2bdcc6566785",
+        ),
+        (
+            "agy --sandbox",
+            "--sandbox --conversation=96671fc5-6d69-4754-a501-2bdcc6566785",
+        ),
+    ] {
+        assert_eq!(
+            rewrite_argv(&w(launch), Some("96671fc5-6d69-4754-a501-2bdcc6566785")).unwrap(),
+            w(relaunch),
+            "the relaunch carries the launch's own model words and adds none: {launch}"
+        );
+    }
     assert_eq!(
         argv_model(&w("agy -i --model=evil")).as_deref(),
         None,
         "an interactive prompt argument is not read as --model"
-    );
-    assert_eq!(
-        with_model(&w("agy -i --model"), "b"),
-        w("agy --model=b -i --model"),
-        "with_model preserves the value of another flag"
     );
     assert_eq!(
         config_flags(&w("agy -i --gemini_dir=/evil -gemini_dir")),

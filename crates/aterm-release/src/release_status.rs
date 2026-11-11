@@ -11,6 +11,10 @@ const MAX_OPEN_STAGES: usize = 256;
 
 use crate::ledger::{Error, GitCli};
 
+#[cfg(test)]
+#[path = "release_commit_gate_stream_tests.rs"]
+mod commit_gate_stream_tests;
+
 struct OpenStage {
     title: String,
     started_at_unix_ms: Option<u64>,
@@ -247,6 +251,7 @@ fn read_events(reader: impl Read) -> std::io::Result<Events> {
                                 | "check-finished"
                                 | "test-binary-finished"
                                 | "test-case-failed"
+                                | "commit-gate-failed"
                                 | "release-stage"
                                 | "build-child-finished"
                                 | "step-child-finished"

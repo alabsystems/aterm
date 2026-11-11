@@ -626,7 +626,8 @@ fn queue_owned(
         submission,
         events,
         recipe: Some(recipe::Recipe {
-            kind: recipe::Kind::Ay,
+            ay: None,
+            kind: recipe::Kind::LifecycleFixture,
             compiler: None,
             program: "/bin/sleep".into(),
             arguments: vec![OsString::from("60")],
@@ -677,6 +678,91 @@ fn read_event(client: &CtlStream, binding: &Binding) -> Event {
 
 #[test]
 #[cfg(target_os = "macos")]
+fn root_start_clock_is_durable_but_lost_ack_never_authorizes_go() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::root_start_clock_is_durable_but_lost_ack_never_authorizes_go",
+    ) {
+        return;
+    }
+    crate::runtime::test_endpoint().unwrap();
+    for lose_ack in [false, true] {
+        let mut world = World::new();
+        let marker = world.scratch.path.join("root-ran");
+        let (binding, memory, client) = world.queue_sleep(HANG);
+        let pending = world.owner.pending.back_mut().unwrap();
+        let recipe = pending.recipe.as_mut().unwrap();
+        recipe.program = "/bin/sh".into();
+        recipe.arguments = vec![
+            "-c".into(),
+            "printf actual-root > \"$1\"".into(),
+            "root-clock-fixture".into(),
+            marker.as_os_str().into(),
+        ];
+        assert_eq!(read_event(&client, &binding), Event::Queued);
+        if lose_ack {
+            world.owner.journal.lose_running_ack_once();
+        }
+        world.owner.tick_queue();
+        let job = &world.owner.jobs[&(binding.session.clone(), binding.attempt)];
+        assert_eq!(job.launched, !lose_ack);
+        let records = world.owner.journal.outstanding().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(journal::record_binding(record).unwrap(), binding);
+        assert_eq!(record["phase"].as_str(), Some("running"));
+        assert!(record["monotonic_ns"].as_u64().unwrap() > 0);
+        assert!(record["unix_ns"].as_u64().unwrap() > 0);
+        if lose_ack {
+            assert!(!marker.exists());
+            assert_eq!(world.owner.debt.reserved().unwrap(), 1);
+            assert_eq!(
+                world.owner.ledger.cohort_claim_state(&memory).unwrap(),
+                CohortClaimState::Retained
+            );
+        } else {
+            let Event::Started {
+                pid,
+                birth,
+                monotonic_ns,
+                unix_ns,
+            } = read_event(&client, &binding)
+            else {
+                panic!("acknowledged durable Root did not start")
+            };
+            assert_eq!(record["root_pid"].as_u64(), Some(u64::from(pid)));
+            assert_eq!(record["root_birth"].as_u64(), Some(birth));
+            assert_eq!(record["monotonic_ns"].as_u64(), Some(monotonic_ns));
+            assert_eq!(record["unix_ns"].as_u64(), Some(unix_ns));
+        }
+        world.settle();
+        assert_eq!(world.owner.debt.reserved().unwrap(), 0);
+        assert!(world.owner.journal.outstanding().unwrap().is_empty());
+        if lose_ack {
+            assert!(!marker.exists());
+            assert_eq!(
+                wire::read_frame(&client, Instant::now() + HANG)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        } else {
+            assert!(
+                marker.exists(),
+                "the positive owned Root must actually execute"
+            );
+            assert!(matches!(
+                read_event(&client, &binding),
+                Event::Finished {
+                    outcome: Outcome::Exit(0),
+                    ..
+                }
+            ));
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
 fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
     if !aterm_uds::test_binary::isolated_lifecycle(
         "actor::owner::tests::actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources",
@@ -709,6 +795,13 @@ fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
             panic!("actual host failed to publish Started")
         };
         assert!(pid > 1 && birth > 0 && monotonic_ns > 0 && unix_ns > 0);
+        let records = world.owner.journal.outstanding().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(journal::record_binding(&records[0]).unwrap(), binding);
+        assert_eq!(records[0]["root_pid"].as_u64(), Some(u64::from(pid)));
+        assert_eq!(records[0]["root_birth"].as_u64(), Some(birth));
+        assert_eq!(records[0]["monotonic_ns"].as_u64(), Some(monotonic_ns));
+        assert_eq!(records[0]["unix_ns"].as_u64(), Some(unix_ns));
         let capability = *world.owner.jobs[&(binding.session.clone(), binding.attempt)]
             .delegation
             .capability

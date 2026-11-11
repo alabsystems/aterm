@@ -432,6 +432,9 @@ fn codex_execution(outcome: super::super::login_drive::Outcome) -> Execution {
             Execution::Deferred("completed native login retained without publication".into())
         }
         super::super::login_drive::Outcome::NotRun(why) => Execution::NotStarted(why),
+        super::super::login_drive::Outcome::PreparationFailed(stage) => {
+            Execution::NotStarted(stage.reason().into())
+        }
         super::super::login_drive::Outcome::PageNotOpened(why)
         | super::super::login_drive::Outcome::Unverified(why) => Execution::Unknown(why),
         _ => Execution::Unknown("device-local Codex sign-in did not complete".into()),

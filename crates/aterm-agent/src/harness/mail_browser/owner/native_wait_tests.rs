@@ -183,7 +183,7 @@ fn required_native_owner_client_keeps_original_wait_and_sends_no_expired_frame()
                 assert!(matches!(
                     got,
                     Err(ApiError {
-                        kind: Kind::Network,
+                        kind: Kind::Timeout,
                         ..
                     })
                 ));
@@ -207,7 +207,7 @@ fn required_native_owner_server_keeps_original_wait_and_protocol_refusals() {
                 assert!(matches!(
                     got,
                     Err(ApiError {
-                        kind: Kind::Network,
+                        kind: Kind::Timeout,
                         ..
                     })
                 ));

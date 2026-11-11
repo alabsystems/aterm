@@ -8,8 +8,18 @@
 //! keeps its own argv.
 
 extern "C" fn enter() {
-    crate::solver_bootstrap::tests::entry();
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if matches!(args.as_slice(), [argument] if argument == "--resource-capabilities")
+        && let Some(marker) = std::env::var_os("ATERM_TEST_RECIPE_PROBE_MARKER")
+    {
+        // A native canary, not a maintained AY implementation or source grant.
+        std::fs::write(marker, b"actual candidate executed").unwrap();
+        println!(
+            "{{\"version\":3,\"native_campaign\":true,\"admission\":\"resource-inspect-v3\",\"worker_argument\":\"--resource-worker-v3\",\"subgroup_custody\":\"host-owned-v3\",\"subgroup_argument\":\"--resource-subgroups-v3\",\"commands\":[\"bench run\"]}}"
+        );
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        std::process::exit(0);
+    }
     if let Some(result) = crate::metadata_prelude::entry(&args) {
         std::process::exit(if result == std::process::ExitCode::SUCCESS {
             0
@@ -17,6 +27,9 @@ extern "C" fn enter() {
             75
         });
     }
+    // The intermediate image inherits selected non-loader environment. Its
+    // private exec verb must run before final-image bootstrap is considered.
+    crate::solver_bootstrap::tests::entry();
     crate::actor::metadata_native_role();
 }
 

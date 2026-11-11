@@ -19,6 +19,19 @@ use read::{AuthorityObservation, EntryObservation};
 #[cfg(test)]
 thread_local! { static MANIFEST_CUT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
+thread_local! { static PREPARATION_CUT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+fn cut_preparation(at: u8) -> Result<(), String> {
+    PREPARATION_CUT.with(|cut| {
+        if cut.get() == at {
+            cut.set(0);
+            Err("fixture preparation persistence cut".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+#[cfg(test)]
 fn cut_manifest(at: u8) -> Result<(), String> {
     MANIFEST_CUT.with(|cut| {
         if cut.get() == at {
@@ -44,6 +57,8 @@ pub(super) struct CatalogueScope {
     namespace: String,
     admission: String,
     source: codex_enrollment::Staging,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    guarded_preparation: bool,
 }
 impl std::fmt::Debug for CatalogueScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -71,6 +86,8 @@ struct Manifest {
     directory: codex_enrollment::DirectoryIdentity,
     sequence: u64,
     members: BTreeMap<String, CatalogueScope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unattempted: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,15 +148,35 @@ fn manifest_bytes(
     ))
 }
 fn membership_successor(old: &Manifest, next: &Manifest) -> bool {
+    let immutable_members = old
+        .members
+        .iter()
+        .all(|(id, scope)| next.members.get(id) == Some(scope));
+    let insertion = old.members.len().checked_add(1) == Some(next.members.len())
+        && immutable_members
+        && next
+            .members
+            .iter()
+            .find(|(id, _)| !old.members.contains_key(*id))
+            .is_some_and(|(id, scope)| {
+                let mut expected = old.unattempted.clone();
+                if scope.guarded_preparation {
+                    expected.push(id.clone());
+                    expected.sort();
+                }
+                next.unattempted == expected
+            });
+    let exchange = old.members == next.members
+        && next.unattempted.len().checked_add(1) == Some(old.unattempted.len())
+        && next
+            .unattempted
+            .iter()
+            .all(|id| old.unattempted.contains(id));
     next.valid()
         && old.namespace == next.namespace
         && old.directory == next.directory
         && old.sequence.checked_add(1) == Some(next.sequence)
-        && old.members.len().checked_add(1) == Some(next.members.len())
-        && old
-            .members
-            .iter()
-            .all(|(id, scope)| next.members.get(id) == Some(scope))
+        && (insertion || exchange)
 }
 impl Manifest {
     fn valid(&self) -> bool {
@@ -147,6 +184,13 @@ impl Manifest {
             && valid_hex(&self.namespace, 64)
             && self.sequence > 0
             && self.members.len() <= MAX_PENDING
+            && self.unattempted.len() <= self.members.len()
+            && self.unattempted.windows(2).all(|pair| pair[0] < pair[1])
+            && self.unattempted.iter().all(|id| {
+                self.members
+                    .get(id)
+                    .is_some_and(|scope| scope.guarded_preparation)
+            })
             && self.members.iter().all(|(id, scope)| {
                 valid_hex(id, 32)
                     && scope.valid()
@@ -258,6 +302,7 @@ impl Authority {
                         directory: codex_enrollment::DirectoryIdentity::capture(&directory)?,
                         sequence: 1,
                         members: BTreeMap::new(),
+                        unattempted: Default::default(),
                     },
                     None,
                 )
@@ -686,10 +731,32 @@ pub(super) fn prepare(
     let Some(source_store) = env.accounts_store_for(crate::harness::accounts::Cli::Codex) else {
         return Ok(None);
     };
-    let (logins, warning) = source_store.load_logins(env.now)?;
-    if warning.is_some() {
-        return Err("catalogue source uncertain".into());
+    // Admission precedes namespace/membership writes. The live row driver
+    // already owns this writer and uses prepare_held instead of reopening it.
+    let held = source_store
+        .acquire_within(&[std::time::Duration::ZERO])
+        .map_err(|_| "catalogue anchor unavailable")?
+        .ok_or("catalogue anchor busy")?;
+    prepare_held(env, request, stage, &source_store, &held)
+}
+
+pub(super) fn prepare_held(
+    env: &Env,
+    request: &codex_enrollment::Request,
+    stage: &Path,
+    source_store: &super::super::accounts::Store,
+    held: &super::super::accounts::Lock,
+) -> Result<Option<CatalogueScope>, String> {
+    let canonical = env
+        .accounts_store_for(crate::harness::accounts::Cli::Codex)
+        .ok_or("catalogue source unavailable")?;
+    if std::fs::canonicalize(&canonical.dir).map_err(|_| "catalogue source unavailable")?
+        != std::fs::canonicalize(&source_store.dir).map_err(|_| "catalogue writer unavailable")?
+    {
+        return Err("catalogue writer belongs to another source".into());
     }
+    let snapshot = source_store.native_retirement_snapshot_held(held, env.now)?;
+    let logins = snapshot.retained_image();
     let Some(_) = logins.enrollment.lookup(request)? else {
         return Ok(None);
     };
@@ -708,9 +775,32 @@ pub(super) fn prepare(
     {
         return Err("catalogue preparation source changed".into());
     }
-    let mut authority = Authority::open(env, true)?;
+    let authority = Authority::open(env, true)?;
+    let repairs: Vec<_> = authority
+        .manifest
+        .members
+        .values()
+        .filter(|scope| {
+            scope.source.store == staging.store
+                && scope.guarded_preparation
+                && authority.manifest.unattempted.contains(&scope.request().id)
+        })
+        .cloned()
+        .collect();
+    authority.current()?;
+    drop(authority);
+    for scope in repairs {
+        reconcile_preparation_held(env, &scope, source_store, held)?;
+    }
+    let mut authority = Authority::open(env, false)?;
     let scope = match authority.manifest.members.get(&request.id) {
-        Some(scope) if scope.source == staging => scope.clone(),
+        Some(scope)
+            if scope.source == staging
+                && scope.guarded_preparation
+                && authority.manifest.unattempted.contains(&request.id) =>
+        {
+            scope.clone()
+        }
         Some(_) => return Err("catalogue operation already used".into()),
         None => {
             if authority.manifest.members.len() >= MAX_PENDING {
@@ -724,6 +814,7 @@ pub(super) fn prepare(
                 namespace: authority.manifest.namespace.clone(),
                 admission,
                 source: staging,
+                guarded_preparation: true,
             };
             authority.manifest.sequence = authority
                 .manifest
@@ -734,14 +825,21 @@ pub(super) fn prepare(
                 .manifest
                 .members
                 .insert(request.id.clone(), scope.clone());
+            authority.manifest.unattempted.push(request.id.clone());
+            authority.manifest.unattempted.sort();
             authority.save()?;
+            #[cfg(test)]
+            cut_preparation(1)?;
             scope
         }
     };
     authority.current()?;
     drop(authority);
     let mut claimed = ClaimedEntry::open(env, &scope, true)?;
-    with_anchor(env, &scope, |anchor| {
+    // Reuse the actual row writer; opening a second exclusive accounts.lock
+    // here would conflict with the caller's own source-pinned snapshot.
+    let mut anchor = CatalogueAnchorWriter::new(source_store, held, request, env.now);
+    (|anchor: &mut CatalogueAnchorWriter<'_>| {
         let expected = anchor.read()?;
         if claimed.entry.is_none() {
             if expected.is_some() {
@@ -759,6 +857,8 @@ pub(super) fn prepare(
             })?;
         }
         claimed.durable_current()?;
+        #[cfg(test)]
+        cut_preparation(2)?;
         let next = claimed.witness()?;
         if next.phase != CataloguePhase::Prepared
             || (expected.is_some() && expected.as_ref() != Some(&next))
@@ -770,8 +870,82 @@ pub(super) fn prepare(
             expected,
             next,
         })
-    })?;
+    })(&mut anchor)?;
     Ok(Some(scope))
+}
+
+#[cfg(all(test, unix))]
+#[path = "codex_grant_preparation_tests.rs"]
+mod preparation_tests;
+
+/// Complete only an original, positively fenced metadata preparation. Missing
+/// mutable files alone never prove that a provider exchange did not happen.
+fn reconcile_preparation_held(
+    env: &Env,
+    scope: &CatalogueScope,
+    source_store: &super::super::accounts::Store,
+    held: &super::super::accounts::Lock,
+) -> Result<(), String> {
+    let authority = AuthorityObservation::read(env)?;
+    if !scope.guarded_preparation
+        || authority.manifest.members.get(&scope.request().id) != Some(scope)
+        || !authority.manifest.unattempted.contains(&scope.request().id)
+    {
+        return Err("catalogue preparation has no independent no-attempt fence".into());
+    }
+    let snapshot = source_store.native_retirement_snapshot_held(held, env.now)?;
+    let logins = snapshot.retained_image();
+    if std::fs::canonicalize(&source_store.dir).map_err(|_| "catalogue source unavailable")?
+        != scope.source.store
+        || !scope.source.store_current()
+        || logins.enrollment.catalogue_staging(scope.request())? != scope.source
+    {
+        return Err("catalogue preparation source changed".into());
+    }
+    if !logins
+        .enrollment
+        .refused_catalogue_preparation(scope.request())?
+    {
+        return Ok(());
+    }
+    // A successfully constructed producer always has its durable issuer body.
+    // An active owner refuses this exclusive claim; parked or retained custody
+    // refuses below too. Neither is overwritten or converted into no-send proof.
+    let issuer = super::Store::open(env, &scope.request().id, true)?;
+    if issuer.as_ref().is_some_and(|(_, record)| record.is_some()) {
+        return Err("catalogue preparation still has issuer custody".into());
+    }
+    let mut claimed = ClaimedEntry::open(env, scope, true)?;
+    if let Some(entry) = &claimed.entry {
+        if entry.phase != CataloguePhase::Prepared
+            || entry.sequence != 1
+            || entry.predecessor.is_some()
+        {
+            return Err("catalogue preparation already advanced".into());
+        }
+    } else {
+        claimed.save(Entry {
+            schema: 1,
+            scope: scope.clone(),
+            sequence: 1,
+            predecessor: None,
+            phase: CataloguePhase::Prepared,
+            reference: None,
+            facts: None,
+            response_digest: None,
+        })?;
+    }
+    claimed.durable_current()?;
+    authority.current()?;
+    snapshot.current()?;
+    let mut anchor = CatalogueAnchorWriter::new(source_store, held, scope.request(), env.now);
+    anchor.compare_exchange(&CatalogueTransition {
+        scope: scope.clone(),
+        expected: None,
+        next: claimed.witness()?,
+    })?;
+    drop(issuer);
+    Ok(())
 }
 
 pub(super) fn location(env: &Env, scope: &CatalogueScope) -> Result<PathBuf, String> {
@@ -838,6 +1012,26 @@ pub(super) fn attempted(env: &Env, scope: &CatalogueScope) -> Result<(), String>
     let inventory = Inventory::read(env, Some(scope))?;
     if inventory.members.iter().any(|member| member.pending) {
         return Err("catalogue refresh requires reconciliation before code exchange".into());
+    }
+    if scope.guarded_preparation {
+        let mut authority = Authority::open(env, false)?;
+        if authority.manifest.members.get(&scope.request().id) != Some(scope) {
+            return Err("catalogue exchange membership changed".into());
+        }
+        if let Some(index) = authority
+            .manifest
+            .unattempted
+            .iter()
+            .position(|id| id == &scope.request().id)
+        {
+            authority.manifest.unattempted.remove(index);
+            authority.manifest.sequence = authority
+                .manifest
+                .sequence
+                .checked_add(1)
+                .ok_or("catalogue sequence exhausted")?;
+            authority.save()?;
+        }
     }
     advance(env, scope, CataloguePhase::Attempted, None, None, None)
 }
@@ -964,6 +1158,7 @@ impl InventorySnapshot {
     fn read(env: &Env, own: Option<&CatalogueScope>) -> Result<Self, String> {
         let authority = AuthorityObservation::read(env)?;
         let scopes: Vec<_> = authority.manifest.members.values().cloned().collect();
+        let unattempted = authority.manifest.unattempted.clone();
         let sequence = authority.manifest.sequence;
         let namespace = authority.manifest.namespace.clone();
         // Membership is not inferred only from a restored manifest. Actual
@@ -1034,6 +1229,12 @@ impl InventorySnapshot {
             let entry = claimed.entry.as_ref().ok_or("catalogue entry absent")?;
             match entry.phase {
                 CataloguePhase::Prepared | CataloguePhase::NotDispatched => {
+                    if entry.phase == CataloguePhase::Prepared
+                        && (!scope.guarded_preparation
+                            || !unattempted.contains(&scope.request().id))
+                    {
+                        return Err("catalogue exchange requires reconciliation".into());
+                    }
                     claimed.store.unchanged().map_err(str::to_owned)?;
                     continue;
                 }

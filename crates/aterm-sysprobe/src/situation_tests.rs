@@ -173,10 +173,12 @@ fn a_power_read_that_never_answers_is_tried_once_a_minute() {
 
 /// The adapter's rating is read with a source post on AC, or where the source became AC, and a
 /// charge post keeps the rating read before; on battery there is none. A swapped adapter is a
-/// source post, so its new rating is read.
+/// source post, so its new rating is read, even where the read at that post failed and the next
+/// one to answer came with a charge post.
 /// NEGATIVE CONTROL: reading the adapter at every read on AC (`PowerSource::Ac => adapter()`
 /// for both AC arms) fails the second rating assertion: a charge post reads the adapter's 96 W
-/// rather than keeping 70.
+/// rather than keeping 70. Forgetting a source post whose read failed (`self.adapter_due =
+/// posted.source` for `|=`) keeps 70 W after a swap to 140, and the last assertion fails.
 #[test]
 fn the_adapter_is_read_only_when_the_source_was_posted() {
     let adapters = Cell::new(0u32);
@@ -222,6 +224,23 @@ fn the_adapter_is_read_only_when_the_source_was_posted() {
         "a swap"
     );
     assert_eq!(adapters.get(), 3);
+
+    let ac = on(PowerSource::Ac, 82);
+    let mut swapped = PowerLatch::default();
+    assert_eq!(
+        rated(swapped.step(SOURCE, T0, || Some(ac), || Some(70))),
+        Some(70)
+    );
+    assert_eq!(
+        swapped.step(SOURCE, T0 + 1, || None, || Some(140)),
+        None,
+        "the swap's read failed"
+    );
+    assert_eq!(
+        rated(swapped.step(CHARGE, T0 + 2, || Some(ac), || Some(140))),
+        Some(140),
+        "the swap's source post is still due when a charge post's read answers"
+    );
 }
 
 /// The words `IOPSGetProvidingPowerSourceType` answers, and nothing else.
@@ -234,8 +253,10 @@ fn a_source_is_one_of_the_power_managers_words() {
     assert_eq!(PowerSource::of(""), None);
 }
 
-/// A sleep is a span only where the wake follows it; its cause is the power manager's and its
-/// wake word the kernel's.
+/// A sleep is a span only where the wake follows it (a wake at the sleep's own moment does not);
+/// its cause is the power manager's and its wake word the kernel's.
+/// NEGATIVE CONTROL: `to_ms >= from_ms` for `>` in [`awake_of`] makes a span of no length, and
+/// the assertion at the sleep's own moment fails.
 #[test]
 fn the_last_sleep_is_a_span_only_where_the_wake_follows_it() {
     let mut t = crate::timeline::Timeline {
@@ -263,6 +284,12 @@ fn the_last_sleep_is_a_span_only_where_the_wake_follows_it() {
             cause: Some("Clamshell Sleep".into()),
             wake: Some("RTP.multi-touch".into()),
         })
+    );
+    t.wake_ms = Some(T0 + 10);
+    assert_eq!(
+        awake_of(&t, None).last_sleep,
+        None,
+        "a wake at the sleep's own moment"
     );
     t.wake_ms = Some(T0 + 5);
     assert_eq!(

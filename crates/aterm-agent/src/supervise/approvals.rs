@@ -591,7 +591,6 @@ fn held_rows(rows: &mut dyn Iterator<Item = String>) -> Option<(Vec<String>, usi
                 plain -= 1;
             }
             if LandWalk::reads(&row)
-                || SwitchWalk::reads(&row)
                 || row.contains(RULE_EARLIER_BOOKS)
                 || row.contains(super::policy::turn_end::RULE_GO_AHEAD_HOUR)
             {
@@ -623,7 +622,7 @@ fn older_kept(
     Ok(older)
 }
 
-type Standing = std::collections::BTreeMap<Option<String>, (LandWalk, SwitchWalk)>;
+type Standing = std::collections::BTreeMap<Option<String>, LandWalk>;
 
 struct CutWork {
     entries: usize,
@@ -654,21 +653,9 @@ impl CutWork {
             0,
         )?;
         let bytes = state
-            .iter()
-            .try_fold(0_usize, |bytes, (sid, (_, switch))| {
-                let model = switch.open.as_ref().map_or(0, |s| {
-                    s.to.len()
-                        .saturating_add(s.from.as_ref().map_or(0, String::len))
-                        .saturating_add(
-                            s.proc
-                                .as_ref()
-                                .and_then(|p| p.conversation.as_ref())
-                                .map_or(0, String::len),
-                        )
-                });
-                bytes
-                    .checked_add(sid.as_ref().map_or(0, String::len))?
-                    .checked_add(model)
+            .keys()
+            .try_fold(0_usize, |bytes, sid| {
+                bytes.checked_add(sid.as_ref().map_or(0, String::len))
             })
             .ok_or(())?;
         self.spend(0, 0, bytes.saturating_mul(copies.max(1)))
@@ -701,11 +688,10 @@ impl CutWork {
     }
 }
 
-type WalkRow = (Option<String>, aterm_json::Value, bool, bool);
+type WalkRow = (Option<String>, aterm_json::Value);
 
 fn standing_row(line: &str) -> Option<WalkRow> {
-    let (land, switch) = (LandWalk::reads(line), SwitchWalk::reads(line));
-    if !land && !switch {
+    if !LandWalk::reads(line) {
         return None;
     }
     let v = aterm_json::from_str::<aterm_json::Value>(line).ok()?;
@@ -713,12 +699,12 @@ fn standing_row(line: &str) -> Option<WalkRow> {
         .get("sid")
         .and_then(aterm_json::Value::as_str)
         .map(str::to_string);
-    Some((sid, v, land, switch))
+    Some((sid, v))
 }
 
 fn standing_step(
     state: &Standing,
-    (sid, v, land, switch): &WalkRow,
+    (sid, v): &WalkRow,
     work: &mut CutWork,
 ) -> Result<Option<Standing>, ()> {
     work.state(state, 3)?;
@@ -740,19 +726,14 @@ fn standing_step(
         1,
         row_bytes.saturating_mul(state.len().saturating_add(3)),
     )?;
-    let was = state.get(sid).cloned().unwrap_or_default();
-    let mut next = was.clone();
-    if *land {
-        next.0.step(v);
-    }
-    if *switch {
-        next.1.step(v);
-    }
+    let was = state.get(sid).copied().unwrap_or_default();
+    let mut next = was;
+    next.step(v);
     if next == was {
         return Ok(None);
     }
     let mut state = state.clone();
-    if next == <(LandWalk, SwitchWalk)>::default() {
+    if next == LandWalk::default() {
         state.remove(sid);
     } else {
         state.insert(sid.clone(), next);
@@ -2449,9 +2430,7 @@ pub struct StreakSeed {
 
 #[must_use]
 pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
-    use super::policy::turn_end::{
-        RULE_ACCOUNT, RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, RULE_USAGE_PROBE,
-    };
+    use super::policy::turn_end::{RULE_ACCOUNT, RULE_USAGE_PROBE};
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut last: Option<StreakSeed> = None;
     let mut recorded = false;
@@ -2515,11 +2494,10 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
         }
         let point = match text("decision") {
             Some("typed")
-                if matches!(
-                    rule,
-                    RULE_USAGE_PROBE | RULE_MODEL_FALLBACK | RULE_MODEL_RESTORE
-                ) || (rule == RULE_ACCOUNT
-                    && text("command").is_some_and(|c| c.starts_with(ACCOUNT_MOVE_COMMAND))) =>
+                if rule == RULE_USAGE_PROBE
+                    || (rule == RULE_ACCOUNT
+                        && text("command")
+                            .is_some_and(|c| c.starts_with(ACCOUNT_MOVE_COMMAND))) =>
             {
                 continue;
             }
@@ -3149,181 +3127,6 @@ pub fn act_reason_after(after: Carried, limit: Option<LimitTry>) -> String {
         reason.push(')');
     }
     reason
-}
-
-#[must_use]
-pub fn model_switch_reason(
-    from: Option<&str>,
-    back_at_unix: Option<i64>,
-    made_unix: i64,
-) -> String {
-    format!(
-        "the turn-end policy (model switch: from={} back_at={} made={made_unix})",
-        from.unwrap_or("-"),
-        back_at_unix.map_or_else(|| "-".to_string(), |s| s.to_string())
-    )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenSwitch {
-    pub from: Option<String>,
-    pub to: String,
-    pub back_at_unix: Option<i64>,
-    pub asked: bool,
-    pub made_unix: i64,
-    /// The agent process the switch is in, by its newest [`switch_process_reason`] row.
-    pub proc: Option<super::policy::turn_end::SwitchProc>,
-}
-
-pub const FALLBACK_ASKED: &str =
-    "a turn was asked on the fallback: the bucket it left is a wall again";
-
-const SWITCH_RUNS: &str = "the model switch is in the agent process";
-
-/// The reason of the row that puts the open model switch in `p`
-/// ([`super::policy::turn_end::SwitchScope::Moved`]).
-#[must_use]
-pub fn switch_process_reason(p: &super::policy::turn_end::SwitchProc) -> String {
-    format!(
-        "{SWITCH_RUNS} (proc={}@{} conversation={})",
-        p.pid,
-        p.start,
-        p.conversation.as_deref().unwrap_or("-")
-    )
-}
-
-/// The reason of the row that closes the open model switch
-/// ([`super::policy::turn_end::SwitchScope::Closed`]).
-pub const SWITCH_CLOSED: &str =
-    "the model switch is over: another program, on another conversation, runs in the tab";
-
-#[must_use]
-pub fn open_model_switch_in(body: &str, sid: Option<&str>) -> Option<OpenSwitch> {
-    let want = sid.map(|s| s.trim_start_matches('@'));
-    let mut walk = SwitchWalk::default();
-    for line in act_lines(body).filter(|l| SwitchWalk::reads(l)) {
-        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
-            continue;
-        };
-        if v.get("sid").and_then(aterm_json::Value::as_str) == want {
-            walk.step(&v);
-        }
-    }
-    walk.open
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct SwitchWalk {
-    open: Option<OpenSwitch>,
-}
-
-impl SwitchWalk {
-    fn reads(line: &str) -> bool {
-        line.contains(",\"decision\":\"typed\",")
-            || line.contains(FALLBACK_ASKED)
-            || line.contains(SWITCH_RUNS)
-            || line.contains(SWITCH_CLOSED)
-    }
-
-    fn step(&mut self, v: &aterm_json::Value) {
-        use super::policy::turn_end::{
-            RULE_ACCOUNT, RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, SwitchProc,
-        };
-        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
-        if text("decision") != Some("typed") {
-            if text("decision") != Some("waiting") {
-                return;
-            }
-            let reason = text("reason").unwrap_or("");
-            match text("rule_id") {
-                Some(RULE_MODEL_RESTORE) if reason == SWITCH_CLOSED => self.open = None,
-                Some(RULE_MODEL_FALLBACK) => {
-                    let Some(open) = &mut self.open else {
-                        return;
-                    };
-                    if reason == FALLBACK_ASKED {
-                        open.asked = true;
-                    } else if reason.starts_with(SWITCH_RUNS)
-                        && let Some((pid, start)) = switch_field(reason, "proc")
-                            .as_deref()
-                            .and_then(|p| p.split_once('@'))
-                            .and_then(|(pid, start)| {
-                                Some((crate::parse_uint(pid)?, crate::parse_int(start)?))
-                            })
-                    {
-                        open.proc = Some(SwitchProc {
-                            pid,
-                            start,
-                            conversation: switch_field(reason, "conversation"),
-                        });
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-        match text("rule_id") {
-            Some(RULE_MODEL_RESTORE) => self.open = None,
-            Some(RULE_ACCOUNT)
-                if text("command").is_some_and(|c| c.starts_with(ACCOUNT_MOVE_COMMAND))
-                    && text("reason").is_some_and(|r| r.contains("account move:")) =>
-            {
-                self.open = None;
-            }
-            Some(RULE_MODEL_FALLBACK) => {
-                let Some(to) = text("command").and_then(|c| {
-                    c.strip_prefix("relaunch --model ")
-                        .or_else(|| c.strip_prefix("/model "))
-                }) else {
-                    // The switch's own turn (a `/model` switch's `keep
-                    // going`): asked on the fallback.
-                    if let Some(open) = &mut self.open {
-                        open.asked = true;
-                    }
-                    return;
-                };
-                let reason = text("reason").unwrap_or("");
-                let field = |name: &str| switch_field(reason, name);
-                if !reason.contains("model switch:") {
-                    return;
-                }
-                let written = v.get("ts").and_then(aterm_json::Value::as_i64).unwrap_or(0);
-                self.open = Some(OpenSwitch {
-                    from: field("from"),
-                    to: to.trim().to_string(),
-                    back_at_unix: field("back_at").and_then(|w| crate::parse_int(&w)),
-                    asked: false,
-                    made_unix: field("made")
-                        .and_then(|w| crate::parse_int(&w))
-                        .unwrap_or_else(|| written.div_euclid(1000)),
-                    proc: None,
-                });
-            }
-            _ => {
-                if let Some(open) = &mut self.open {
-                    open.asked = true;
-                }
-            }
-        }
-    }
-}
-
-/// The word after `name=` in a switch row's reason, up to a space or `)`; `-` is none.
-fn switch_field(reason: &str, name: &str) -> Option<String> {
-    let at = reason.find(&format!("{name}="))? + name.len() + 1;
-    let word: String = reason[at..]
-        .chars()
-        .take_while(|c| !c.is_whitespace() && *c != ')')
-        .collect();
-    (word != "-" && !word.is_empty()).then_some(word)
-}
-
-#[must_use]
-pub fn open_model_switch(path: &Path, sid: Option<&str>) -> Option<OpenSwitch> {
-    open_model_switch_in(
-        &crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024).ok()??,
-        sid,
-    )
 }
 
 pub const ACCOUNT_MOVE_COMMAND: &str = "relaunch under account ";
@@ -4388,7 +4191,7 @@ mod tests {
 
     #[test]
     fn a_file_past_sixteen_mib_is_streamed_and_cut() {
-        use super::super::policy::turn_end::RULE_MODEL_FALLBACK;
+        use super::super::policy::turn_end::RULE_LAND;
         let dir = crate::supervise::ScratchDir::new("apr", "big");
         let past = 17 << 20;
         let sid = "s-195cbb43bd1fc3dc2c7b";
@@ -4411,15 +4214,15 @@ mod tests {
         assert!(body.ends_with(&cut), "the newest rows kept");
 
         let ledger = path_under(&dir, Some("@s-9")).expect("the drive dir");
-        let switch = Row {
-            rule_id: RULE_MODEL_FALLBACK,
+        let land = Row {
+            rule_id: RULE_LAND,
             outcome: Outcome::Typed,
-            command: "relaunch --model sonnet",
-            reason: &model_switch_reason(Some("opus"), None, 1),
+            command: "(land)",
+            reason: &act_reason(None),
             box_seq: 1,
         }
         .to_json(1_000, Some("@s-9"));
-        let mut body = format!("{switch}\n");
+        let mut body = format!("{land}\n");
         let mut ts = 2_000;
         while body.len() <= past {
             body.push_str(
@@ -4436,16 +4239,16 @@ mod tests {
             ts += 1;
         }
         std::fs::write(&ledger, &body).expect("write");
-        let standing = open_model_switch_in(&body, Some("@s-9"));
-        assert!(standing.is_some(), "the switch stands");
+        let standing = land_episode_in(&body, Some("@s-9"));
+        assert!(standing.is_some(), "the episode stands");
         bound(&ledger);
         let cut = std::fs::read_to_string(&ledger).expect("read");
         assert_eq!(cut.lines().count(), KEEP_ROWS + 1, "the ledger is cut");
         assert!(cut.len() as u64 <= MAX_BYTES, "{} bytes", cut.len());
         assert_eq!(
-            open_model_switch_in(&cut, Some("@s-9")),
+            land_episode_in(&cut, Some("@s-9")),
             standing,
-            "the standing switch survives the cut"
+            "the standing episode survives the cut"
         );
     }
 
@@ -5349,7 +5152,7 @@ mod tests {
 
     #[test]
     fn a_record_between_a_try_and_its_first_read_is_no_read() {
-        use super::super::policy::turn_end::{RULE_LIMIT_RESUME, RULE_MODEL_FALLBACK};
+        use super::super::policy::turn_end::RULE_LIMIT_RESUME;
         let dir = crate::supervise::ScratchDir::new("apr-seed", "first-read");
         let limit = LimitTry {
             bucket: false,
@@ -5357,12 +5160,11 @@ mod tests {
             attempts: 1,
             entitlement: true,
         };
-        let records: [(&str, &str, &str); 5] = [
+        let records: [(&str, &str, &str); 4] = [
             ("none", "", ""),
             ("off", RULE_OFF_STOOD, OFF_STOOD),
             ("land-over", RULE_LAND_OVER, LAND_OVER),
             ("task-done", RULE_TASK_DONE, TASK_DONE),
-            ("fallback-asked", RULE_MODEL_FALLBACK, FALLBACK_ASKED),
         ];
         for (tag, rule, reason) in records {
             let mut rows = vec![
@@ -5493,7 +5295,7 @@ mod tests {
 
     #[test]
     fn the_short_streak_is_the_last_act_s_or_point_s() {
-        use super::super::policy::turn_end::{RULE_CONTINUE, RULE_MODEL_FALLBACK};
+        use super::super::policy::turn_end::{AccountAt, RULE_ACCOUNT, RULE_CONTINUE};
         let dir = crate::supervise::ScratchDir::new("apr-seed", "streak");
         let act = |ts: i64, n: u32| {
             (
@@ -5515,10 +5317,10 @@ mod tests {
         };
         let relaunch = (
             9_000,
-            RULE_MODEL_FALLBACK,
+            RULE_ACCOUNT,
             Outcome::Typed,
-            "relaunch --model sonnet",
-            model_switch_reason(Some("opus"), None, 9),
+            "relaunch under account w2",
+            account_switch_reason("w2", AccountAt::Wall),
         );
         let sid = Some("@s-9");
         let path = seed_ledger(&dir, "streak-acts", &[act(1_000, 2), act(2_000, 3)]);
@@ -6701,7 +6503,7 @@ mod tests {
 
     #[test]
     fn a_cut_keeps_what_the_readers_read_of_a_run_of_records() {
-        use super::super::policy::turn_end::{RULE_LAND, RULE_LAND_NUDGE, RULE_MODEL_FALLBACK};
+        use super::super::policy::turn_end::{RULE_LAND, RULE_LAND_NUDGE};
         let dir = crate::supervise::ScratchDir::new("apr-seed", "cut");
         let sid = Some("@s-9");
         let filler = "cd /Users//someone/Developer/project && cargo test -p project-core --lib -- parser::tests 2>&1 | tail -40";
@@ -6712,14 +6514,6 @@ mod tests {
             })
             .collect();
         let t = 1_000_000_i64;
-        let switch = model_switch_reason(Some("opus"), Some(t / 1000 + 3 * 86_400), t / 1000);
-        rows.push((
-            t,
-            RULE_MODEL_FALLBACK,
-            Outcome::Typed,
-            "relaunch --model sonnet",
-            switch,
-        ));
         let point = |ts: i64, n: u32| {
             (
                 ts,
@@ -6755,7 +6549,6 @@ mod tests {
         rows.push(ran(t + 10_000 + 300_000 * i64::from(wakes + 1)));
         let read = |path: &Path| {
             (
-                open_model_switch(path, sid).map(|o| o.to),
                 land_episode(path, sid),
                 short_streak(path, sid),
                 done_check_owed(path, sid),
@@ -6765,8 +6558,8 @@ mod tests {
         let path = seed_ledger(&dir, "whole", &rows);
         assert!(std::fs::metadata(&path).unwrap().len() > MAX_BYTES);
         let before = read(&path);
-        assert!(before.0.is_some() && before.1.is_some(), "{before:?}");
-        let streak = before.2.clone().expect("a streak");
+        assert!(before.0.is_some(), "{before:?}");
+        let streak = before.1.clone().expect("a streak");
         assert!(
             streak.point && streak.ran && streak.short == wakes,
             "{streak:?}"
@@ -6791,14 +6584,14 @@ mod tests {
         let path = seed_ledger(&dir, "whole-plain", &rows);
         crate::harness::cli::bound_ledger(&path, MAX_BYTES, KEEP_ROWS).expect("cut");
         let plain = read(&path);
-        assert!(plain.0.is_none() && plain.1.is_none(), "CONTROL: {plain:?}");
+        assert!(plain.0.is_none(), "CONTROL: {plain:?}");
     }
 
     #[test]
     fn a_cut_keeps_the_rows_of_the_states_that_stand_past_a_run_of_acts() {
         use super::super::policy::turn_end::{
             LAND, LAND_ANSWER, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE, RULE_LAND,
-            RULE_LAND_ANSWER, RULE_LAND_NUDGE, RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE,
+            RULE_LAND_ANSWER, RULE_LAND_NUDGE,
         };
         let dir = crate::supervise::ScratchDir::new("apr-seed", "cut-acts");
         let sid = Some("@s-9");
@@ -6810,14 +6603,6 @@ mod tests {
             })
             .collect();
         let t = 1_000_000_i64;
-        let switch = model_switch_reason(Some("opus"), Some(t / 1000 + 3 * 86_400), t / 1000);
-        rows.push((
-            t,
-            RULE_MODEL_FALLBACK,
-            Outcome::Typed,
-            "relaunch --model sonnet",
-            switch,
-        ));
         let point = |ts: i64| {
             (
                 ts,
@@ -6844,7 +6629,6 @@ mod tests {
         }
         let read = |path: &Path| {
             (
-                open_model_switch(path, sid).map(|o| o.to),
                 land_episode(path, sid),
                 short_streak(path, sid),
                 done_check_owed(path, sid),
@@ -6854,33 +6638,12 @@ mod tests {
         let path = seed_ledger(&dir, "acts", &rows);
         assert!(std::fs::metadata(&path).unwrap().len() > MAX_BYTES);
         let before = read(&path);
-        assert!(before.0.is_some() && before.1.is_some(), "{before:?}");
-        bound(&path);
-        let kept = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(read(&path), before);
-        let first = kept.lines().next().expect("rows");
-        assert!(first.contains(RULE_MODEL_FALLBACK), "{first}");
-        let land_only: Vec<_> = rows
-            .iter()
-            .filter(|r| r.1 != RULE_MODEL_FALLBACK)
-            .cloned()
-            .collect();
-        let path = seed_ledger(&dir, "acts-land", &land_only);
-        let before = read(&path);
-        assert!(before.0.is_none() && before.1.is_some(), "{before:?}");
+        assert!(before.0.is_some(), "{before:?}");
         bound(&path);
         assert_eq!(read(&path), before);
         let mut done = rows.clone();
-        let end = t + 10_000 + 300_000 * 1101;
         done.push((
-            end,
-            RULE_MODEL_RESTORE,
-            Outcome::Typed,
-            "relaunch --model opus",
-            act_reason(None),
-        ));
-        done.push((
-            end + 1,
+            t + 10_000 + 300_000 * 1101,
             RULE_CONTINUE,
             Outcome::Typed,
             "keep going",
@@ -6888,7 +6651,7 @@ mod tests {
         ));
         let path = seed_ledger(&dir, "acts-over", &done);
         let over = read(&path);
-        assert!(over.0.is_none() && over.1.is_none(), "{over:?}");
+        assert!(over.0.is_none(), "{over:?}");
         bound(&path);
         let cut = std::fs::read_to_string(&path).unwrap();
         let acts = cut.lines().filter(|l| record_of(l).is_none()).count();
@@ -6925,7 +6688,7 @@ mod tests {
             ));
         }
         let landed = held("land-held", &land);
-        assert!(landed.1.is_some_and(|e| e.nudges == 2), "{landed:?}");
+        assert!(landed.0.is_some_and(|e| e.nudges == 2), "{landed:?}");
         let mut compact_answered = vec![
             (t, RULE_LAND, Outcome::Typed, LAND, act_reason(None)),
             point(t + 1),
@@ -6947,7 +6710,7 @@ mod tests {
         ];
         compact_answered.extend(land.iter().skip(6).cloned());
         let owed = held("land-answer-compacted", &compact_answered)
-            .1
+            .0
             .expect("the answer's compact");
         assert!(owed.compact && !owed.landing, "{owed:?}");
         assert_eq!(owed.owed, Some(RULE_LAND_ANSWER));
@@ -6973,30 +6736,13 @@ mod tests {
         }
         let landed = held("land-answered", &answered);
         assert!(
-            landed.1.is_some_and(|e| e.nudges == 2 && !e.landing),
+            landed.0.is_some_and(|e| e.nudges == 2 && !e.landing),
             "{landed:?}"
         );
-        let mut switched: Vec<(i64, &str, Outcome, &str, String)> = vec![(
-            t,
-            RULE_MODEL_FALLBACK,
-            Outcome::Typed,
-            "relaunch --model sonnet",
-            model_switch_reason(Some("opus"), None, t / 1000),
-        )];
-        for n in 1..=4000_i64 {
-            let at = t + 600_000 * n;
-            let act = act_reason(None);
-            switched.push((at, RULE_CONTINUE, Outcome::Typed, "keep going", act));
-            switched.push(point(at + 300_000));
-        }
-        let path = seed_ledger(&dir, "switch-held-before", &switched);
-        let open = open_model_switch(&path, sid).expect("the switch");
-        assert!(open.asked && open.back_at_unix.is_none(), "{open:?}");
-        assert_eq!(held("switch-held", &switched).0.as_deref(), Some("sonnet"));
         let path = seed_ledger(&dir, "acts-plain", &rows);
         crate::harness::cli::bound_ledger(&path, MAX_BYTES, KEEP_ROWS).expect("cut");
         let plain = read(&path);
-        assert!(plain.0.is_none() && plain.1.is_none(), "CONTROL: {plain:?}");
+        assert!(plain.0.is_none(), "CONTROL: {plain:?}");
     }
 
     #[test]
@@ -7134,7 +6880,7 @@ mod tests {
 
     #[test]
     fn a_restored_tab_s_cut_keeps_its_take_up_while_a_state_of_the_earlier_books_stands() {
-        use super::super::policy::turn_end::{RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE};
+        use super::super::policy::turn_end::{RULE_CONTINUE, RULE_LAND};
         let dir = crate::supervise::ScratchDir::new("apr-seed", "restored-cut");
         let root: &Path = &dir;
         let (was, tab) = ("s-a0", "s-b1");
@@ -7150,16 +6896,15 @@ mod tests {
             format!("{}\n", row.to_json(ts, Some(sid)))
         };
         let t = 1_000_000_i64;
-        let switch = model_switch_reason(Some("opus"), Some(t / 1000 + 3 * 86_400), t / 1000);
         let theirs = ledger_under(root, Some(was));
         std::fs::write(
             &theirs,
             row(
                 t,
-                RULE_MODEL_FALLBACK,
+                RULE_LAND,
                 Outcome::Typed,
-                "relaunch --model sonnet",
-                &switch,
+                "(land)",
+                &act_reason(None),
                 was,
             ),
         )
@@ -7198,30 +6943,30 @@ mod tests {
             } else {
                 own
             };
-            (up, open_model_switch_in(&books, Some(tab)).map(|o| o.to))
+            (up, land_episode_in(&books, Some(tab)).is_some())
         };
         let path = ledger_under(root, Some(tab));
         std::fs::write(&path, format!("{take_up}{}", approvals(t + 2_000))).expect("the tab's");
         assert!(std::fs::metadata(&path).unwrap().len() > MAX_BYTES);
         let before = books(&path);
-        assert!(before.0 && before.1.is_some(), "{before:?}");
+        assert!(before.0 && before.1, "{before:?}");
         bound(&path);
-        assert_eq!(books(&path), before, "the switch stands: the take-up kept");
-        let back = row(
+        assert_eq!(books(&path), before, "the episode stands: the take-up kept");
+        let over = row(
             t + 1_500,
-            RULE_MODEL_RESTORE,
+            RULE_CONTINUE,
             Outcome::Typed,
-            "relaunch --model opus",
+            "keep going",
             &act_reason(None),
             tab,
         );
-        std::fs::write(&path, format!("{take_up}{back}{}", approvals(t + 2_000))).expect("over");
-        assert_eq!(books(&path), (true, None));
+        std::fs::write(&path, format!("{take_up}{over}{}", approvals(t + 2_000))).expect("over");
+        assert_eq!(books(&path), (true, false));
         bound(&path);
-        assert_eq!(books(&path), (false, None), "the take-up cut");
+        assert_eq!(books(&path), (false, false), "the take-up cut");
         std::fs::write(&path, format!("{take_up}{}", approvals(t + 2_000))).expect("plain");
         crate::harness::cli::bound_ledger(&path, MAX_BYTES, KEEP_ROWS).expect("cut");
-        assert_eq!(books(&path), (false, None), "CONTROL");
+        assert_eq!(books(&path), (false, false), "CONTROL");
     }
 
     #[test]
@@ -7264,7 +7009,7 @@ mod tests {
 
     #[test]
     fn a_second_restore_reads_no_state_the_tab_between_ended_before_its_cut() {
-        use super::super::policy::turn_end::{RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE};
+        use super::super::policy::turn_end::{RULE_CONTINUE, RULE_LAND};
         let dir = crate::supervise::ScratchDir::new("apr-seed", "restored-chain");
         let root: &Path = &dir;
         let (a, b, c) = ("s-a0", "s-b1", "s-c2");
@@ -7280,17 +7025,9 @@ mod tests {
             format!("{}\n", row.to_json(ts, Some(sid)))
         };
         let t = 1_000_000_i64;
-        let switch = model_switch_reason(Some("opus"), Some(t / 1000 + 3 * 86_400), t / 1000);
         std::fs::write(
             ledger_under(root, Some(a)),
-            row(
-                t,
-                RULE_MODEL_FALLBACK,
-                Outcome::Typed,
-                "relaunch --model sonnet",
-                &switch,
-                a,
-            ),
+            row(t, RULE_LAND, Outcome::Typed, "(land)", &act_reason(None), a),
         )
         .expect("A's books");
         crate::harness::upgrade_drive::note_earlier_tab_under(root, b, a);
@@ -7304,11 +7041,11 @@ mod tests {
             EARLIER_BOOKS,
             b,
         );
-        let back = row(
+        let over = row(
             t + 1_500,
-            RULE_MODEL_RESTORE,
+            RULE_CONTINUE,
             Outcome::Typed,
-            "relaunch --model opus",
+            "keep going",
             &act_reason(None),
             b,
         );
@@ -7340,35 +7077,35 @@ mod tests {
                 own
             }
         };
-        let switched = |tab: &str| open_model_switch_in(&books_of(tab), Some(tab)).map(|o| o.to);
+        let landing = |tab: &str| land_episode_in(&books_of(tab), Some(tab)).is_some();
         let bp = ledger_under(root, Some(b));
-        std::fs::write(&bp, format!("{take_up}{back}{approvals}")).expect("B's books");
-        assert_eq!(switched(b), None, "B switched back");
+        std::fs::write(&bp, format!("{take_up}{over}{approvals}")).expect("B's books");
+        assert!(!landing(b), "B ended the episode");
         bound(&bp);
         assert!(
             !took_up_earlier(&std::fs::read_to_string(&bp).unwrap(), b),
             "B's take-up cut"
         );
-        assert_eq!(switched(b), None, "B after its cut");
+        assert!(!landing(b), "B after its cut");
         crate::harness::upgrade_drive::note_earlier_tab_under(root, c, b);
-        assert_eq!(switched(c), None, "C reads no switch B ended");
+        assert!(!landing(c), "C reads no episode B ended");
         let cont = dir.join("continuous.jsonl");
         let a_rows = std::fs::read_to_string(ledger_under(root, Some(a)))
             .unwrap()
             .replace("\"sid\":\"s-a0\"", "\"sid\":\"s-b1\"");
-        std::fs::write(&cont, format!("{a_rows}{back}{approvals}")).unwrap();
+        std::fs::write(&cont, format!("{a_rows}{over}{approvals}")).unwrap();
         bound(&cont);
         assert!(
-            open_model_switch(&cont, Some(b)).is_none(),
+            land_episode(&cont, Some(b)).is_none(),
             "CONTROL: continuous"
         );
-        std::fs::write(&bp, format!("{take_up}{approvals}")).expect("B's books, no switch back");
+        std::fs::write(&bp, format!("{take_up}{approvals}")).expect("B's books, the episode open");
         bound(&bp);
         assert!(
             took_up_earlier(&std::fs::read_to_string(&bp).unwrap(), b),
             "CONTROL: kept"
         );
-        assert_eq!(switched(c).as_deref(), Some("sonnet"), "CONTROL: through B");
+        assert!(landing(c), "CONTROL: through B");
     }
 
     #[test]
@@ -7446,15 +7183,15 @@ mod tests {
 
     #[test]
     fn a_cut_keeps_every_standing_row_when_its_standing_workspace_is_full() {
-        use super::super::policy::turn_end::RULE_MODEL_FALLBACK;
+        use super::super::policy::turn_end::RULE_LAND;
         let mut rows = vec![String::new()];
         for sid in ["@s-9", "@s-10"] {
             rows.push(
                 Row {
-                    rule_id: RULE_MODEL_FALLBACK,
+                    rule_id: RULE_LAND,
                     outcome: Outcome::Typed,
-                    command: "relaunch --model sonnet",
-                    reason: &model_switch_reason(Some("opus"), None, 1),
+                    command: "(land)",
+                    reason: &act_reason(None),
                     box_seq: 1,
                 }
                 .to_json(1_000, Some(sid)),
@@ -7489,12 +7226,7 @@ mod tests {
             let from = rows.len() - KEEP_ROWS;
             rows.iter()
                 .enumerate()
-                .filter(|(i, l)| {
-                    *i >= from
-                        || LandWalk::reads(l)
-                        || SwitchWalk::reads(l)
-                        || l.contains(RULE_EARLIER_BOOKS)
-                })
+                .filter(|(i, l)| *i >= from || LandWalk::reads(l) || l.contains(RULE_EARLIER_BOOKS))
                 .map(|(_, l)| (*l).to_string())
                 .collect()
         };
@@ -7502,9 +7234,9 @@ mod tests {
         assert!(cut.len() < original.len(), "an ordinary cut still cuts");
         for sid in ["@s-9", "@s-10"] {
             assert_eq!(
-                open_model_switch_in(&cut.join("\n"), Some(sid)),
-                open_model_switch_in(&body, Some(sid)),
-                "the standing switch survives"
+                land_episode_in(&cut.join("\n"), Some(sid)),
+                land_episode_in(&body, Some(sid)),
+                "the standing episode survives"
             );
         }
         let earlier = (0..64)
@@ -7587,9 +7319,9 @@ mod tests {
             );
             for sid in ["@s-9", "@s-10"] {
                 assert_eq!(
-                    open_model_switch_in(&kept.join("\n"), Some(sid)),
-                    open_model_switch_in(&body, Some(sid)),
-                    "the standing switch survives an unadmitted workspace"
+                    land_episode_in(&kept.join("\n"), Some(sid)),
+                    land_episode_in(&body, Some(sid)),
+                    "the standing episode survives an unadmitted workspace"
                 );
             }
         }

@@ -372,6 +372,8 @@ mod setup_token_lab {
     }
 }
 #[cfg(target_os = "macos")]
+mod fsevents;
+#[cfg(target_os = "macos")]
 mod settings_witness;
 #[cfg(target_os = "macos")]
 mod sleep;
@@ -478,6 +480,9 @@ usage: targo --unverified lab <command> [tag] [args]
        up takes one optional tag beside --window, --fabric and --tab-strip; down, ps, crash, relaunch and sleep
        take any first word as the tag;
        a verb that brings up its own lab defaults to a tag of its own)
+  fsevents OUT -- PROGRAM ARGS  count file-level FSEvents on / while PROGRAM runs; write path counts to OUT
+  fsevents summarize OUT PREFIX DEPTH
+                                 rank captured path prefixes; counts include coalescing and report dropped markers
   artifact-serve --bind LAN_IP:PORT --peer IP --status NEW_PATH --file NAME=ABSOLUTE_PATH...
                                  serve immutable named snapshots to one peer using a capability stored only in the private status file
                                  bounded by --lifetime-secs (default 900, maximum 3600) and --max-requests (default 32, maximum 128)
@@ -1348,6 +1353,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
         "video-sheet" => video_sheet::cmd(args),
         "system-state-gallery" => system_state_gallery::cmd_system_state_gallery(args),
+        "fsevents" => fsevents::cmd(args),
         "allocation-monitor" => allocation_monitor::cmd(args),
         "window-custody" => window_custody::cmd(args),
         "window-custody-owner" => window_custody::owner(args),
@@ -1517,6 +1523,17 @@ fn main() -> std::process::ExitCode {
                     mesh_churn::converge_standin(rest).unwrap_or(2)
                 }
                 "key-dump" => meta_keys::keydump_main(rest),
+                // The census measures the caller's command in its actual environment and
+                // directory, before private-instance labs confine either.
+                "fsevents" => match fsevents::cmd(rest) {
+                    Ok(code) => code,
+                    Err(fail) => {
+                        if let Some(message) = fail.msg {
+                            eprintln!("fsevents: {message}");
+                        }
+                        fail.code
+                    }
+                },
                 "mcp-standin" => codex_rig::mcp_main(rest),
                 _ => {
                     sys::forget_env(paths::forgotten);

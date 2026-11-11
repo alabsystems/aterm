@@ -859,26 +859,48 @@ fn front_door_main(
     #[cfg(unix)]
     aterm_machines::init_secrets::on_ask_members(aterm_agent::members_cli::ask_members_admitted);
     #[cfg(target_os = "macos")]
-    aterm_gui::on_system_machine_name_apply(|number| {
-        use aterm_machines::port::System as _;
-        let sys = aterm_machines::port::Live::new();
-        if sys.euid() == 0 || aterm_machines::console::remote(&sys) {
-            return Err("macOS naming waits for this Mac's console account".into());
-        }
-        let state = aterm_types::dirs::state_dir().ok_or("this machine's state is unavailable")?;
-        let config = aterm_types::dirs::aterm_config_path()
-            .ok_or("this machine's naming policy is unavailable")?;
-        let current = || {
-            aterm_agent::machine_name::publish::check_current(&state, &config, number)
-                .map_err(|why| why.phrase())
-        };
-        aterm_machines::root_steps::name_by_rule(&sys, &number.to_string(), &current)
-            .map(|_| ())
-            .map_err(|why| {
-                aterm_log::info!("machine name: existing macOS authorization did not apply: {why}");
-                "macOS naming did not finish through setup's existing authorization".to_owned()
-            })
-    });
+    aterm_gui::on_system_machine_name_apply(
+        |state, config, names| {
+            use aterm_machines::port::System as _;
+            let sys = aterm_machines::port::Live::new();
+            if sys.euid() == 0 || aterm_machines::console::remote(&sys) {
+                return Err("macOS naming waits for this Mac's console account".into());
+            }
+            if aterm_types::dirs::state_dir().as_deref() != Some(state)
+                || aterm_types::dirs::aterm_config_path().as_deref() != Some(config)
+            {
+                return Err(
+                    "macOS naming requires this account's current name and settings".into(),
+                );
+            }
+            let current = || {
+                aterm_agent::machine_name::publish::check_system_current(state, config, names)
+                    .map_err(|why| why.phrase())
+            };
+            aterm_machines::root_steps::name_by_rule(&sys, names, &current)
+                .map(|_| ())
+                .map_err(|why| {
+                    aterm_log::info!(
+                        "machine name: existing macOS authorization did not apply: {why}"
+                    );
+                    "macOS naming did not finish through setup's existing authorization".to_owned()
+                })
+        },
+        |state, config| {
+            use aterm_machines::port::System as _;
+            let sys = aterm_machines::port::Live::new();
+            if sys.euid() == 0
+                || aterm_machines::console::remote(&sys)
+                || aterm_types::dirs::state_dir().as_deref() != Some(state)
+                || aterm_types::dirs::aterm_config_path().as_deref() != Some(config)
+            {
+                return Err(
+                    "macOS naming authorization requires this Mac's console account".into(),
+                );
+            }
+            aterm_machines::root_steps::name_rule_current(&sys)
+        },
+    );
     // Every removal path signs its table cutoffs before its `Remove` (one-mesh §4.10, B11):
     // aterm-db writes table operations and depends on aterm-secrets, which signs the `Remove`.
     #[cfg(unix)]
@@ -7320,7 +7342,7 @@ struct SetupIo {
         &[aterm_types::macos_setup::Subject],
         bool,
         aterm_cli::macos_doctor::ObservationRead,
-    ) -> aterm_cli::macos_doctor::ObservationBatch,
+    ) -> Vec<aterm_types::macos_setup::Observation>,
     /// Save a person's Stop of a run, durably, on the Stop's worker
     /// (`aterm_cli::macos_doctor::request_initial_setup_stop`).
     save_stop: fn(u64) -> Result<(), String>,
@@ -7834,6 +7856,7 @@ fn with_setup_readback<T>(scope: SetupReadbackScope, pass: impl FnOnce() -> T) -
 
 /// One queued read of System State rows.
 #[cfg(target_os = "macos")]
+#[derive(Clone, PartialEq, Eq)]
 struct ObserveRequest {
     /// The page's plan; `None` keeps the last one.
     plan: Option<aterm_types::macos_setup::Plan>,
@@ -7865,6 +7888,8 @@ impl ObserveRequest {
 #[cfg(target_os = "macos")]
 struct ObserveQueue {
     running: bool,
+    active: Vec<ObserveRequest>,
+    current: Option<ObserveRequest>,
     /// Latest ordinary refresh, kept apart from a Check of another source.
     next: Option<ObserveRequest>,
     /// Latest explicit Check. Its scope never transfers to another plan.
@@ -7885,7 +7910,7 @@ impl ObserveQueue {
             }
             if request.choices > pending.choices {
                 // A person's newer choice retires both pending intents.
-                for previous in self.take_pending().into_iter().flatten() {
+                for previous in [self.next.take(), self.check.take()].into_iter().flatten() {
                     request.include_subjects(previous.subjects);
                 }
             }
@@ -7932,13 +7957,31 @@ impl ObserveQueue {
     /// Dispatch one finite batch: the current-source refresh first, then the
     /// explicit Check. New ordinary arrivals cannot postpone that Check.
     fn take_pending(&mut self) -> [Option<ObserveRequest>; 2] {
-        [self.next.take(), self.check.take()]
+        let batch = [self.next.take(), self.check.take()];
+        self.active = batch.iter().flatten().cloned().collect();
+        batch
+    }
+
+    fn progress(&self) -> Vec<(ObserveRequest, bool)> {
+        self.current
+            .iter()
+            .map(|request| (request.clone(), false))
+            .chain(
+                self.active
+                    .iter()
+                    .chain(self.next.iter())
+                    .chain(self.check.iter())
+                    .map(|request| (request.clone(), true)),
+            )
+            .collect()
     }
 }
 
 #[cfg(target_os = "macos")]
 static OBSERVE_QUEUE: std::sync::Mutex<ObserveQueue> = std::sync::Mutex::new(ObserveQueue {
     running: false,
+    active: Vec::new(),
+    current: None,
     next: None,
     check: None,
     retry: None,
@@ -7949,6 +7992,8 @@ static OBSERVE_QUEUE: std::sync::Mutex<ObserveQueue> = std::sync::Mutex::new(Obs
 #[cfg(target_os = "macos")]
 struct ObservedRows {
     rows: Vec<aterm_types::macos_setup::Observation>,
+    last_known: Vec<aterm_types::macos_setup::Observation>,
+    unconfirmed: Vec<aterm_types::macos_setup::Subject>,
     generation: u64,
     caps_live: Option<(u64, aterm_types::macos_setup::LiveKeyboardMapping)>,
     /// The vault source the Secrets and Repositories readings share; a reading for another
@@ -7967,6 +8012,8 @@ struct ObservedRows {
 #[cfg(target_os = "macos")]
 static OBSERVED_ROWS: std::sync::Mutex<ObservedRows> = std::sync::Mutex::new(ObservedRows {
     rows: Vec::new(),
+    last_known: Vec::new(),
+    unconfirmed: Vec::new(),
     generation: 0,
     caps_live: None,
     vault_url: None,
@@ -7980,12 +8027,64 @@ fn retire_observed_rows(
     rows: &mut ObservedRows,
     subjects: &[aterm_types::macos_setup::Subject],
 ) -> bool {
+    retire_observed_rows_with_history(rows, subjects, false)
+}
+
+#[cfg(target_os = "macos")]
+fn remember_observed_values(
+    rows: &mut ObservedRows,
+    subjects: &[aterm_types::macos_setup::Subject],
+) -> bool {
+    use aterm_types::macos_setup::Standing;
+    let mut changed = false;
+    for row in rows.rows.iter().filter(|row| {
+        subjects.contains(&row.subject)
+            && !rows.unconfirmed.contains(&row.subject)
+            && !matches!(row.standing, Standing::Unknown | Standing::Failed)
+    }) {
+        match rows
+            .last_known
+            .iter_mut()
+            .find(|old| old.subject == row.subject)
+        {
+            Some(old) if old == row => {}
+            Some(old) => {
+                *old = row.clone();
+                changed = true;
+            }
+            None => {
+                rows.last_known.push(row.clone());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+#[cfg(target_os = "macos")]
+fn retire_observed_rows_with_history(
+    rows: &mut ObservedRows,
+    subjects: &[aterm_types::macos_setup::Subject],
+    keep_history: bool,
+) -> bool {
+    let mut history_changed = if keep_history {
+        remember_observed_values(rows, subjects)
+    } else {
+        let before = rows.last_known.len();
+        rows.last_known
+            .retain(|row| !subjects.contains(&row.subject));
+        before != rows.last_known.len()
+    };
+    let unconfirmed = rows.unconfirmed.len();
+    rows.unconfirmed
+        .retain(|subject| !subjects.contains(subject));
+    history_changed |= unconfirmed != rows.unconfirmed.len();
     let before = rows.rows.len();
     rows.rows.retain(|row| !subjects.contains(&row.subject));
     let live_retired = subjects.contains(&aterm_types::macos_setup::Subject::Setting(
         aterm_types::macos_setup::Setting::CapsLock,
     )) && rows.caps_live.take().is_some();
-    let changed = rows.rows.len() != before || live_retired;
+    let changed = rows.rows.len() != before || live_retired || history_changed;
     if changed {
         rows.generation += 1;
     }
@@ -7994,8 +8093,15 @@ fn retire_observed_rows(
 
 #[cfg(target_os = "macos")]
 fn replace_observed_row(rows: &mut ObservedRows, seen: aterm_types::macos_setup::Observation) {
+    let was_unconfirmed = rows.unconfirmed.contains(&seen.subject);
+    let unconfirmed = seen.standing == aterm_types::macos_setup::Standing::Unknown;
+    if unconfirmed && !was_unconfirmed {
+        rows.unconfirmed.push(seen.subject);
+    } else if !unconfirmed {
+        rows.unconfirmed.retain(|subject| *subject != seen.subject);
+    }
     match rows.rows.iter_mut().find(|row| row.subject == seen.subject) {
-        Some(row) if *row == seen => return,
+        Some(row) if *row == seen && was_unconfirmed == unconfirmed => return,
         Some(row) => *row = seen,
         None => rows.rows.push(seen),
     }
@@ -8135,7 +8241,23 @@ fn request_observation(
     if subjects.is_empty() {
         return true;
     }
-    invalidate_setup_observations(&subjects);
+    if forced {
+        // A pure Check retires current authority, but keeps its last useful values
+        // separately for display. Real source/device/choice/effect changes clear both.
+        let changed = if let Ok(mut activity) = SETUP_ACTIVITY.lock()
+            && let Ok(mut rows) = OBSERVED_ROWS.lock()
+        {
+            activity.touch(&subjects);
+            retire_observed_rows_with_history(&mut rows, &subjects, true)
+        } else {
+            false
+        };
+        if changed {
+            publish_setup_readings();
+        }
+    } else {
+        invalidate_setup_observations(&subjects);
+    }
     queue_observation(ObserveRequest {
         plan,
         choices: OBSERVED_ROWS.lock().map_or(0, |rows| rows.choices),
@@ -8232,6 +8354,8 @@ fn dispatch_observation_with(
         queue.enqueue(request);
     }
     if queue.running || (queue.next.is_none() && queue.check.is_none()) {
+        drop(queue);
+        publish_setup_readings();
         return true;
     }
     let now = now();
@@ -8241,6 +8365,8 @@ fn dispatch_observation_with(
         .and_then(|retry| retry.remaining(now))
         .is_some_and(|left| !left.is_zero())
     {
+        drop(queue);
+        publish_setup_readings();
         return true;
     }
     queue.running = true;
@@ -8256,14 +8382,26 @@ fn dispatch_observation_with(
                 let batch = queue.take_pending();
                 if batch.iter().all(Option::is_none) {
                     queue.running = false;
+                    drop(queue);
+                    publish_setup_readings();
                     return;
                 }
                 batch
             };
+            publish_setup_readings();
             // A started read, Unknown included, is consumed once. Only new requests
             // enter the queue while this finite batch runs.
             for request in batch.into_iter().flatten() {
+                if let Ok(mut queue) = OBSERVE_QUEUE.lock() {
+                    queue.active.retain(|active| active != &request);
+                    queue.current = Some(request.clone());
+                }
+                publish_setup_readings();
                 observe_rows(request);
+                if let Ok(mut queue) = OBSERVE_QUEUE.lock() {
+                    queue.current = None;
+                }
+                publish_setup_readings();
             }
         }
     }));
@@ -8274,9 +8412,12 @@ fn dispatch_observation_with(
             .get_or_insert_default()
             .reaped(aterm_secrets::converge::Last::Failed, now);
         drop(queue);
+        publish_setup_readings();
         aterm_log::warn!("System State could not read its rows: {why}");
         return false;
     }
+    drop(queue);
+    publish_setup_readings();
     true
 }
 
@@ -8295,6 +8436,7 @@ fn observe_rows(request: ObserveRequest) {
     }
     let named = request
         .plan
+        .clone()
         .or_else(|| pending.as_ref().map(|admission| admission.plan.clone()));
     let Some((plan, choices)) = observed_plan(named, request.choices) else {
         return;
@@ -8309,6 +8451,7 @@ fn observe_rows(request: ObserveRequest) {
         .iter()
         .copied()
         .filter(|subject| !request.pending_repositories || *subject == repositories)
+        .filter(|subject| network || *subject != repositories)
         .filter(|subject| match subject {
             aterm_types::macos_setup::Subject::Setting(setting)
                 if setting.group() == aterm_types::macos_setup::Group::Accounts =>
@@ -8318,6 +8461,19 @@ fn observe_rows(request: ObserveRequest) {
             _ => true,
         })
         .collect();
+    // Progress names the plan actually admitted by observed_plan, not an old
+    // queued choice or the other source in this worker's finite batch.
+    if let Ok(mut queue) = OBSERVE_QUEUE.lock()
+        && queue.current.is_some()
+    {
+        queue.current = Some(ObserveRequest {
+            plan: Some(plan.clone()),
+            choices,
+            subjects: subjects.clone(),
+            ..request.clone()
+        });
+    }
+    publish_setup_readings();
     if network && subjects.contains(&repositories) && !request.pending_repositories {
         pending = (setup_io().pending_repositories)().ok().flatten();
     }
@@ -8352,20 +8508,34 @@ fn observe_rows(request: ObserveRequest) {
             page_front: aterm_gui::system_state_on_screen,
         }
     };
+    // Keep the last useful value before a read can supply Unknown or be skipped.
+    // This is presentation history only, under the same choice/source scope.
+    if let Ok(mut rows) = OBSERVED_ROWS.lock()
+        && rows.choices == choices
+    {
+        let same_source = rows.vault_url.as_deref() == Some(plan.vault_url.trim());
+        let remembered: Vec<_> = subjects
+            .iter()
+            .copied()
+            .filter(|subject| !subject.uses_vault_source() || same_source)
+            .collect();
+        if remember_observed_values(&mut rows, &remembered) {
+            rows.generation += 1;
+        }
+    }
     let read = std::panic::catch_unwind(|| (setup_io().read)(&plan, &subjects, network, admission))
         .unwrap_or_else(|_| {
             // Do not keep a previous success as this reading's result, nor
             // retry the failed batch. The worker still drains accepted work;
             // publication below retains its choice, source and stage fences.
             aterm_log::warn!("System State's row reading unwound; the requested rows are unknown");
-            let rows: Vec<_> = subjects
+            subjects
                 .iter()
                 .map(|subject| Observation {
                     note: Some("This reading did not finish. Check again.".into()),
                     ..Observation::unknown(*subject)
                 })
-                .collect();
-            aterm_cli::macos_doctor::ObservationBatch::from(rows)
+                .collect()
         });
     // A child's status supplies no readiness. Only a fresh native reading for the same
     // still-pending plan/revision can settle its park, even when the displayed row was
@@ -8420,6 +8590,10 @@ fn observe_rows(request: ObserveRequest) {
         let mut changed = rows.vault_url.as_deref() != Some(source);
         if changed {
             rows.rows.retain(|row| !row.subject.uses_vault_source());
+            rows.last_known
+                .retain(|row| !row.subject.uses_vault_source());
+            rows.unconfirmed
+                .retain(|subject| !subject.uses_vault_source());
             rows.vault_url = Some(source.to_owned());
         }
         rows.plan = Some(plan);
@@ -8431,17 +8605,28 @@ fn observe_rows(request: ObserveRequest) {
         // Admission skips carry no new evidence, including on the launch's first
         // read. Keep an existing reading, or leave the subject pending until its
         // reader is admitted when the page is shown.
-        for seen in read.rows.into_iter().filter(|seen| {
-            !read.not_admitted.contains(&seen.subject)
-                && !activity.subjects.contains(&seen.subject)
-                && !(activity.input_readback
-                    && seen.subject
-                        == aterm_types::macos_setup::Subject::Setting(Setting::CapsLock))
+        let current_subject = |subject: &Subject| {
+            !activity.subjects.contains(subject)
+                && !(activity.input_readback && *subject == Subject::Setting(Setting::CapsLock))
                 && activity
                     .touched
                     .iter()
-                    .all(|(row, epoch)| *row != seen.subject || *epoch <= started)
-        }) {
+                    .all(|(row, epoch)| row != subject || *epoch <= started)
+        };
+        for seen in read
+            .into_iter()
+            .filter(|seen| current_subject(&seen.subject))
+        {
+            let was_unconfirmed = rows.unconfirmed.contains(&seen.subject);
+            if seen.standing == Standing::Unknown {
+                if !was_unconfirmed {
+                    rows.unconfirmed.push(seen.subject);
+                    changed = true;
+                }
+            } else if was_unconfirmed {
+                rows.unconfirmed.retain(|subject| *subject != seen.subject);
+                changed = true;
+            }
             wake |= repository_ready_can_wake
                 && seen.subject == repositories
                 && seen.standing == Standing::InPlace;
@@ -8955,6 +9140,8 @@ fn begin_setup_choice(
         None
     };
     let choices = OBSERVED_ROWS.lock().map_or(0, |mut rows| {
+        rows.last_known.clear();
+        rows.unconfirmed.clear();
         rows.choices += 1;
         rows.plan = Some(plan.clone());
         rows.choices
@@ -8991,6 +9178,8 @@ fn forget_setup_choice(choice: &SetupChoice) {
     let restored = if let Ok(mut rows) = OBSERVED_ROWS.lock()
         && rows.choices == choice.choices
     {
+        rows.last_known.clear();
+        rows.unconfirmed.clear();
         rows.choices += 1;
         rows.plan = None;
         true
@@ -9028,6 +9217,9 @@ fn observed_plan(
 fn add_setup_readings(status: &mut aterm_gui::SetupStatus) {
     let readings = setup_readings();
     status.observed = readings.observed;
+    status.last_known = readings.last_known;
+    status.unconfirmed_observations = readings.unconfirmed_observations;
+    status.observing = readings.observing;
     status.observed_generation = readings.observed_generation;
     status.caps_live = readings.caps_live;
     status.observed_vault_url = readings.observed_vault_url;
@@ -9037,6 +9229,9 @@ fn add_setup_readings(status: &mut aterm_gui::SetupStatus) {
 /// One coherent cache snapshot, with no record, native, privacy or healing read.
 #[cfg(target_os = "macos")]
 fn setup_readings() -> aterm_gui::SetupReadings {
+    let requests = OBSERVE_QUEUE
+        .lock()
+        .map_or_else(|_| Vec::new(), |queue| queue.progress());
     if let Ok(activity) = SETUP_ACTIVITY.lock()
         && let Ok(rows) = OBSERVED_ROWS.lock()
     {
@@ -9045,6 +9240,29 @@ fn setup_readings() -> aterm_gui::SetupReadings {
         observed
             .sort_unstable_by_key(|row| order.iter().position(|subject| *subject == row.subject));
         let mut running = activity.settings.clone();
+        let mut observing = Vec::new();
+        for (request, queued) in requests {
+            if !queued && request.choices != rows.choices {
+                continue;
+            }
+            let plan = request
+                .plan
+                .as_ref()
+                .filter(|_| request.choices == rows.choices)
+                .or(rows.plan.as_ref());
+            for subject in request.subjects {
+                let source = if subject.uses_vault_source() {
+                    let Some(plan) = plan else { continue };
+                    Some(plan.vault_url.trim().to_owned())
+                } else {
+                    None
+                };
+                let progress = (subject, source, queued);
+                if !observing.contains(&progress) {
+                    observing.push(progress);
+                }
+            }
+        }
         if activity.input_readback
             && !running.contains(&aterm_types::macos_setup::Setting::CapsLock)
         {
@@ -9052,6 +9270,9 @@ fn setup_readings() -> aterm_gui::SetupReadings {
         }
         return aterm_gui::SetupReadings {
             observed,
+            last_known: rows.last_known.clone(),
+            unconfirmed_observations: rows.unconfirmed.clone(),
+            observing,
             observed_generation: rows.generation,
             caps_live: rows.caps_live.map(|(_, live)| live),
             observed_vault_url: rows.vault_url.clone(),
@@ -10570,12 +10791,7 @@ impl PreferenceReadings {
             let mut rows = OBSERVED_ROWS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let before = rows.rows.len();
-            rows.rows
-                .retain(|row| !guard.subjects.contains(&row.subject));
-            if rows.rows.len() != before {
-                rows.generation += 1;
-            }
+            retire_observed_rows(&mut rows, &guard.subjects);
         }
         aterm_gui::publish_initial_setup_status(initial_setup_status());
         guard
@@ -11478,7 +11694,6 @@ mod initial_setup_result_tests {
         /// Replies bound to each reading when it starts, before a held read
         /// can be overtaken by a choice.
         readings: VecDeque<Vec<Observation>>,
-        not_admitted: Vec<Subject>,
         /// Readings wait while this is set.
         hold: bool,
         /// The next held reading unwinds after releasing the script lock.
@@ -11571,7 +11786,6 @@ mod initial_setup_result_tests {
             reads: Vec::new(),
             read_checks: Vec::new(),
             readings: VecDeque::new(),
-            not_admitted: Vec::new(),
             hold: false,
             panic_read: false,
             stop_attempts: Vec::new(),
@@ -11671,10 +11885,17 @@ mod initial_setup_result_tests {
             ..StopSaves::default()
         };
         drop(saves);
-        OBSERVED_ROWS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .plan = None;
+        {
+            let mut rows = OBSERVED_ROWS.lock().unwrap_or_else(PoisonError::into_inner);
+            rows.plan = None;
+            rows.last_known.clear();
+            rows.unconfirmed.clear();
+        }
+        {
+            let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+            queue.active.clear();
+            queue.current = None;
+        }
         *GITHUB_TOKEN_MARK
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
@@ -11755,7 +11976,7 @@ mod initial_setup_result_tests {
             subjects: &[Subject],
             network: bool,
             admission: aterm_cli::macos_doctor::ObservationRead,
-        ) -> aterm_cli::macos_doctor::ObservationBatch {
+        ) -> Vec<Observation> {
             let mut script = script();
             script
                 .reads
@@ -11765,15 +11986,11 @@ mod initial_setup_result_tests {
                 aterm_cli::macos_doctor::ObservationRead::ExplicitCheck
             ));
             let reading = script.readings.pop_front().unwrap_or_default();
-            let not_admitted = std::mem::take(&mut script.not_admitted);
             let panics = std::mem::take(&mut script.panic_read);
             SCRIPT_MOVED.notify_all();
             drop(wait_while(script, |script| script.hold));
             assert!(!panics, "injected reader unwind");
-            aterm_cli::macos_doctor::ObservationBatch {
-                rows: reading,
-                not_admitted,
-            }
+            reading
         }
 
         fn save_stop(revision: u64) -> Result<(), String> {
@@ -11904,19 +12121,16 @@ mod initial_setup_result_tests {
         plan
     }
 
-    /// A [`TestIo`] holds [`TEST_IO`] for its whole life and lets it go once
-    /// it drops, so a second one waits for the first rather than replacing its
-    /// [`SETUP_IO`], and no drop puts back the live one under another test.
+    /// A [`TestIo`] holds [`TEST_IO`] for its whole life, so a second one waits
+    /// for the first before replacing [`SETUP_IO`].
     #[test]
     fn a_test_io_holds_its_tests_lock_while_it_lives() {
         let _globals = globals();
-        let io = TestIo::install();
+        let _io = TestIo::install();
         assert!(
             TEST_IO.try_lock().is_err(),
             "a TestIo another test can replace while this one lives"
         );
-        drop(io);
-        assert!(TEST_IO.try_lock().is_ok(), "a dropped TestIo kept its lock");
     }
 
     /// The window recording Full Disk Access granted starts the follow-up that puts back what
@@ -12019,11 +12233,7 @@ mod initial_setup_result_tests {
                     rows.rows = previous.clone().into_iter().collect();
                 }
                 change(|script| {
-                    script.readings.push_back(vec![Observation {
-                        note: Some("Not read in the background".into()),
-                        ..Observation::unknown(dock)
-                    }]);
-                    script.not_admitted = vec![dock];
+                    script.readings.push_back(Vec::new());
                 });
                 let choices = OBSERVED_ROWS.lock().unwrap().choices;
                 let request = || ObserveRequest {
@@ -12073,6 +12283,10 @@ mod initial_setup_result_tests {
             let _io = TestIo::install();
             let subjects: Vec<_> = Subject::all()
                 .into_iter()
+                .filter(|subject| {
+                    *subject != Subject::Setting(Setting::Repositories)
+                        || plan.selection.contains(Setting::Repositories)
+                })
                 .filter(|subject| {
                     subject.setting().group() != Group::Accounts
                         || plan.selection.contains(subject.setting())
@@ -12454,6 +12668,8 @@ mod initial_setup_result_tests {
     fn pending_repository_refresh_cannot_widen_or_retire_an_ordinary_observation() {
         let mut queue = ObserveQueue {
             running: false,
+            active: Vec::new(),
+            current: None,
             next: None,
             check: None,
             retry: None,
@@ -13513,6 +13729,8 @@ mod initial_setup_result_tests {
         fn drop(&mut self) {
             let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
             queue.running = false;
+            queue.active.clear();
+            queue.current = None;
             queue.next = None;
             queue.check = None;
             queue.retry = None;
@@ -13670,7 +13888,7 @@ mod initial_setup_result_tests {
                 ObserveRequest {
                     plan: Some(left_as_is()),
                     choices,
-                    subjects: vec![preference, personal],
+                    subjects: vec![preference, personal, repositories],
                     forced: false,
                     pending_repositories: false,
                 },
@@ -13755,6 +13973,7 @@ mod initial_setup_result_tests {
         let vault = Subject::Setting(Setting::Secrets);
         let accepted = Observation {
             standing: Standing::InPlace,
+            now: Some("Synced".into()),
             ..Observation::unknown(vault)
         };
         let draft = Observation {
@@ -13781,8 +14000,37 @@ mod initial_setup_result_tests {
         release_readings();
         wait_until("the returning page's reading finishes", observe_idle);
         assert_eq!(
-            while_reading, before,
+            while_reading.observed, before.observed,
             "a same-plan focus refresh keeps the shown values until their replacement arrives"
+        );
+        assert_eq!(while_reading.observed_vault_url, before.observed_vault_url);
+        assert!(
+            while_reading
+                .observing
+                .contains(&(vault, Some(shown.vault_url.clone()), false))
+        );
+        change(|script| {
+            script.reads.clear();
+            script.hold = true;
+            script.readings = [vec![accepted.clone()]].into();
+        });
+        assert!(check_initial_setup(shown.clone()).reading);
+        wait_until("the same-source Check starts", || script().reads.len() == 1);
+        let checking = setup_readings();
+        release_readings();
+        wait_until("the same-source Check finishes", observe_idle);
+        assert!(
+            !checking.observed.iter().any(|row| row.subject == vault),
+            "Check still retires current authority"
+        );
+        assert!(
+            checking.last_known.contains(&accepted),
+            "the useful value remains presentation history"
+        );
+        assert!(
+            checking
+                .observing
+                .contains(&(vault, Some(shown.vault_url.clone()), false))
         );
         change(|script| {
             script.reads.clear();
@@ -13803,8 +14051,42 @@ mod initial_setup_result_tests {
         // a genuine focus return asks for the accepted source once more.
         assert!(observe_initial_setup(checked.clone()));
         assert!(observe_initial_setup(shown.clone()));
+        let queued = setup_readings();
+        // Keep the second source's actual reader held after A finishes, so
+        // the completed source cannot hide inside a whole-batch progress bit.
+        SETUP_IO.write().unwrap().read = |plan, subjects, network, admission| {
+            if plan.vault_url.ends_with("/draft-b") {
+                change(|script| script.hold = true);
+            }
+            TestIo::read(plan, subjects, network, admission)
+        };
+        release_readings();
+        wait_until("the explicit other-source Check starts", || {
+            script().reads.len() == 3
+        });
+        let only_b = setup_readings();
         release_readings();
         wait_until("the accepted observation work finishes", observe_idle);
+        assert!(
+            queued
+                .observing
+                .contains(&(vault, Some(shown.vault_url.clone()), false))
+        );
+        assert!(
+            queued
+                .observing
+                .contains(&(vault, Some(checked.vault_url.clone()), true))
+        );
+        assert_eq!(
+            only_b
+                .observing
+                .iter()
+                .filter(|(subject, _, _)| *subject == vault)
+                .cloned()
+                .collect::<Vec<_>>(),
+            [(vault, Some(checked.vault_url.clone()), false)],
+            "completed A is no longer checking while B remains held"
+        );
 
         let reads = std::mem::take(&mut script().reads);
         assert_eq!(reads.len(), 3, "both pending intents must be read");
@@ -13890,6 +14172,8 @@ mod initial_setup_result_tests {
             fn drop(&mut self) {
                 let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
                 queue.running = false;
+                queue.active.clear();
+                queue.current = None;
                 queue.next = None;
                 queue.check = None;
             }
@@ -13958,6 +14242,8 @@ mod initial_setup_result_tests {
             fn drop(&mut self) {
                 let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
                 queue.running = false;
+                queue.active.clear();
+                queue.current = None;
                 queue.next = None;
                 queue.check = None;
             }
@@ -14017,6 +14303,8 @@ mod initial_setup_result_tests {
             fn drop(&mut self) {
                 let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
                 queue.running = false;
+                queue.active.clear();
+                queue.current = None;
                 queue.next = None;
                 queue.check = None;
             }
@@ -14174,6 +14462,8 @@ mod initial_setup_result_tests {
                 fn drop(&mut self) {
                     let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
                     queue.running = false;
+                    queue.active.clear();
+                    queue.current = None;
                     queue.next = None;
                     queue.check = None;
                 }
@@ -14329,6 +14619,8 @@ mod initial_setup_result_tests {
             fn drop(&mut self) {
                 let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
                 queue.running = false;
+                queue.active.clear();
+                queue.current = None;
                 queue.next = None;
                 queue.check = None;
             }
@@ -14494,6 +14786,79 @@ mod initial_setup_result_tests {
             .live_mapping(&native.keyboard_service_observations().unwrap())
             .unwrap();
         let paid_commands = native.calls();
+        // An attempted old Unknown is no newer evidence than an old row.
+        // Exercise both publication while the real stage is active and after
+        // its canonical native readback has supplied the completed fact.
+        for during_stage in [true, false] {
+            set_setup_run(Some(1));
+            let choices = {
+                let mut rows = OBSERVED_ROWS.lock().unwrap();
+                rows.plan = Some(plan.clone());
+                rows.rows = vec![Observation::unknown(caps)];
+                rows.last_known.clear();
+                rows.unconfirmed.clear();
+                rows.choices
+            };
+            OBSERVE_QUEUE.lock().unwrap().next = None;
+            change(|script| {
+                script.reads.clear();
+                script.hold = true;
+                script.readings = [vec![Observation::unknown(caps)]].into();
+            });
+            let reading_plan = plan.clone();
+            let mut old = Reader(Some(std::thread::spawn(move || {
+                observe_rows(ObserveRequest {
+                    plan: Some(reading_plan),
+                    choices,
+                    subjects: vec![caps],
+                    forced: false,
+                    pending_repositories: false,
+                })
+            })));
+            wait_until("the attempted old Unknown sample starts", || {
+                script().reads.len() == 1
+            });
+            with_setup_readback(capture_setup_readback_scope(Some(1)), || {
+                setup_readback_stage(StageEvent {
+                    revision: 1,
+                    settings: &[Setting::CapsLock],
+                    subjects: &[caps],
+                    running: true,
+                    readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
+                });
+                if during_stage {
+                    release_readings();
+                    old.0.take().unwrap().join().unwrap();
+                }
+                setup_readback_stage(StageEvent {
+                    revision: 1,
+                    settings: &[Setting::CapsLock],
+                    subjects: &[caps],
+                    running: false,
+                    readback: &readback,
+                });
+            });
+            release_readings();
+            if let Some(reader) = old.0.take() {
+                reader.join().unwrap();
+            }
+            let shown = setup_readings();
+            assert!(
+                shown
+                    .observed
+                    .iter()
+                    .any(|seen| seen.subject == caps && seen.standing == Standing::InPlace)
+            );
+            assert!(
+                !shown.unconfirmed_observations.contains(&caps),
+                "a stale Unknown cannot downgrade the paid result (during stage: {during_stage})"
+            );
+            assert_eq!(
+                native.calls(),
+                paid_commands,
+                "transporting the fact adds no HID reads"
+            );
+        }
         for withdrawal in [
             "none",
             "input",
@@ -14612,8 +14977,11 @@ mod initial_setup_result_tests {
                     invalidate_input_observations();
                 }
                 change(|script| {
-                    script.readings.push_back(vec![Observation::unknown(caps)]);
-                    script.not_admitted = if attempted { Vec::new() } else { vec![caps] };
+                    script.readings.push_back(if attempted {
+                        vec![Observation::unknown(caps)]
+                    } else {
+                        Vec::new()
+                    });
                 });
                 let choices = OBSERVED_ROWS.lock().unwrap().choices;
                 observe_rows(ObserveRequest {
@@ -16098,12 +16466,14 @@ fn update_summary(
     st: &aterm_update::UpdateStatus,
     lane: Option<&aterm_update::ApplyLaneReport>,
     now: i64,
-    installs_by_itself: bool,
+    automatic_install_configured: bool,
     automatic_checks: bool,
     dev: &DevCopy,
     log_hint: &str,
 ) -> (String, Option<String>) {
-    const CHECKS_OFF: &str = " \u{b7} automatic checks are off (Settings \u{25b8} Software Update)";
+    const CHECKS_OFF: &str =
+        " \u{b7} automatic checks are configured off (Settings \u{25b8} Software Update)";
+    const CHECKS_ON: &str = "; automatic checks are configured on";
     if !st.enabled {
         let remedy = st.outcome.trim();
         return (
@@ -16189,7 +16559,7 @@ fn update_summary(
             .filter(|refusal| !refusal.is_empty())
         {
             return (
-                format!("{downloaded}; installation is waiting"),
+                format!("{downloaded}; the last install was refused"),
                 Some(refusal.to_string()),
             );
         }
@@ -16204,12 +16574,9 @@ fn update_summary(
                 format!("{downloaded} but didn\u{2019}t install ({tries})"),
                 Some(log_hint.to_string()),
             )
-        } else if installs_by_itself {
+        } else if automatic_install_configured {
             (
-                format!(
-                    "{downloaded} and installs within a minute while an aterm \
-                     window is open"
-                ),
+                format!("{downloaded}; automatic installation is configured on"),
                 None,
             )
         } else {
@@ -16259,7 +16626,7 @@ fn update_summary(
             }
         };
         let next = if automatic_checks {
-            "; aterm keeps trying"
+            CHECKS_ON
         } else {
             CHECKS_OFF
         };
@@ -16273,7 +16640,7 @@ fn update_summary(
             .map(|words| format!(": {words}"))
             .unwrap_or_default();
         let next = if automatic_checks {
-            "; aterm will try again"
+            CHECKS_ON
         } else {
             CHECKS_OFF
         };

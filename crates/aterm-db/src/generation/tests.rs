@@ -257,6 +257,70 @@ fn native_source_holds_the_completed_successor_and_all_ancestor_controls() {
 }
 
 #[test]
+fn native_projection_retains_both_entry_vaults_across_completed_succession() {
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    let registry = crate::alab::Registry::at(original.clone());
+    registry.open().unwrap();
+    let config = original.home.join("config.toml");
+    let mut selection = reserved(&lab);
+    let next = move_admitted_candidate(&mut lab);
+    import(&mut selection).unwrap();
+    let before = [files(&original.dir), files(&next.dir)];
+    for entry_vault in [&original, &next] {
+        let expected = client::config(entry_vault).unwrap().unwrap();
+        registry
+            .with_admitted_projection(&config, entry_vault, &expected, None, |_, reader| {
+                assert!(matches!(
+                    reader.observe("unselected-candidate").unwrap(),
+                    client::EntryRead::Absent(_)
+                ));
+                for paths in [&original, &next] {
+                    for (dir, name) in [
+                        (paths.dir.clone(), ".lock"),
+                        (paths.dir.join("commons/control"), "control.lock"),
+                    ] {
+                        assert_eq!(
+                            PrivateLock::take(&dir, name, Duration::ZERO, "projection custody")
+                                .err()
+                                .map(|error| error.kind()),
+                            Some(std::io::ErrorKind::WouldBlock),
+                            "{} / {name}",
+                            dir.display()
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert_eq!([files(&original.dir), files(&next.dir)], before);
+}
+
+#[test]
+fn native_projection_does_not_read_through_an_unfinished_succession() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let paths = &lab.paths[0];
+    let registry = crate::alab::Registry::at(paths.clone());
+    registry.open().unwrap();
+    let expected = client::config(paths).unwrap().unwrap();
+    let _selection = reserved(&lab);
+    let before = files(&paths.dir);
+    assert!(
+        registry
+            .with_admitted_projection::<()>(
+                &paths.home.join("config.toml"),
+                paths,
+                &expected,
+                None,
+                |_, _| panic!("unfinished succession admitted a local receipt"),
+            )
+            .is_err()
+    );
+    assert_eq!(files(&paths.dir), before);
+}
+
+#[test]
 fn a_busy_ancestor_releases_every_partial_source_read_before_waiting() {
     let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
     data(&lab);

@@ -1351,11 +1351,11 @@ fn the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset() {
 }
 
 #[test]
-fn full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits() {
-    let fallback = full();
-    assert!(fallback.model_fallback && fallback.approve == Approve::All);
+fn full_power_waits_at_the_limit_and_never_buys_credits() {
+    let power = full();
+    assert!(power.approve == Approve::All);
     let rows = phase_fixtures::screen(phase_fixtures::LIMIT_OPTIONS_DIALOG);
-    let d = on_screen(&rows, &fallback);
+    let d = on_screen(&rows, &power);
     assert_eq!(d, on_screen(&rows, &ctx()));
     assert_eq!(d, on_screen(&rows, &none(full())));
     let wait = "Wait here, then continue automatically when the limit resets";
@@ -1367,7 +1367,7 @@ fn full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits() 
     ] {
         let d = on_screen(
             &phase_fixtures::limit_options_dialog(&labels, focus),
-            &fallback,
+            &power,
         );
         let (rule, choice, _, _, _) = approval(&d);
         assert_eq!(rule, RULE_LIMIT_WAIT, "{labels:?}: {d:?}");
@@ -1387,7 +1387,7 @@ fn full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits() 
         phase_fixtures::limit_options_dialog(&["Upgrade your plan", CREDITS], 0),
         phase_fixtures::limit_options_dialog(&[CREDITS, "Upgrade your plan"], 0),
     ] {
-        let d = on_screen(&rows, &fallback);
+        let d = on_screen(&rows, &power);
         if let Decision::Approve { choice, .. } = &d {
             let chosen = match choice {
                 Choice::Digit(n) => rows
@@ -1400,7 +1400,6 @@ fn full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits() 
             };
             assert!(!chosen.contains(CREDITS), "{d:?}");
         }
-        assert_ne!(approved(&d), Some(RULE_MODEL_SWITCH), "{d:?}");
     }
 }
 
@@ -2374,7 +2373,7 @@ fn a_tmpdir_that_holds_too_much_is_no_scratch_root() {
 #[test]
 fn a_read_through_a_symlink_is_judged_where_it_leads() {
     use std::os::unix::fs::symlink;
-    let base = std::fs::canonicalize("/tmp")
+    let base = std::fs::canonicalize(aterm_tempfile::quiet_in(std::path::Path::new("/tmp")))
         .expect("/tmp")
         .join(format!("aterm-read-links-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
@@ -8344,49 +8343,49 @@ fn a_plan_is_approved_on_its_least_power_yes() {
 }
 
 #[test]
-fn the_session_paused_dialog_switches_to_the_fallback() {
-    let rows = phase_fixtures::screen(phase_fixtures::SESSION_PAUSED);
-    let d = on_screen(&rows, &full());
-    let (rule, choice, _, subject, _) = approval(&d);
-    assert_eq!(rule, RULE_MODEL_SWITCH, "{d:?}");
-    assert_eq!(choice, &Choice::Digit(1));
-    assert!(subject.ends_with("=> Switch to Sonnet 4.5"), "{subject}");
-    let limited = ApprovalCtx {
-        model_fallback: false,
-        ..full()
+fn the_session_paused_dialog_is_left_for_its_person_and_no_switch_is_pressed() {
+    let switch_pressed = |rows: &[String], d: &Decision| {
+        let Decision::Approve { choice, .. } = d else {
+            return false;
+        };
+        let chosen = match choice {
+            Choice::Digit(n) => rows
+                .iter()
+                .find(|r| r.contains(&format!("{n}. ")))
+                .cloned()
+                .unwrap_or_default(),
+            Choice::Focus { label, .. } | Choice::FocusKey { label, .. } => label.clone(),
+            Choice::Answer(_) | Choice::Note { .. } => String::new(),
+        };
+        chosen.contains("Switch to")
     };
-    let d = on_screen(&rows, &limited);
-    assert!(reason(&d).contains("model_fallback is off"), "{d:?}");
-    let retitled: Vec<String> = rows
+    let paused = phase_fixtures::screen(phase_fixtures::SESSION_PAUSED);
+    // Measured on 2.1.308: the dialog over the API-retry row Claude Code left standing under it,
+    // which a window tab stood at for hours, read as no box (2026-10-26).
+    let retry_row = phase_fixtures::screen(phase_fixtures::SESSION_PAUSED_RETRY_ROW);
+    for rows in [&paused, &retry_row] {
+        let d = on_screen(rows, &full());
+        assert!(
+            reason(&d).contains("aterm changes no session's model"),
+            "{d:?}"
+        );
+        for c in [full(), ctx(), none(full())] {
+            let d = on_screen(rows, &c);
+            assert!(!switch_pressed(rows, &d), "{d:?}");
+        }
+    }
+    let retitled: Vec<String> = paused
         .iter()
         .map(|r| r.replace("Session paused", "Session halted"))
         .collect();
-    assert_ne!(
-        approved(&on_screen(&retitled, &full())),
-        Some(RULE_MODEL_SWITCH)
-    );
-    let at = rows
+    assert!(!switch_pressed(&retitled, &on_screen(&retitled, &full())));
+    let at = paused
         .iter()
         .position(|r| r.contains("2. Edit prompt"))
         .expect("the edit option");
-    let mut three = rows.clone();
+    let mut three = paused.clone();
     three.insert(at + 1, "    3. Cancel".to_string());
-    assert_ne!(
-        approved(&on_screen(&three, &full())),
-        Some(RULE_MODEL_SWITCH)
-    );
-    // Measured on 2.1.308: the dialog over the API-retry row Claude Code left standing under it,
-    // which a window tab stood at for hours, read as no box (2026-10-26).
-    let rows = phase_fixtures::screen(phase_fixtures::SESSION_PAUSED_RETRY_ROW);
-    let d = on_screen(&rows, &full());
-    let (rule, choice, _, subject, _) = approval(&d);
-    assert_eq!(
-        (rule, choice),
-        (RULE_MODEL_SWITCH, &Choice::Digit(1)),
-        "{d:?}"
-    );
-    assert!(subject.ends_with("=> Switch to Opus 4.8"), "{subject}");
-    assert!(reason(&on_screen(&rows, &limited)).contains("model_fallback is off"));
+    assert!(!switch_pressed(&three, &on_screen(&three, &full())));
 }
 
 const RULE_UNDER_TEST: &str = "decline-under-test@v0";

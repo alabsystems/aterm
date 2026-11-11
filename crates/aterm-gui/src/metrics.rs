@@ -16,8 +16,8 @@ use crate::deadline_heal::Heal;
 use crate::label_enum::label_enum;
 pub(crate) use instrument::Histogram;
 use instrument::{
-    Baselined, Counter, Dist, HistCopy, Last, LastFlag, LastLabel, Max, MaxBy, Peak, Stamp, Tally,
-    Windowed, window_ledger,
+    Baselined, Counter, Dist, HistCopy, Last, LastFlag, LastLabel, LatencyDist, Max, MaxBy, Peak,
+    Stamp, Tally, Windowed, window_ledger,
 };
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub(crate) use restore_experiment::{RestoreExperiment, record_restore_experiment};
@@ -146,7 +146,7 @@ window_ledger! {
         /// Successful application presents (`frames`).
         pub(crate) frames: Counter,
         /// Output→application-present-return on glass (`present_latency`).
-        pub(crate) latency: Dist,
+        pub(crate) latency: LatencyDist,
         /// When the worst `latency` was booked (`now_ns`), and the gap since its window's previous present.
         pub(crate) latency_at: Last,
         pub(crate) latency_gap: Last,
@@ -215,7 +215,7 @@ window_ledger! {
     /// unmeasured, and the refusals of the input contract; and the costs printed beside them
     /// (menu-bar glance, need publication, transcript holds).
     pub(crate) struct InputLedger {
-        pub(crate) input: Dist,
+        pub(crate) input: LatencyDist,
         /// When the worst `input` slice was booked (`now_ns`).
         pub(crate) input_at: Last,
         pub(crate) session_stamp: Stamp,
@@ -3630,7 +3630,12 @@ fn emit_key_clock_availability(input: &InputLedger, s: &mut dyn wire::FieldSink)
 }
 
 fn emit_quantiles(s: &mut dyn wire::FieldSink, keys: [&str; 4], h: &HistCopy) {
-    emit_quantiles_in(s, keys, h, wire::ms);
+    let unit = if matches!(keys[0], "n_input" | "n_present") {
+        wire::ms6
+    } else {
+        wire::ms
+    };
+    emit_quantiles_in(s, keys, h, unit);
 }
 
 fn emit_quantiles_ms3(s: &mut dyn wire::FieldSink, keys: [&str; 4], h: &HistCopy) {
@@ -5473,6 +5478,67 @@ mod window_tests {
     use super::instrument::{Counter, Dist, Probe, Windowed, window_ledger};
     use super::{Metrics, emit_quantiles, inert_text, now_ns, wire};
     use std::sync::atomic::Ordering;
+
+    /// Replay known elapsed times through both live ledgers and the public
+    /// percentile emitter. This controls recording/rounding error, independently
+    /// of the scheduler noise in a windowed workload.
+    #[test]
+    fn latency_wire_resolves_identical_replay_and_a_two_percent_delay() {
+        let keys = [
+            "input_p50_ms",
+            "input_p95_ms",
+            "input_p99_ms",
+            "present_p50_ms",
+            "present_p95_ms",
+            "present_p99_ms",
+        ];
+        let replay = |pair: u64, percent: u64| {
+            let m = Metrics::new();
+            for sample in 1..=1000 {
+                let elapsed = (100_000 + sample * 1000 + pair * 37) * percent / 100;
+                m.window.input.input.record(elapsed);
+                m.window.present.latency.record(elapsed);
+            }
+            let ctx = wire::ReadCtx::inert(&m, 0);
+            let text = wire::render_text(|s| super::emit_percentiles(&ctx, s));
+            keys.map(|key| {
+                text.split_whitespace()
+                    .find_map(|field| {
+                        let (name, value) = field.split_once('=')?;
+                        (name == key).then(|| value.parse::<f64>().unwrap())
+                    })
+                    .unwrap()
+            })
+        };
+        let mut control: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::new());
+        let mut planted: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::new());
+        for pair in 0..32 {
+            let (a, aa, delayed) = (replay(pair, 100), replay(pair, 100), replay(pair, 102));
+            for i in 0..6 {
+                control[i].push((aa[i] / a[i]).ln());
+                planted[i].push((delayed[i] / a[i]).ln());
+            }
+        }
+        for (i, key) in keys.into_iter().enumerate() {
+            for (name, values) in [("aa", &control[i]), ("delay2", &planted[i])] {
+                let mean = values.iter().sum::<f64>() / 32.0;
+                let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / 31.0;
+                let half = 2.039_513 * (variance / 32.0).sqrt();
+                let (lo, hi) = (
+                    100.0 * (mean - half).exp_m1(),
+                    100.0 * (mean + half).exp_m1(),
+                );
+                println!(
+                    "latency-replay control={name} field={key} pairs=32 lo_pct={lo:.6} hi_pct={hi:.6}"
+                );
+                if name == "aa" {
+                    assert_eq!((lo, hi), (0.0, 0.0));
+                } else {
+                    assert!(lo > 1.8 && hi < 2.2, "{key}: [{lo}, {hi}]");
+                }
+            }
+        }
+    }
 
     fn silent<R>(
         fresh: impl Fn() -> R,

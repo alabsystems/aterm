@@ -5,7 +5,7 @@
 
 §1 holds the proved specs: each is a `trust_contract_fn!` postcondition citing a Clean theorem
 over the kernel import of the compiled body (`trust_import_amacs_files__<module>__<fn>`), the
-recipe of `docs/PLAN-tests-to-specs-2026-10-15.md` ("The recipe that works"). §2 lists the
+recipe of `docs/TRUST-LANE.md` ("The recipe that works"). §2 lists the
 safety obligations the code was reshaped to discharge, §3 the properties not provable today.
 
 The contract macros (two `trust_contract_fn!` and two `verify_island!` arms, copied from
@@ -15,8 +15,8 @@ islands on a build-script `cfg(clean_islands)` instead breaks every `targo --unv
 (`AutoBoundHeadOverApplied`), so the crate has no build script. Stock rustc gets plain fns.
 
 The clauses and theorems spell the 32 MiB limits as the literal 33554432; the bodies compare
-against `DOCUMENT_LIMIT_LEN` (host.rs) and `MAX_INSERT_LEN` (io.rs). No landing check runs the
-lane, so a const assertion beside each constant fails an ordinary build when it leaves its spec.
+against `DOCUMENT_LIMIT_LEN` (host.rs) and `MAX_INSERT_LEN` (io.rs). Not on yet: no landing check runs the
+Trust lane (a defect; no tracker package holds it yet), so a const assertion beside each constant fails an ordinary build when it leaves its spec.
 
 A clause over three or more conjuncts nests them to the right with parentheses
 (`a && (b && c)`), as Clean and the E6 reader do; the clause parser nests to the left, and the
@@ -42,7 +42,7 @@ bare-line-feed	io::is_bare_line_feed(previous: u8, byte: u8) -> bool	∀ previou
 
 The size and offset predicates take `u64` and their callers convert with `as u64`: E6 imports
 only `bool`, `uN` and `iN` carriers and refuses a body that holds a cast or a call
-(`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §3.3). For the same reason
+(`docs/TRUST-LANE.md` (Blocking gaps) §3.3). For the same reason
 `is_lower_hex_digit` compares instead of calling `RangeInclusive::contains`.
 
 ## 2. Safety obligations TR3 made provable (TSV)
@@ -65,7 +65,7 @@ io::parse_hex16	closure runtime_checked: absent callee `RangeInclusive::contains
 
 Each row is a property the crate does not prove. The blocker is the lane's exact text where it
 reported one (prover 41d799797), or else a gap of audit §7
-(`docs/AUDIT-trust-for-test-migration-2026-10-15.md`), for which no contract was attempted.
+(`docs/TRUST-LANE.md` (Blocking gaps)), for which no contract was attempted.
 
 ```tsv
 property	functions	blocker	held today by

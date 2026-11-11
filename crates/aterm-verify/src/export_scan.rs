@@ -781,11 +781,18 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
         whole: listed.whole,
         export: &export,
     };
-    let scanned = export_scan::scan(
-        &listing,
-        engine.as_ref().ok().map(|(_, engine)| engine),
-        Some(&tree),
-    );
+    let scan = || {
+        export_scan::scan(
+            &listing,
+            engine.as_ref().ok().map(|(_, engine)| engine),
+            Some(&tree),
+        )
+    };
+    let scanned = if ctx.pool.is_some() {
+        aterm_census::without_parallel_workers(scan)
+    } else {
+        scan()
+    };
     let mut findings: Vec<Finding> = scanned
         .findings
         .iter()
@@ -961,7 +968,10 @@ fn gitleaks_leaks(
     std::fs::write(&ignore, b"").map_err(|e| format!("{}: {e}", ignore.display()))?;
     let mut env = ctx.exec_env();
     env.child_ceiling = Some(std::time::Duration::from_secs(GITLEAKS_CEILING_S));
-    let command = scanner.command(tree, &report, &ignore)?;
+    let mut command = scanner.command(tree, &report, &ignore)?;
+    if ctx.pool.is_some() {
+        command = command.env("GOMAXPROCS", "1");
+    }
     let run = exec::run(&command, env);
     if let Some(e) = &run.spawn_error {
         return Err(format!("gitleaks did not start: {e}"));

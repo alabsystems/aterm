@@ -495,7 +495,7 @@ impl Hashes {
         if let Some(dir) = file.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = super::super::upgrade_models::write_atomic_ordered(file, &self.encode());
+        let _ = super::super::atomic_write::write_atomic_ordered(file, &self.encode());
     }
 }
 

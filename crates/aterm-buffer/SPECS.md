@@ -3,16 +3,6 @@
 
 # aterm-buffer: spec recovery from its 25 unit tests
 
-> Status 2026-10-17, after the merge with the tests-and-gates audit: the rows naming 2 tests it
-> deleted are gone, and so is §4's row of a third, the deleted source-compatibility test.
-> Counts below are reconciled with current `main` (2026-10-28).
-
-> Audit amendment: The 2026-10-16 code audit corrected the source invariant to use logical log.total() after eviction (§5.1). The dated inventory below records the earlier snapshot; behavior is unchanged.
-
-> Status 2026-10-15: this is the crate's migration worklist. The 16 specs below are proved
-> through Trust/Clean, then the tests each subsumes are deleted. All non-spec tests from §4
-> have been retired or folded into conformance negative controls. No spec has been proved yet.
-
 Source: `crates/aterm-buffer` (read only). Every `#[test]` is mapped
 (src/lib.rs 11, tests/{conformance_cursor 1, conformance_eventlog 2, conformance_evict_full 1,
 conformance_kernel 2, conformance_snapshot 1, conformance_subscribe 2, conformance_temporal 3,
@@ -53,7 +43,7 @@ Result: **16 specs**, covering **25 tests**. **0 non-spec tests remain** (§4).
 
 `subsumes` lists the primary tests (secondary ones are in §2). `difficulty` names the Rust
 features a proof must handle. `blocking gaps` are rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes Clean rows)
+`docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (a seal that publishes Clean rows)
 blocks every row and is left out. Every row also needs gaps 1 and 2 (non-scalar carriers,
 certified `&self`/`&mut self` views); §6 says how to start before they close.
 
@@ -76,40 +66,6 @@ poll-contract	contract	Surface::{subscribe,poll}	∀ s∈Reach: s.subscribe(c) =
 transact-occ	contract	Surface::transact	∀ s∈Reach, base: Seq, body: Vec<Edit>: s.seq() ≠ base ⇒ transact returns Conflict and s is entirely unchanged (L, N and G identical, so no lost update). s.seq() = base ⇒ the result s' = foldl (apply c) s body, and transact returns Committed(s'.seq()) with s'.seq().0 = base.0 + |body| (by apply-refines-line-model).	src/lib.rs::transact_is_atomic_and_cc_guarded, conformance_transact::real_transact_clean_commit_matches_model, conformance_transact::real_transact_conflict_aborts_no_lost_update	EASY given apply-refines-line-model: &mut self, a for loop consuming a Vec<Edit>, callee-ensures composition from apply, an enum return	1, 2, 4, 7
 refines-kernel-family-models	refinement	Surface::{apply,transact,poll,snapshot}, EventLog::append_at	Each real transition, projected onto a model's variables, is a step of the matching aterm_spec::derive model, with the model's constants set to the real ones (Cap = MAX, MaxSeq lifted): (seq, count) → kernel_model Emit, SeqIsCount; (seq, lo) → ring_model Push; the live set → evict_full_model EvictOldestContiguous; (seq, cursor) → cursor_model Grow/Deliver, CursorBounded; (seq, lo, cursor, lost) → subscribe_model, PollGap ⇔ lo > cursor+1; (seq, snapped, leaked) → snapshot_model SnapshotIsolated; (seq, tbase, active, lost) → transact_model, CommitClean ⇔ seq = tbase, else Abort. Follows from append-at-contract, log-window-invariant, apply-refines-line-model, snapshot-isolation, poll-contract and transact-occ. The model-side facts (the guards, and Buggy admitting the defect) belong to aterm-spec's Tier-0 checks.	conformance_kernel::real_surface_spine_conforms_to_kernel_model	MEDIUM once the code specs hold: model-to-code refinement over projections of heap state (ty_model! models bound to Rust data), cross-crate model citation	1, 2, 10, 12
 ```
-
-### Distribution by kind (16)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 8 | append-at-contract, log-forget, line-lower-bound, read-text-contract, snapshot-isolation, cow-sharing, poll-contract, transact-occ |
-| invariant | 4 | log-window-invariant, ring-capacity-bound, op-event-slot-sizes, ts-monotone-newest-is-max |
-| refinement | 2 | apply-refines-line-model, refines-kernel-family-models |
-| equivalence | 1 | live-after-is-filter |
-| round-trip | 1 | no-silent-loss |
-
-### Proof dependency order
-
-`append-at-contract` → `log-window-invariant` → {`no-silent-loss`, `ts-monotone-newest-is-max`,
-`live-after-is-filter`, `ring-capacity-bound`}. `line-lower-bound` → {`apply-refines-line-model`,
-`read-text-contract`} → `transact-occ`. `log-window-invariant` + `live-after-is-filter` +
-`apply-refines-line-model` → `poll-contract`. `apply-refines-line-model` → {`snapshot-isolation`,
-`cow-sharing`}. All of the above → `refines-kernel-family-models`.
-
-### Blocking-gap histogram (specs blocked by each audit §7 gap)
-
-| gap | specs |
-|---|---|
-| 0 (seal) | 16 |
-| 1 (non-scalar carriers) | 16 |
-| 2 (`&self`/`&mut self` views) | 15 |
-| 3 (E6 body widening) | 5 |
-| 4 (callee-ensures composition) | 7 |
-| 5 (quantified clauses) | 5 |
-| 7 (loops) | 5 |
-| 8 (effects/unsafe) | 1 |
-| 10 (model→code refinement) | 1 |
-| 11 (generics) | 1 |
-| 12 (cross-crate citation) | 1 |
 
 ## 2. Test → spec map (TSV)
 
@@ -144,47 +100,12 @@ tests/conformance_transact.rs	real_transact_clean_commit_matches_model	transact-
 tests/conformance_transact.rs	real_transact_conflict_aborts_no_lost_update	transact-occ	refines-kernel-family-models
 ```
 
-## 3. Coverage
-
-- 25 live tests mapped across the 16 specs (0 non-spec tests remain in §4).
-- The biggest collapses are `poll-contract` (4 primary), `log-window-invariant` (4), `cow-sharing` (3)
-  and `transact-occ` (3).
-- `read-text-contract` and `ts-monotone-newest-is-max` have no primary test. Each is sampled only
-  as a side assertion of another spec's test. They are still needed as lemmas: `read-text-contract`
-  for `snapshot-isolation`, and `ts-monotone-newest-is-max` for the timestamp half of
-  `live_after_seek_…`.
-- `refines-kernel-family-models` has 1 primary test, but it is the secondary spec of 10 conformance
-  tests. Once the code-level specs are proved, it is what lets those tests' `ty_model!` bindings go.
-
 ## 4. Tests that are not spec samples
 
 Status 2026-10-28: 0 standalone non-spec tests remain; `conformance_kernel::a_gapped_append_is_the_buggy_step_the_bind_rejects` was folded into `real_append_at_spine_conforms_to_kernel_model` as its `kernel_model` negative control.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **(Fixed 2026-10-16.) The crate doc's invariant was stale.** `src/lib.rs` now states the
-   invariant in terms of `log.total()`, the logical length across eviction (`apply-refines-line-model`'s
-   `SeqIsCount`).
-2. **(Fixed 2026-10-28.) `EventLog::append_at` pushed before popping (`len = MAX + 1`) and relied
-   on `reserve_exact(1)`.** `append_at` now pops the oldest entry before pushing whenever
-   `ring.len() >= MAX_LOG_EVENTS`, so `ring.len()` never exceeds `MAX_LOG_EVENTS`, the 2 MiB
-   `65,536 -> 65,537` reallocation is eliminated, and `capacity ≤ MAX` holds directly.
-3. **(Fixed 2026-10-28.) `conformance_snapshot` checked a tautology.** `conformance_snapshot` now
-   projects `snapped` and `leaked` from `Snapshot::read_text` vs the captured text across `Write`,
-   `Snap` and post-snapshot `Write` transitions (`validate_transition_tiered`), with a `Buggy = 1`
-   negative control.
-4. **(Fixed 2026-10-28.) `conformance_subscribe` projected the test's cursor, not the code's.**
-   Both tests now read the before/after cursor positions back through `poll`, derive `lost` from the
-   returned `SubUpdate`, validate `PollDeliver`/`PollGap` transitions (`validate_transition_tiered`),
-   and include the `Buggy = 1` silent-loss negative control.
-5. **(Fixed 2026-10-28.) `narrow_tail_line_operations_do_logarithmic_work` now enforces the exact
-   `⌈log2(n+1)⌉` binary-search bound** (`(n + 1).next_power_of_two().ilog2()` per `line_lower_bound`
-   call, `2 * bound` for `read_text` and `bound` for `SetLine`) across `n ∈ {1, 2, 3, 7, 8, 15, 16,
-   1023, 1024, 4096}`. The `#[cfg(test)]` comparison counter retires with the test once
-   `line-lower-bound` is Certified.
-6. **(Fixed 2026-10-28.) Three test files restated the cap.** `conformance_eventlog.rs`,
-   `conformance_evict_full.rs` and `conformance_subscribe.rs` now import
-   `aterm_buffer::MAX_LOG_EVENTS` directly.
 7. **A "control" that is a positive sample.** `dropping_the_evicted_event_loses_seqs_control` is
    called a negative control, but it asserts only that, after `MAX + 1000` appends, the live window
    starts at seq 1001 and holds `MAX` events. That is `log-window-invariant`'s corollary
@@ -192,15 +113,3 @@ Status 2026-10-28: 0 standalone non-spec tests remain; `conformance_kernel::a_ga
    positive side of it: the returned `Some(ev)` is the only remaining copy.
 8. **The raw test count is 26, and there are 25 live tests.** `tests/buffer_suite.rs` mentions
    `#[test]` only in a doc comment. A naive substring grep over-counts this crate by one.
-
-## 6. Proof order
-
-To start before gaps 1 and 2 close, cut each spec's scalar core into a pure `fn` over
-`u64`/`usize`, blocked only by gap 0 (and gap 3 for `min`/`saturating_*`), and prove the
-code-level spec over it once those gaps land.
-
-Runner-up: **`ring-capacity-bound`**. With §5.2's pop-before-push guard in `EventLog::append_at`
-(`if self.ring.len() >= MAX_LOG_EVENTS { self.ring.pop_front() }`), `ring.len() ≤ MAX_LOG_EVENTS`
-holds at every push as a corollary of `log-window-invariant` without exceeding `MAX_LOG_EVENTS`.
-Defer **`cow-sharing`** (gap 8: `Arc`/`String` internals) and **`refines-kernel-family-models`**
-(gaps 10 and 12) to the end.

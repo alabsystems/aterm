@@ -97,26 +97,5 @@ impl<T: Serialize> Serialize for Wrapping<T> {
 
 #[cfg(all(test, feature = "serde"))]
 #[allow(clippy::unwrap_used)]
-mod tests {
-    use crate::{U64, Wrapping};
-
-    #[test]
-    fn serde() {
-        const TEST: Wrapping<U64> = Wrapping(U64::from_u64(0x0011223344556677));
-
-        let serialized = bincode::serialize(&TEST).unwrap();
-        let deserialized: Wrapping<U64> = bincode::deserialize(&serialized).unwrap();
-
-        assert_eq!(TEST, deserialized);
-    }
-
-    #[test]
-    fn serde_owned() {
-        const TEST: Wrapping<U64> = Wrapping(U64::from_u64(0x0011223344556677));
-
-        let serialized = bincode::serialize(&TEST).unwrap();
-        let deserialized: Wrapping<U64> = bincode::deserialize_from(serialized.as_slice()).unwrap();
-
-        assert_eq!(TEST, deserialized);
-    }
-}
+#[path = "wrapping_tests.rs"]
+mod tests;

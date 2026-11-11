@@ -561,7 +561,7 @@ pub const FUTILE_AFTER_TRIES: usize = 3;
 pub const CONTEXT_EXHAUSTED_AFTER: usize = 3;
 /// And how long past the reset.
 pub const FUTILE_AFTER: Duration = Duration::from_secs(60 * 60);
-/// How long a bucket no reset ends stands, its fallback not made, before it is an exception.
+/// How long a bucket no reset ends stands before it is an exception.
 pub const BUCKET_STUCK_AFTER: Duration = Duration::from_secs(60 * 60);
 
 const ACCOUNT_LIMITS: &[(&str, &str, &str)] = &[
@@ -1126,7 +1126,6 @@ pub fn exception_for(
         });
     }
     match kind {
-        WallKind::ModelBucket { .. } if state.bucket_left(reading) => None,
         WallKind::Auth if attempts > 0 || !cfg.retry_api_errors => {
             let (why, action, clears) = login_text(reading.program, &reading.wall_message);
             Some(Exception {
@@ -1155,41 +1154,18 @@ pub fn exception_for(
         }
         WallKind::ModelBucket { .. }
             if reading.reset_at.is_none()
-                && state.model_switch().is_none()
                 && state
                     .wall_since(kind)
                     .is_some_and(|s| now.saturating_duration_since(s) >= BUCKET_STUCK_AFTER) =>
         {
-            let from = bucket_model(&reading.wall_message);
-            let name = from
+            let name = bucket_model(&reading.wall_message)
                 .as_deref()
                 .map_or_else(|| "The model".to_string(), title);
-            let can_switch = cfg.relaunch
-                && reading.restartable
-                && !state.fallback_refused()
-                && cfg
-                    .model_fallback
-                    .as_deref()
-                    .is_some_and(|f| Some(f) != from.as_deref());
-            let (why, action) = match (&cfg.model_fallback, can_switch) {
-                (Some(to), true) => (
-                    format!(
-                        "{name} has no reset time, and this tab's running jobs keep it from switching to {to}."
-                    ),
-                    format!("Run /model in this tab and pick {to}."),
-                ),
-                _ => (
-                    format!(
-                        "{name} has no reset time, and this tab has no other model to fall back on."
-                    ),
-                    "Run /model in this tab and pick another model.".to_string(),
-                ),
-            };
             Some(Exception {
                 kind: ExceptionKind::Bucket,
                 when: Urgency::Later,
-                why,
-                action,
+                why: format!("{name} has no reset time, so this limit does not end by itself."),
+                action: "Run /model in this tab and pick another model.".to_string(),
                 clears: "the agent working",
                 escalated: false,
                 notice: None,

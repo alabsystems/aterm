@@ -269,7 +269,7 @@ fn resume_exception(kind: ExceptionKind) -> Exception {
             "Add usage credits in claude.ai settings.",
         ),
         ExceptionKind::Bucket => (
-            "Fable has no reset time, and this tab has no other model to fall back on.",
+            "Fable has no reset time, so this limit does not end by itself.",
             "Run /model in this tab and pick another model.",
         ),
         ExceptionKind::GoalCleared => (

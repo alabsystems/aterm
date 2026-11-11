@@ -1204,11 +1204,6 @@ const SUPERVISE_READS: &[(&str, ClockShape, &str)] = &[
         "the approval ledger by its path (`approvals::usage_attempt_at`)",
     ),
     (
-        "approvals::open_model_switch",
-        ClockShape::Named,
-        "the approval ledger by its path (`approvals::open_model_switch`)",
-    ),
-    (
         "approvals::account_moves",
         ClockShape::Named,
         "the approval ledger by its path (`approvals::account_moves`)",

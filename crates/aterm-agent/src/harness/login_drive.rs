@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use super::accounts::AttemptOutcome;
 use crate::ai::connector::{Cli, Completion, Drive, Flow, Grammar, Region, Route, Seam, SignIn};
 
 pub use super::auth_deadline::Deadline;
@@ -501,7 +502,7 @@ pub fn program_of(cli: Cli, home: &Path) -> PathBuf {
         && let Some(text) = super::accounts::read_bounded(&twin, 64 * 1024)
             .ok()
             .flatten()
-        && let Some(exe) = super::upgrade_catalog::twin_binary(&text)
+        && let Some(exe) = super::twin::twin_binary(&text)
         && exe.is_file()
     {
         return exe;
@@ -614,6 +615,49 @@ pub trait Approver {
     }
 }
 
+/// Credential-free stage at which native enrollment stopped before provider dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativePreparationStage {
+    /// Read and validate the selected row's current snapshot and policy.
+    RowPolicy,
+    /// Prepare durable custody for an authorization-code response.
+    GrantCustody,
+    /// Bind the native browser reservation and its source namespace.
+    NativeScope,
+    /// Bind the selected row's retained staging admission to its producer.
+    RowAdmission,
+}
+
+impl NativePreparationStage {
+    /// Stable ledger word; neither paths nor nested diagnostic text are retained.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RowPolicy => "row-policy",
+            Self::GrantCustody => "grant-custody",
+            Self::NativeScope => "native-scope",
+            Self::RowAdmission => "row-admission",
+        }
+    }
+
+    /// Describe this pre-dispatch refusal without granting a retry or authentication claim.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::RowPolicy => "native row snapshot or policy unavailable",
+            Self::GrantCustody => "native grant custody preparation unavailable",
+            Self::NativeScope => "native scope binding unavailable",
+            Self::RowAdmission => "native row admission unavailable",
+        }
+    }
+
+    /// Discard a private implementation error at its typed diagnostic boundary.
+    pub(super) fn checked<T>(self, result: Result<T, String>) -> Result<T, Self> {
+        result.map_err(|_| self)
+    }
+}
+
 /// How a driven sign-in ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -651,6 +695,8 @@ pub enum Outcome {
     Hung,
     /// No provider action or retained completion was used.
     NotRun(String),
+    /// Native preparation failed before any provider action or retained completion was used.
+    PreparationFailed(NativePreparationStage),
     /// The CLI's sign-in named its page and the approver stopped before opening it (no browser to
     /// open it in, its download failed), so nothing was approved and the CLI was ended. A person
     /// reads this as [`Outcome::NotRun`]: no sign-in ran. Shared recovery reads it as
@@ -678,7 +724,9 @@ impl Outcome {
             Outcome::BotCheck(_) => "bot-check".to_owned(),
             Outcome::Failed => "failed".to_owned(),
             Outcome::Hung => "hung".to_owned(),
-            Outcome::NotRun(_) | Outcome::PageNotOpened(_) => "not-run".to_owned(),
+            Outcome::NotRun(_) | Outcome::PreparationFailed(_) | Outcome::PageNotOpened(_) => {
+                "not-run".to_owned()
+            }
             Outcome::Unverified(_) => "unverified".to_owned(),
         }
     }
@@ -697,12 +745,39 @@ impl Drove {
     /// The ledger's line for it under `flow`: host, flow and outcome.
     #[must_use]
     pub fn why(&self, flow: Flow) -> String {
-        format!(
+        let why = format!(
             "{} {} {}",
             self.host.as_deref().unwrap_or("no-page"),
             flow.as_str(),
             self.outcome.word()
-        )
+        );
+        match self.outcome {
+            Outcome::PreparationFailed(stage) => {
+                format!("{why} preparation={}", stage.as_str())
+            }
+            _ => why,
+        }
+    }
+
+    /// How the renewal a [`Self::why`] line records ended, read back from it: a bot check
+    /// stopped it ([`AttemptOutcome::Blocked`]), it bound a login
+    /// ([`AttemptOutcome::SignedIn`]), or it ended another way short of one
+    /// ([`AttemptOutcome::Failed`]); `None` for a line of another shape.
+    #[must_use]
+    pub fn attempt_of(why: &str) -> Option<AttemptOutcome> {
+        let words: Vec<&str> = why.split(' ').collect();
+        let [host, flow, outcome] = words.as_slice() else {
+            return None;
+        };
+        if host.is_empty() || outcome.is_empty() {
+            return None;
+        }
+        Flow::parse(flow)?;
+        Some(match *outcome {
+            "signed-in" => AttemptOutcome::SignedIn,
+            "bot-check" => AttemptOutcome::Blocked,
+            _ => AttemptOutcome::Failed,
+        })
     }
 }
 
@@ -1707,6 +1782,9 @@ fn complete_sign_in(
     }
     if retained && let Outcome::NotRun(why) | Outcome::PageNotOpened(why) = &drove.outcome {
         drove.outcome = Outcome::Unverified(why.clone());
+    }
+    if retained && let Outcome::PreparationFailed(stage) = drove.outcome {
+        drove.outcome = Outcome::Unverified(stage.reason().into());
     }
     let native_saved = custody == CompletionCustody::NativeSaved;
     let stopped = |approver: &dyn Approver| {

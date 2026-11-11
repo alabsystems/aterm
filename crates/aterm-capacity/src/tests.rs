@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
-use crate::admit::{Other, counted, decide};
+use crate::admit::{Other, counted, decide, funded_lead_reservation};
 use crate::floor::{self, GIB};
 use crate::reading::{Proc, Procs, TreeUse};
 use crate::{
@@ -865,6 +865,52 @@ fn a_dead_holder_releases_its_claim_on_the_next_poll() {
         1,
         "the poll removed the dead holder's file"
     );
+}
+
+#[test]
+fn a_release_parent_stays_queued_when_unclaimed_memory_never_returns() {
+    let s = scratch("release-parent-no-relief");
+    let m = Fixed::new(Reading::of_gib(96, 35, 28));
+    let need = Need::new("release slice memory budget")
+        .rank(crate::Rank::Release)
+        .mem_gib(44)
+        .margin(1);
+    let mut parent = enter(&s, &m, need.clone());
+    for _ in 0..8 {
+        let (next, short) = waits(parent, &m);
+        names(&short.to_string(), &["memory short by", "35 GiB available"]);
+        assert!(
+            short.holders.is_empty(),
+            "no claim can return the missing memory"
+        );
+        parent = next;
+    }
+    drop(parent);
+
+    let stopped = std::cell::Cell::new(false);
+    let error = admit_until(
+        &s.ledger,
+        &m,
+        need.clone(),
+        Admit::Wait,
+        Pace::default(),
+        &mut |line| {
+            names(line, &["release slice memory budget", "memory short by"]);
+            eprintln!("{line}");
+            stopped.set(true);
+        },
+        &|| stopped.get(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Stopped { short: Some(_), .. }));
+    assert!(s.ledger.list().unwrap().is_empty());
+
+    m.set(Reading::of_gib(96, 44, 28));
+    let (parent, _) = waits(enter(&s, &m, need), &m);
+    let mut covering = Reading::of_gib(96, 44, 28);
+    covering.available = Some(44 * GIB + 1);
+    m.set(covering);
+    assert_eq!(admitted(parent, &m).record().need.mem, 44 * GIB);
 }
 
 /// Set, the waiting stand-in's ledger is under this directory.
@@ -2185,7 +2231,7 @@ fn a_claim_inside_held_work_is_held_to_the_other_held_claims_only() {
             vec![&waiting, &trust, &boot],
             20,
             Some(&started_by_verify),
-            None
+            None,
         )),
         [11, 12]
     );
@@ -7244,211 +7290,354 @@ fn an_adoption_proves_its_lock_is_held_and_one_that_fails_lets_nothing_go() {
     assert!(s.ledger.list().expect("listed").is_empty());
 }
 
-/// THE LEDGER REFINES THE QUALIFY'S MEMORY MODEL, SURE LEADS FIRST
-/// (`aterm_models_capacity::qualify_memory_model`): each step of an m3-sized qualify is asked of
-/// [`counted`] and [`decide`] as the claims stand, laid out as a qualify runs: the release (1)
-/// holds its line, one `ship build` (30) holds both slices' drivers, each link's wrapper (31, 41)
-/// runs under its slice's Cargo (35, 45), and the tree's units (11, 12) under verify's Cargo (15)
-/// under verify (10), which holds the tree's driver. The ledger admits exactly where the model's
-/// action is enabled. The native link waits for 42 GiB beside the compat link's 23; it is sure
-/// beside the tree's 2 GiB driver, so the tree's heavy unit (23.52 GiB), which asked before it,
-/// waits for it, and a small unit that fits beside its room runs. With a 40 GiB tree driver the
-/// link is not sure, and the tree's unit, leaving that driver spare, no longer counts it, as the
-/// model's guard says (counting it, the ledger would refuse that unit). The
-/// model ends every run, a 40 GiB tree driver's too. NEGATIVE CONTROLS: the same native link
-/// without `leads` is a waiter the tree's inside unit does not count, so the ledger admits that
-/// heavy unit, which only the buggy model's `HeavyPasses` does, breaking `LeadsFirst`; and where
-/// every lead is sure (the buggy dial at 2), the tree's units count a link its own driver leaves
-/// no room, and the model deadlocks.
+/// THE LEDGER REFINES QUALIFY'S SHARED-PARENT MODEL
+/// (`aterm_models_capacity::qualify_memory_model`). One 47 GiB global parent contains the
+/// private 43 GiB compiler budget and both 2 GiB slice drivers. While every compiler token is
+/// held, Tippy's enforceable 28 GiB whole-stage claim is admitted beside that parent; only then
+/// may compiler work start. After Tippy releases that claim, test compilation spends only the
+/// measured host's 28.8 GiB residual: its 2 GiB driver, a 23.52 GiB heavy unit and one 2 GiB unit
+/// fit, while a second does not. In the private accounting domain two small units overlap, but a
+/// held 43 GiB native link excludes the 24 GiB compat link. The declared margined scenario has
+/// a 52 GiB private budget, a 56 GiB parent and 52/29 GiB links; on the same host Tippy queues,
+/// every non-export token stays with build and the private ledger still excludes the other link.
+/// NEGATIVE CONTROLS: asking for whole lint after available memory has fallen reproduces its wait;
+/// a 43 GiB parent that omits both drivers wrongly admits the tree's second small unit; and a
+/// compat link placed outside the native link's private ledger is wrongly admitted.
+/// The matching model mutants break `CompilerWorkFollowsMemoryDecision`,
+/// `ParentCoversBothDrivers` and `SliceUnitsStayWithinBudget`.
 #[test]
-fn the_ledger_refines_the_qualify_memory_model_and_its_sure_leads_go_first() {
+fn the_ledger_refines_qualifys_shared_parent_and_private_budget() {
     use crate::Rank;
     use aterm_spec::interp::{State, find_deadlock, with_consts};
+
     const CENTI: u64 = GIB / 100;
     let model = aterm_models_capacity::qualify_memory_model();
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let mut reading = Reading::of_gib(128, 76, 18);
-    reading.available = Some(7580 * CENTI);
-    let p = |pid, ppid| Proc {
-        pid,
-        ppid,
-        charged: 0,
-        footprint: 0,
-        written: 0,
-        cpu_ns: 0,
-        runnable_ns: 0,
-    };
-    let procs = Procs::of(vec![
-        p(1, 0),
-        p(10, 1),
-        p(15, 10),
-        p(11, 15),
-        p(12, 15),
-        p(30, 1),
-        p(35, 30),
-        p(31, 35),
-        p(45, 30),
-        p(41, 45),
-    ]);
-    // A driver leaves an unclaimed load no ALONE admission; a unit leaves spare the drivers its
-    // own admission does not count: the tree's one, or the build's two.
-    let claim = |pid: u32, at: u64, centi: u64, margin: u64, leads: bool| {
-        let need = Need::new(format!("pid {pid}"))
-            .rank(Rank::Release)
-            .mem(centi * CENTI)
-            .margin(margin);
-        record(pid, at, if leads { need.leads() } else { need }, None)
-    };
-    let driver = |pid, at, centi| claim(pid, at, centi, 1, false);
-    let unit = |pid, at, centi| claim(pid, at, centi, 200 * CENTI, false);
-    let link = |pid, at, centi| claim(pid, at, centi, 400 * CENTI, true);
-    let held = |mut r: Record| {
-        r.held = Some(crate::Held {
-            admitted_ms: r.start_ms,
+    let mut global = Reading::of_gib(128, 76, 18);
+    global.available = Some(7580 * CENTI);
+    let mut private = Reading::of_gib(128, 43, 1);
+    private.available = Some(4300 * CENTI);
+    let held = |mut record: Record| {
+        record.held = Some(crate::Held {
+            admitted_ms: record.start_ms,
             cores: 0,
             alone: false,
         });
-        r
+        record
     };
-    let admits = |records: &[Record], asker: &Record| {
-        let all: Vec<&Record> = records
-            .iter()
-            .filter(|r| r.order() != asker.order())
-            .collect();
-        let others: Vec<Other<'_>> = counted(all, asker.pid, Some(&procs), reading.available)
-            .into_iter()
-            .map(plain)
-            .collect();
-        decide(&asker.need, asker.order(), &reading, &others, 0).is_ok()
+    let claim = |pid: u32, at: u64, what: &str, centi: u64| {
+        record(
+            pid,
+            at,
+            Need::new(what).rank(Rank::Release).mem(centi * CENTI),
+            None,
+        )
+    };
+    let whole_lint_claim = |pid: u32, at: u64| {
+        record(
+            pid,
+            at,
+            Need::new("verify tippy lint (--workspace)")
+                .rank(Rank::Release)
+                .mem(2800 * CENTI)
+                .covers()
+                .margin(1),
+            None,
+        )
+    };
+    let parent_claim = |centi| {
+        record(
+            30,
+            30,
+            Need::new("release slice memory budget")
+                .rank(Rank::Release)
+                .mem(centi * CENTI)
+                .margin(1),
+            None,
+        )
+    };
+    let admits = |reading: &Reading, records: &[Record], asker: &Record| {
+        let others: Vec<Other<'_>> = records.iter().map(plain).collect();
+        decide(&asker.need, asker.order(), reading, &others, 0).is_ok()
     };
     fn enabled(
-        m: &aterm_spec::derive::Model,
+        model: &aterm_spec::derive::Model,
         state: &aterm_spec::interp::State,
         action: &str,
     ) -> bool {
-        !m.successors(action, state).is_empty()
+        !model.successors(action, state).is_empty()
     }
-    fn run(m: &aterm_spec::derive::Model, state: &mut State, action: &str) {
-        let mut next = m.successors(action, state);
+    fn run(model: &aterm_spec::derive::Model, state: &mut State, action: &str) {
+        let mut next = model.successors(action, state);
         assert_eq!(next.len(), 1, "{action}");
         *state = next.pop().expect("one successor");
     }
+
     let mut state = model.init_state();
-    let line = held(record(
-        1,
-        1,
-        Need::new("release line").rank(Rank::Release),
-        None,
-    ));
-    let mut records: Vec<Record> = vec![line.clone()];
-    let step =
-        |state: &mut State, records: &mut Vec<Record>, action: &str, asker: Option<Record>| {
-            if let Some(asker) = asker {
-                let admitted = admits(records, &asker);
-                assert_eq!(admitted, enabled(&model, state, action), "{action}");
-                assert!(admitted, "{action} is a step of this run");
-                records.retain(|r| r.order() != asker.order());
-                records.push(held(asker));
-            }
-            run(&model, state, action);
-        };
-    for at in [30, 31] {
-        let asker = driver(30, at, 200);
-        assert!(admits(&records, &asker), "slice driver {at}");
-        records.push(held(asker));
-    }
-    step(&mut state, &mut records, "SlicesStart", None);
-    records.push(link(41, 41, 2300));
-    step(&mut state, &mut records, "CompatAsks", None);
-    step(
-        &mut state,
-        &mut records,
-        "CompatRuns",
-        Some(link(41, 41, 2300)),
-    );
-    step(
-        &mut state,
-        &mut records,
-        "StartDriver",
-        Some(driver(10, 50, 200)),
-    );
-    records.push(link(31, 60, 4200));
-    step(&mut state, &mut records, "NativeAsks", None);
-
-    let heavy = unit(11, 55, 2352);
-    assert!(
-        !admits(&records, &heavy),
-        "the heavy unit waits for the link's room"
-    );
-    assert!(!enabled(&model, &state, "HeavyUnit"));
-    let mut unled = records.clone();
-    unled.retain(|r| r.pid != 31);
-    unled.push(claim(31, 60, 4200, 400 * CENTI, false));
-    assert!(
-        admits(&unled, &heavy),
-        "NEGATIVE CONTROL: a link that does not lead is passed"
-    );
-    assert!(enabled(&buggy, &state, "HeavyPasses"));
-    assert!(!enabled(&model, &state, "HeavyPasses"));
-
-    step(
-        &mut state,
-        &mut records,
-        "SmallUnit",
-        Some(unit(12, 65, 200)),
-    );
-    step(
-        &mut state,
-        &mut records,
-        "NativeRuns",
-        Some(link(31, 60, 4200)),
-    );
-    assert!(!admits(&records, &heavy), "both links leave no room for it");
-    assert!(!enabled(&model, &state, "HeavyUnit"));
-    records.retain(|r| r.pid != 41 && !(r.pid == 30 && r.start_ms == 31));
-    step(&mut state, &mut records, "CompatEnds", None);
-    step(&mut state, &mut records, "HeavyUnit", Some(heavy));
-
-    // A tree driver of 40 GiB leaves the waiting native link no room: it is not sure, and the
-    // tree's unit, inside that driver, no longer counts it.
-    let parent = with_consts(&model, &[("Tree", 4000)]);
-    let mut state = parent.init_state();
-    for action in ["SlicesStart", "StartDriver", "NativeAsks"] {
-        run(&parent, &mut state, action);
-    }
-    let mut records = vec![line, held(driver(10, 50, 4000)), link(31, 60, 4200)];
-    for at in [30, 31] {
-        records.push(held(driver(30, at, 200)));
-    }
-    let small = claim(12, 65, 200, 4000 * CENTI, false);
-    let held_to: Vec<u32> = counted(
-        records.iter().collect(),
-        small.pid,
-        Some(&procs),
-        reading.available,
-    )
-    .into_iter()
-    .map(|r| r.pid)
-    .collect();
-    assert_eq!(held_to, [30, 30], "the slices' drivers, not the link");
-    assert!(admits(&records, &small));
-    assert!(enabled(&parent, &state, "SmallUnit"));
-    let every = with_consts(&model, &[("Tree", 4000), ("Buggy", 2)]);
-    assert!(!enabled(&every, &state, "SmallUnit"));
-
-    let ended = |s: &State| s["ndone"] == 1 && s["cdone"] == 1 && s["tree"] == 2;
-    assert!(aterm_spec::interp::bmc(&model).is_ok());
-    assert!(aterm_spec::interp::bmc(&parent).is_ok());
-    assert!(aterm_spec::interp::bmc(&buggy).is_err());
-    assert_eq!(find_deadlock(&model, ended), None, "every qualify ends");
-    assert_eq!(find_deadlock(&parent, ended), None, "a large parent's too");
-    let stuck = find_deadlock(&every, ended).expect("counting every lead deadlocks");
+    let parent = parent_claim(4700);
     assert_eq!(
-        (stuck["tree"], stuck["nwait"], stuck["small"]),
-        (1, 1, 0),
-        "the tree's driver waits for its units, which wait for the link, which waits for it"
+        admits(&global, &[], &parent),
+        enabled(&model, &state, "ParentAdmit")
     );
-    assert!(stuck["left"] > 0 || stuck["heavy"] == 0, "{stuck:?}");
+    let mut global_records = vec![held(parent)];
+    run(&model, &mut state, "ParentAdmit");
+
+    assert!(
+        !enabled(&model, &state, "NativeSmallStarts"),
+        "the compiler-token barrier stays closed until lint is reserved"
+    );
+    let lint = whole_lint_claim(10, 40);
+    assert_eq!(
+        admits(&global, &global_records, &lint),
+        enabled(&model, &state, "WholeLintAdmit")
+    );
+    let mut late = global.clone();
+    late.available = Some(7480 * CENTI);
+    assert!(
+        !admits(&late, &global_records, &lint),
+        "NEGATIVE CONTROL: delaying whole lint until only 74.8 GiB is available reproduces the wait"
+    );
+    global_records.push(held(lint.clone()));
+    run(&model, &mut state, "WholeLintAdmit");
+    assert_eq!((state["build_tokens"], state["tree_tokens"]), (13, 1));
+    assert!(enabled(&model, &state, "NativeSmallStarts"));
+    run(&model, &mut state, "TreeStarts");
+    let mut widened = state.clone();
+    for action in [
+        "NativeSmallStarts",
+        "CompatSmallStarts",
+        "NativeSmallEnds",
+        "CompatSmallEnds",
+        "NativeLinkStarts",
+        "NativeLinkEnds",
+        "CompatLinkStarts",
+        "CompatLinkEnds",
+        "ParentEnds",
+    ] {
+        run(&model, &mut widened, action);
+    }
+    run(&model, &mut widened, "BuildEnds");
+    assert_eq!(
+        (widened["build_tokens"], widened["tree_tokens"]),
+        (0, 14),
+        "normal build completion widens the same live tree"
+    );
+    run(&model, &mut state, "WholeLintEnds");
+    global_records.retain(|record| record.pid != 10);
+
+    let tree_driver = claim(11, 50, "test compile driver", 200);
+    assert_eq!(
+        admits(&global, &global_records, &tree_driver),
+        enabled(&model, &state, "TreeCompileStarts")
+    );
+    global_records.push(held(tree_driver));
+    run(&model, &mut state, "TreeCompileStarts");
+
+    let tree_heavy = claim(12, 60, "tree heavy unit", 2352);
+    assert_eq!(
+        admits(&global, &global_records, &tree_heavy),
+        enabled(&model, &state, "TreeHeavyStarts")
+    );
+    global_records.push(held(tree_heavy));
+    run(&model, &mut state, "TreeHeavyStarts");
+    let small = claim(13, 70, "tree small unit", 200);
+    assert!(
+        admits(&global, &global_records, &small),
+        "one small unit still fits the residual memory"
+    );
+    assert!(
+        !enabled(&model, &state, "TreeSmallStarts"),
+        "the one-token tree share is stricter until build drains"
+    );
+    // Exercise the memory ledger independently of that stricter FIFO: one hypothetical small
+    // unit fits beside the heavy one, while a second crosses the residual bound.
+    global_records.push(held(small));
+    let second = claim(14, 71, "tree second small unit", 200);
+    assert!(!admits(&global, &global_records, &second));
+    assert!(!enabled(&model, &state, "TreeSmallStarts"));
+
+    let mut missing_drivers = global_records.clone();
+    missing_drivers.retain(|record| record.pid != 30);
+    missing_drivers.push(held(parent_claim(4300)));
+    assert!(
+        admits(&global, &missing_drivers, &second),
+        "NEGATIVE CONTROL: omitting both drivers exposes 4 GiB to tree work"
+    );
+    assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 3)).is_err());
+
+    let mut serial = model.init_state();
+    for action in [
+        "ParentAdmit",
+        "WholeLintQueues",
+        "NativeSmallStarts",
+        "CompatSmallStarts",
+        "NativeSmallEnds",
+        "CompatSmallEnds",
+        "NativeLinkStarts",
+        "NativeLinkEnds",
+        "CompatLinkStarts",
+        "CompatLinkEnds",
+        "ParentEnds",
+        "BuildEnds",
+    ] {
+        run(&model, &mut serial, action);
+    }
+    assert_eq!(
+        (serial["build_tokens"], serial["tree_tokens"]),
+        (0, 14),
+        "the serial escape transfers the bounded grant only after build drains"
+    );
+    assert!(
+        !enabled(&model, &serial, "TreeStarts"),
+        "a queued lint request opens slice work, never tree work"
+    );
+    run(&model, &mut serial, "QueuedWholeLintAdmits");
+    assert!(enabled(&model, &serial, "TreeStarts"));
+
+    let mut slice_state = model.init_state();
+    for action in [
+        "ParentAdmit",
+        "WholeLintAdmit",
+        "NativeSmallStarts",
+        "CompatSmallStarts",
+    ] {
+        run(&model, &mut slice_state, action);
+    }
+    let native_small = held(claim(31, 70, "native small unit", 200));
+    let compat_small = claim(41, 71, "compat small unit", 200);
+    assert!(admits(&private, &[native_small], &compat_small));
+    for action in ["NativeSmallEnds", "CompatSmallEnds", "NativeLinkStarts"] {
+        run(&model, &mut slice_state, action);
+    }
+    let native_link = held(claim(31, 80, "native link", 4300));
+    let compat_link = claim(41, 81, "compat link", 2400);
+    assert!(!admits(
+        &private,
+        std::slice::from_ref(&native_link),
+        &compat_link
+    ));
+    assert!(!enabled(&model, &slice_state, "CompatLinkStarts"));
+    assert!(
+        admits(&private, &[], &compat_link),
+        "NEGATIVE CONTROL: a second private ledger lets both links spend 67 GiB"
+    );
+    assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
+
+    let margined = with_consts(
+        &model,
+        &[
+            ("SliceBudget", 5200),
+            ("Parent", 5600),
+            ("NativeLink", 5200),
+            ("CompatLink", 2900),
+        ],
+    );
+    let mut margined_state = margined.init_state();
+    let margined_parent = parent_claim(5600);
+    assert!(admits(&global, &[], &margined_parent));
+    run(&margined, &mut margined_state, "ParentAdmit");
+    let margined_records = vec![held(margined_parent)];
+    assert!(
+        !admits(&global, &margined_records, &lint),
+        "a 56 GiB parent and 28 GiB Tippy claim cannot oversubscribe m3"
+    );
+    assert!(!enabled(&margined, &margined_state, "WholeLintAdmit"));
+    assert!(enabled(&margined, &margined_state, "WholeLintQueues"));
+    run(&margined, &mut margined_state, "WholeLintQueues");
+    assert_eq!(
+        (
+            margined_state["build_tokens"],
+            margined_state["tree_tokens"]
+        ),
+        (14, 0),
+        "the margined parent keeps the whole compiler grant on the critical path"
+    );
+    let mut margined_private = Reading::of_gib(128, 52, 1);
+    margined_private.available = Some(5200 * CENTI);
+    let margined_native = held(claim(31, 80, "margined native link", 5200));
+    let margined_compat = claim(41, 81, "margined compat link", 2900);
+    assert!(
+        !admits(
+            &margined_private,
+            std::slice::from_ref(&margined_native),
+            &margined_compat,
+        ),
+        "the margined links must spend the same private budget"
+    );
+    for action in [
+        "NativeSmallStarts",
+        "CompatSmallStarts",
+        "NativeSmallEnds",
+        "CompatSmallEnds",
+        "NativeLinkStarts",
+        "NativeLinkEnds",
+        "CompatLinkStarts",
+        "CompatLinkEnds",
+        "ParentEnds",
+        "BuildEnds",
+    ] {
+        run(&margined, &mut margined_state, action);
+    }
+    assert!(enabled(&margined, &margined_state, "QueuedWholeLintAdmits"));
+    assert!(
+        admits(&global, &[], &lint),
+        "Tippy admits once the margined parent leaves"
+    );
+    run(&margined, &mut margined_state, "QueuedWholeLintAdmits");
+    let stale_parent = held(parent_claim(4700));
+    assert!(
+        admits(&global, std::slice::from_ref(&stale_parent), &lint),
+        "NEGATIVE CONTROL: stale pre-margin parent arithmetic would wrongly overlap Tippy"
+    );
+
+    let ended = |state: &State| {
+        state["parent"] == 2
+            && state["native"] == 4
+            && state["compat"] == 4
+            && state["tree"] == 4
+            && state["build_ended"] == 1
+    };
+    assert!(aterm_spec::interp::bmc(&model).is_ok());
+    assert_eq!(find_deadlock(&model, ended), None, "every qualify ends");
+    assert!(aterm_spec::interp::bmc(&margined).is_ok());
+    assert_eq!(
+        find_deadlock(&margined, ended),
+        None,
+        "every margined qualify ends"
+    );
+}
+
+/// A LATER LEAD OUTRANKS AN EARLIER ORDINARY WAITER ([`decide`]). With 12 GiB free, the later
+/// 8 GiB release-slice unit reserves its turn and the earlier 8 GiB tree unit waits. NEGATIVE
+/// CONTROL: removing `leads` restores ordinary FIFO order and admits the tree unit.
+#[test]
+fn a_later_lead_goes_before_an_earlier_non_lead() {
+    let reading = Reading::of_gib(64, 12, 14);
+    let tree = record(
+        11,
+        1,
+        Need::new("tree unit").rank(crate::Rank::Release).mem_gib(8),
+        None,
+    );
+    let lead = record(
+        21,
+        2,
+        Need::new("slice unit")
+            .rank(crate::Rank::Release)
+            .mem_gib(8)
+            .leads(),
+        None,
+    );
+    assert!(
+        decide(&tree.need, tree.order(), &reading, &[plain(&lead)], 3).is_err(),
+        "the later lead reserves its turn before ordinary work"
+    );
+
+    let mut ordinary = lead;
+    ordinary.need.leads = false;
+    assert!(
+        decide(&tree.need, tree.order(), &reading, &[plain(&ordinary)], 3,).is_ok(),
+        "NEGATIVE CONTROL: without leads, FIFO admits the earlier tree unit"
+    );
 }
 
 /// AN INSIDE WAITER COUNTS A LEAD ONLY WHERE IT IS SURE ([`counted`]): a waiter under held work
@@ -7542,7 +7731,7 @@ fn an_inside_waiter_counts_a_lead_only_where_it_is_sure() {
         counts(
             &[held(10, 1, 4), crediting(held(70, 6, 32))],
             20 * GIB,
-            sweep
+            sweep,
         ),
         [20]
     );
@@ -7553,6 +7742,905 @@ fn an_inside_waiter_counts_a_lead_only_where_it_is_sure() {
         [10, 20, 21, 22],
         "no ancestor is known"
     );
+}
+
+/// A CRITICAL WAITER PROTECTS ITS ADMISSION MARGIN: with exactly its 30 GiB claim and 4 GiB
+/// margin free, a later 4 GiB unit waits. Before critical retention, virtual admission removed
+/// only the 30 GiB claim and offered the margin to that unit, which is the negative control.
+/// With 4 GiB beyond the complete envelope, the unit backfills and the critical waiter still
+/// fits beside it.
+#[test]
+fn a_critical_waiter_protects_its_margin_and_only_true_slack_backfills() {
+    let lead = record(
+        20,
+        1,
+        Need::new("critical")
+            .rank(crate::Rank::Release)
+            .mem_gib(30)
+            .margin(4 * GIB)
+            .critical_path(),
+        None,
+    );
+    let small = record(30, 2, Need::new("small").mem_gib(4), None);
+    let exact = Reading::of_gib(64, 34, 14);
+    assert!(
+        decide(&small.need, small.order(), &exact, &[plain(&lead)], 3).is_err(),
+        "the margin is part of the critical admission envelope"
+    );
+
+    let mut old = lead.clone();
+    old.need.critical = false;
+    assert!(
+        decide(&small.need, small.order(), &exact, &[plain(&old)], 3).is_ok(),
+        "NEGATIVE CONTROL: today's virtual lead offers its margin to the later unit"
+    );
+
+    let extra = Reading::of_gib(64, 38, 14);
+    assert!(
+        decide(&small.need, small.order(), &extra, &[plain(&lead)], 3).is_ok(),
+        "only room beyond the complete critical envelope backfills"
+    );
+    let held_small = record(30, 2, small.need.clone(), Some(0));
+    assert!(
+        decide(&lead.need, lead.order(), &extra, &[plain(&held_small)], 3).is_ok(),
+        "that backfill leaves the critical waiter's real turn unchanged"
+    );
+}
+
+/// RETAINED HOLDBACK IS PART OF THE SHORTFALL. A later waiter is inside a 6 GiB parent that
+/// `counted` hid, while a visible 10 GiB holder remains. The critical lead's proof conservatively
+/// carries that 6 GiB. With 40 GiB available, the visible holder's exact 10 GiB end funds the
+/// protected turn, so no backfill is safe. The old shortfall omitted holdback, saw only a 4 GiB
+/// shortfall and incorrectly offered the holder's 6 GiB overshoot to the later unit. At 46 GiB,
+/// the same 6 GiB unit is genuinely beyond the protected envelope and may backfill.
+#[test]
+fn retained_holdback_cannot_be_spent_as_release_overshoot() {
+    let visible = record(10, 1, Need::new("visible holder").mem_gib(10), Some(0));
+    let mut lead = record(
+        20,
+        2,
+        Need::new("critical")
+            .rank(crate::Rank::Release)
+            .mem_gib(30)
+            .margin(4 * GIB)
+            .critical_path(),
+        None,
+    );
+    lead.need.lead_reservation = Some(crate::LeadReservation {
+        needed: 1,
+        holdback: 6 * GIB,
+        sponsors: vec![crate::LeadSponsor {
+            order: (0, 99, 0),
+            bytes: 1,
+        }],
+    });
+    let small = Need::new("inside hidden parent").mem_gib(6);
+    let exact = Reading::of_gib(64, 40, 14);
+    assert!(
+        decide(
+            &small,
+            (3, 30, 0),
+            &exact,
+            &[plain(&visible), plain(&lead)],
+            4,
+        )
+        .is_err(),
+        "the exact funding belongs to the protected critical turn"
+    );
+    let safe = Reading::of_gib(64, 46, 14);
+    assert!(
+        decide(
+            &small,
+            (3, 30, 0),
+            &safe,
+            &[plain(&visible), plain(&lead)],
+            4,
+        )
+        .is_ok(),
+        "only the overshoot beyond the protected turn may backfill"
+    );
+}
+
+/// A SPONSOR DESCENDANT IS THE ABBA ESCAPE. The retained lead is sure for unrelated work inside
+/// another holder, but not for a child the sponsor may have to join before ending. Exempting that
+/// child breaks the sponsor -> child -> lead -> sponsor cycle; once admitted, its finite claim is
+/// visible to the lead, so it cannot disappear from the critical turn's accounting.
+#[test]
+fn a_sponsor_descendant_passes_the_retained_lead_without_exempting_other_work() {
+    let sponsor = record(
+        30,
+        1,
+        Need::new("sponsor")
+            .rank(crate::Rank::Release)
+            .mem_gib(20)
+            .critical_path(),
+        Some(0),
+    );
+    let mut lead = record(
+        20,
+        2,
+        Need::new("lead")
+            .rank(crate::Rank::Release)
+            .mem_gib(30)
+            .critical_path(),
+        None,
+    );
+    lead.need.lead_reservation = Some(crate::LeadReservation {
+        needed: 10 * GIB,
+        holdback: 0,
+        sponsors: vec![crate::LeadSponsor {
+            order: sponsor.order(),
+            bytes: sponsor.need.mem,
+        }],
+    });
+    let other_parent = record(40, 3, Need::new("other parent").mem_gib(1), Some(0));
+    let procs = Procs::of(vec![
+        Proc {
+            pid: 31,
+            ppid: 30,
+            ..Proc::default()
+        },
+        Proc {
+            pid: 41,
+            ppid: 40,
+            ..Proc::default()
+        },
+    ]);
+    let rows = vec![&sponsor, &lead, &other_parent];
+    let child = counted(rows.clone(), 31, Some(&procs), Some(30 * GIB));
+    assert!(
+        !child.iter().any(|record| record.order() == lead.order()),
+        "the sponsor's child does not wait for what waits for its parent"
+    );
+    let unrelated = counted(rows, 41, Some(&procs), Some(30 * GIB));
+    assert!(
+        unrelated
+            .iter()
+            .any(|record| record.order() == lead.order()),
+        "unrelated nested work still honors the retained turn"
+    );
+    let reused_pid = record(
+        30,
+        99,
+        Need::new("later claim at old pid").mem_gib(1),
+        Some(0),
+    );
+    let after_sponsor = counted(vec![&lead, &reused_pid], 31, Some(&procs), Some(30 * GIB));
+    assert!(
+        after_sponsor
+            .iter()
+            .any(|record| record.order() == lead.order()),
+        "after the exact sponsor ends, its old PID grants no escape"
+    );
+}
+
+/// SAME-PID HELD CLAIMS REMAIN PARENTS OF AN ORDINARY LEAD. They cannot be treated as memory an
+/// independent holder will return: this process may be retaining the outer claim while it waits.
+/// With its unused 20 GiB reservation, the 30 GiB lead is not sure in 40 GiB; omitting the
+/// same-PID claim would incorrectly put that lead ahead of unrelated nested work.
+#[test]
+fn an_ordinary_lead_does_not_count_its_same_pid_parent_as_independent_room() {
+    let parent = record(21, 1, Need::new("same-pid parent").mem_gib(20), Some(0));
+    let lead = record(21, 2, Need::new("ordinary lead").mem_gib(30).leads(), None);
+    let other_parent = record(40, 3, Need::new("other parent").mem_gib(1), Some(0));
+    let procs = Procs::of(vec![
+        Proc {
+            pid: 21,
+            ppid: 1,
+            ..Proc::default()
+        },
+        Proc {
+            pid: 41,
+            ppid: 40,
+            ..Proc::default()
+        },
+    ]);
+    let counted = counted(
+        vec![&parent, &lead, &other_parent],
+        41,
+        Some(&procs),
+        Some(40 * GIB),
+    );
+    assert!(
+        !counted.iter().any(|record| record.order() == lead.order()),
+        "the same-PID parent's unused reservation keeps the lead unsure"
+    );
+}
+
+/// A FINAL LINK RETAINS THE ROOM ANOTHER FINAL LINK FUNDS. The 30 GiB critical link, with 4 GiB
+/// spare, is 8 GiB short beside the 4 GiB tree driver. The held 20 GiB compat link is a terminal
+/// critical sponsor in the same release checkout. Its append-only proof keeps a lagged 30 GiB
+/// available reading from being refilled after the compat record disappears: all 64 temporal
+/// tree units wait. Without the proof each is admitted, reproducing the old starvation stream.
+/// At the first 38 GiB reading the critical link starts; at 46 GiB a 4 GiB unit is provably safe
+/// beside its full envelope and conservative 6 GiB holdback. Once the finite link ends, small
+/// work starts again.
+#[test]
+fn a_terminal_link_funds_a_retained_critical_turn_without_starving_small_work() {
+    let p = |pid, ppid, charged| Proc {
+        pid,
+        ppid,
+        charged,
+        footprint: charged,
+        written: 0,
+        cpu_ns: 0,
+        runnable_ns: 0,
+    };
+    let mut processes = vec![
+        p(1, 0, 0),
+        p(10, 1, 0),
+        p(11, 10, 0),
+        p(20, 1, 0),
+        p(21, 20, 0),
+        p(30, 1, 20 * GIB),
+    ];
+    processes.extend((0..64).map(|i| p(100 + i, 10, 0)));
+    let procs = Procs::of(processes);
+    let release = |what: &str, gib| Need::new(what).rank(crate::Rank::Release).mem_gib(gib);
+    let slice_driver = record(20, 1, release("slice driver", 2), Some(0));
+    let tree_driver = record(10, 2, release("tree driver", 4), Some(0));
+    let sponsor = record(
+        30,
+        3,
+        release("compat final link", 20).critical_path(),
+        Some(0),
+    );
+    let mut lead = record(
+        21,
+        4,
+        release("native final link", 30)
+            .margin(4 * GIB)
+            .critical_path(),
+        None,
+    );
+    let proving = [&slice_driver, &tree_driver, &sponsor];
+    let reservation = funded_lead_reservation(&lead, &proving, &procs, Some(30 * GIB))
+        .expect("the terminal compat link funds the critical native link");
+    assert_eq!(reservation.needed, 8 * GIB);
+    assert_eq!(reservation.holdback, 6 * GIB);
+    assert_eq!(reservation.sponsors.len(), 1);
+    assert_eq!(reservation.sponsors[0].order, sponsor.order());
+    assert_eq!(reservation.sponsors[0].bytes, 20 * GIB);
+    lead.need.lead_reservation = Some(reservation);
+
+    let asks = |records: &[Record], asker: &Record, available: u64| {
+        let records: Vec<&Record> = records.iter().collect();
+        let counted = counted(records, asker.pid, Some(&procs), Some(available));
+        let others: Vec<Other<'_>> = counted.into_iter().map(plain).collect();
+        decide(
+            &asker.need,
+            asker.order(),
+            &Reading::of_gib(64, available / GIB, 14),
+            &others,
+            20,
+        )
+    };
+    let after_sponsor = [slice_driver.clone(), tree_driver.clone(), lead.clone()];
+    let mut legacy = lead.clone();
+    legacy.need.lead_reservation = None;
+    let legacy_records = [slice_driver.clone(), tree_driver.clone(), legacy];
+    for i in 0..64 {
+        let small = record(
+            100 + i,
+            10 + u64::from(i),
+            Need::new(format!("tree unit {i}")).mem_gib(4),
+            None,
+        );
+        assert!(
+            asks(&legacy_records, &small, 30 * GIB).is_ok(),
+            "NEGATIVE CONTROL: the snapshot-only rule admits temporal unit {i}"
+        );
+        assert!(
+            asks(&after_sponsor, &small, 30 * GIB).is_err(),
+            "the retained turn stops temporal unit {i} from refilling sponsor memory"
+        );
+    }
+
+    assert!(
+        asks(&after_sponsor[..2], &lead, 38 * GIB).is_ok(),
+        "the lead starts at the first reading that covers its real envelope"
+    );
+    let small = record(11, 80, Need::new("bounded backfill").mem_gib(4), None);
+    assert!(
+        asks(&after_sponsor, &small, 46 * GIB).is_ok(),
+        "a unit beyond the full envelope and holdback backfills"
+    );
+    let mut held_small = small.clone();
+    held_small.held = Some(crate::Held {
+        admitted_ms: 80,
+        cores: 0,
+        alone: false,
+    });
+    assert!(
+        asks(
+            &[slice_driver.clone(), tree_driver.clone(), held_small],
+            &lead,
+            46 * GIB,
+        )
+        .is_ok(),
+        "the bounded backfill cannot move the lead's turn"
+    );
+    assert!(
+        asks(&[slice_driver, tree_driver], &small, 30 * GIB).is_ok(),
+        "small work resumes after the finite critical unit ends"
+    );
+}
+
+#[cfg(unix)]
+const CRITICAL_REPLAY_LEDGER: &str = "ATERM_CAPACITY_CRITICAL_REPLAY_LEDGER";
+#[cfg(unix)]
+const CRITICAL_REPLAY_SIGNALS: &str = "ATERM_CAPACITY_CRITICAL_REPLAY_SIGNALS";
+#[cfg(unix)]
+const CRITICAL_REPLAY_ROLE: &str = "ATERM_CAPACITY_CRITICAL_REPLAY_ROLE";
+#[cfg(unix)]
+const CRITICAL_REPLAY_AVAILABLE: &str = "ATERM_CAPACITY_CRITICAL_REPLAY_AVAILABLE";
+#[cfg(unix)]
+const CRITICAL_REPLAY_WORKER: &str = "tests::critical_path_replay_worker";
+
+/// One real claimant in [`critical_path_qualify_replay_walls`]. The sponsor holds a terminal
+/// critical 20 GiB claim until released. A tree unit polls for 4 GiB, says when it first waits
+/// and when it is actually admitted, then holds its claim until released. Each process has its
+/// own PID, as the release's compiler and tree units do.
+#[cfg(unix)]
+#[test]
+fn critical_path_replay_worker() {
+    let Some(ledger) = std::env::var_os(CRITICAL_REPLAY_LEDGER).map(PathBuf::from) else {
+        return;
+    };
+    let signals = PathBuf::from(std::env::var_os(CRITICAL_REPLAY_SIGNALS).expect("signal dir"));
+    let role = std::env::var(CRITICAL_REPLAY_ROLE).expect("worker role");
+    let available: u64 = std::env::var(CRITICAL_REPLAY_AVAILABLE)
+        .expect("available GiB")
+        .parse()
+        .expect("numeric available GiB");
+    let need = match role.as_str() {
+        "sponsor" => Need::new("compat final link")
+            .rank(crate::Rank::Release)
+            .mem_gib(20)
+            .critical_path(),
+        "tree" => Need::new("tree compiler unit").mem_gib(4),
+        other => panic!("unknown replay role {other}"),
+    };
+    let machine = Fixed::new(Reading::of_gib(64, available, 14));
+    let mut waiter =
+        Some(Waiter::enter(&Ledger::at(ledger), &machine, need).expect("entered replay worker"));
+    let mut said_wait = false;
+    let claim = until_within(MUST_HAPPEN, "replay worker admission", || {
+        match waiter.take().expect("replay waiter").poll(&machine) {
+            Polled::Admitted(claim) => Some(claim),
+            Polled::Waiting(next, _) => {
+                waiter = Some(next);
+                if !said_wait {
+                    std::fs::write(signals.join("waiting"), "").expect("said waiting");
+                    said_wait = true;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                None
+            }
+            Polled::Gone(error) => panic!("replay claim gone: {error}"),
+            Polled::Unqualified(why) => panic!("replay claim unqualified: {why}"),
+        }
+    });
+    std::fs::write(signals.join("admitted"), std::process::id().to_string())
+        .expect("said admitted");
+    until_within(MUST_HAPPEN, "replay worker release", || {
+        signals.join("release").exists().then_some(())
+    });
+    drop(claim);
+    std::fs::write(signals.join("done"), "").expect("said done");
+}
+
+#[cfg(unix)]
+struct CriticalReplayWorker {
+    child: aterm_uds::spawnfd::Child,
+    signals: PathBuf,
+    finished: bool,
+}
+
+#[cfg(unix)]
+impl CriticalReplayWorker {
+    fn wait_for(&self, name: &str) -> String {
+        let path = self.signals.join(name);
+        until_within(
+            MUST_HAPPEN,
+            &format!("replay worker to write {name}"),
+            || std::fs::read_to_string(&path).ok(),
+        )
+    }
+
+    fn release_and_wait(mut self) {
+        std::fs::write(self.signals.join("release"), "").expect("released replay worker");
+        let status = self.child.wait().expect("replay worker exit");
+        self.finished = true;
+        assert!(status.success(), "replay worker failed: {status}");
+        assert!(
+            self.signals.join("done").exists(),
+            "worker dropped its claim"
+        );
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CriticalReplayWorker {
+    fn drop(&mut self) {
+        if !self.finished && matches!(self.child.try_wait(), Ok(None)) {
+            let _ = std::fs::write(self.signals.join("release"), "");
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn critical_replay_worker(
+    scratch: &Scratch,
+    signals: PathBuf,
+    role: &str,
+    available_gib: u64,
+) -> CriticalReplayWorker {
+    std::fs::create_dir(&signals).expect("replay signal dir");
+    let child = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+        .args([
+            "--exact",
+            CRITICAL_REPLAY_WORKER,
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(CRITICAL_REPLAY_LEDGER, scratch.ledger.dir())
+        .env(CRITICAL_REPLAY_SIGNALS, &signals)
+        .env(CRITICAL_REPLAY_ROLE, role)
+        .env(CRITICAL_REPLAY_AVAILABLE, available_gib.to_string())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("critical replay worker");
+    CriticalReplayWorker {
+        child,
+        signals,
+        finished: false,
+    }
+}
+
+/// A SCALED QUALIFY-SHAPED WALL REPLAY, run only as an explicit measurement. Every admission is
+/// a real [`Waiter::poll`] against a private ledger, and every unit is a real cross-process claim
+/// held for its measured work interval. The control's broad lead exposes its 4 GiB margin, so
+/// eight 4 GiB tree units take the gap in sequence and the link ends last. The retained lead
+/// stops the first unit, starts at the first covering reading after its 20 GiB sponsor ends, then
+/// releases tree work; all eight units finish, including work remaining after the link's finite
+/// claim ends: no small-unit starvation. The
+/// A/B/B/A walls measure admission and claim lifetime on this Mac without allocating the claimed
+/// bytes. They are replay evidence, not a whole-release speed claim.
+#[cfg(unix)]
+#[test]
+#[ignore = "explicit critical-path admission ABBA"]
+fn critical_path_qualify_replay_walls() {
+    #[derive(Clone, Copy)]
+    struct ReplayResult {
+        slice_end: Duration,
+        tree_end: Duration,
+        wall: Duration,
+    }
+
+    let run = |retained: bool| {
+        let scratch = scratch(if retained {
+            "critical-replay-after"
+        } else {
+            "critical-replay-before"
+        });
+        let sponsor =
+            critical_replay_worker(&scratch, scratch.dir.path().join("sponsor"), "sponsor", 40);
+        let sponsor_pid: u32 = sponsor
+            .wait_for("admitted")
+            .trim()
+            .parse()
+            .expect("sponsor pid");
+        let machine = Fixed::new(Reading::of_gib(64, 20, 14));
+        let me = std::process::id();
+        machine.set_procs(Some(Procs::of(vec![
+            Proc {
+                pid: me,
+                ppid: 1,
+                ..Proc::default()
+            },
+            Proc {
+                pid: sponsor_pid,
+                ppid: me,
+                charged: 20 * GIB,
+                footprint: 20 * GIB,
+                ..Proc::default()
+            },
+        ])));
+        let lead = Need::new("native final link")
+            .rank(crate::Rank::Release)
+            .mem_gib(30)
+            .margin(4 * GIB);
+        let lead = if retained {
+            lead.critical_path()
+        } else {
+            lead.leads()
+        };
+        let (mut lead, _) = waits(enter(&scratch, &machine, lead), &machine);
+        let recorded = scratch
+            .ledger
+            .list()
+            .expect("listed replay")
+            .into_iter()
+            .find(|record| record.need.what == "native final link")
+            .expect("lead record");
+        assert_eq!(
+            recorded.need.lead_reservation.is_some(),
+            retained,
+            "only the new arm retains its sponsor's funding"
+        );
+
+        let began = std::time::Instant::now();
+        sponsor.release_and_wait();
+        machine.set(Reading::of_gib(64, 34, 14));
+
+        let (slice_end, tree_end) = if retained {
+            let first =
+                critical_replay_worker(&scratch, scratch.dir.path().join("tree-0"), "tree", 34);
+            first.wait_for("waiting");
+            assert!(
+                !first.signals.join("admitted").exists(),
+                "the first small unit waits for the retained lead"
+            );
+            let claim = admitted(lead, &machine);
+            let link = std::thread::spawn(move || {
+                let claim = claim;
+                std::thread::sleep(Duration::from_millis(120));
+                drop(claim);
+                began.elapsed()
+            });
+            first.wait_for("admitted");
+            std::thread::sleep(Duration::from_millis(40));
+            first.release_and_wait();
+            for i in 1..8 {
+                let unit = critical_replay_worker(
+                    &scratch,
+                    scratch.dir.path().join(format!("tree-{i}")),
+                    "tree",
+                    34,
+                );
+                unit.wait_for("admitted");
+                std::thread::sleep(Duration::from_millis(40));
+                unit.release_and_wait();
+            }
+            let tree_end = began.elapsed();
+            (link.join().expect("link replay"), tree_end)
+        } else {
+            for i in 0..8 {
+                let unit = critical_replay_worker(
+                    &scratch,
+                    scratch.dir.path().join(format!("tree-{i}")),
+                    "tree",
+                    34,
+                );
+                unit.wait_for("admitted");
+                let waited = waits(lead, &machine);
+                lead = waited.0;
+                std::thread::sleep(Duration::from_millis(40));
+                unit.release_and_wait();
+            }
+            let tree_end = began.elapsed();
+            let claim = admitted(lead, &machine);
+            std::thread::sleep(Duration::from_millis(120));
+            drop(claim);
+            (began.elapsed(), tree_end)
+        };
+        ReplayResult {
+            slice_end,
+            tree_end,
+            wall: began.elapsed(),
+        }
+    };
+
+    let _warmup = run(false);
+    let mut results = Vec::new();
+    for (take, retained) in [false, true, true, false].into_iter().enumerate() {
+        let result = run(retained);
+        let arm = if retained { "after" } else { "before" };
+        eprintln!(
+            "critical-path-replay take={} arm={arm} slice_end_ms={:.3} tree_end_ms={:.3} step_wall_ms={:.3}",
+            take + 1,
+            result.slice_end.as_secs_f64() * 1000.0,
+            result.tree_end.as_secs_f64() * 1000.0,
+            result.wall.as_secs_f64() * 1000.0,
+        );
+        results.push((retained, result));
+    }
+    for (retained, result) in results {
+        if retained {
+            assert!(
+                result.slice_end < result.tree_end,
+                "critical slice ends first"
+            );
+        } else {
+            assert!(
+                result.tree_end < result.slice_end,
+                "old policy ends the slice last"
+            );
+        }
+    }
+}
+
+/// RETAINED FUNDING HAS A NARROW AUTHORITY: only one already-held, memory-only, non-phased,
+/// non-alone terminal critical Release claim from the same checkout can sponsor. An absent
+/// available-memory reading never falls back to physical memory. A nonselected phased claim is
+/// budgeted at its immutable peak, not its stepped current claim.
+#[test]
+fn only_same_release_terminal_claims_can_fund_a_critical_turn() {
+    let p = |pid, charged| Proc {
+        pid,
+        ppid: 1,
+        charged,
+        footprint: charged,
+        written: 0,
+        cpu_ns: 0,
+        runnable_ns: 0,
+    };
+    let procs = Procs::of(vec![p(21, 0), p(30, 20 * GIB), p(40, 10 * GIB)]);
+    let terminal = |what: &str, gib| {
+        Need::new(what)
+            .rank(crate::Rank::Release)
+            .mem_gib(gib)
+            .critical_path()
+    };
+    let lead = record(
+        21,
+        1,
+        terminal("native final link", 30).margin(4 * GIB),
+        None,
+    );
+    let sponsor = record(30, 2, terminal("compat final link", 20), Some(0));
+    let proves =
+        |candidate: &Record| funded_lead_reservation(&lead, &[candidate], &procs, Some(20 * GIB));
+    assert!(proves(&sponsor).is_some());
+
+    let mut changed = sponsor.clone();
+    changed.need.critical = false;
+    assert!(
+        proves(&changed).is_none(),
+        "a broad lead is not terminal authority"
+    );
+    changed = sponsor.clone();
+    changed.need.rank = crate::Rank::Ordinary;
+    assert!(
+        proves(&changed).is_none(),
+        "Ordinary work cannot sponsor Release"
+    );
+    changed = sponsor.clone();
+    changed.checkout = "/another-release".to_owned();
+    assert!(
+        proves(&changed).is_none(),
+        "another checkout is another release run"
+    );
+    changed = sponsor.clone();
+    changed.need.run_mem = Some(10 * GIB);
+    assert!(
+        proves(&changed).is_none(),
+        "a phased claim is not immutable"
+    );
+    changed = sponsor.clone();
+    changed.need.alone = true;
+    changed.held.as_mut().unwrap().alone = true;
+    assert!(
+        proves(&changed).is_none(),
+        "an ALONE claim cannot fund coexistence"
+    );
+    changed = sponsor.clone();
+    changed.accounting = crate::Accounting::CohortOwned;
+    assert!(
+        proves(&changed).is_none(),
+        "cohort custody has no terminal PID contract"
+    );
+    let second = record(
+        30,
+        3,
+        Need::new("same holder's second claim").mem_gib(1),
+        Some(0),
+    );
+    assert!(
+        funded_lead_reservation(&lead, &[&sponsor, &second], &procs, Some(20 * GIB)).is_none(),
+        "a multi-claim holder is not a terminal sponsor"
+    );
+    let same_pid_parent = record(21, 4, Need::new("same-pid parent").mem_gib(10), Some(0));
+    assert!(
+        funded_lead_reservation(&lead, &[&sponsor, &same_pid_parent], &procs, Some(20 * GIB),)
+            .is_none(),
+        "a same-PID parent is budgeted but cannot sponsor its own waiter"
+    );
+    assert!(
+        funded_lead_reservation(&lead, &[&sponsor], &procs, None).is_none(),
+        "physical memory is not an available-memory reading"
+    );
+
+    let mut phased = record(40, 4, Need::new("non-sponsor phased").mem_gib(20), Some(0));
+    phased.need.run_mem = Some(10 * GIB);
+    phased.need.stepped = Some(10 * GIB);
+    let proof = funded_lead_reservation(&lead, &[&sponsor, &phased], &procs, Some(40 * GIB))
+        .expect("the terminal sponsor covers the immutable-peak shortage");
+    assert_eq!(proof.needed, 4 * GIB, "20 GiB peak, not 10 GiB current");
+    assert_eq!(proof.holdback, 20 * GIB);
+}
+
+/// A retained proof round-trips only on its waiting critical record. A caller cannot forge one
+/// into a new wait; held records discard it. Duplicate, redundant and overlong sponsor evidence
+/// is malformed and therefore grants no priority.
+#[test]
+fn a_critical_reservation_round_trips_but_malformed_or_forged_evidence_does_not() {
+    let reservation = crate::LeadReservation {
+        needed: 8 * GIB,
+        holdback: 6 * GIB,
+        sponsors: vec![crate::LeadSponsor {
+            order: (3, 30, 0),
+            bytes: 20 * GIB,
+        }],
+    };
+    let head = aterm_json::json!({
+        "v": 1,
+        "pid": 21,
+        "start_ms": 4,
+        "seq": 0,
+        "checkout": "/ck",
+        "what": "native final link",
+        "mem": 30 * GIB,
+        "margin": 4 * GIB,
+        "cores": 0,
+        "rank": "release",
+        "disk": 0,
+        "quiet": null,
+        "leads": true,
+        "critical": true,
+        "volume": null
+    });
+    let encoded = |proof: &crate::LeadReservation| {
+        format!("{head}\n{}", Record::lead_reservation_line(proof))
+    };
+    let decoded = Record::decode(&encoded(&reservation), false).expect("complete proof");
+    assert_eq!(decoded.need.lead_reservation, Some(reservation.clone()));
+    let mut ordinary_rank = head.clone();
+    ordinary_rank
+        .as_object_mut()
+        .unwrap()
+        .insert("rank".into(), aterm_json::json!("ordinary"));
+    assert!(
+        Record::decode(
+            &format!(
+                "{ordinary_rank}\n{}",
+                Record::lead_reservation_line(&reservation)
+            ),
+            false,
+        )
+        .is_none(),
+        "critical authority is Release-only on the wire"
+    );
+    let mut broad_head = head.clone();
+    broad_head.as_object_mut().unwrap().remove("critical");
+    let broad = format!(
+        "{broad_head}\n{}",
+        Record::lead_reservation_line(&reservation)
+    );
+    assert_eq!(
+        Record::decode(&broad, false)
+            .expect("ordinary lead record")
+            .need
+            .lead_reservation,
+        None,
+        "a broad lead cannot inherit critical reservation authority"
+    );
+    assert_eq!(
+        Record::decode(&encoded(&reservation), true)
+            .expect("held record")
+            .need
+            .lead_reservation,
+        None,
+        "held work no longer reserves its future turn"
+    );
+
+    let duplicate = crate::LeadReservation {
+        sponsors: vec![
+            reservation.sponsors[0].clone(),
+            reservation.sponsors[0].clone(),
+        ],
+        ..reservation.clone()
+    };
+    assert_eq!(
+        Record::decode(&encoded(&duplicate), false)
+            .expect("the record remains readable")
+            .need
+            .lead_reservation,
+        None
+    );
+    let redundant = crate::LeadReservation {
+        needed: GIB,
+        sponsors: vec![
+            reservation.sponsors[0].clone(),
+            crate::LeadSponsor {
+                order: (4, 31, 0),
+                bytes: 20 * GIB,
+            },
+        ],
+        ..reservation.clone()
+    };
+    assert_eq!(
+        Record::decode(&encoded(&redundant), false)
+            .expect("the record remains readable")
+            .need
+            .lead_reservation,
+        None
+    );
+    let overlong = crate::LeadReservation {
+        needed: u64::MAX,
+        sponsors: (0..=crate::LEAD_SPONSORS_MAX)
+            .map(|i| crate::LeadSponsor {
+                order: (
+                    100 + u64::try_from(i).unwrap(),
+                    100 + u32::try_from(i).unwrap(),
+                    0,
+                ),
+                bytes: u64::MAX,
+            })
+            .collect(),
+        ..reservation.clone()
+    };
+    assert_eq!(
+        Record::decode(&encoded(&overlong), false)
+            .expect("the record remains readable")
+            .need
+            .lead_reservation,
+        None
+    );
+
+    let s = scratch("caller-critical-proof");
+    let m = mac48();
+    let mut need = Need::new("forged")
+        .rank(crate::Rank::Release)
+        .mem_gib(1)
+        .critical_path();
+    need.lead_reservation = Some(reservation);
+    let waiter = Waiter::enter(&s.ledger, &m, need).expect("entered");
+    assert_eq!(waiter.record().need.lead_reservation, None);
+}
+
+/// A CRITICAL SPONSOR'S CUSTODY EDGES ARE IMMUTABLE. Numeric credit could add a foreign waiter
+/// after the lead's proof; descriptor handoff or detachment could transfer the sponsor away from
+/// the PID ancestry used by the ABBA escape. Final compiler links need none of these operations,
+/// so all fail closed.
+#[cfg(unix)]
+#[test]
+fn a_critical_claim_cannot_add_credit_or_detach_after_sponsoring() {
+    let s = scratch("critical-custody");
+    let machine = mac48();
+    let mut claim = admitted(
+        enter(
+            &s,
+            &machine,
+            Need::new("final link")
+                .rank(crate::Rank::Release)
+                .mem_gib(1)
+                .critical_path(),
+        ),
+        &machine,
+    );
+    let external = if std::process::id() == 2 { 3 } else { 2 };
+    let credit = claim
+        .credit(&[external])
+        .expect_err("critical credit refused");
+    assert_eq!(credit.kind(), std::io::ErrorKind::Unsupported);
+    assert!(claim.record().credit.is_empty());
+    assert!(s.ledger.list().unwrap()[0].credit.is_empty());
+    let descriptor = claim
+        .descriptor()
+        .expect_err("critical descriptor transfer refused");
+    assert_eq!(descriptor.kind(), std::io::ErrorKind::Unsupported);
+
+    let (claim, detached) = claim
+        .into_retained_guard()
+        .expect_err("critical detachment refused");
+    assert_eq!(detached.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(claim.record().accounting, crate::Accounting::Holder);
+    assert!(claim.record().need.critical);
 }
 
 /// A CLAIM THAT LEADS SAYS SO IN ITS RECORD: admitted with `leads`, the ledger lists it so.

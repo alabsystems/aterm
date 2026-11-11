@@ -7,7 +7,7 @@
 
 use std::io::{self, ErrorKind};
 use std::net::{SocketAddr, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -26,6 +26,26 @@ const SO_NOSIGPIPE: libc::c_int = 0x1022;
 /// connection, polling, or peer-address error.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn until(path: &Path, deadline: Instant) -> io::Result<CtlStream> {
+    until_cancelled(path, deadline, None)
+}
+
+/// Connect by the original deadline, with a latched stop in the same readiness wait.
+/// # Errors
+/// As [`until`], or `Interrupted` when the stop is set.
+pub fn until_stopped(
+    path: &Path,
+    deadline: Instant,
+    stop: &crate::stop::Stop,
+) -> io::Result<CtlStream> {
+    until_cancelled(path, deadline, Some(stop.bell()?))
+}
+
+pub(crate) fn until_cancelled(
+    path: &Path,
+    deadline: Instant,
+    cancel: Option<BorrowedFd<'_>>,
+) -> io::Result<CtlStream> {
+    crate::ready::check_cancelled(cancel)?;
     check_deadline(deadline)?;
     // SAFETY: sockaddr_un is a plain C address; zero also terminates sun_path.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -62,7 +82,7 @@ pub fn until(path: &Path, deadline: Instant) -> io::Result<CtlStream> {
         match error.raw_os_error() {
             Some(libc::EINPROGRESS | libc::EINTR) => {
                 // Writability alone can describe an unconnected AF_UNIX socket.
-                wait_connected(stream.as_raw_fd(), deadline, || {
+                wait_connected(stream.as_fd(), deadline, cancel, || {
                     connected_to(stream.take_error()?, stream.peer_addr())
                 })?;
             }
@@ -71,6 +91,7 @@ pub fn until(path: &Path, deadline: Instant) -> io::Result<CtlStream> {
         }
     }
     stream.peer_addr()?;
+    crate::ready::check_cancelled(cancel)?;
     check_deadline(deadline)?;
     stream.set_nonblocking(false)?;
     Ok(stream)
@@ -95,6 +116,25 @@ pub fn until(path: &Path, deadline: Instant) -> io::Result<CtlStream> {
 /// error.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn tcp_within(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    tcp_within_cancelled(addr, timeout, None)
+}
+
+/// [`tcp_within`] with the stop also owning cancellation of a broker request or pending dial.
+/// # Errors
+/// As [`tcp_within`], or `Interrupted` when the stop is set.
+pub fn tcp_within_stopped(
+    addr: &SocketAddr,
+    timeout: Duration,
+    stop: &crate::stop::Stop,
+) -> io::Result<TcpStream> {
+    tcp_within_cancelled(addr, timeout, Some(stop))
+}
+
+fn tcp_within_cancelled(
+    addr: &SocketAddr,
+    timeout: Duration,
+    stop: Option<&crate::stop::Stop>,
+) -> io::Result<TcpStream> {
     crate::partition::check(*addr)?;
     let deadline = Some(timeout)
         .filter(|timeout| !timeout.is_zero())
@@ -102,16 +142,26 @@ pub fn tcp_within(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream>
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "invalid connect timeout"))?;
     #[cfg(target_os = "macos")]
     if crate::lan::is_local_network(&addr.ip()) {
-        return crate::lan::broker::connect(
-            &crate::lan::Target::Addr(*addr),
-            addr.port(),
-            timeout,
-            crate::lan::ConnectOptions::default(),
-        )
+        return match stop {
+            Some(stop) => crate::lan::broker::connect_stopped(
+                &crate::lan::Target::Addr(*addr),
+                addr.port(),
+                timeout,
+                crate::lan::ConnectOptions::default(),
+                stop,
+            ),
+            None => crate::lan::broker::connect(
+                &crate::lan::Target::Addr(*addr),
+                addr.port(),
+                timeout,
+                crate::lan::ConnectOptions::default(),
+            ),
+        }
         .map(|(stream, _)| stream)
         .map_err(crate::lan::LanError::into_io);
     }
-    tcp_until(addr, deadline, |_| Ok(()))
+    let cancel = stop.map(crate::stop::Stop::bell).transpose()?;
+    tcp_until_cancelled(addr, deadline, |_| Ok(()), cancel)
 }
 
 /// Dial `addr` from this process by `deadline`, `configure` given the socket before its connect
@@ -127,6 +177,16 @@ pub(crate) fn tcp_until(
     deadline: Instant,
     configure: impl FnOnce(&TcpStream) -> io::Result<()>,
 ) -> io::Result<TcpStream> {
+    tcp_until_cancelled(addr, deadline, configure, None)
+}
+
+pub(crate) fn tcp_until_cancelled(
+    addr: &SocketAddr,
+    deadline: Instant,
+    configure: impl FnOnce(&TcpStream) -> io::Result<()>,
+    cancel: Option<BorrowedFd<'_>>,
+) -> io::Result<TcpStream> {
+    crate::ready::check_cancelled(cancel)?;
     check_deadline(deadline)?;
     let family = if addr.is_ipv4() {
         libc::AF_INET
@@ -143,7 +203,7 @@ pub(crate) fn tcp_until(
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::EINPROGRESS | libc::EINTR | libc::EALREADY) => {
-                wait_connected(stream.as_raw_fd(), deadline, || {
+                wait_connected(stream.as_fd(), deadline, cancel, || {
                     connected_to(stream.take_error()?, stream.peer_addr())
                 })?;
             }
@@ -151,6 +211,7 @@ pub(crate) fn tcp_until(
         }
     }
     stream.peer_addr()?;
+    crate::ready::check_cancelled(cancel)?;
     stream.set_nonblocking(false)?;
     Ok(stream)
 }
@@ -277,37 +338,14 @@ fn connected_to<A>(pending: Option<io::Error>, peer: io::Result<A>) -> io::Resul
 
 /// Wait by `deadline` for the connect in flight on `fd` to end, then ask `connected` how.
 fn wait_connected(
-    fd: RawFd,
+    fd: BorrowedFd<'_>,
     deadline: Instant,
+    cancel: Option<BorrowedFd<'_>>,
     connected: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
-    loop {
-        check_deadline(deadline)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        // Round up so sub-millisecond remaining time does not become a busy poll.
-        let millis = remaining.as_millis().saturating_add(u128::from(
-            !remaining.subsec_nanos().is_multiple_of(1_000_000),
-        ));
-        let millis = libc::c_int::try_from(millis).unwrap_or(libc::c_int::MAX);
-        let mut poll = libc::pollfd {
-            fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // SAFETY: poll points to exactly one initialized descriptor record.
-        let ready = unsafe { libc::poll(&raw mut poll, 1, millis) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if ready == 0 {
-            continue;
-        }
-        return connected();
-    }
+    crate::ready::until_cancelled(fd, crate::ready::Interest::Write, deadline, cancel)?;
+    crate::ready::check_cancelled(cancel)?;
+    connected()
 }
 
 #[cfg(test)]
@@ -384,6 +422,14 @@ mod tests {
         assert_eq!(
             until(&missing, deadline()).unwrap_err().raw_os_error(),
             Some(libc::ENOENT)
+        );
+        let stopped = crate::stop::Stop::new();
+        assert!(stopped.set());
+        assert_eq!(
+            until_stopped(&missing, deadline(), &stopped)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Interrupted
         );
         for path in [
             Path::new("").to_owned(),

@@ -1411,9 +1411,9 @@ WHAT IT IS
     offer (`Teach auto mode about your environment?`) is put off with `Not now`.
   * Usage limits: waits at the limit dialog, resumes after the reset, rotates across
     configured accounts (`accounts`), or takes an eligible reset (`limit_reset`) or
-    usage credits (`usage_credits`); a model-bucket limit falls back to
-    `model_fallback`. A limit that names no reset is retried after 30 min, 2 h, then
-    every 6 h.
+    usage credits (`usage_credits`). It never moves a session to another model: a
+    model-bucket limit waits for its reset, and one no reset ends is left for its person
+    to `/model`. A limit that names no reset is retried after 30 min, 2 h, then every 6 h.
   * Recovery: retries transient API and overload errors, runs `/compact` on a context
     wall, renews expired logins, and relaunches a crashed agent on its conversation.
     Under Cruise (the default) and Land (until its work lands), a Claude Code, Muse
@@ -1632,7 +1632,6 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                                   (`"renew"` or `"off"`), in every CLI's roster
                                   but Grok Build's
   hosts [[]]                      remote hosts `accounts renew --due` also renews
-  model_fallback ["opus"]         fallback model on a Claude Code model-bucket limit
   compact_on_context_wall [true]  run `/compact` (or shrink images) on a full context
   autocompact_offer ["400k"]      answer Claude Code's autocompact offer (`"400k"`|`"off"`)
   relaunch [true]                 relaunch crashed agents on their conversation
@@ -1644,7 +1643,7 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                                   pressure) past this footprint (`auto`, GiB, or `off`;
                                   `auto`: an eighth of the Mac plus half the memory
                                   `sys mem` calls available)
-  upgrade [true]                  move idle sessions onto newer builds/models
+  upgrade [true]                  move idle sessions onto newer builds
   upgrade_ask [false]             true: ask the agent before restarting for an upgrade;
                                   false: restart quietly at a genuinely idle point
   human_grace_s [120]             seconds to keep hands off after a person's input (a
@@ -1705,7 +1704,7 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
              `[harness] accounts = "off"` stops that sync); Claude Code's report ends with
              the outlook the footer and Accounts card show (`--json`: `outlook`, and `fresh`
              and `projection` beside each figure)
-  upgrade    move live sessions onto a newer build or model, at an idle point
+  upgrade    move live sessions onto a newer build, at an idle point
   tap        the status-line usage tap aterm adds to Claude Code relaunches
 
 VAULT TOKENS (Claude Code's pool, macOS)
@@ -1793,10 +1792,11 @@ THE FOOTER
   path, `⎇` the branch, `◐` the context and `Σ` the session's usage. As the rule
   narrows the model gives way last: the workspace facts first, then the account unit's
   forms, then the wall, then the effort. In Claude Code a click (or Enter or Space) on
-  the model or its effort switches the session to the best model of the harness's
-  priority list (`aterm harness upgrade models`) that its Claude Code build offers, at
-  the highest effort that build admits for it (the list's first model at xhigh where
-  the build's catalog is not read), keeping a
+  the model or its effort switches the session to the first model of the click's model
+  order (`models.json`'s `priority` under the harness's upgrade state, else Opus 5.5,
+  Fable 5.1, Opus 5) that its Claude Code build offers, at the highest effort that build
+  admits for it (the order's first model at xhigh where the build's catalog is not read),
+  keeping a
   1M-context variant the usage tap names, remembering what it ran as its own, and from
   there back to that (Claude's default model and auto effort where nothing is
   remembered). `[claude_footer] switch_model` (a model id such as `claude-opus-5-5`,
@@ -2679,9 +2679,7 @@ const fn verb_line(v: crate::Verb) -> &'static str {
         crate::Verb::Fleet => {
             "the lab at a glance, one row per seat, and this machine's fleet membership"
         }
-        crate::Verb::Name => {
-            "this machine's name: its NAME (m8, or m0 until it is numbered) and nickname"
-        }
+        crate::Verb::Name => "this machine's numeric ID and display name",
         crate::Verb::Node => "the windowless fleet and Commons node job (Unix)",
         crate::Verb::Drive => "the window harness's readers, run by hand",
         crate::Verb::Link => "the fabric bridge: this instance's inbox and post traffic to the bus",
@@ -3005,9 +3003,11 @@ WHEN A MACOS COPY SAYS IT CAN'T UPDATE ITSELF
       release should (the PATH links, the shell hooks, the agent primer) and says so
       at start, naming the verb that puts each back (`aterm pkg repair`, `aterm
       agents install`).
-  With "{check}" off (Settings ▸ Software Update), nothing checks by itself and
-  `aterm update status` says so; `aterm update check` still checks, and a downloaded
-  update still installs. Turning it back on applies the next time aterm opens.
+  Changes to "{check}" take effect next time aterm opens,
+  whether turning checks on or off (Settings ▸ Software Update). With checks off
+  at launch, nothing checks by itself and `aterm update status` says so.
+  `aterm update check` still checks. Disabling checks does not disable installation
+  of an update already downloaded.
 
 LOG
   Settings ▸ Messages lists everything aterm told you, newest first (each update it
@@ -3759,7 +3759,7 @@ FILES & CONFIG (`<state>` is `~/Library/Application Support/aterm` on macOS)
                                    # (default false)"#;
 
 /// `aterm help name`: this machine's name (`docs/DESIGN-machine-names-2026-11-04.md` §5.7).
-const NAME_PAGE: &str = r#"name — this machine's name: its NAME (`m8`, or `m0` until it is numbered) and nickname
+const NAME_PAGE: &str = r#"name — this machine's name: its NAME (`m8`, or `unnumbered` until it is numbered) and nickname
 
   aterm name [--json]
   aterm name set <mN> [--nick <word>] [--dry-run] [--json]
@@ -3777,7 +3777,7 @@ WHAT IT SAYS
   finished yet (`migration=pending` or `migration=waiting`), and this machine's fleet node
   once it has one. An unreadable identity is journaled; an existing valid name is still
   reported, with no node in text and `node: null` in JSON. `--json` prints one object:
-  `name`, `number` (null while `m0`), `nick`,
+  `name`, `number` (null while `unnumbered`), `nick`,
   `title`, `class`, `nick_class`, `since`, `rev`, `migration`, `fleet`, `node`, and `made`,
   where a name this run wrote came from (`kept` when it was there already). On macOS the
   menu bar shows the same title right of the version, its nickname clipped to 16 letters.
@@ -3794,8 +3794,8 @@ CHANGING THE NAME
   it. Change Nickname… changes only the nickname, and can draw a random noun.
 
   From a shell, `aterm name set m86 --nick Marigold` chooses that number and nickname.
-  Leave out `--nick` to keep the nickname. The number must be positive; `m0` means the
-  machine has not been numbered. A number another known machine holds is refused, and so
+  Leave out `--nick` to keep the name. The numeric ID ranges from 0 to 999999;
+  `unnumbered` means no ID has been assigned. A number another known machine holds is refused, and so
   is one its vault gives another Mac, with what holds it. `--dry-run` reports the
   proposed name without changing it. A real change also updates the naming policy and
   checked fleet name. On macOS, one system-password prompt covers ComputerName,
@@ -3805,11 +3805,13 @@ CHANGING THE NAME
 THE NICKNAME
   `aterm name nick Heron` sets the nickname (one argument: quote `"Blue Heron"`), and
   `--random` draws another noun, drawn again up to eight times while it is one that other
-  machines' records in view carry or the one held. Either is `chosen`, so it never changes
+  machines' records in view carry or the one held, then searches the remaining pool.
+  An exhausted pool is refused. Either is `chosen`, so it never changes
   by itself; the NAME, its class and `since` stay as they were, and `rev` rises on a change.
-  It prints the name as it then stands, says so on
-  stderr when the nickname was held already or another machine in view goes by it too
-  (two may share one), and `--dry-run` changes no nickname (a first run still makes the
+  It prints the name as it then stands and says on stderr when it was held already.
+  Name keys use lowercase with whitespace collapsed to a single space; the chosen display
+  spelling is remembered. Another known machine's name is refused,
+  and `--dry-run` changes no nickname (a first run still makes the
   name, as any read does). Who asked is kept beside it: an agent when the command runs in
   an aterm session whose `status` names an agent program or an agent's state, a person
   otherwise, or when that session does not answer within 2 seconds. A nickname must be non-empty.
@@ -3824,11 +3826,12 @@ THE FIRST RUN
 
   With no bound registry row, it takes the vault roster's label, else the NAME an older
   build kept in `fleet-name`, and a word in `fleet-name` as the nickname,
-  pending migration (`made=evidence`), else `m0` and a short noun drawn at random, drawn
+  pending migration (`made=evidence`), else `unnumbered` and a short noun drawn at random, drawn
   again up to eight times while another machine's record in view carries it as its
-  nickname (`made=drawn`). A `fleet-name`, node key or vault roster that cannot be read
+  nickname, then searches the remaining pool (`made=drawn`). An exhausted pool creates nothing.
+  A `fleet-name`, node key or vault roster that cannot be read
   makes nothing: `aterm name` says why and exits 1, and the next run tries again, so a
-  passing failure never leaves an established Mac named `m0`.
+  passing failure never leaves an established Mac named `unnumbered`.
 
 FILES (`<state>` is `~/Library/Application Support/aterm` on macOS)
   `machine-name.toml` (0600) and its `machine-name.lock`."#;
@@ -4439,9 +4442,9 @@ fn rust_page() -> String {
          \x20 * Never point CARGO_TARGET_DIR or --out-dir under /tmp: Trust voids a verified run whose\n\
          \x20   directory is world-writable, and what surfaces after that reads like a transport bug.\n\
          \x20 * Through atpkg's `targo` shim a build's intermediates land in a `*.noindex` folder,\n\
-         \x20   which Spotlight skips: the shared cache, or `<target>/build.noindex` under a target\n\
+         \x20   which Spotlight skips: the shared cache, or `<target>/.ubd/build.noindex` under a target\n\
          \x20   you chose and for `targo trust`. A build that bypasses the shim names its target\n\
-         \x20   `*.noindex` (`target/check.noindex`); `aterm doctor --read-only` shows what\n\
+         \x20   `*.noindex` (`target/.ubd/check.noindex`); `aterm doctor --read-only` shows what\n\
          \x20   Spotlight indexes.\n\
          \x20 * Never build in a checkout another session is working in — `git worktree add` your own.\n\
          \x20 * Never rebuild a toolchain from source to answer a rustup error: `aterm pkg doctor`,\n\

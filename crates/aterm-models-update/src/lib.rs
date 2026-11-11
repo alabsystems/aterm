@@ -42,9 +42,9 @@ pub use models_update_activation_observation::native_update_activation_observati
 pub use models_update_boot_image::native_update_boot_image_model;
 pub use models_update_carried_health::native_update_carried_health_model;
 pub use models_update_check_coordination::{
-    native_update_boot_health_lock_model, native_update_check_join_model,
-    native_update_check_receipt_model, native_update_check_wait_model,
-    native_update_two_process_apply_model,
+    native_update_boot_health_confirmation_model, native_update_boot_health_lock_model,
+    native_update_check_join_model, native_update_check_receipt_model,
+    native_update_check_wait_model, native_update_two_process_apply_model,
 };
 pub use models_update_editor_carry::native_update_editor_carry_model;
 pub use models_update_environment_repair::native_update_environment_repair_model;

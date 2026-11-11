@@ -121,7 +121,7 @@ pub(super) fn save(opts: &Opts, tab: &str, observed: &Observed) -> std::io::Resu
     }
     #[cfg(not(unix))]
     {
-        super::super::upgrade_models::write_atomic(&path, &body)
+        super::super::atomic_write::write_atomic(&path, &body)
     }
 }
 

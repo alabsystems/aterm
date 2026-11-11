@@ -1556,9 +1556,11 @@ enum Plan {
 
 fn checkout(scratch: &Scratch, name: &str, pin: &str) -> PathBuf {
     let dir = scratch.mkdir(&format!("{name}/tools"));
-    std::fs::copy(install_sh(), dir.join("install.sh")).expect("copy install.sh");
+    aterm_tempfile::copy_to_new_file(install_sh(), dir.join("install.sh"))
+        .expect("copy install.sh");
     let dir = scratch.join(name);
-    std::fs::copy(root().join("Cargo.toml"), dir.join("Cargo.toml")).expect("copy Cargo.toml");
+    aterm_tempfile::copy_to_new_file(root().join("Cargo.toml"), dir.join("Cargo.toml"))
+        .expect("copy Cargo.toml");
     write(
         &dir.join("rust-toolchain.toml"),
         format!("[toolchain]\nchannel = \"{pin}\"\n"),

@@ -11,7 +11,7 @@ editor core, the protocol and the rope, §5 the language table, and §6
 `fill-paragraph` and TAB. E6 is Trust's kernel import of a compiled body: its
 carriers are `bool`, `uN` and `iN`, and it refuses calls. "Gap 1" (non-scalar
 carriers get no E6 import) and "gap 3" (E6 refuses shapes such as a
-checked-arithmetic assert) are the gaps of `docs/PLAN-tests-to-specs-2026-10-15.md`,
+checked-arithmetic assert) are the gaps of `docs/TRUST-LANE.md`,
 "What blocks the rest".
 
 ## 1. The lane

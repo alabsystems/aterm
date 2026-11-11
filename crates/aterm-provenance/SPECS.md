@@ -19,7 +19,7 @@ function can retire them; none is proved yet. The code is `src/provenance.rs` (`
 ## 1. Specs (TSV)
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes`, `difficulty` (Rust features the proof must
-handle), `blocking gaps` (rows of §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`; gap 0,
+handle), `blocking gaps` (rows of `docs/TRUST-LANE.md` (Blocking gaps); gap 0,
 the installed seal, blocks every row).
 
 ```tsv
@@ -29,20 +29,6 @@ from-pty-as-ref-roundtrip	round-trip	provenance::Provenance::from_pty, provenanc
 pty-wrap-ref-identity	contract	pty_wrap::pty_wrap_ref, provenance::Provenance::as_ref	∀ T: ?Sized, ∀ r: &'a T: wrap(r) has no UB and returns a &'a Prov<T> with inner(wrap(r)) is r (core::ptr::from_ref(inner(wrap(r))) = core::ptr::from_ref(r) as a fat-pointer comparison). Corollaries: for [U] and str, as_ptr and len are unchanged and *inner(wrap(r)) = *r (multi-byte UTF-8 included); for Sized T, *inner(wrap(r)) = *r. The call reads and writes no memory. Carries the soundness obligation of the crate's one unsafe block: &*(from_ref(r) as *const Prov<T>) is valid because layout-transparent makes the target's size, alignment and validity invariant equal T's.	src/pty_wrap.rs::wrap_scalar_reference_preserves_identity, src/pty_wrap.rs::wrap_str_preserves_bytes	MEDIUM: raw-pointer cast plus unsafe deref inside a const fn; fat pointers over ?Sized generics ([u8], str); references and lifetimes; composition with the as_ref field projection; a per-definition generic proof. No loops, no heap.	0, 1, 2, 4, 8, 11
 pty-slice-inspectors	contract	provenance::{pty_slice_byte_at, pty_slice_u16_le_at, pty_slice_u16_be_at, pty_slice_u32_le_at, pty_slice_u32_be_at, pty_slice_u64_le_at, pty_slice_u64_be_at, pty_slice_has_csi_prefix, pty_slice_has_osc_prefix, pty_slice_has_dcs_prefix}, Provenance<u8,Pty>::{is_c0_or_del, is_printable_ascii, is_csi_param_byte, is_csi_final_byte, to_ascii_digit}, Provenance<u16,Pty>::{clamp_param, push_csi_digit_capped, to_le_bytes_pty, from_le_bytes_pty}, Provenance<(u16,u16,u16,u16),Pty>::{encode_csi_rect_le, decode_csi_rect_le}	Every slice reader returns None iff offset + width > bytes.len() (checked without usize overflow) and otherwise wraps the exact LE/BE scalar in Provenance<_, Pty>; the prefix predicates check ESC followed by '[', ']' or 'P' on slices of length ≥ 2; byte classifiers and CSI parameter combinators preserve Pty provenance, clamp/saturate without overflow, and round-trip u16 and 4×u16 LE wire frames.	src/provenance.rs::pty_slice_inspectors_preserve_provenance_and_bounds	EASY: const fn checked_add/saturating arithmetic, fixed-array LE packing, scalar range predicates	0, 1, 3
 ```
-
-### Distribution by kind (4)
-
-| kind | count | ids |
-|---|---|---|
-| invariant | 1 | layout-transparent |
-| round-trip | 1 | from-pty-as-ref-roundtrip |
-| contract | 2 | pty-wrap-ref-identity, pty-slice-inspectors |
-
-### Proof dependency order
-
-`layout-transparent` and `from-pty-as-ref-roundtrip` are independent. `pty-wrap-ref-identity` cites both:
-the layout fact discharges the unsafe cast, and `inner(p) = &p.value` lets the identity be stated through
-`as_ref`.
 
 ## 2. Test → spec map (TSV)
 
@@ -55,10 +41,6 @@ src/pty_wrap.rs	provenance_adds_no_bytes	layout-transparent
 src/pty_wrap.rs	wrap_scalar_reference_preserves_identity	pty-wrap-ref-identity	from-pty-as-ref-roundtrip (as_ref projection)
 src/pty_wrap.rs	wrap_str_preserves_bytes	pty-wrap-ref-identity	from-pty-as-ref-roundtrip (as_ref projection), layout-transparent (unsized str)
 ```
-
-## 3. Coverage
-
-- All 4 live `#[test]` functions across `src/provenance.rs` (1) and `src/pty_wrap.rs` (3) are mapped in §2 across the 4 specs.
 
 ## 4. Tests that are not spec samples
 
@@ -78,20 +60,3 @@ None: every test maps to a spec in §2, and the sized/fat-reference layout equal
    test names as safety evidence; `pty_wrap_ref`'s SAFETY note cites `#[repr(transparent)]` directly.
 4. **Resolved: `as_ref` doc states that the returned borrow strips its [`Origin`] tag.**
 5. **Resolved: `_origin` field-order comment states Rust's unsized-last-field rule accurately.**
-
-## 6. Proof order (easiest, high value first)
-
-No spec is blocked by gap 0 alone; all three also need generics (11) and some carrier support (1).
-
-1. **`layout-transparent`**. Retires 1 test and is the precondition the unsafe discharge cites. Sized and
-   fat-reference `size_of`/`align_of` equalities are already enforced at compile time in `src/pty_wrap.rs`;
-   the general quantified form waits on layout facts (gaps 1, 8, 11).
-2. **`from-pty-as-ref-roundtrip`**. Safe code: one constructor that moves its argument into a field and one
-   accessor that borrows it. The structural form needs no `T: PartialEq` and no `String` content model, so
-   beyond gap 0 it needs the `&self` view (2), composition (4), generics (11) and only a minimal carrier
-   (1). It retires no test now and supplies the `inner(p) = &p.value` lemma.
-3. **`pty-wrap-ref-identity`**. Highest value: the crate's only `unsafe`, and it retires 2 tests. It adds
-   the unsafe-block discharge (gap 8) and fat-pointer metadata for `[U]`/`str` (gap 1) on top of step 2.
-   Prove it once over generic `T: ?Sized`, not per instance.
-
-After all three: delete the remaining subsumed tests.

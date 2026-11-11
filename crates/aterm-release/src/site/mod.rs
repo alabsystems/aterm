@@ -727,6 +727,7 @@ pub(crate) fn private_dir(prefix: &str) -> Result<PathBuf, String> {
 /// # Errors
 /// As [`private_dir`].
 pub(crate) fn private_dir_in(base: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let base = aterm_tempfile::quiet_in(base);
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut last = String::from("no attempt");
     for _ in 0..64 {
@@ -787,6 +788,7 @@ impl Drop for Scratch {
 /// Remove each scratch directory under `base` an earlier sync kept ([`Scratch`]) once its
 /// first-exec hold is spent.
 fn reclaim_kept(base: &Path) {
+    let base = aterm_tempfile::quiet_in(base);
     let Ok(entries) = std::fs::read_dir(base) else {
         return;
     };

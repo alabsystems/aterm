@@ -11,7 +11,7 @@ use aterm_agent::harness::footer::{self, FactKind, FactMask, FooterFacts};
 use aterm_agent::harness::outlook;
 use aterm_agent::harness::quota_view::QuotaView;
 use aterm_agent::harness::session_usage::{self, UsageFacts};
-use aterm_agent::harness::{upgrade_drive, upgrade_models};
+use aterm_agent::harness::switch_top;
 
 use crate::claude_lights::Fact;
 use crate::{App, WindowId};
@@ -43,9 +43,9 @@ pub(crate) struct SessionFacts {
 }
 
 /// The model and effort a click on the model fact or its effort switches a session to: what
-/// `[claude_footer] switch_model` and `switch_effort` name, else the top of the harness's model
-/// priority list that the session's Claude Code build offers, at that model's highest effort
-/// ([`upgrade_models::Top`]).
+/// `[claude_footer] switch_model` and `switch_effort` name, else the first model of the click's
+/// model order that the session's Claude Code build offers, at that model's highest effort
+/// ([`switch_top::Top`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SwitchTarget {
     pub(crate) model: crate::claude_slash::ModelArg,
@@ -62,7 +62,7 @@ impl SwitchTarget {
     pub(crate) fn of(
         model: Option<&str>,
         effort: Option<&str>,
-        top: &upgrade_models::Top,
+        top: &switch_top::Top,
     ) -> Option<Self> {
         use crate::claude_slash::ModelArg;
         let model = model
@@ -86,8 +86,8 @@ impl SwitchTarget {
 }
 
 /// The top with nothing read: of the seed list, with no build's catalog.
-fn unread_top() -> upgrade_models::Top {
-    upgrade_models::top(&upgrade_models::Priority::seed(0), "", None)
+fn unread_top() -> switch_top::Top {
+    switch_top::top(&switch_top::seed(), None)
 }
 
 /// How long a read top stands before the resolver reads it again.
@@ -99,7 +99,7 @@ const TOPS_MAX: usize = 8;
 /// The top each Claude Code build's sessions switch to, as the footer's resolver thread last
 /// read it ([`note_switch_top`]): the main thread reads no file for a title or a click.
 #[derive(Default)]
-pub(crate) struct Tops(Vec<(Option<String>, Instant, Arc<upgrade_models::Top>)>);
+pub(crate) struct Tops(Vec<(Option<String>, Instant, Arc<switch_top::Top>)>);
 
 impl Tops {
     /// Whether `version`'s top is unread, or has stood [`TOP_RECHECK`] at `now`.
@@ -111,7 +111,7 @@ impl Tops {
     }
 
     /// Hold `top` as `version`'s, read at `now`.
-    pub(crate) fn hold(&mut self, version: Option<&str>, now: Instant, top: upgrade_models::Top) {
+    pub(crate) fn hold(&mut self, version: Option<&str>, now: Instant, top: switch_top::Top) {
         self.0.retain(|(v, _, _)| v.as_deref() != version);
         if self.0.len() >= TOPS_MAX {
             self.0.remove(0);
@@ -122,7 +122,7 @@ impl Tops {
 
     /// The top last read for `version`.
     #[must_use]
-    pub(crate) fn get(&self, version: Option<&str>) -> Option<Arc<upgrade_models::Top>> {
+    pub(crate) fn get(&self, version: Option<&str>) -> Option<Arc<switch_top::Top>> {
         self.0
             .iter()
             .find(|(v, _, _)| v.as_deref() == version)
@@ -134,8 +134,8 @@ static TOPS: Mutex<Tops> = Mutex::new(Tops(Vec::new()));
 
 /// Read the top a session on Claude Code `version` switches to, off the main thread (the
 /// footer's resolver, after it read the session's facts) and at most every [`TOP_RECHECK`]: the
-/// harness's priority list and the build's cached catalog under its state
-/// ([`upgrade_drive::switch_top`]). No lock is held over the read.
+/// click's model order and the build's cached catalog under the harness's state
+/// ([`switch_top::switch_top`]). No lock is held over the read.
 pub(crate) fn note_switch_top(version: Option<&str>, now: Instant) {
     if cfg!(test) {
         return;
@@ -150,14 +150,14 @@ pub(crate) fn note_switch_top(version: Option<&str>, now: Instant) {
     let Some(state) = crate::harness_host::harness_state() else {
         return;
     };
-    let top = upgrade_drive::switch_top(&state, version);
+    let top = switch_top::switch_top(&state, version);
     TOPS.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .hold(version, now, top);
 }
 
 /// The top last read for `version`, [`unread_top`] before the resolver's first read.
-fn top_read_for(version: Option<&str>) -> Arc<upgrade_models::Top> {
+fn top_read_for(version: Option<&str>) -> Arc<switch_top::Top> {
     let read = TOPS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -197,7 +197,7 @@ pub(crate) struct ModelSwitch {
     pub(crate) back: Option<Pick>,
     /// Where its last switch toward the [`SwitchTarget`] went, until a switch back: a session
     /// that shows it is at its target although the target has since moved (a catalog read, the
-    /// priority list or the `[claude_footer]` setting changed), so a click still goes back.
+    /// model order or the `[claude_footer]` setting changed), so a click still goes back.
     pub(crate) to: Option<Pick>,
     /// The `/model` in flight and the `/effort` typed once it is answered.
     pub(crate) then: Option<(crate::claude_slash::Slash, crate::claude_slash::Slash)>,

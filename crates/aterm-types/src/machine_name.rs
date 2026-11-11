@@ -14,6 +14,7 @@ use std::fmt;
 
 mod check;
 mod choose;
+mod generated;
 mod long;
 pub mod nouns;
 mod platform;
@@ -22,6 +23,7 @@ mod sizes;
 
 pub use check::{Verdict, WAS_MAX, check, renamed, taken};
 pub use choose::{Blocked, Choice, Fleet, Kept, Labels, choose, top};
+pub use generated::GeneratedNames;
 pub use long::{
     DNS_LABEL_MAX, Disk, LONG_CHIP_TIER, MODEL_WORDS, MachineFacts, NameOs, OsSlot, VM_WORD,
     WINDOWS_DESCRIPTION_MAX, chip_word, is_virtual, long_name, long_name_within, model_word,
@@ -49,8 +51,8 @@ pub const OS_NOUN: &str = if cfg!(target_os = "macos") {
 pub const NUMBER_MAX_DIGITS: usize = 6;
 
 /// What a machine never numbered shows in place of its number. Display only: never a
-/// record value, alias, OS name or table label, and `--host m0` names no machine.
-pub const UNNUMBERED: &str = "m0";
+/// record value, alias, OS name or table label, and it names no machine.
+pub const UNNUMBERED: &str = "unnumbered";
 
 /// Words no nickname or alias may be, because `--host` and the fleet book give them a
 /// meaning of their own.
@@ -65,7 +67,7 @@ pub enum Refusal {
     Empty,
     /// Longer than the kind allows.
     TooLong,
-    /// `m0`, which means "not numbered yet" and names no machine.
+    /// The unassigned display label, which names no machine.
     Unnumbered,
     /// A number spelled with a leading zero (`m08`).
     LeadingZero,
@@ -98,10 +100,10 @@ impl fmt::Display for Refusal {
         match self {
             Self::Empty => f.write_str("nothing was given"),
             Self::TooLong => f.write_str("it is too long"),
-            Self::Unnumbered => f.write_str("m0 names no machine"),
+            Self::Unnumbered => f.write_str("the unassigned label names no machine"),
             Self::LeadingZero => f.write_str("a number has no leading zero"),
             Self::TooManyDigits => write!(f, "a number has at most {NUMBER_MAX_DIGITS} digits"),
-            Self::NotANumber => f.write_str("a machine number is m and digits, such as m8"),
+            Self::NotANumber => f.write_str("a numeric ID is a non-negative integer, such as 8"),
             Self::Characters => f.write_str("it holds a character or space it may not"),
             Self::StartsWithoutLetter => f.write_str("a nickname starts with a letter"),
             Self::NumberShaped => f.write_str("only a machine's number may look like one"),
@@ -115,7 +117,7 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// A machine's number, `m1` to `m999999`: its NAME, unique in a fleet once records meet.
+/// A machine's number, `m0` to `m999999`: its NAME, unique in a fleet once records meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Number(u32);
 
@@ -123,14 +125,10 @@ impl Number {
     /// The greatest number: [`NUMBER_MAX_DIGITS`] nines.
     pub const MAX: u32 = 999_999;
 
-    /// `n` as a number, when it is 1 to [`Number::MAX`].
+    /// `n` as a number, when it is 0 to [`Number::MAX`].
     #[must_use]
     pub const fn new(n: u32) -> Option<Self> {
-        if n >= 1 && n <= Self::MAX {
-            Some(Self(n))
-        } else {
-            None
-        }
+        if n <= Self::MAX { Some(Self(n)) } else { None }
     }
 
     /// The number's value (`8` for `m8`).
@@ -143,7 +141,7 @@ impl Number {
     /// whitespace aside.
     ///
     /// # Errors
-    /// The [`Refusal`] naming what is wrong: `m0` ([`Refusal::Unnumbered`]), `m08`,
+    /// The [`Refusal`] naming what is wrong: `m08`,
     /// `m1234567`, or anything that is not `m` and digits.
     pub fn parse(word: &str) -> Result<Self, Refusal> {
         let word = word.trim_ascii();
@@ -173,7 +171,7 @@ impl Number {
     fn from_digits(digits: &[u8]) -> Result<Self, Refusal> {
         match digits {
             [] => Err(Refusal::NotANumber),
-            [b'0'] => Err(Refusal::Unnumbered),
+            [b'0'] => Ok(Self(0)),
             [b'0', ..] => Err(Refusal::LeadingZero),
             _ if digits.len() > NUMBER_MAX_DIGITS => Err(Refusal::TooManyDigits),
             _ => {
@@ -246,8 +244,8 @@ fn is_reserved(word: &str) -> bool {
 }
 
 /// A machine's nickname: 1 to 24 characters and at most 64 bytes, starting with a
-/// letter, of letters, digits, single inner spaces, `-` and `'`. Not unique: it
-/// resolves under `--host` only while no other machine shares it.
+/// letter, of letters, digits, single inner spaces, `-` and `'`. Edits enforce uniqueness
+/// after case and whitespace normalization against known fleet records, retaining display spelling.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Nickname(String);
 
@@ -257,12 +255,14 @@ impl Nickname {
     /// The most bytes a nickname has.
     pub const MAX_BYTES: usize = 64;
 
-    /// `word` as a nickname, stored as typed.
+    /// `word` as a nickname, with whitespace collapsed and display case preserved.
     ///
     /// # Errors
     /// The [`Refusal`]: a number shape (`m12`, `m8.2`, `m0`), a node word, eight or more
     /// hex digits alone, a reserved word, or a character or length outside the grammar.
     pub fn parse(word: &str) -> Result<Self, Refusal> {
+        let normalized = word.split_whitespace().collect::<Vec<_>>().join(" ");
+        let word = normalized.as_str();
         let mut chars = word.chars();
         let Some(first) = chars.next() else {
             return Err(Refusal::Empty);
@@ -301,6 +301,15 @@ impl Nickname {
         &self.0
     }
 
+    /// The unique comparison key, independent of display spelling and whitespace.
+    #[must_use]
+    pub fn canonical(word: &str) -> String {
+        word.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
     /// The nickname as the menu bar shows it: an all-lowercase ASCII one (a drawn noun,
     /// `heron`) with its first letter capitalised, any other as typed.
     #[must_use]
@@ -333,7 +342,7 @@ impl Alias {
     /// suffix dropped (`Studio-2.local` is `studio-2`).
     ///
     /// # Errors
-    /// The [`Refusal`]: a preference word (`m2.2`), `m0` or another zero-led or
+    /// The [`Refusal`]: a preference word (`m2.2`), a zero-led or
     /// seven-digit number shape, a node word, eight or more hex digits alone, a reserved
     /// word, or anything that is not a DNS label.
     pub fn parse(word: &str) -> Result<Self, Refusal> {

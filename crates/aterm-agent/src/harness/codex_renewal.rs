@@ -869,7 +869,7 @@ pub fn write_receipt(env: &Env, receipt: &Receipt) -> Result<(), &'static str> {
     if !receipt.revoked && read_cancellation(env, receipt)?.is_some() {
         return Err("receipt-revoked");
     }
-    super::upgrade_models::write_atomic_mode(&path, &text, Some(0o600))
+    super::atomic_write::write_atomic_mode(&path, &text, Some(0o600))
         .map_err(|_| "receipt-write")?;
     aterm_durable::Flush::Durable
         .dir(parent)

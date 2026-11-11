@@ -802,28 +802,3 @@ fn a_waiter_that_fits_beside_the_reservations_ahead_spares_what_its_fit_leaves()
         }]
     );
 }
-
-/// Lead priority also orders the phased backfill calculation. Without the lead flag, the
-/// older margin waiter leaves only 2 GiB past both waiters; with it, the compiler reserves
-/// first and their eventual ends leave 6 GiB. The ordinary variant is the negative control.
-#[test]
-fn phased_backfill_orders_compiler_leads_before_older_waiters() {
-    let reading = Reading::of_gib(64, 40, 14);
-    let admits = |leading| {
-        let held = claim_of(1, 0, Need::new("held").mem_gib(10), true);
-        let older = claim_of(2, 1, Need::new("older").mem_gib(20).margin(14 * GIB), false);
-        let mut compiler = Need::new("compiler").mem_gib(8);
-        compiler.leads = leading;
-        let lead = claim_of(3, 2, compiler, false);
-        decide(
-            &Need::new("small").mem_gib(5),
-            (9, 99, 0),
-            &reading,
-            &others(&[held, older, lead]),
-            10,
-        )
-        .is_ok()
-    };
-    assert!(admits(true));
-    assert!(!admits(false));
-}

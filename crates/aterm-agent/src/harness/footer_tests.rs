@@ -58,7 +58,6 @@ fn folded(
         fold,
         &clock,
         None,
-        None,
     )
 }
 
@@ -118,7 +117,7 @@ fn tail_cache_reuses_only_one_process_and_one_unchanged_file() {
     let before = "2026-09-27T11:00:00Z";
     let during = "2026-09-27T13:00:00Z";
     let after = "2026-09-27T15:00:00Z";
-    let start = crate::harness::upgrade_models::parse_utc("2026-09-27T12:00:00Z").unwrap();
+    let start = crate::harness::unix_time::parse_utc("2026-09-27T12:00:00Z").unwrap();
     let old = format!("{}\n", assistant_row("claude-opus-5", before));
     std::fs::write(&path, &old).unwrap();
     let mut cache = TailCache::default();
@@ -187,7 +186,7 @@ fn tail_cache_reuses_only_one_process_and_one_unchanged_file() {
         "same-size, same-mtime replacement invalidates"
     );
 
-    let new_start = crate::harness::upgrade_models::parse_utc("2026-09-27T14:00:00Z").unwrap();
+    let new_start = crate::harness::unix_time::parse_utc("2026-09-27T14:00:00Z").unwrap();
     assert_eq!(
         read(&mut cache, Some(new_start), new_start),
         TailFacts::default()
@@ -245,7 +244,7 @@ fn the_path_and_branch_follow_the_bash_tools_directory() {
     std::fs::create_dir_all(claude.join("sessions")).unwrap();
     let project = claude.join("projects").join(project_slug(&cwd));
     std::fs::create_dir_all(&project).unwrap();
-    let started = crate::harness::upgrade_models::parse_utc("2026-09-27T12:00:00Z").unwrap();
+    let started = crate::harness::unix_time::parse_utc("2026-09-27T12:00:00Z").unwrap();
     std::fs::write(
         claude.join("sessions/4242.json"),
         aterm_json::to_string(&aterm_json::json!({
@@ -487,7 +486,7 @@ fn an_unreadable_model_choice_voids_model_and_effort() {
     let answer = r#"{"type":"assistant","timestamp":"2026-09-24T04:13:30.000Z","effort":"xhigh","message":{"model":"claude-opus-5"}}"#;
     let command = r#"{"type":"user","timestamp":"2026-09-24T04:13:31.000Z","message":{"role":"user","content":"<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>"}}"#;
     let unread = r#"{"type":"user","timestamp":"2026-09-24T04:13:31.000Z","message":{"role":"user","content":"<local-command-stdout>Model switch to X was blocked by a PreModelSwitch hook</local-command-stdout>"}}"#;
-    let start = crate::harness::upgrade_models::parse_utc("2026-09-24T04:13:26Z");
+    let start = crate::harness::unix_time::parse_utc("2026-09-24T04:13:26Z");
     let void = TailFacts {
         model: Said::Unread,
         effort: Said::Unread,
@@ -530,7 +529,7 @@ fn an_unstamped_row_is_not_attributed() {
     let unstamped =
         r#"{"type":"assistant","effort":"xhigh","message":{"model":"claude-opus-5-5"}}"#;
     let stamped = r#"{"type":"assistant","timestamp":"2026-09-24T04:15:32.000Z","effort":"xhigh","message":{"model":"claude-opus-5-5"}}"#;
-    let start = crate::harness::upgrade_models::parse_utc("2026-09-24T04:13:26Z");
+    let start = crate::harness::unix_time::parse_utc("2026-09-24T04:13:26Z");
     assert_eq!(
         tail_facts(format!("{unstamped}\n").as_bytes(), start),
         TailFacts::default()
@@ -615,7 +614,7 @@ fn a_kept_model_leaves_the_facts_as_they_were() {
     const ANSWER: &str = r#"{"parentUuid":"00000000-0000-4000-8000-000000000030","isSidechain":false,"type":"assistant","effort":"xhigh","message":{"model":"claude-fable-5-1","role":"assistant","content":[{"type":"text","text":"Done."}]},"uuid":"00000000-0000-4000-8000-000000000031","timestamp":"2026-09-22T17:05:50.000Z","userType":"external","entrypoint":"cli","cwd":"/Users//person/ty","sessionId":"00000000-0000-4000-8000-000000000004","version":"2.1.278"}"#;
     const KEPT_COMMAND: &str = r#"{"parentUuid":"00000000-0000-4000-8000-000000000031","isSidechain":false,"type":"system","subtype":"local_command","content":"<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>","level":"info","timestamp":"2026-09-22T17:06:02.248Z","uuid":"00000000-0000-4000-8000-000000000032","isMeta":false,"userType":"external","entrypoint":"cli","cwd":"/Users//person/ty","sessionId":"00000000-0000-4000-8000-000000000004","version":"2.1.278"}"#;
     const KEPT_RESULT: &str = r#"{"parentUuid":"00000000-0000-4000-8000-000000000032","isSidechain":false,"type":"system","subtype":"local_command","content":"<local-command-stdout>Kept model as `Fable 5.1`</local-command-stdout>","level":"info","timestamp":"2026-09-22T17:06:02.248Z","uuid":"00000000-0000-4000-8000-000000000033","isMeta":false,"commandRun":{"command":"model","args":""},"userType":"external","entrypoint":"cli","cwd":"/Users//person/ty","sessionId":"00000000-0000-4000-8000-000000000004","version":"2.1.278"}"#;
-    let start = crate::harness::upgrade_models::parse_utc("2026-09-22T17:00:00Z");
+    let start = crate::harness::unix_time::parse_utc("2026-09-22T17:00:00Z");
     let before = tail_facts(format!("{ANSWER}\n").as_bytes(), start);
     let kept = tail_facts(
         format!("{ANSWER}\n{KEPT_COMMAND}\n{KEPT_RESULT}\n").as_bytes(),
@@ -671,7 +670,7 @@ fn a_model_command_row_pins_whatever_its_result_says() {
         .tempdir()
         .unwrap();
     let path = dir.path().join("session.jsonl");
-    let floor = crate::harness::upgrade_models::parse_utc("2026-09-24T04:00:00Z").unwrap();
+    let floor = crate::harness::unix_time::parse_utc("2026-09-24T04:00:00Z").unwrap();
     let (old, at) = ("2026-09-24T03:00:00.000Z", "2026-09-24T04:13:31.000Z");
     let chose = |rows: &[&str]| {
         std::fs::write(&path, body(rows)).unwrap();
@@ -711,7 +710,7 @@ fn a_model_command_row_pins_whatever_its_result_says() {
 
 #[test]
 fn a_switch_that_names_no_effort_keeps_it_only_for_the_same_model() {
-    let start = crate::harness::upgrade_models::parse_utc("2026-09-28T15:00:00Z");
+    let start = crate::harness::unix_time::parse_utc("2026-09-28T15:00:00Z");
     let opus = answer_at("claude-opus-5-5", "2026-09-28T15:01:00.000Z", Some("xhigh"));
     let switch = |at: &str, to: &str| {
         [
@@ -783,7 +782,7 @@ fn a_switch_that_names_no_effort_keeps_it_only_for_the_same_model() {
 
 #[test]
 fn a_command_pairs_only_with_the_result_directly_under_it() {
-    let start = crate::harness::upgrade_models::parse_utc("2026-09-28T15:00:00Z");
+    let start = crate::harness::unix_time::parse_utc("2026-09-28T15:00:00Z");
     let opus = answer_at("claude-opus-5-5", "2026-09-28T15:01:00.000Z", Some("xhigh"));
     let model_cmd = command_at("model", "2026-09-28T15:02:00.000Z");
     let unread = result_at("2026-09-28T15:02:00.000Z", "Set model to Fable 5.1");
@@ -823,7 +822,7 @@ fn a_command_pairs_only_with_the_result_directly_under_it() {
 
 #[test]
 fn the_floor_second_is_the_processs_and_the_first_row_before_it_ends_the_scan() {
-    let floor = crate::harness::upgrade_models::parse_utc("2026-09-28T15:00:00Z");
+    let floor = crate::harness::unix_time::parse_utc("2026-09-28T15:00:00Z");
     let at_floor = answer_at("claude-opus-5-5", "2026-09-28T15:00:00.900Z", Some("high"));
     let before = answer_at("claude-fable-5-1", "2026-09-28T14:59:59.900Z", None);
     let above = answer_at("claude-sonnet-5", "2026-09-28T15:10:00.000Z", Some("low"));
@@ -863,7 +862,7 @@ impl Proc {
         std::fs::create_dir_all(claude.join("sessions")).unwrap();
         let project = claude.join("projects").join(project_slug(&cwd));
         std::fs::create_dir_all(&project).unwrap();
-        let start = crate::harness::upgrade_models::parse_utc(start).unwrap();
+        let start = crate::harness::unix_time::parse_utc(start).unwrap();
         Self {
             _root: root,
             claude,
@@ -876,7 +875,7 @@ impl Proc {
 
     fn at(&self, stamp: &str) {
         self.clock
-            .set(crate::harness::upgrade_models::parse_utc(stamp).unwrap());
+            .set(crate::harness::unix_time::parse_utc(stamp).unwrap());
     }
 
     fn register(&self, session: &str) {
@@ -1470,7 +1469,7 @@ fn a_launch_pins_the_model_by_flag_or_environment() {
 
 #[test]
 fn an_effort_result_names_the_effort_at_once() {
-    let start = crate::harness::upgrade_models::parse_utc("2026-09-24T04:13:26Z");
+    let start = crate::harness::unix_time::parse_utc("2026-09-24T04:13:26Z");
     let answer = r#"{"type":"assistant","timestamp":"2026-09-24T04:13:30.000Z","effort":"high","message":{"model":"claude-opus-5-5"}}"#;
     let command = r#"{"type":"user","timestamp":"2026-09-24T04:13:31.000Z","message":{"content":"<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args></command-args>"}}"#;
     let result = |text: &str| {
@@ -1540,7 +1539,7 @@ fn an_effort_result_names_the_effort_at_once() {
 fn an_answer_past_the_tail_window_is_carried_for_the_same_process() {
     let root = cache_test_dir("carry");
     let path = root.join("session.jsonl");
-    let start = crate::harness::upgrade_models::parse_utc("2026-09-28T15:04:08Z").unwrap();
+    let start = crate::harness::unix_time::parse_utc("2026-09-28T15:04:08Z").unwrap();
     let append = |text: &str| {
         std::fs::OpenOptions::new()
             .append(true)
@@ -1620,7 +1619,7 @@ fn facts_floor_at_the_kernel_else_the_registry_start() {
         ),
     )
     .unwrap();
-    let start = crate::harness::upgrade_models::parse_utc("2026-09-24T04:13:26Z").unwrap();
+    let start = crate::harness::unix_time::parse_utc("2026-09-24T04:13:26Z").unwrap();
     let entry = |proc_start: Option<u64>| {
         let stamp = proc_start.map_or(String::new(), |s| {
             format!(r#","procStart":"{}""#, lstart_utc(s))
@@ -1715,7 +1714,7 @@ fn a_clear_keeps_the_model_the_process_chose() {
     std::fs::create_dir_all(claude.join("sessions")).unwrap();
     let project = claude.join("projects").join(project_slug(&cwd));
     std::fs::create_dir_all(&project).unwrap();
-    let start = crate::harness::upgrade_models::parse_utc("2026-09-28T15:04:08Z").unwrap();
+    let start = crate::harness::unix_time::parse_utc("2026-09-28T15:04:08Z").unwrap();
     let registry = |session: &str, image: u64| {
         std::fs::write(
             claude.join("sessions/4242.json"),
@@ -1735,7 +1734,7 @@ fn a_clear_keeps_the_model_the_process_chose() {
     let launch = launch_facts(&["claude".into(), "--model".into(), "claude-opus-5-5".into()]);
     let read_at = |cache: &mut TailCache, at: &str| {
         let entry = session_of_pid(&claude, 4242, Some(start)).expect("the registry");
-        let at = crate::harness::upgrade_models::parse_utc(at).unwrap();
+        let at = crate::harness::unix_time::parse_utc(at).unwrap();
         facts_for_entry_at(
             &claude,
             4242,
@@ -2078,7 +2077,7 @@ fn the_folded_facts_are_this_sessions_transcript() {
     let project = claude.join("projects").join("-w-repo");
     std::fs::create_dir_all(claude.join("sessions")).unwrap();
     std::fs::create_dir_all(&project).unwrap();
-    let started = crate::harness::upgrade_models::parse_utc("2026-09-27T12:00:00Z").unwrap();
+    let started = crate::harness::unix_time::parse_utc("2026-09-27T12:00:00Z").unwrap();
     let name_session = |id: &str| {
         std::fs::write(
             claude.join("sessions/4242.json"),
@@ -2272,7 +2271,7 @@ fn a_resume_to_another_session_never_pairs_its_model_with_the_old_usage() {
     let project = claude.join("projects").join("-w-repo");
     std::fs::create_dir_all(claude.join("sessions")).unwrap();
     std::fs::create_dir_all(&project).unwrap();
-    let started = crate::harness::upgrade_models::parse_utc("2026-09-27T12:00:00Z").unwrap();
+    let started = crate::harness::unix_time::parse_utc("2026-09-27T12:00:00Z").unwrap();
     let name_session = |id: &str| {
         std::fs::write(
             claude.join("sessions/4242.json"),
@@ -4362,7 +4361,7 @@ fn excerpt_row(kind: &str, at: &str, message: &str) -> String {
 fn the_excerpts_ride_the_tail_read_and_its_appends() {
     let root = cache_test_dir("excerpts");
     let path = root.join("session.jsonl");
-    let start = crate::harness::upgrade_models::parse_utc("2026-10-15T10:00:00Z").unwrap();
+    let start = crate::harness::unix_time::parse_utc("2026-10-15T10:00:00Z").unwrap();
     let at = "2026-10-15T10:01:00Z";
     let append = |text: String| {
         std::fs::OpenOptions::new()
@@ -4494,7 +4493,7 @@ fn the_excerpts_ride_the_tail_read_and_its_appends() {
 #[test]
 fn a_cold_back_read_past_its_bound_names_no_prompt() {
     let root = cache_test_dir("excerpts-cold");
-    let start = crate::harness::upgrade_models::parse_utc("2026-10-15T10:00:00Z").unwrap();
+    let start = crate::harness::unix_time::parse_utc("2026-10-15T10:00:00Z").unwrap();
     let at = "2026-10-15T10:01:00Z";
     let filler = |n: usize| {
         excerpt_row(
@@ -5499,7 +5498,7 @@ fn capital_key() -> String {
 }
 
 fn effort_after_answer(text: Option<&str>) -> TailFacts {
-    let start = crate::harness::upgrade_models::parse_utc("2026-10-19T10:00:00Z");
+    let start = crate::harness::unix_time::parse_utc("2026-10-19T10:00:00Z");
     let answer = answer_at("claude-opus-5-5", "2026-10-19T10:00:10.000Z", Some("high"));
     let command = command_at("effort", "2026-10-19T10:00:20.000Z");
     let mut rows = vec![answer, command];

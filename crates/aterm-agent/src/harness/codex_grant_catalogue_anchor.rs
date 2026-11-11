@@ -104,6 +104,7 @@ impl MembershipAnchor {
             directory: codex_enrollment::DirectoryIdentity::capture(directory)?,
             sequence: 1,
             members: BTreeMap::new(),
+            unattempted: Default::default(),
         };
         if Head::of(&manifest)? != *pending {
             return Err("catalogue bootstrap physical identity changed".into());

@@ -23,6 +23,8 @@ pub fn native_update_successor_attach_model() -> Model {
             var proved = 0;
             var handed = 0;
             var draining = 0;
+            var lost = 0;
+            var blocked = 0;
             action Widen when (lane == 0 && many == 0) {
                 many = 1;
             }
@@ -36,6 +38,7 @@ pub fn native_update_successor_attach_model() -> Model {
             action StartDegraded when (lane == 0) {
                 lane = 2;
                 handed = 1;
+                blocked = 1;
             }
             action Attach0 when (lane > 0 && phase == 0) {
                 phase = 1;
@@ -67,8 +70,17 @@ pub fn native_update_successor_attach_model() -> Model {
             action PresentExtras when (extras == 1 && kicked == 1 && painted_extras == 0) {
                 painted_extras = 1;
             }
+            action RebuildWithLostWindow when (
+                phase == 1 && queued == 1 && lane == 1 && many == 1
+            ) {
+                queued = 0;
+                extras = 0;
+                kicked = 0;
+                lost = 1;
+                blocked = 1;
+            }
             action Prove when (
-                lane == 1 && proved == 0 && painted0 == 1 &&
+                lane == 1 && blocked == 0 && proved == 0 && painted0 == 1 &&
                 queued == 0 && painted_extras == extras
             ) {
                 proved = 1;
@@ -109,13 +121,22 @@ pub fn native_update_successor_attach_model() -> Model {
                 extras = 1;
                 kicked = 0;
             }
+            action RebuildWithUnnoticedLoss when (
+                Buggy == 1 && phase == 1 && queued == 1 && lane == 1 && many == 1
+            ) {
+                queued = 0;
+                extras = 0;
+                kicked = 0;
+                lost = 1;
+            }
             invariant ColdRestoreAfterFirstPaint:
                 lane == 1 || queued == 1 || painted0 + painted_extras > 0;
             invariant HandoffAttachesInOnePass:
                 lane == 2 || phase <= 1 || queued == 0;
-            invariant EveryRebuiltWindowPresents: kicked == extras;
+            invariant RemainingWindowsHaveRedrawRequests: kicked == extras;
             invariant ProofNeedsDrainedAndPainted:
                 proved == 0 || (queued == 0 && painted0 == 1 && painted_extras == extras);
+            invariant ProofRetainsCompleteLayout: proved == 0 || lost == 0;
             invariant HandedRebuildsWhole: handed == 0 || draining == 0;
             invariant ColdSlicesAfterFirstPaint:
                 draining == 0 || painted0 + painted_extras > 0;
@@ -123,22 +144,26 @@ pub fn native_update_successor_attach_model() -> Model {
     }
 }
 
-/// Progress property for [`native_update_successor_attach_model`].
+/// Progress to a painted restore, an adoption proof, or a failed window attachment.
+/// A failed attachment settles this restore attempt without proving readiness.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(native_update_successor_attach_model)]
 pub fn native_update_successor_attach_liveness() -> Liveness {
     Liveness {
-        name: "TheSuccessorProves",
+        name: "TheSuccessorSettles",
         goal: or_(
-            eq(var("proved"), int(1)),
-            and_(
-                eq(var("lane"), int(2)),
+            eq(var("lost"), int(1)),
+            or_(
+                eq(var("proved"), int(1)),
                 and_(
-                    eq(var("queued"), int(0)),
+                    eq(var("lane"), int(2)),
                     and_(
-                        eq(var("painted0"), int(1)),
-                        eq(var("painted_extras"), var("extras")),
+                        eq(var("queued"), int(0)),
+                        and_(
+                            eq(var("painted0"), int(1)),
+                            eq(var("painted_extras"), var("extras")),
+                        ),
                     ),
                 ),
             ),

@@ -9933,6 +9933,12 @@ mod reroute_path_env_tests {
                 .filter(|(shell, _)| std::path::Path::new(shell).exists())
         };
         if std::env::var_os(CHILD).is_some() {
+            #[cfg(target_vendor = "apple")]
+            {
+                // SAFETY: the native spawn made this original child its own
+                // session leader. Set its own inherited stdin as the ctty.
+                assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
+            }
             // SAFETY: both calls take no pointers and only read process state.
             let (foreground, own) =
                 unsafe { (libc::tcgetpgrp(libc::STDIN_FILENO), libc::getpgrp()) };
@@ -9955,7 +9961,7 @@ mod reroute_path_env_tests {
         }
         let (master, slave) = aterm_pty::open_pty_pair().expect("a pty pair");
         // SAFETY: two live descriptors this test owns, each taken by exactly one `OwnedFd`; the
-        // stand-in's stdin is the copy std makes of `slave`.
+        // stand-in's stdin is the native copy of `slave`.
         let (master, slave) = unsafe {
             use std::os::fd::{FromRawFd as _, OwnedFd};
             (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave))
@@ -9965,9 +9971,12 @@ mod reroute_path_env_tests {
             .command()
             .env(CHILD, "1")
             .env("HISTFILE", "/dev/null")
-            .stdin(std::process::Stdio::from(slave));
+            .stdin(crate::test_alone::Stdio::from(slave));
+        #[cfg(target_vendor = "apple")]
+        stand_in.command().setsid(true);
         // SAFETY: the hook runs between fork and exec and calls only `setsid` and `ioctl`, both
         // async-signal-safe, on the child's own stdin.
+        #[cfg(not(target_vendor = "apple"))]
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(stand_in.command(), || {
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {

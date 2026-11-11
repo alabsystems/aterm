@@ -198,10 +198,18 @@ mod file_events_tests {
     }
 }
 
-/// `aterm doctor --help`: the grammar and [`HELP_ROWS`].
+/// `aterm doctor --help`: the grammar, [`HELP_ROWS`] and registered base check IDs.
 #[must_use]
 pub fn help() -> String {
-    format!("usage: aterm doctor {GRAMMAR}\n{HELP_ROWS}")
+    let checks = ROWS
+        .iter()
+        .map(|(_, id, _, title)| format!("  {id}  {title}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "usage: aterm doctor {GRAMMAR}\n{HELP_ROWS}\n\
+         Base check IDs for --only (some are platform-specific):\n{checks}\n"
+    )
 }
 
 const ROWS: [(&str, &str, &str, &str); 17] = [

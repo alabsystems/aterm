@@ -224,6 +224,11 @@ pub const WHYS: &[&str] = &[
     // Why a tab's sighting is noted ([`SeenWhy`]); `seen` above is the hourly refresh.
     "first",
     "changed",
+    // How a sign-in that left its row without a login ended
+    // ([`super::accounts::AttemptOutcome::as_str`]).
+    "no-route",
+    "failed",
+    "blocked",
 ];
 
 /// One journal note: an event about one account, in the journal's closed vocabulary. `Copy`,
@@ -785,7 +790,10 @@ fn window_word(name: &str) -> Option<&'static str> {
 /// The note a ledger row becomes, keyed by `pk` (and `to` for a switch or a displacement), or
 /// none for a kind the journal does not take (a sample, a proof, a pin, a warning, a move, a
 /// wall, which the state's diff notes with its reset, and a probe claim, which
-/// [`probe_note`] notes from the read the claim led to).
+/// [`probe_note`] notes from the read the claim led to), for a sign-in that signed its row in,
+/// whose `renewed` or `signed-in` row notes it, or for a step of one
+/// ([`super::accounts::sign_in_step`]). A failed sign-in carries how it ended as one word, never
+/// its reason line.
 fn of_ledger(cli: Cli, event: &Event, pk: Key, to: Option<Key>) -> Option<Note> {
     let t = secs(event.t)?;
     let (kind, src, why) = match event.kind {
@@ -804,7 +812,15 @@ fn of_ledger(cli: Cli, event: &Event, pk: Key, to: Option<Key>) -> Option<Note> 
         Kind::LoginEnded => ("login-ended", "cli-output", None),
         Kind::WrongAccount => ("wrong-account", "signin-flow", None),
         Kind::Epoch => ("auth", "cli-output", Some("epoch")),
-        Kind::SignIn => ("sign-in-failed", "signin-flow", None),
+        Kind::SignIn if super::accounts::sign_in_step(&event.why) => return None,
+        Kind::SignIn => match super::accounts::AttemptOutcome::of_sign_in(&event.why) {
+            Some(super::accounts::AttemptOutcome::SignedIn) => return None,
+            outcome => (
+                "sign-in-failed",
+                "signin-flow",
+                outcome.map(super::accounts::AttemptOutcome::as_str),
+            ),
+        },
         Kind::Displaced => ("displaced", "signin-flow", None),
         Kind::Wall
         | Kind::Probe

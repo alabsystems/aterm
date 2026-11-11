@@ -47,7 +47,7 @@ Text selection (`text_selection/mod.rs`):
 ## 1. Specs (TSV)
 
 `subsumes` names the primary tests a proof retires (secondary ones are in §2). `blocking gaps`
-are rows of the gap list in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a
+are rows of the gap list in `docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (a
 seal that publishes Clean rows) blocks every spec, and every spec also needs gap 1 or 2.
 
 ```tsv
@@ -161,20 +161,6 @@ tests/conformance_text_selection.rs	real_calls_conform_to_the_lifecycle_model	li
 tests/conformance_text_selection.rs	a_dropped_phase_check_is_rejected	lifecycle-refines-model	
 ```
 
-## 3. Coverage
-
-- 62 live tests mapped in §2 across the 37 specs (0 non-spec tests remain; 146 original tests read in the initial 2026-10-15 audit).
-- One spec, `selection-no-panic`, has no test of its own. Every test above samples it in passing,
-  and it is what makes the arithmetic in the other specs total.
-- The biggest collapses are `basic-word-is-containing-word` (15 primary), `project-range` (12),
-  `adjust-for-scroll` (12), `contains-region` (10), `rule-precedence` (10), `contains-cell-glyph-whole`
-  (9), `clamp-head` (6), `lifecycle-refines-model` (6) and `word-at-column` (6).
-- The seven `pat-*` specs retire 23 tests. All of them hinge on the aterm-regex crate's spec
-  being citable across crates (gap 12).
-- Gap histogram (specs blocked by each gap): 0 → 37, 1 → 35, 2 → 22, 3 → 17, 4 → 11, 5 → 10,
-  7 → 15, 10 → 1, 11 → 2, 12 → 17, 13 → 5. Gaps 6, 8, 9 and 14–17 block no spec here directly.
-  6, 14, 16 and 17 still apply to every proof, as the audit says.
-
 ## 4. Tests that are not spec samples
 
 None. No test is a pure regression of a removed bug with no general property. Every regression-shaped
@@ -197,11 +183,6 @@ cross-anchor extension, the wide-glyph halves) is an instance of a general spec 
    `adjust_for_row_splice` kept a row equal to `max_rows` (the check was `> max_rows`), yet
    `max_rows` is a row count, so row `max_rows` does not exist on screen. Both checks are now
    `>= max_rows`, as `adjust-for-scroll` and `row-splice` state: the kept window is `[−f, M)`.
-3. **(Fixed 2026-10-28.) A comment did not match its case.**
-   `test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount` put "A live span and an
-   archived span move by the same 4 rows: one relabel." above the degenerate `kept_rows = 0` case.
-   The misplaced comment is gone and the `kept_rows = 0` assertion explicitly states that the
-   selection clears (`rows-shrink`).
 4. **`enabled` was dead in production, and the extensibility doc was false; both are gone.**
    `SelectionRule.enabled` and the `is_enabled` filter in `rule_match_at` and `find_all` had no
    non-test setter, and the crate docs advertised "Extensible: Add custom rules" with no public
@@ -213,44 +194,3 @@ cross-anchor extension, the wide-glyph halves) is an instance of a general spec 
    belongs in aterm-grapheme. Here these tests reduce to `basic-word-is-containing-word` plus a
    citation (gap 12). Move the Unicode table claims to aterm-grapheme's SPECS.md when that crate is
    migrated, so the property is proved once.
-6. **(Fixed 2026-10-28.) `truncate_to_floor` had an unstated debug-only precondition.** It carried
-   a `debug_assert!(min_row <= 0)` that no caller contract stated, while release builds clamped via
-   `min_row.min(0)`. The assert is removed so debug and release share the total `min_row.min(0)`
-   contract (`truncate-to-floor`, `selection-no-panic`).
-7. **(Fixed 2026-11-04.) `truncate_to_floor` and `intersects_absolute_band` clamped `u64` absolute
-   row counters to `i64::MAX`.** Above `i64::MAX as u64`, `truncate_to_floor` collapsed
-   `oldest_abs - live_top_abs` to `0` and cleared every scrollback selection, while
-   `intersects_absolute_band` miscomputed scrollback row offsets and returned `true` on inverted
-   `lo_abs > hi_abs` ranges. Both now compute exact `u64` differences and bounds
-   (`truncate-to-floor`, `intersects-absolute-band`).
-
-## 6. Proof order (easiest high-value first)
-
-No spec here is blocked only by gap 0. The cheapest lane is the text-selection specs, which need
-only gaps 1–4 (in-crate structs and enums, `&self`/`&mut self` views, straight-line saturating
-arithmetic, callee composition). The smart-selection specs also need loops (7), cross-crate citation
-(12) and, for the patterns, a regex-crate spec. So prove them later.
-
-1. **`translate-rows`, `relocate`, `selection-bounds-codec`** (gaps 0, 1, 2, 3). Straight-line scalar
-   and two-state struct field contracts with frame conditions, the simplest entry points in the crate.
-2. **`is-empty`, `expand-gated`, `include-all`, `intersects-absolute-band`** (gaps 0, 1, 2, 3).
-   Straight-line `&self`/`&mut self` contracts over the struct, enum guards and `u64` bounds. They
-   establish the anchor-struct carrier (gap 1) that every later text-selection spec reuses.
-3. **`normalize` → `side-adjusted-bounds` → `contains-region` → `project-range` →
-   `contains-cell-glyph-whole`** (gaps 0–4, 12 for the aterm-types callees). This is one chain:
-   each spec is the lemma for the next. Together they retire 35 tests, the largest block in the
-   crate, and they fix the §5.1 advice. Add `anchor-total-order` (gaps 0, 1, 3, 5, 11, 12) next to
-   `normalize` if the derived `Ord` of `SelectionSide` can be cited.
-4. **`clamp-head` → `adjust-for-scroll` → `rows-shrink`, `row-splice`, `truncate-to-floor`**
-   (gaps 0–4, plus 13 for the closure in `row-splice`). These retire 24 tests.
-5. **`truncated-per-span`, `extend-anchor-side`, `lifecycle-refines-model`** (adds gap 10 for the
-   model refinement). These retire 9 tests, including the conformance test and its negative control.
-6. **`word-classifier`, `column-to-byte`, `byte-span-to-columns` → `word-at-column`** (gaps 0, 1, 7,
-   12; plus 2 and 3 for `word-classifier` and 4 for `word-at-column`). These retire 11 tests once the
-   aterm-grapheme grid spec can be cited.
-7. **`add-rule-sorted`, `builtin-rule-table`, `rule-precedence`, `basic-word-is-containing-word`** (adds
-   gap 13 for the sort-key and classifier closures). These retire 28 tests.
-8. **The seven `pat-*` specs** (gaps 0, 1, 5, 7, 12). Each is a regular-language statement over
-   aterm-regex. Prove them after aterm-regex's `find_iter` spec exists. They retire 23 tests.
-9. **`selection-no-panic`** comes free once steps 1–8 are proved, because each spec there is total.
-   Until then, it is the cheap panic-freedom pass for the text-selection half.

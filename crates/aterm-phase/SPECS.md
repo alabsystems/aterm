@@ -76,7 +76,7 @@ Result: **82 specs**, covering **279 tests**. **3 tests are not spec samples** (
 - **table-property**: a finite table (fixture or const row → reading), decided by evaluating the
   compiled function on each entry. A corpus table is the only executable sample of the refinement
   `reader(Render_CC(s,w)) = s` until `Render_CC` is modelled.
-- **Gaps** (`blocking_gaps`) are the gap numbers of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+- **Gaps** (`blocking_gaps`) are the gap numbers of `docs/TRUST-LANE.md` (Blocking gaps)
   §7: 1 non-scalar carriers (`&str`, `String`, `Vec`, `Option`, enums, structs), 3 E6 body widening
   (calls, loops, matches), 4 callee-ensures composition, 5 quantified clauses, 7 loops, 8 effects,
   10 model→code refinement, 11 generics (the `dyn ScreenReader` dispatch), 13 closures. Gap 0 (a seal
@@ -551,28 +551,6 @@ tests/live_zone_sweep.rs	the_plan_approval_is_read_whole_through_its_zone	live-z
 tests/panic_sweep.rs	the_reader_never_panics_on_any_window_of_any_fixture	reader-no-panic	
 ```
 
-## 3. Coverage
-
-- 282 tests read. 279 map to one of the 82 specs as their primary spec. 3 are not spec samples (§4).
-- The biggest collapses: `wall-placement-owner-walk` (16), `box-wrap-invariance` (12), `autocompact-offer-read` (11), `question-form-soundness` (11), `background-wall-priority` (10), `reading-composition` (10).
-- Specs blocked per gap (a spec counts once for each gap it needs): gap 1: 81, gap 3: 80, gap 4: 2, gap 5: 72, gap 7: 68, gap 8: 1, gap 10: 6, gap 11: 4, gap 13: 1. Every spec needs gap 0 first.
-- No spec is blocked by gap 0 alone. The smallest blocker sets are `cursor-inside-text` (gap 1 only),
-  `reads-limited-table` (1, 3), and `anchor-table-invariant`, `reader-no-panic` and the two corpus
-  tables (gaps 1, 3 and 7, plus 11 for `reader-no-panic`).
-- Three specs subsume tests whose current form is a sweep over fixture windows and cuts:
-  `reader-no-panic` (tests/panic_sweep.rs), `busy-zone` (tests/busy_zone_sweep.rs) and
-  `live-zone-start`/`read-trailing-blank-invariance` (tests/live_zone_sweep.rs). Each spec states the
-  property for every input, not only the fixtures. So the spec is strictly stronger than the sweep it
-  replaces.
-- `role-label-table`'s primary tests are `src/prompt.rs::a_label_cut_short_is_read_so_under_its_selected_mark`
-  and `src/prompt.rs::roles_come_from_the_label_table`, the role table label by label, the kept answers
-  among them. It is sampled too by the MCP and narrow-pane tests that list it under `also` in §2:
-  `a_wrapped_unnumbered_option_is_read_as_one`, `an_answer_kept_for_good_is_read_from_its_rows`,
-  `options_described_beside_their_labels_are_read_by_their_labels` and
-  `the_mcp_server_dialogs_are_named_by_their_titles_and_every_answer_is_kept`, all in `src/prompt.rs`.
-  `roles_come_from_the_label_table` is the label-table half of `roles_come_from_the_label_table_and_the_two_parsers_agree`,
-  which also sampled `prompt-v1-projection`; the parser half is deleted.
-
 ## 4. Tests that are not spec samples
 
 `§4:move-to-bench` marks a vendor-drift check in `benches/vendor_drift.rs`
@@ -621,58 +599,3 @@ this crate's code, so it gets no proof.
 9. **A test pinned the Unicode version (resolved 2026-10-27).** `src/text.rs::the_byte_trims_are_the_char_trims`
    no longer counts Unicode's White_Space chars. The spec (`text-byte-trims`) is equality with
    `char::is_whitespace`, whatever the count, and the test's per-char loop checks exactly that.
-10. **(Fixed 2026-10-28.) The busy guard is checked as a compiled regex.** `src/reader.rs::each_reader_says_how_to_type_into_its_program`
-    and `src/anchors.rs::a_guard_regex_escapes_metacharacters_and_dots_its_spaces` now compile
-    `guard_regex` / `busy_guard()` with `aterm_regex::Regex` and check positive, NBSP-space, and
-    negative row matches, alongside `aterm_agent`'s `each_agents_busy_guard_is_up_on_its_busy_row_alone`.
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone, because each one reads strings, rows or enums (gap 1). The order
-below starts with the specs that need the fewest gaps beyond 0, and among those prefers the ones that
-are lemmas for many others.
-
-1. **`cursor-inside-text`** (gap 1). A scalar `match` on `Option<(usize,usize)>` checking `row == caret && col > 2`.
-   It is the first E6 import that needs only an `Option`/tuple carrier, so it is the cheapest probe of gap 1.
-2. **`reads-limited-table`** (gaps 1, 3). An enum `match` returning `bool`/`&'static str`. It is
-   decidable by case split once enum carriers exist. `phase-priority`, `limit-notice-wall-agree`
-   and `background-wall-priority` all cite it.
-3. **`text-byte-find`, then `text-byte-trims`** (gaps 1, 3, 5, 7). The byte-level `&str` primitives.
-   Every row reading in the crate goes through them, so they are the base lemmas for the other 79
-   specs. Each is one `while` loop over bytes with an obvious invariant. `text-byte-find` needs no
-   Unicode model, so it comes first.
-4. **`guard-regex-contract`** (gaps 1, 3, 5). A char map into a `String`, with no loop invariant
-   beyond the map; §5.10's compiled-regex check already samples it.
-5. **`anchor-table-invariant`** (gaps 1, 3, 7). A table property over `const` arrays, decided by
-   evaluation. Every anchor-based grammar cites it.
-6. **`reader-no-panic`** (gaps 1, 3, 7, 11). It is the highest-value proof per unit of effort. Trust's
-   own panic-freedom obligations (slice bounds, overflow, unwrap) are exactly this spec, so it needs no
-   functional statement. It also retires the panic sweep with a stronger, all-inputs result. The
-   seal-150efe4a parser run showed that these obligations currently produce spurious refutations
-   without loop invariants and path facts (gap 7). Expect to fix those Trust precision gaps here.
-7. **`row-byte-readings`, `wrap-continues-line-end`, `prompt-box-holds`** (gaps 1, 3, 5, 7). These are
-   short row predicates over the text lemmas from step 3, and they are the vocabulary of the frame,
-   status-block and box specs.
-8. **The two corpus table-properties**: `claude-phase-corpus` and `question-corpus` (gaps 1, 3,
-   7). They are decided by evaluating the compiled reader
-   on embedded data, and they retire 4 tests outright. They prove nothing general, so the real
-   specs below still have to be proved. `launch-card-corpus` and `prompt-corpus` follow once their
-   data is embedded (gap 8) and, for `prompt-corpus`, `Render_CC` exists (gap 10).
-9. **The small grammars**, which need no rows: `reset-line-classify`, `question-tab-bar-grammar`,
-   `rm-breaker-grammar`, `header-grammar`, `hint-footer-grammar`, `reset-row-grammar`,
-   `reset-confirm-roundtrip`, `usage-tab-row-predicates`, `identify-dispatch` (gaps 1, 3, 5, plus 11
-   for `identify-dispatch`). These are prefix grammars and round trips over `&str`.
-10. **The frame and zone layer**: `live-zone-start`, `status-block-walk`, `busy-signal-rules`,
-    `spinner-shape-glyph-agnostic`, `busy-zone`, `context-left-grammar`, `composer-text-and-suggestion`,
-    then `phase-priority` (which also needs gap 4, callee-ensures composition) and
-    `dead-frame-prefix-invariance` and `parked-block-transparency`.
-11. **Walls**: `classify-wall-phrase-table` (gap 13, because of its closures), `reset-of-grammar`,
-    `wall-placement-owner-walk`, `limit-notice-wall-agree`,
-    `background-wall-priority`, and the rest of the wall specs.
-12. **Boxes and questions**: `prompt-v1-projection` with `role-label-table`, `option-role-soundness`,
-    `box-context-independence`, `tail-cut-never-idle`, `question-form-soundness`, and the rest.
-13. **Last**: the renderer refinements, which need a Clean model of Ink/wrap-ansi (gap 10):
-    `wrap-rows-in-refines-ink`, `wall-wrapped-line`, `box-wrap-invariance`, `quoted-box-refusal`,
-    `question-free-text-roundtrip`, and `prompt-corpus` as a refinement rather than a table.
-    `read-trailing-blank-invariance` and `reading-composition` wait for gap 11 (the `dyn ScreenReader`
-    dispatch).

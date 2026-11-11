@@ -146,7 +146,7 @@ impl ReceiptWriter<'_> {
         }
         self.create(initial)?;
         let path = key.path(self.env)?;
-        super::super::super::upgrade_models::write_atomic_mode(&path, &initial.id, Some(0o600))
+        super::super::super::atomic_write::write_atomic_mode(&path, &initial.id, Some(0o600))
             .map_err(|_| "index-write")?;
         flush_parent(&path)
     }

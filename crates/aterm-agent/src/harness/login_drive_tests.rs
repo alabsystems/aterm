@@ -15,6 +15,36 @@ use std::ffi::OsString;
 use super::*;
 use crate::ai::connector::{CODEX_SIGNIN, GROK_SIGNIN, Hosts, KIMI_SIGNIN};
 
+#[test]
+fn native_preparation_stages_reach_the_account_ledger_without_private_errors() {
+    use crate::harness::accounts::{Event, Kind};
+    let private_error = "synthetic-private-error /private/staging credential=fixture";
+    for (stage, word) in [
+        (NativePreparationStage::RowPolicy, "row-policy"),
+        (NativePreparationStage::GrantCustody, "grant-custody"),
+        (NativePreparationStage::NativeScope, "native-scope"),
+        (NativePreparationStage::RowAdmission, "row-admission"),
+    ] {
+        let failure = stage
+            .checked(Err::<(), _>(private_error.to_owned()))
+            .unwrap_err();
+        let drove = Drove {
+            outcome: Outcome::PreparationFailed(failure),
+            host: None,
+        };
+        let line = Event::new(1, Kind::SignIn, "configured-row")
+            .because(&drove.why(Flow::Browser))
+            .to_json_line();
+        let event: aterm_json::Value = aterm_json::from_str(&line).unwrap();
+        assert_eq!(
+            event["why"].as_str(),
+            Some(format!("no-page browser not-run preparation={word}").as_str())
+        );
+        assert!(!line.contains(private_error));
+        assert!(!line.contains("/private/") && !line.contains("credential="));
+    }
+}
+
 /// Native wrapper preserves the exact sandbox preflight arguments and runs the real probe.
 #[cfg(target_os = "macos")]
 #[test]

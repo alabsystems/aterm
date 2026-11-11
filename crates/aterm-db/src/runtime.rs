@@ -21,6 +21,7 @@ use aterm_types::MutexExt;
 use aterm_types::network_state::{MachineIdentity, Visibility};
 use aterm_uds::stop::Stop;
 use std::{
+    io,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
@@ -176,26 +177,45 @@ fn serve_paced<S, E>(
 /// would wake for a round's end; a wait that fails rests a [`TICK`], so none spins. The doorbell
 /// is cleared before the tick it wakes reads what it announced.
 fn rest(stop: &Stop, transport: &transport::Transport, floor: Instant, until: Instant) {
-    let pace = || stop.sleep(floor.saturating_duration_since(Instant::now()));
     match transport.waits_on() {
-        Some(fds) => match aterm_uds::ready::any_now(&fds) {
-            Ok(ready) if ready.is_empty() => {
-                if stop.wait_ready(&fds, Some(until.max(floor))).is_err() {
-                    stop.sleep(TICK);
-                }
-            }
-            Ok(_) => {
-                pace();
-            }
-            Err(_) => {
-                stop.sleep(TICK);
-            }
-        },
+        Some(fds) => rest_ready(
+            floor,
+            until,
+            || aterm_uds::ready::any_now(&fds).map(|ready| !ready.is_empty()),
+            |deadline| stop.wait_ready(&fds, Some(deadline)).map(drop),
+            |duration| {
+                stop.sleep(duration);
+            },
+            Instant::now,
+        ),
         None => {
-            pace();
+            stop.sleep(floor.saturating_duration_since(Instant::now()));
         }
     }
     transport.clear_doorbell();
+}
+
+fn rest_ready(
+    floor: Instant,
+    until: Instant,
+    ready: impl FnOnce() -> io::Result<bool>,
+    wait: impl FnOnce(Instant) -> io::Result<()>,
+    sleep: impl FnOnce(Duration),
+    clock: impl FnOnce() -> Instant,
+) {
+    match ready() {
+        Ok(false) => {
+            if wait(until.max(floor)).is_err() {
+                sleep(TICK);
+            } else {
+                // Readiness may arrive before the floor: the poll deadline only
+                // bounds its latest return. Preserve pacing after an early wake.
+                sleep(floor.saturating_duration_since(clock()));
+            }
+        }
+        Ok(true) => sleep(floor.saturating_duration_since(clock())),
+        Err(_) => sleep(TICK),
+    }
 }
 /// How often the contact ledger is kept, and a steward refreshes the roster from it.
 const KEEP: Duration = Duration::from_secs(600);

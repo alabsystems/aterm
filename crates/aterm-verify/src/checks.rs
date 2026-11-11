@@ -75,7 +75,9 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::Census],
         reach: Reach::WholeTree,
         needs: &[],
-        also: "",
+        also: "in a blobless partial clone lacking the public baseline's harness version files, \
+               network to import those blobs from its promisor remote (GitHub: an agh with \
+               `repo fetch --objects`; up to 10 minutes)",
         runs: "aterm-census's source guards and its five L0 censuses",
     },
     Spec {
@@ -760,7 +762,12 @@ mod tests {
             "Apple silicon with Rosetta, limactl (verify provision --linux), network for the first \
              provision"
         );
-        assert_eq!(needs_of(Check::Census), "-");
+        // Census needs no tool; a partial clone's baseline import names the network.
+        let census = needs_of(Check::Census);
+        assert!(
+            census.starts_with("in a blobless partial clone") && census.contains("network"),
+            "{census}"
+        );
         let table = list_table();
         assert!(!table.contains("brew"), "{table}");
         for spec in CHECKS {

@@ -352,7 +352,16 @@ fn an_unmeasured_builds_rollout_is_read_partial() {
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(kinds(&partial), kinds(&on), "the very steps");
+    let measured_steps = kinds(&on);
+    let expected_partial: Vec<_> = measured_steps
+        .into_iter()
+        .filter(|event| !matches!(event, StepEvent::HarnessTurn { .. }))
+        .collect();
+    assert_eq!(
+        kinds(&partial),
+        expected_partial,
+        "unmeasured builds preserve ordinary steps and omit gated harness attribution"
+    );
     let read: [fn(&StepEvent) -> bool; 4] = [
         |e| matches!(e, StepEvent::Prompt { .. }),
         |e| matches!(e, StepEvent::TurnEnd { tok_in, .. } if *tok_in > 0),

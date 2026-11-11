@@ -350,6 +350,65 @@ impl<'a> Remote<'a> {
         }
     }
 
+    /// Import exact raw objects (a partial clone's missing blobs), publishing no ref: the
+    /// explicit, bounded counterpart of the lazy fetch every local read here forbids. A local
+    /// remote is asked as git's own lazy fetch asks it (no negotiation, no tags, no
+    /// `FETCH_HEAD`). GitHub goes through agh's routed object import, into a scratch bare
+    /// repository: agh refuses to run git in a partial clone, whose promisor keys sit outside
+    /// its transport policy, so the objects then cross from the scratch over the file transport.
+    pub(crate) fn import(&self, objects: &[String]) -> Result<(), String> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        if objects.len() > agh::git::FETCH_ROWS_MAX
+            || !objects
+                .iter()
+                .all(|oid| aterm_types::land_trailer::object_id(oid))
+        {
+            return Err("an object import needs 1–2048 exact object IDs".into());
+        }
+        match &self.kind {
+            Kind::Local(_) => self.objects_from(self.name.as_ref(), objects),
+            Kind::Github(slug) => {
+                let dir = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
+                let input = dir.path().join("objects.json");
+                std::fs::write(&input, json!(objects).to_string()).map_err(|e| e.to_string())?;
+                let scratch = dir.path().join("objects.git");
+                let mut init = words(&["init", "--quiet", "--bare"]);
+                init.push(scratch.clone().into_os_string());
+                success(Tool::Git, (self.run)(Tool::Git, &init)?)?;
+                let mut config = vec![OsString::from("--git-dir"), scratch.clone().into()];
+                config.extend(words(&["config", "uploadpack.allowAnySHA1InWant", "true"]));
+                success(Tool::Git, (self.run)(Tool::Git, &config)?)?;
+                let mut args = words(&["repo", "fetch", slug]);
+                args.extend([
+                    scratch.clone().into_os_string(),
+                    "--objects".into(),
+                    input.into_os_string(),
+                ]);
+                success(Tool::Agh, (self.run)(Tool::Agh, &args)?)?;
+                self.objects_from(scratch.as_os_str(), objects)
+            }
+        }
+    }
+
+    /// Fetch exact `objects` from the local repository `source` (a remote's name or a path)
+    /// into this checkout, over the file transport only and with no ref, tag or `FETCH_HEAD`.
+    fn objects_from(&self, source: &std::ffi::OsStr, objects: &[String]) -> Result<(), String> {
+        let mut args = local_words(&[
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--recurse-submodules=no",
+        ]);
+        args.push(source.to_owned());
+        args.extend(objects.iter().map(OsString::from));
+        success(Tool::Git, (self.run)(Tool::Git, &args)?).map(drop)
+    }
+
     /// Publish exact local objects, expected ref included. An unknown outcome stops the caller;
     /// only a typed refusal which sent nothing permits observation of the blocking intent.
     pub(crate) fn push(

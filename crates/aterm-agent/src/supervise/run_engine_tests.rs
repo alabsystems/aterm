@@ -3850,6 +3850,8 @@ struct TestHost {
     turns_ran: std::sync::atomic::AtomicUsize,
     taps: std::sync::atomic::AtomicUsize,
     busy_taps: std::sync::atomic::AtomicUsize,
+    /// Each time the loop asked for the session's sighting ([`IdleHost::account_seen`]).
+    sightings: std::sync::atomic::AtomicUsize,
     /// Each turn break told ([`IdleHost::turn_break`]), its `theirs`.
     breaks: std::sync::Mutex<Vec<Option<Guard>>>,
     types: AtomicBool,
@@ -3877,7 +3879,6 @@ struct TestHost {
     limit_asks: std::sync::atomic::AtomicUsize,
     standing: std::sync::Mutex<Option<crate::harness::upgrade::StandingLimit>>,
     tails: std::sync::Mutex<Option<(String, String)>>,
-    tail_asks: std::sync::atomic::AtomicUsize,
     /// Each step leaves the next look due at once (the window's look every `first_look` at a
     /// conversation it has not named).
     keeps_looking: AtomicBool,
@@ -4032,6 +4033,9 @@ impl IdleHost for TestHost {
     fn busy_tap(&self) {
         self.busy_taps.fetch_add(1, Ordering::SeqCst);
     }
+    fn account_seen(&self) {
+        self.sightings.fetch_add(1, Ordering::SeqCst);
+    }
     fn turn_break(&self, theirs: Option<Guard>) {
         self.breaks.lock().unwrap().push(theirs);
     }
@@ -4084,7 +4088,6 @@ impl IdleHost for TestHost {
         self.standing.lock().unwrap().clone()
     }
     fn transcript_tail(&self) -> Option<String> {
-        self.tail_asks.fetch_add(1, Ordering::SeqCst);
         let (before, after) = self.tails.lock().unwrap().clone()?;
         Some(if self.restarted.lock().unwrap().is_empty() {
             before
@@ -5593,13 +5596,6 @@ impl Stop {
     }
 }
 
-fn continued_on_usage(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path).is_ok_and(|j| {
-        j.lines()
-            .any(|l| l.contains("CONTINUED seq=") && l.contains("rule=usage-resume@v1"))
-    })
-}
-
 fn hosted_with_host(
     m: &mut Mock,
     opts: &SuperviseOpts,
@@ -6664,225 +6660,6 @@ fn a_restart_that_typed_its_carry_on_typed_a_harness_turn() {
     assert!(!continued(&lines), "{lines:#?}");
 }
 
-fn fable_named() -> Vec<String> {
-    let mut r = rows(&[
-        "⏺ Running the suite.",
-        "  ⎿  You've hit your Fable limit · resets Oct 30 at 9pm (America/Los_Angeles)",
-        "",
-        "✻ Worked for 3m 2s · done 4:51 PM",
-        "",
-    ]);
-    r.extend(composer("  ? for shortcuts"));
-    r
-}
-
-const FABLE_NOTICE: &str = r#"{"parentUuid":"a","isSidechain":false,"type":"user","message":{"role":"user","content":"run the suite"},"timestamp":"2026-10-08T16:35:31.654Z"}
-{"parentUuid":"b","isSidechain":false,"type":"assistant","timestamp":"2026-10-08T16:35:31.676Z","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your Fable limit · resets Oct 30 at 9pm (America/Los_Angeles)"}]},"error":"rate_limit","isApiErrorMessage":true}
-{"parentUuid":"c","isSidechain":false,"type":"system","subtype":"turn_duration","timestamp":"2026-10-08T16:35:31.677Z"}"#;
-
-#[test]
-fn a_model_buckets_relaunch_keeps_its_way_back_when_the_transcript_moves_on() {
-    let carried = format!(
-        "{FABLE_NOTICE}\n{}",
-        r#"{"parentUuid":"d","isSidechain":false,"type":"user","message":{"role":"user","content":"aterm relaunched you on opus; carry on"},"timestamp":"2026-10-08T16:36:00.000Z"}"#
-    );
-    let run = |tails: Option<(String, String)>| {
-        let (dir, ledger) = ledger_file("bucket-books");
-        let host = Arc::new(TestHost::default());
-        *host.restarts.lock().unwrap() = vec![Some("continued")].into();
-        *host.tails.lock().unwrap() = tails;
-        let mut m = Mock::new(vec![busy_screen(), fable_named()]);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        let opts = SuperviseOpts {
-            max: Duration::from_secs(30),
-            ..SuperviseOpts::hosted()
-        };
-        let (r, lines) = hosted_with_host_at(
-            &mut m,
-            &opts,
-            &host,
-            Stop::reached(
-                |h| !h.restarted.lock().unwrap().is_empty(),
-                Duration::from_millis(500),
-            ),
-            None,
-            &ledger,
-            Some(1_791_486_000),
-        );
-        assert_eq!(r, Ok(()));
-        let open = crate::supervise::approvals::open_model_switch(&ledger, Some("@s-1"));
-        let _ = std::fs::remove_dir_all(&dir);
-        let asks = host.tail_asks.load(Ordering::SeqCst);
-        (lines, open.map(|o| (o.from, o.back_at_unix)), asks)
-    };
-    let want = Some((Some("fable".to_string()), Some(1_793_419_200)));
-    let (lines, open, _) = run(None);
-    assert_eq!(open, want, "with no transcript: {lines:#?}");
-    let (lines, open, asks) = run(Some((FABLE_NOTICE.to_string(), carried)));
-    assert_eq!(open, want, "with the transcript moved on: {lines:#?}");
-    assert!(
-        lines.iter().any(|l| l.starts_with("RESTARTED seq=")
-            && l.contains("relaunch --model opus (from fable, back at ")),
-        "{lines:#?}"
-    );
-    assert!(
-        !lines.iter().any(|l| l.contains("rule=wall-confirm@v1")),
-        "nothing refused: {lines:#?}"
-    );
-    assert!(asks >= 1, "the decision asked: {asks}");
-}
-
-#[test]
-fn a_model_buckets_relaunch_not_made_keeps_the_decisions_verdict() {
-    let moved = format!(
-        "{FABLE_NOTICE}\n{}\n{}",
-        r#"{"parentUuid":"d","isSidechain":false,"type":"user","message":{"role":"user","content":"carry on"},"timestamp":"2026-10-08T16:36:00.000Z"}"#,
-        r#"{"parentUuid":"e","isSidechain":false,"type":"system","subtype":"turn_duration","timestamp":"2026-10-08T16:36:01.000Z"}"#
-    );
-    for answer in ["wait:changed", "refused:off"] {
-        let (dir, ledger) = ledger_file("bucket-unmade-books");
-        let host = Arc::new(TestHost::default());
-        *host.restarts.lock().unwrap() = vec![Some(answer)].into();
-        *host.tails.lock().unwrap() = Some((FABLE_NOTICE.to_string(), moved.clone()));
-        let mut m = Mock::new(vec![busy_screen(), fable_named()]);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        let opts = SuperviseOpts {
-            max: Duration::from_secs(30),
-            ..SuperviseOpts::hosted()
-        };
-        let (r, lines) = hosted_with_host_at(
-            &mut m,
-            &opts,
-            &host,
-            Stop::reached(
-                |h| !h.restarted.lock().unwrap().is_empty(),
-                Duration::from_millis(500),
-            ),
-            None,
-            &ledger,
-            Some(1_791_486_000),
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(r, Ok(()), "{answer}");
-        assert_eq!(
-            *host.restarted.lock().unwrap(),
-            ["model"],
-            "{answer}: the relaunch asked once: {lines:#?}"
-        );
-        assert!(
-            !lines.iter().any(|l| l.contains("rule=wall-confirm@v1")),
-            "{answer}: nothing refused: {lines:#?}"
-        );
-        assert_eq!(
-            host.tail_asks.load(Ordering::SeqCst),
-            1,
-            "{answer}: the transcript asked at the decision only: {lines:#?}"
-        );
-    }
-}
-
-#[test]
-fn a_model_bucket_is_relaunched_on_the_fallback_and_back_never_by_model() {
-    let fable = || {
-        let mut r = rows(&[
-            "⏺ Running the suite.",
-            "  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch \
-             models with /model.",
-            "",
-            "✻ Worked for 3m 2s · done 4:51 PM",
-            "",
-        ]);
-        r.extend(composer("  ? for shortcuts"));
-        r
-    };
-    let run = |screens: Vec<Vec<String>>,
-               answers: Vec<Option<&'static str>>,
-               ledger: &std::path::Path| {
-        let host = Arc::new(TestHost::default());
-        *host.restarts.lock().unwrap() = answers.into();
-        let mut m = Mock::new(screens);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        let opts = SuperviseOpts {
-            max: Duration::from_secs(30),
-            ..SuperviseOpts::hosted()
-        };
-        let (r, lines) = hosted_with_host_ledger(
-            &mut m,
-            &opts,
-            &host,
-            Stop::reached(
-                |h| !h.restarted.lock().unwrap().is_empty(),
-                Duration::from_millis(300),
-            ),
-            None,
-            ledger,
-        );
-        assert_eq!(r, Ok(()));
-        let restarted = host.restarted.lock().unwrap().clone();
-        (m, lines, restarted)
-    };
-    let no_model = |m: &Mock| !m.requests.iter().any(|r| r.contains("/model"));
-
-    let (dir, ledger) = ledger_file("bucket-fallback");
-    let (m, lines, restarted) = run(vec![busy_screen(), fable()], vec![Some("adopted")], &ledger);
-    assert_eq!(restarted, ["model"], "{lines:#?}");
-    assert!(
-        lines.iter().any(|l| l.starts_with("RESTARTED seq=")
-            && l.contains("rule=model-fallback@v1 relaunch --model opus (from fable, ")),
-        "the notice names no reset: none is guessed (BK): {lines:#?}"
-    );
-    assert!(no_model(&m), "{:#?}", m.requests);
-    let open = crate::supervise::approvals::open_model_switch(&ledger, Some("@s-1"))
-        .expect("the open switch");
-    assert_eq!(
-        (open.from.as_deref(), open.to.as_str(), open.back_at_unix),
-        (Some("fable"), "opus", None)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-
-    let (dir, ledger) = ledger_file("bucket-back");
-    let unix_now = crate::supervise::journal::unix_ms() / 1000;
-    super::turn_end::seed_switch(&ledger, Some("s-1"), unix_now - 60, false, false);
-    let (m, lines, restarted) = run(
-        vec![busy_screen(), idle_screen()],
-        vec![Some("adopted")],
-        &ledger,
-    );
-    assert_eq!(restarted, ["model-back"], "{lines:#?}");
-    assert!(
-        lines.iter().any(|l| l.starts_with("RESTARTED seq=")
-            && l.ends_with("rule=model-restore@v1 relaunch --model fable")),
-        "{lines:#?}"
-    );
-    assert!(no_model(&m), "{:#?}", m.requests);
-    let _ = std::fs::remove_dir_all(&dir);
-
-    let (dir, ledger) = ledger_file("bucket-refused");
-    let (m, lines, restarted) = run(
-        vec![busy_screen(), fable()],
-        vec![Some("refused:line")],
-        &ledger,
-    );
-    assert_eq!(restarted, ["model"]);
-    assert!(no_model(&m), "{:#?}", m.requests);
-    assert!(
-        !lines
-            .iter()
-            .any(|l| l.starts_with("RESTARTED") || l.starts_with("TYPED")),
-        "{lines:#?}"
-    );
-    assert_eq!(
-        m.requests
-            .iter()
-            .filter(|r| r.contains("meta set attention owner=supervisor"))
-            .count(),
-        0,
-        "{:#?}",
-        m.requests
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn the_hosts_step_is_taken_at_the_idle_point_and_the_loop_runs_on() {
     let host = Arc::new(TestHost::default());
@@ -7457,6 +7234,39 @@ fn the_host_reads_its_usage_tap_at_each_decided_idle_turn_end() {
         Stop::After(Duration::from_millis(300)),
     );
     assert_eq!(taps, 0, "a limit is no idle point");
+}
+
+/// The host is asked for the session's sighting at a decided turn end with the account rotation
+/// and the login repair both off: which account a tab runs is told to the fleet whatever this Mac
+/// does about its accounts.
+/// NEGATIVE CONTROL: with the ask made in `account_advise`, behind its `accounts == Off &&
+/// !logins` return, the idle session is never asked: `at a decided idle point: 0`.
+#[test]
+fn the_host_is_asked_for_the_sessions_sighting_with_the_accounts_off() {
+    let policy = SupervisorConfig {
+        accounts: crate::harness::accounts::Mode::Off,
+        logins: false,
+        ..SupervisorConfig::default()
+    };
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&policy)
+    };
+    let run = |screens: Vec<Vec<String>>| {
+        let host = Arc::new(TestHost::default());
+        host.owns.store(true, Ordering::SeqCst);
+        let mut m = Mock::new(screens);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        m.vanish_after = Some(0);
+        let stop = Stop::reached(
+            |h| h.sightings.load(Ordering::SeqCst) >= 1,
+            Duration::from_millis(300),
+        );
+        let _ = hosted_with_host(&mut m, &full, &host, stop, None);
+        host.sightings.load(Ordering::SeqCst)
+    };
+    let idle = run(vec![idle_screen()]);
+    assert!(idle >= 1, "at a decided idle point: {idle}");
 }
 
 /// The host is told each turn break the loop decides, whether or not it wants a step there:
@@ -12207,281 +12017,6 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     let bad = reset_violations(&m, &host);
     assert_eq!(bad.len(), 1, "{bad:#?}");
     named(&bad, "TypesTheCommand", "NeverTheTypedCommand");
-}
-
-#[test]
-fn a_model_fallback_the_host_keeps_deferring_is_asked_again_and_nothing_is_typed_blind() {
-    use aterm_phase::prompt::fixtures::screen;
-    const FABLE: &str = include_str!(
-        "../../../aterm-phase/src/fixtures/claude-2.1.283-wall-fable-goal-rate-limited-shell.txt"
-    );
-    let run = |wall: Vec<String>| {
-        let host = Arc::new(TestHost::default());
-        *host.restarts.lock().unwrap() = std::iter::repeat_n(Some("wait:changed"), 400).collect();
-        let (jdir, journal) = journal_file("fallback-waits");
-        let opts = SuperviseOpts {
-            max: Duration::from_secs(30),
-            journal: Some(journal.clone()),
-            ..SuperviseOpts::hosted()
-        };
-        let mut m = Mock::new(vec![busy_screen(), wall]);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        let (r, _) = hosted_with_host(
-            &mut m,
-            &opts,
-            &host,
-            Stop::reached(
-                move |h| h.restarted.lock().unwrap().len() >= 12,
-                Duration::from_millis(100),
-            ),
-            Some(TurnEndTiming {
-                restart_backoff: vec![Duration::from_millis(20)],
-                reset_grace: Duration::ZERO,
-                reset_jitter: Duration::ZERO,
-                ..TurnEndTiming::default()
-            }),
-        );
-        assert_eq!(r, Ok(()));
-        let (records, _) = journal_records(&journal);
-        let _ = std::fs::remove_dir_all(&jdir);
-        let lines: Vec<String> = records.into_iter().map(|r| r.line).collect();
-        let asked = host.restarted.lock().unwrap().clone();
-        (lines, asked, m.requests.clone())
-    };
-    let (lines, asked, requests) = run(screen(FABLE));
-    assert!(
-        asked.len() >= 12 && asked.iter().all(|w| *w == "model"),
-        "{lines:#?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("WAITING ") && l.contains("restart:model waits")),
-        "{lines:#?}"
-    );
-    assert!(
-        !lines.iter().any(
-            |l| l.starts_with("CONTINUED") || l.starts_with("WAITING ") && l.contains("resets")
-        ),
-        "nothing typed, no reset waited for, at a wall no reset ends: {lines:#?}"
-    );
-    assert_eq!(
-        requests.iter().filter(|r| r.starts_with("turn")).count(),
-        0,
-        "{requests:#?}"
-    );
-}
-
-#[test]
-fn a_fallback_the_host_keeps_deferring_gives_way_to_the_continuation_at_the_reset() {
-    const FABLE: &str = include_str!(
-        "../../../aterm-phase/src/fixtures/claude-2.1.283-wall-fable-goal-rate-limited-shell.txt"
-    );
-    let reset = Duration::from_secs(1);
-    let backoff = Duration::from_millis(20);
-    let tail = Duration::from_millis(300);
-    let resets = format!("· resets in {}s", reset.as_secs());
-    let named: Vec<String> = aterm_phase::prompt::fixtures::screen(FABLE)
-        .into_iter()
-        .map(|r| {
-            r.replace(
-                "Run /usage-credits to continue or switch models with /model.",
-                &resets,
-            )
-        })
-        .collect();
-    let host = Arc::new(TestHost::default());
-    *host.restarts.lock().unwrap() = std::iter::repeat_n(Some("wait:changed"), 4000).collect();
-    let (jdir, journal) = journal_file("fallback-named");
-    let opts = SuperviseOpts {
-        max: Duration::from_secs(30),
-        journal: Some(journal.clone()),
-        ..SuperviseOpts::hosted()
-    };
-    let mut m = Mock::new(vec![busy_screen(), named]);
-    m.stall_sleep = Some(Duration::from_millis(5));
-    let watched = journal.clone();
-    let (r, _) = hosted_with_host(
-        &mut m,
-        &opts,
-        &host,
-        Stop::reached(move |_| continued_on_usage(&watched), tail),
-        Some(TurnEndTiming {
-            restart_backoff: vec![backoff],
-            reset_grace: Duration::ZERO,
-            reset_jitter: Duration::ZERO,
-            limit_backoff: vec![Duration::from_secs(600)],
-            ..TurnEndTiming::default()
-        }),
-    );
-    assert_eq!(r, Ok(()));
-    let (records, _) = journal_records(&journal);
-    let _ = std::fs::remove_dir_all(&jdir);
-    let lines: Vec<String> = records.into_iter().map(|r| r.line).collect();
-    let asked = host.restarted.lock().unwrap().len();
-    assert!(asked >= 2, "asked again before the reset: {lines:#?}");
-    let room = usize::try_from((reset + tail).as_millis() / backoff.as_millis()).unwrap() + 2;
-    assert!(
-        asked <= room,
-        "asked {asked} times, where the reset and the run's tail leave room for {room}: {:#?}",
-        &lines[..lines.len().min(40)]
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("CONTINUED ") && l.contains("usage-resume@v1")),
-        "the continuation at the reset, the host still deferring: {lines:#?}"
-    );
-    let first_turn = lines
-        .iter()
-        .position(|l| l.starts_with("CONTINUED "))
-        .unwrap();
-    assert!(
-        lines[..first_turn]
-            .iter()
-            .any(|l| l.contains(" restart:model ask=model@") && l.contains(" step=wait:changed")),
-        "{lines:#?}"
-    );
-}
-
-#[test]
-fn a_deferred_fallback_is_retried_at_the_reset_the_grace_and_the_sessions_share() {
-    use super::super::turn_end_loop::resume_jitter;
-    use crate::supervise::policy::turn_end::{RULE_MODEL_FALLBACK, Restart};
-    const FABLE: &str = include_str!(
-        "../../../aterm-phase/src/fixtures/claude-2.1.283-wall-fable-goal-rate-limited-shell.txt"
-    );
-    let named: Vec<String> = aterm_phase::prompt::fixtures::screen(FABLE)
-        .into_iter()
-        .map(|r| {
-            r.replace(
-                "Run /usage-credits to continue or switch models with /model.",
-                "· resets in 3h",
-            )
-        })
-        .collect();
-    let grace = Duration::from_secs(150);
-    let reset_unix = TEST_NOW + 3 * 3600;
-    let run = |share: Duration| {
-        let host = Arc::new(TestHost::default());
-        *host.restarts.lock().unwrap() = [Some("wait:changed")].into();
-        let mut m = Mock::new(vec![named.clone()]);
-        let mut s = session(&mut m, Some("@s-1".to_string()));
-        s.set_clock(TEST_NOW, PDT);
-        s.set_zone_lookup(test_zones);
-        s.set_turn_end_timing(TurnEndTiming {
-            restart_backoff: vec![Duration::from_secs(10 * 3600)],
-            reset_grace: grace,
-            reset_jitter: share,
-            ..TurnEndTiming::default()
-        });
-        let opts = SuperviseOpts {
-            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            ..SuperviseOpts::hosted()
-        };
-        let point = Turn {
-            phase: Phase::Idle,
-            screen: Screen {
-                rows: named.clone(),
-                seq: 102,
-                cursor_col: 2,
-                ..Screen::default()
-            },
-            timed_out: false,
-        };
-        let action = TurnEndAction::Restart {
-            why: Restart::Model {
-                to: "opus".to_string(),
-            },
-            rule_id: RULE_MODEL_FALLBACK,
-            otherwise: Box::new(TurnEndAction::Nothing),
-        };
-        let began = Instant::now();
-        s.turn_end_execute(&point, action, &opts, &[], &mut Alone)
-            .expect("the restart is deferred, not failed");
-        let took = began.elapsed();
-        let Due { at, why, .. } = s.turn_end_due.clone().expect("a retry is due");
-        assert!(why.contains("restart:model waits"), "{why}");
-        (at.duration_since(began), took)
-    };
-    let span = Duration::from_secs(60);
-    let share = resume_jitter("@s-1", reset_unix, span);
-    assert!(
-        share >= Duration::from_secs(5),
-        "pick another sid: {share:?}"
-    );
-    let (due, took) = run(span);
-    let want = Duration::from_secs(3 * 3600) + grace + share;
-    assert!(
-        due >= want && due <= want + took,
-        "{due:?} vs {want:?} (the call took {took:?})"
-    );
-    let (due, took) = run(Duration::ZERO);
-    let want = Duration::from_secs(3 * 3600) + grace;
-    assert!(
-        due >= want && due <= want + took,
-        "no share: {due:?} vs {want:?} (the call took {took:?})"
-    );
-}
-
-#[test]
-fn a_return_to_the_bucket_model_the_host_defers_never_holds_the_continuation() {
-    let run = |answers: Vec<Option<&'static str>>| {
-        let (dir, ledger) = ledger_file("back-waits");
-        let unix_now = crate::supervise::journal::unix_ms() / 1000;
-        super::turn_end::seed_switch(&ledger, Some("s-1"), unix_now - 60, false, false);
-        let host = Arc::new(TestHost::default());
-        *host.restarts.lock().unwrap() = answers.into();
-        let mut ended = rows(&["⏺ Done.", "", "✻ Worked for 3m 2s · done 4:24 PM", ""]);
-        ended.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
-        let mut m = Mock::new(vec![busy_screen(), ended]);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        let (jdir, journal) = journal_file("back-waits");
-        let opts = SuperviseOpts {
-            max: Duration::from_secs(30),
-            journal: Some(journal.clone()),
-            ..SuperviseOpts::hosted()
-        };
-        let (r, lines) = hosted_with_host_ledger(
-            &mut m,
-            &opts,
-            &host,
-            Stop::After(Duration::from_millis(1500)),
-            Some(TurnEndTiming {
-                restart_backoff: vec![Duration::from_millis(20)],
-                ..TurnEndTiming::default()
-            }),
-            &ledger,
-        );
-        assert_eq!(r, Ok(()));
-        let asked = host.restarted.lock().unwrap().clone();
-        let (records, _) = journal_records(&journal);
-        let journaled: Vec<String> = records.into_iter().map(|r| r.line).collect();
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&jdir);
-        (asked, lines, journaled)
-    };
-    let (asked, lines, journaled) = run(vec![Some("wait:changed"); 200]);
-    let continued = lines.iter().filter(|l| l.starts_with("CONTINUED")).count();
-    assert_eq!(continued, 1, "{lines:#?}");
-    assert_eq!(
-        asked,
-        ["model-back"],
-        "asked at the point, not in a loop: {lines:#?}"
-    );
-    assert!(
-        journaled
-            .iter()
-            .any(|l| l.starts_with("DEFERRED ") && l.contains("restart:model-back")),
-        "{journaled:#?}"
-    );
-    let (asked, lines, _) = run(vec![Some("adopted")]);
-    assert_eq!(asked, ["model-back"]);
-    assert_eq!(
-        lines.iter().filter(|l| l.starts_with("CONTINUED")).count(),
-        0,
-        "{lines:#?}"
-    );
 }
 
 #[test]

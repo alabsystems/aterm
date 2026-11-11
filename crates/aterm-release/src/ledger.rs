@@ -275,6 +275,13 @@ pub trait Origin {
         Err("this origin does not resolve submodule tips".into())
     }
     fn get(&self, reference: &str) -> std::result::Result<Option<String>, String>;
+    /// Observe both publisher controls. Native origins use one advertisement.
+    fn publisher_controls(&self) -> std::result::Result<(Option<String>, Option<String>), String> {
+        Ok((
+            self.get(agh::git::RELEASE_LEASE_REF)?,
+            self.get(agh::git::PUBLISHER_FENCE_REF)?,
+        ))
+    }
     fn import(&self, oid: &str) -> std::result::Result<(), String>;
     /// An annotated tag's final commit. A lightweight object returns `None`;
     /// an annotated tag ending at a tree/blob refuses rather than becoming a claim.
@@ -299,6 +306,9 @@ pub trait Origin {
 }
 
 impl Origin for crate::github_remote::Remote {
+    fn publisher_controls(&self) -> std::result::Result<(Option<String>, Option<String>), String> {
+        Self::publisher_controls(self)
+    }
     fn refresh_main(&self) -> std::result::Result<String, String> {
         Self::refresh_main(self)
     }

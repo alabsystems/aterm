@@ -15,6 +15,8 @@ const LOCKS: usize = 1024;
 
 pub(super) fn scan(root: &Path) -> std::io::Result<Seen> {
     #[cfg(test)]
+    SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
+    #[cfg(test)]
     let entries = SURVEY_ENTRIES.with(std::cell::Cell::get);
     #[cfg(not(test))]
     let entries = ENTRIES;
@@ -24,6 +26,13 @@ pub(super) fn scan(root: &Path) -> std::io::Result<Seen> {
 #[cfg(test)]
 thread_local! {
     static SURVEY_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(ENTRIES) };
+    static SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Ordinary inventory attempts on this test thread, including those that refuse a tree.
+#[cfg(all(test, unix))]
+pub(super) fn scans_here() -> usize {
+    SCANS.with(std::cell::Cell::get)
 }
 
 /// Inject a small real survey budget on this test thread. Replacing retirement's scan

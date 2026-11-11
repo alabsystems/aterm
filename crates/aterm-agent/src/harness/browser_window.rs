@@ -674,7 +674,7 @@ pub fn quiet_password_manager(profile: &Path) -> std::io::Result<()> {
         }
     }
     let text = aterm_json::to_string(&prefs).map_err(std::io::Error::other)?;
-    super::upgrade_models::write_atomic(&path, &text)
+    super::atomic_write::write_atomic(&path, &text)
 }
 
 /// The sites of identity providers whose cookies are dropped under any top-level domain
@@ -906,7 +906,7 @@ pub const MAKE_UP_WITHIN: Duration = Duration::from_secs(30);
 /// # Errors
 /// The mark could not be written.
 pub fn mark_untidied(profile: &Path) -> std::io::Result<()> {
-    super::upgrade_models::write_atomic(&profile.join(UNTIDIED_MARK), "")
+    super::atomic_write::write_atomic(&profile.join(UNTIDIED_MARK), "")
 }
 
 /// Removes `profile`'s [`UNTIDIED_MARK`] once its identity providers' cookies are gone.
@@ -1175,6 +1175,22 @@ impl WindowEnd {
             WindowEnd::Killed => "killed".to_owned(),
         }
     }
+}
+
+/// The `why` of the [`super::accounts::Kind::SignIn`] event a window's end writes: its site's
+/// host, `window`, how it ended ([`WindowEnd::word`]) and what was left of its `session`, each
+/// one word.
+#[must_use]
+pub fn ledger_why(site: &str, end: WindowEnd, session: &str) -> String {
+    format!("{site} window {} {session}", end.word())
+}
+
+/// Whether `why` has [`ledger_why`]'s shape.
+#[must_use]
+pub fn is_ledger_why(why: &str) -> bool {
+    let words: Vec<&str> = why.split(' ').collect();
+    matches!(words.as_slice(), [site, "window", end, session]
+        if !site.is_empty() && !end.is_empty() && !session.is_empty())
 }
 
 #[cfg(unix)]

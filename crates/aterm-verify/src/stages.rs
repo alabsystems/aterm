@@ -11,6 +11,10 @@ use crate::scope::Scope;
 use crate::smoke_stages;
 use crate::{Ctx, is_executable_file};
 
+#[cfg(test)]
+#[path = "lint_qualification_tests.rs"]
+mod lint_qualification_tests;
+
 /// Dispatch one stage.
 #[must_use]
 pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
@@ -578,13 +582,13 @@ pub const OBJC_DRIVES: [ObjcDrive; 7] = [
         code3: Code3::None,
         // A death by a signal is a crash in the window code the drive runs: a finding. Closing an answered NSAlert's glass child window at exit (aterm 0.110.0 on macOS 27.2) died by SIGSEGV in the exit turn's pool pop.
         no_status: Severity::GateFailed,
-        pass: "the real window answered every question — title, style mask, geometry, limits, theme, drag-and-drop, close and fullscreen — a focus callback raised inside a real NSAlert waited for its outer handler and was then delivered, and the exit, in the turn a click answered another real NSAlert, closed only winit's own window and none of the alert's",
+        pass: "the real window answered every question — title, style mask, geometry, limits, theme, drag-and-drop, close and fullscreen — callbacks, redraws and native termination raised inside real NSAlert modal loops waited for their outer handlers, a panic from a deferred redraw returned through the pump rather than aborting at the Objective-C block boundary, and the exit, in the turn a click answered another real NSAlert, closed only winit's own windows and none of the alert's",
     },
     ObjcDrive {
         example: "objc_event_drive",
         code3: Code3::AbortFinding,
         no_status: Severity::GateFailed,
-        pass: "every NSEvent-taking WinitView row and sendEvent: survived a real NSEvent of every type AppKit can deliver; the exception control was contained and the panic control aborted",
+        pass: "every NSEvent-taking WinitView row and sendEvent: survived a real NSEvent of every type AppKit can deliver, and flagsChanged: retained its Relayed classifier verdict through deferred KeyboardInput and ModifiersChanged delivery; the exception control was contained and the panic control aborted",
     },
     ObjcDrive {
         example: "objc_frame_clock_drive",
@@ -633,15 +637,71 @@ pub fn objc_drive_not_run_reason(transcript: &str) -> Option<&str> {
     })
 }
 
-/// How the ladder reads one driver's exit without a transcript.
+/// The line every objc driver prints once it has judged, before its verdict rows.
+pub const OBJC_VERDICT_HEADER: &str = "=== VERDICT ===";
+
+/// The first line of `transcript` that names a finding: one whose words, after an optional
+/// `<driver name>…: ` prefix, begin `FINDING` or `FAIL` (`  FINDING: …`, `    FAIL …`,
+/// `objc-confirm-drive: FINDING — …`, `objc-window-drive terminate child: FAIL — …`).
 #[must_use]
-pub fn objc_drive_outcome(drive: &ObjcDrive, code: Option<i32>) -> (Outcome, String) {
-    objc_drive_outcome_with_transcript(drive, code, "")
+pub fn objc_drive_finding<'t>(drive: &ObjcDrive, transcript: &'t str) -> Option<&'t str> {
+    let prefix = drive.example.replace('_', "-");
+    transcript.lines().map(str::trim).find(|line| {
+        let words = match line.strip_prefix(prefix.as_str()) {
+            Some(rest) => rest.split_once(": ").map_or(rest, |(_, after)| after),
+            None => line,
+        };
+        ["FINDING", "FAIL"].iter().any(|mark| {
+            words.strip_prefix(mark).is_some_and(|after| {
+                after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            })
+        })
+    })
 }
 
-/// How the ladder reads one driver's exit and transcript, quoting its `NOT RUN — <reason>` line on exit `2`.
+/// How the ladder reads one driver's exit and transcript.
+///
+/// The verdict is the driver's, not its exit status alone: a line naming a finding is a finding
+/// whatever the status, and a status that reads as a pass counts only when the transcript holds
+/// [`OBJC_VERDICT_HEADER`]. A process that ends before it judges (a queued `terminate:` that
+/// exits `0`, as KI-1110-3 saw) has proven nothing it was meant to prove. Exit `2` quotes the
+/// driver's `NOT RUN — <reason>` line.
 #[must_use]
-pub fn objc_drive_outcome_with_transcript(
+pub fn objc_drive_outcome(
+    drive: &ObjcDrive,
+    code: Option<i32>,
+    transcript: &str,
+) -> (Outcome, String) {
+    let (outcome, what) = objc_drive_exit_outcome(drive, code, transcript);
+    if outcome == Outcome::Fail(Severity::GateFailed) {
+        return (outcome, what);
+    }
+    let name = drive.example;
+    if let Some(line) = objc_drive_finding(drive, transcript) {
+        let status = code.map_or_else(|| "no exit status".to_owned(), |c| format!("exit {c}"));
+        return (
+            Outcome::Fail(Severity::GateFailed),
+            format!("{name}: a finding the exit status did not report ({status}): {line}"),
+        );
+    }
+    if outcome == Outcome::Ok && !transcript.lines().any(|l| l.trim() == OBJC_VERDICT_HEADER) {
+        let status = code.map_or_else(String::new, |c| format!(" {c}"));
+        return (
+            Outcome::Fail(Severity::GateFailed),
+            format!(
+                "{name}: exit{status} without its {OBJC_VERDICT_HEADER} line — the process ended \
+                 before the driver judged, so whatever it had found went unreported"
+            ),
+        );
+    }
+    (outcome, what)
+}
+
+/// The exit status's reading alone, which [`objc_drive_outcome`] holds to the transcript.
+fn objc_drive_exit_outcome(
     drive: &ObjcDrive,
     code: Option<i32>,
     transcript: &str,
@@ -744,14 +804,20 @@ pub fn libc_oracle_not_run_reason(run: &exec::Run) -> Option<String> {
     })
 }
 
-fn run_tests_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
+fn run_tests_at_width(
+    ctx: &Ctx,
+    r: &mut Report,
+    label: &str,
+    cmd: &Cmd,
+    threads: Option<u32>,
+) -> bool {
     if let Err(why) = crate::test_env::prepare(ctx) {
         r.cannot_run(format!(
             "cannot prepare release test environment: {why}; no test was run"
         ));
         return false;
     }
-    let rerun = crate::findings::Rerun::of(cmd, ctx.test_thread_override());
+    let rerun = crate::findings::Rerun::of(cmd, threads);
     let cmd = &cmd.clone().counting_waits();
     run_child(ctx, r, label, cmd, |r, run, label| {
         r.decide_test_child(run, label, &rerun);
@@ -1873,7 +1939,12 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
         ));
         return;
     }
-    run_tests_labeled(ctx, r, &label, &cmd);
+    let threads = if ctx.pool.is_some() {
+        Some(1)
+    } else {
+        ctx.test_thread_override()
+    };
+    run_tests_at_width(ctx, r, &label, &cmd, threads);
     if let Some(path) = halt_marker
         && let Err(error) = crate::docdriver::remove_halt_marker(&path)
     {
@@ -1910,6 +1981,10 @@ fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Result<Cmd, St
         .env(crate::docdriver::DRIVER_ENV, real)
         .env(crate::docdriver::RUNTOOL_ENV, &stand_in)
         .env(crate::docdriver::RUNTOOL_SCRATCH_ENV, &ctx.scratch);
+    if ctx.pool.is_some() {
+        // Each Cargo/rustdoc job already owns one token. Runtime doctests spend that one job.
+        cmd = cmd.env("RUST_TEST_THREADS", "1");
+    }
     if ctx.halt.armed() {
         cmd = cmd.env(
             crate::docdriver::RUNTOOL_HALT_ENV,
@@ -2025,7 +2100,8 @@ fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path, args: Vec<String>) -> Cmd {
     } else {
         Cmd::new(bin)
     };
-    cmd.args(args)
+    let mut cmd = cmd
+        .args(args)
         .env("CARGO_INCREMENTAL", "0")
         .env("PATH", path)
         .env(
@@ -2033,7 +2109,18 @@ fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path, args: Vec<String>) -> Cmd {
             lane_dir(ctx, Lane::TippyTarget).unwrap_or_else(|| ctx.target_dir.clone()),
         )
         .env("TRUST_NO_MIGRATE_WARN", "1")
-        .demoted()
+        .demoted();
+    if ctx.release {
+        // Cargo's loader paths describe the parent verifier, not the sealed compiler.
+        // Remove them from the actual command as well as its content evidence. A loader
+        // setting supplied by Cargo config is still detected as an unbounded input.
+        for (name, _) in std::env::vars_os() {
+            if crate::lint_content::loader_environment(&name.to_string_lossy()) {
+                cmd = cmd.remove_env(name);
+            }
+        }
+    }
+    cmd
 }
 
 fn tippy(ctx: &Ctx, r: &mut Report) {
@@ -2512,12 +2599,12 @@ fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
     let root = ctx.root.clone();
     let var = engine_vars(ctx);
     let memo = aterm_census::Memo::for_root(&ctx.state_dir(), &ctx.root);
-    let (outcomes, report) = match exec::bounded(ctx.child_ceiling, move || {
+    let (outcomes, report) = match bounded_source(ctx, move || {
         census_walk(&root, &var, &selected, Some(&memo))
     }) {
         Ok(o) => o,
         Err(why) => {
-            r.cannot_run(format!("{check} — the walk {}", why.sentence()));
+            r.cannot_run(format!("{check} — the walk {why}"));
             return;
         }
     };
@@ -2535,6 +2622,101 @@ fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
     }
 }
 
+/// The walk owns its CPU token until it actually ends, including after its reporting ceiling.
+/// Nested census jobs execute on that worker with their ordinary input captures. Child
+/// commands retain the bounded walk's executor, which stops and reaps them at its ceiling.
+fn bounded_source<T: Send + 'static>(
+    ctx: &Ctx,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let pool = ctx.pool.clone();
+    let ceiling = ctx.child_ceiling;
+    let began = std::time::Instant::now();
+    exec::bounded(ceiling, move || {
+        let Some(pool) = pool else {
+            return Ok(work());
+        };
+        let executor = aterm_uds::output::current();
+        crate::compile_width::run(
+            Some(&pool),
+            Some(1),
+            None,
+            &|| crate::stopping() || ceiling.is_some_and(|limit| began.elapsed() >= limit),
+            || {
+                aterm_census::on_one_worker(move || match executor {
+                    Some(executor) => aterm_uds::output::with_executor(executor, work),
+                    None => work(),
+                })
+            },
+        )
+        .map_err(|why| format!("CPU admission could not run: {why}"))?
+        .map_err(|why| format!("the source worker could not start: {why}"))
+    })
+    .map_err(|why| why.sentence())?
+}
+
+#[cfg(all(test, unix))]
+mod source_worker_tests {
+    use super::*;
+
+    #[test]
+    fn the_walk_holds_its_token_until_the_work_returns() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut ctx = Ctx::new(
+            dir.path().into(),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            dir.path().join("scratch"),
+        )
+        .with_pool(Some(
+            aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 1).unwrap(),
+        ));
+        ctx.child_ceiling = Some(std::time::Duration::from_secs(60));
+        let pool = ctx.pool.as_ref().unwrap();
+        for stage in [crate::plan::StageId::Census, crate::plan::StageId::Forge] {
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+            let (leave_tx, leave_rx) = std::sync::mpsc::sync_channel(0);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    crate::compile_width::run_stage(
+                        stage,
+                        Some(pool.as_ref()),
+                        Some(1),
+                        None,
+                        &|| false,
+                        || {
+                            bounded_source(&ctx, move || {
+                                entered_tx.send(()).unwrap();
+                                assert!(
+                                    aterm_uds::output::current().is_some(),
+                                    "child commands retain custody"
+                                );
+                                leave_rx
+                                    .recv_timeout(std::time::Duration::from_secs(60))
+                                    .unwrap();
+                                42
+                            })
+                        },
+                    )
+                });
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .unwrap();
+                assert!(
+                    pool.try_acquire().unwrap().is_none(),
+                    "the actual walk owns the token"
+                );
+                leave_tx.send(()).unwrap();
+                assert_eq!(worker.join().unwrap().unwrap().unwrap(), 42);
+            });
+            assert!(
+                pool.try_acquire().unwrap().is_some(),
+                "the completed walk returned its token"
+            );
+        }
+    }
+}
+
 fn preflight_censuses(ctx: &Ctx, r: &mut Report, check: &str) {
     let root = ctx.root.clone();
     let baseline = census_baseline(&root, &engine_vars(ctx));
@@ -2546,43 +2728,47 @@ fn preflight_censuses(ctx: &Ctx, r: &mut Report, check: &str) {
         })
         .collect();
     let memo = aterm_census::Memo::for_root(&ctx.state_dir(), &ctx.root);
-    let result = exec::bounded(ctx.child_ceiling, move || {
-        std::thread::scope(|scope| {
-            let jobs: Vec<_> = aterm_census::CENSUSES
+    let pooled = ctx.pool.is_some();
+    let result = bounded_source(ctx, move || {
+        let run_one = |census: &aterm_census::Census| {
+            let cached = prior.get(census.name).cloned();
+            if let Some(proof) = cached {
+                return (census.name, None, None, Some(proof), None);
+            }
+            // Guards include parallel and publication readers; their aggregate stays
+            // unbounded, and this tree's census memo keeps each rule's record
+            // instead. The five lexical graph censuses use the typed tree reader.
+            if census.name == "guards" {
+                let (mut outcomes, report) =
+                    aterm_census::run_censuses(&root, &[census], &baseline, Some(&memo));
+                return (census.name, outcomes.pop(), None, None, report);
+            }
+            let (outcome, inputs) = aterm_census::inputs::capture(&root, || {
+                aterm_census::run_census(&root, census, &baseline)
+            });
+            (census.name, Some(outcome), inputs, None, None)
+        };
+        if pooled {
+            aterm_census::CENSUSES
                 .iter()
-                .map(|census| {
-                    let root = &root;
-                    let baseline = &baseline;
-                    let memo = &memo;
-                    let cached = prior.get(census.name).cloned();
-                    scope.spawn(move || {
-                        if let Some(proof) = cached {
-                            return (census.name, None, None, Some(proof), None);
-                        }
-                        // Guards include parallel and publication readers; their aggregate stays
-                        // unbounded, and this tree's census memo keeps each rule's record
-                        // instead. The five lexical graph censuses use the typed tree reader.
-                        if census.name == "guards" {
-                            let (mut outcomes, report) =
-                                aterm_census::run_censuses(root, &[census], baseline, Some(memo));
-                            return (census.name, outcomes.pop(), None, None, report);
-                        }
-                        let (outcome, inputs) = aterm_census::inputs::capture(root, || {
-                            aterm_census::run_census(root, census, baseline)
-                        });
-                        (census.name, Some(outcome), inputs, None, None)
-                    })
-                })
-                .collect();
-            jobs.into_iter()
-                .map(|job| job.join().expect("census panic is contained"))
+                .map(run_one)
                 .collect::<Vec<_>>()
-        })
+        } else {
+            std::thread::scope(|scope| {
+                let jobs: Vec<_> = aterm_census::CENSUSES
+                    .iter()
+                    .map(|census| scope.spawn(|| run_one(census)))
+                    .collect();
+                jobs.into_iter()
+                    .map(|job| job.join().expect("census panic is contained"))
+                    .collect::<Vec<_>>()
+            })
+        }
     });
     let outcomes = match result {
         Ok(outcomes) => outcomes,
         Err(why) => {
-            r.cannot_run(format!("{check} — {}", why.sentence()));
+            r.cannot_run(format!("{check} — {why}"));
             return;
         }
     };
@@ -2851,7 +3037,11 @@ pub fn spec_check_cmd(ctx: &Ctx) -> Cmd {
     if ctx.release {
         args.extend(["--".to_string(), "--full".to_string()]);
     }
-    main_targo(ctx, args)
+    let cmd = main_targo(ctx, args).remove_env(aterm_capacity::IMPLICIT_POOL_ENV);
+    match &ctx.pool {
+        Some(pool) => cmd.env(aterm_capacity::IMPLICIT_POOL_ENV, pool.handed()),
+        None => cmd,
+    }
 }
 
 /// Why a `spec-check` that decided nothing did not run: the machine's failure, else its own `could not run` line (a missing `ty` or `ay` names its install).
@@ -3046,7 +3236,7 @@ fn objc_drive(ctx: &Ctx, r: &mut Report, drive: &ObjcDrive) {
     }
     let out = run_row(ctx, &r.title, name, &Cmd::new(&bin));
     r.record_driven(&out, name, |code, transcript| {
-        objc_drive_outcome_with_transcript(drive, code, transcript)
+        objc_drive_outcome(drive, code, transcript)
     });
 }
 
@@ -3376,11 +3566,12 @@ fn forge_gate(ctx: &Ctx, r: &mut Report) {
     if !in_checkout(ctx, r, LABEL) {
         return;
     }
-    let (cargo, root) = (ctx.forge_cargo(), ctx.root.clone());
-    let checked = exec::bounded(ctx.child_ceiling, move || {
-        aterm_forge::check::run(&cargo, &root, &[])
-    })
-    .unwrap_or_else(|why| Err(format!("the walk {}", why.sentence())));
+    let (cargo, root) = (
+        ctx.forge_cargo().with_parallel_cells(ctx.pool.is_none()),
+        ctx.root.clone(),
+    );
+    let checked = bounded_source(ctx, move || aterm_forge::check::run(&cargo, &root, &[]))
+        .unwrap_or_else(|why| Err(format!("the walk {why}")));
     match checked {
         Ok(outcome) if outcome.ok => {
             r.raw(outcome.log);
@@ -5469,10 +5660,13 @@ mod tests {
         c.child_ceiling = Some(std::time::Duration::from_secs(60));
         let mut interner = crate::unitgraph::Interner::default();
         let mut graph = |cmd: Cmd| {
+            // This comparison varies feature scope; keep the main lane's incremental setting
+            // on both arms even when the test is run outside verify's own environment.
             let cmd = cmd
                 .args(UNIT_GRAPH)
                 .arg("--offline")
-                .env("CARGO_HOME", root.join("cargo-home"));
+                .env("CARGO_HOME", root.join("cargo-home"))
+                .env("CARGO_INCREMENTAL", "0");
             let out = exec::run(&cmd, c.exec_env());
             assert!(out.ok, "{:?}: {}", cmd.argv(), out.output);
             let text = out
@@ -6938,7 +7132,8 @@ mod tests {
     fn every_objc_drive_reads_its_exit_contract() {
         for drive in &OBJC_DRIVES {
             let name = drive.example;
-            let read = |code| objc_drive_outcome(drive, code);
+            let judged = format!("{name}: stub\n\n{OBJC_VERDICT_HEADER}\n{name}: OK\n");
+            let read = |code| objc_drive_outcome(drive, code, &judged);
             assert_eq!(read(Some(0)).0, Outcome::Ok, "{name}");
             assert_eq!(
                 read(Some(1)).0,
@@ -6950,7 +7145,7 @@ mod tests {
                 Outcome::Fail(Severity::CouldNotRun),
                 "{name}"
             );
-            let with_reason = objc_drive_outcome_with_transcript(
+            let with_reason = objc_drive_outcome(
                 drive,
                 Some(2),
                 &format!(
@@ -6986,6 +7181,53 @@ mod tests {
         }
         for code3 in [Code3::Hung, Code3::AbortFinding, Code3::None] {
             assert!(OBJC_DRIVES.iter().any(|d| d.code3 == code3), "{code3:?}");
+        }
+    }
+
+    /// NEGATIVE CONTROL (KI-1110-3): a driver's verdict, not its exit status, decides a pass.
+    /// `objc_live_class_audit` printed a FINDING and then exited `0` from a queued `terminate:`
+    /// before its verdict; each half of that transcript alone is red here, for every driver.
+    #[test]
+    fn an_objc_drive_is_judged_by_its_verdict_not_its_exit_status() {
+        for drive in &OBJC_DRIVES {
+            let name = drive.example;
+            let dash = name.replace('_', "-");
+            let gate = Outcome::Fail(Severity::GateFailed);
+            let ok_codes: Vec<i32> = std::iter::once(0)
+                .chain(matches!(drive.code3, Code3::WeakerPassOk(_)).then_some(3))
+                .collect();
+            for code in ok_codes {
+                let unjudged = "=== A. ROWS ===\n  -applicationShouldTerminate: = 0x0\n";
+                let (got, why) = objc_drive_outcome(drive, Some(code), unjudged);
+                assert_eq!(got, gate, "{name} exit {code} without a verdict: {why}");
+                assert!(why.contains(OBJC_VERDICT_HEADER), "{why}");
+                for finding in [
+                    "  FINDING: applicationShouldTerminate: answered 0x0".to_owned(),
+                    "    FAIL the window kept its title".to_owned(),
+                    format!("{dash}: FINDING — the helper panicked"),
+                    format!("{dash} terminate child: FAIL — LoopExiting arrived early"),
+                ] {
+                    let t = format!("{finding}\n{OBJC_VERDICT_HEADER}\n{dash}: OK\n");
+                    let (got, why) = objc_drive_outcome(drive, Some(code), &t);
+                    assert_eq!(got, gate, "{name} exit {code} after {finding:?}: {why}");
+                    assert!(why.contains(finding.trim()), "{why}");
+                }
+            }
+            // A finding outranks a could-not-run reading: it is proven either way.
+            let t = format!("  FINDING: x\n{dash}: NOT RUN — no display\n");
+            assert_eq!(
+                objc_drive_outcome(drive, Some(2), &t).0,
+                Outcome::Fail(Severity::GateFailed)
+            );
+            // Words that merely start alike are not findings.
+            for benign in ["  FAILOVER held", "  FINDINGS none", "  ok   no FAIL here"] {
+                let t = format!("{benign}\n{OBJC_VERDICT_HEADER}\n{dash}: OK\n");
+                assert_eq!(
+                    objc_drive_outcome(drive, Some(0), &t).0,
+                    Outcome::Ok,
+                    "{benign}"
+                );
+            }
         }
     }
 

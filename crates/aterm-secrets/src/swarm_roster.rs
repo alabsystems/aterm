@@ -23,10 +23,10 @@ pub const POLICY_ENTRY: &str = "aterm-swarm-policy";
 /// Reserved admin vault entry carrying the active steward lease (`holder`, `epoch`, `until`).
 pub const LEASE_ENTRY: &str = "aterm-swarm-lease";
 
-/// Extract a canonical `(N, "m<N>")` label ONLY when `name` starts with `m<N>` (`N >= 1`).
+/// Extract a canonical `(N, "m<N>")` label only when `name` starts with `m<N>` (`N >= 0`).
 ///
 /// Mid-string tokens are never accepted: `"Mac-mini-M4"` and `"macbook-m3"` return `None`,
-/// as do alphanumeric suffixes like `"m3pro"` or zero-numbered `"m0"`. Host suffixes such
+/// as do alphanumeric suffixes like `"m3pro"`. Host suffixes such
 /// as `"M22.local"`, `"m100-studio"`, or `"m4 (2)"` return `Some((N, "m<N>"))`.
 #[must_use]
 pub fn leading_m_label(name: &str) -> Option<(u32, String)> {
@@ -920,7 +920,8 @@ node_key = "historical-node-key"
     #[test]
     fn local_hostname_tags_are_leading_only() {
         assert_eq!(leading_m_label("M22.local"), Some((22, "m22".into())));
-        for word in ["Mac-mini-M4", "macbook-m3", "m0", "m3pro"] {
+        assert_eq!(leading_m_label("m0"), Some((0, "m0".into())));
+        for word in ["Mac-mini-M4", "macbook-m3", "m3pro"] {
             assert_eq!(leading_m_label(word), None);
         }
     }

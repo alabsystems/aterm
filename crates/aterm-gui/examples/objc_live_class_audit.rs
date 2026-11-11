@@ -552,6 +552,17 @@ mod macos {
         host_unchecked: Vec<String>,
         /// Rows checked against this fork's own declaration rather than the runtime.
         fork_declared: Vec<String>,
+        /// The application delegate's live send, made once the pump has returned.
+        terminate_send: Option<TerminateSend>,
+    }
+
+    /// What [`Audit::app_delegate_terminate_send`] sends to, read inside the handler.
+    #[derive(Clone, Copy)]
+    struct TerminateSend {
+        app_delegate: Id,
+        app: Id,
+        /// Whether `applicationShouldTerminate:` is in the delegate's registered table.
+        registered: bool,
     }
 
     impl Audit {
@@ -957,15 +968,20 @@ mod macos {
             }
         }
 
-        fn app_delegate_live_sends(
-            &mut self,
-            app_delegate: Id,
-            app: Id,
-            registered: &BTreeMap<String, String>,
-        ) {
-            println!("\n=== C. LIVE SENDS THROUGH THE REGISTERED IMPS ===");
+        /// Sends `applicationShouldTerminate:` from outside every handler, after the pump returned,
+        /// with no exit requested.
+        ///
+        /// Inside a handler (the audit's `about_to_wait`) the fork answers NSTerminateCancel and
+        /// queues a retried `terminate:` for when the handler FIFO is idle (42474d3281a), and that
+        /// retry exits the process. objc_window_drive's 15d holds that path in a child process.
+        /// Once the loop's exit is requested the fork answers NSTerminateCancel too (abdfb7007f1),
+        /// so the driver ends its pump loop without one. This send reads the IMP's eight-byte
+        /// reply where the answer is NSTerminateNow, and the run loop never turns again before
+        /// the verdict, so nothing queued can end the process first.
+        fn app_delegate_terminate_send(&mut self, app_delegate: Id, app: Id, registered: bool) {
+            println!("\n=== C. LIVE SEND OUTSIDE EVERY HANDLER (WinitApplicationDelegate) ===");
             let want = "applicationShouldTerminate:";
-            if !registered.contains_key(want) {
+            if !registered {
                 self.fail(format!(
                     "{want} is not in the registered table, so the live send that would exercise \
                      its return shape cannot be made"
@@ -982,10 +998,11 @@ mod macos {
             println!("  -applicationShouldTerminate: = {reply:#018x}");
             if reply != NS_TERMINATE_NOW {
                 self.fail(format!(
-                    "applicationShouldTerminate: answered {reply:#018x}; with no quit-confirm hook \
-                     registered the fork returns NSTerminateNow ({NS_TERMINATE_NOW:#018x}), so \
-                     either the veto path is wired wrong or the IMP is not returning the \
-                     eight-byte NSApplicationTerminateReply its registered Q@:@ promises"
+                    "applicationShouldTerminate: answered {reply:#018x} from outside every handler; \
+                     with no quit-confirm hook registered, no handler running and no exit \
+                     requested the fork returns NSTerminateNow ({NS_TERMINATE_NOW:#018x}), so either the veto or deferral \
+                     path is wired wrong or the IMP is not returning the eight-byte \
+                     NSApplicationTerminateReply its registered Q@:@ promises"
                 ));
             }
         }
@@ -1786,7 +1803,11 @@ mod macos {
                 self.unchecked_rows(&VIEW, view, &registered);
             }
             if let Some(registered) = self.table_and_conformance(&APP_DELEGATE, app_delegate) {
-                self.app_delegate_live_sends(app_delegate, app, &registered);
+                self.terminate_send = Some(TerminateSend {
+                    app_delegate,
+                    app,
+                    registered: registered.contains_key("applicationShouldTerminate:"),
+                });
             }
             self.table_and_conformance(&WINDOW, window);
             if self.table_and_conformance(&APP, app).is_some() {
@@ -1928,7 +1949,9 @@ mod macos {
             }
             self.audit
                 .run_against(delegate, ns_window, view, app, app_delegate);
-            el.exit();
+            // No `el.exit()`: `done` ends the pump loop when this pump returns, and a requested
+            // exit would make the delegate answer the terminate send NSTerminateCancel
+            // (abdfb7007f1: a native terminate loses to an exit already under way).
         }
     }
 
@@ -1960,6 +1983,13 @@ mod macos {
                 eprintln!("objc-live-class-audit: NOT RUN — no window arrived within {BUDGET:?}");
                 return NOT_RUN;
             }
+        }
+        if driver.audit.blocked.is_none()
+            && let Some(send) = driver.audit.terminate_send.take()
+        {
+            driver
+                .audit
+                .app_delegate_terminate_send(send.app_delegate, send.app, send.registered);
         }
         drop(driver.window.take());
 

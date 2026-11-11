@@ -440,7 +440,7 @@ fn a_new_machine_is_m0_and_a_drawn_noun_and_every_later_reader_keeps_it() {
     assert_eq!(name.rev, 0, "the first local revision");
     assert_ne!(name.nick.as_str(), "otter", "a noun in view is not drawn");
     assert!(nouns::NOUNS.contains(&name.nick.as_str()));
-    assert!(name.title().starts_with("m0 "), "{}", name.title());
+    assert!(name.title().starts_with("unnumbered "), "{}", name.title());
     assert_eq!(
         ensure(root.path(), unread, never, NOW).expect("ensures"),
         (name, Origin::Kept),
@@ -629,6 +629,210 @@ fn an_unread_book_never_counts_as_a_free_number() {
         .is_err()
     );
     assert_eq!(file::read(root.path()).expect("reads"), Some(before));
+    assert!(
+        set_nick(
+            root.path(),
+            &NickTo::Word(Nickname::parse("Heron").unwrap()),
+            ByKind::Person,
+            unread,
+            NOW,
+            false
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_signed_name_arriving_after_preview_refuses_both_fields_at_write() {
+    let root = state();
+    let (before, _) = ensure(root.path(), label("m7"), never, NOW).unwrap();
+    let nick = Nickname::parse("Blue Heron").unwrap();
+    let preview = rename_preview(root.path(), no_labels, unread, NOW).unwrap();
+    assert!(!preview.shared(&nick));
+    let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).unwrap();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                aterm_net::fleet_member::write_held(
+                    root.path(),
+                    aterm_net::fleet_member::Began::Here,
+                    |_| {
+                        write_private(
+                            root.path(),
+                            PEERS_FILE,
+                            entry(&other, &record(&other, Some(86), 3, Some("BLUE HERON")))
+                                .as_bytes(),
+                        )
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            })
+            .join()
+            .unwrap();
+    });
+    let to = NameTo {
+        num: num(8),
+        nick: Some(nick),
+    };
+    for dry_run in [true, false] {
+        assert!(
+            set_name(
+                root.path(),
+                &to,
+                no_labels,
+                ByKind::Person,
+                unread,
+                NOW,
+                dry_run
+            )
+            .is_err()
+        );
+        assert_eq!(file::read(root.path()).unwrap(), Some(before.clone()));
+    }
+}
+
+#[test]
+fn concurrent_combined_edits_leave_one_complete_choice() {
+    let root = state();
+    ensure(root.path(), label("m7"), never, NOW).unwrap();
+    node_identity(root.path()).unwrap();
+    let choices = [
+        NameTo {
+            num: num(8),
+            nick: Some(Nickname::parse("Heron").unwrap()),
+        },
+        NameTo {
+            num: num(9),
+            nick: Some(Nickname::parse("Otter").unwrap()),
+        },
+    ];
+    let start = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = choices
+            .iter()
+            .map(|to| {
+                scope.spawn(|| {
+                    start.wait();
+                    set_name(
+                        root.path(),
+                        to,
+                        no_labels,
+                        ByKind::Person,
+                        unread,
+                        NOW,
+                        false,
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    });
+    let after = file::read(root.path()).unwrap().unwrap();
+    assert!(
+        choices
+            .iter()
+            .any(|to| after.num == Some(to.num) && Some(&after.nick) == to.nick.as_ref())
+    );
+    assert_eq!(after.rev, 2);
+}
+
+#[test]
+fn name_uniqueness_uses_the_newest_verified_record_in_both_books() {
+    let root = state();
+    node_identity(root.path()).unwrap();
+    ensure(root.path(), label("m7"), never, NOW).unwrap();
+    let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).unwrap();
+    write_private(
+        root.path(),
+        ISSUER_BOOK_FILE,
+        entry(&other, &record(&other, Some(86), 3, Some("Blue Heron"))).as_bytes(),
+    )
+    .unwrap();
+    write_private(
+        root.path(),
+        PEERS_FILE,
+        entry(&other, &record(&other, Some(86), 4, Some("Otter"))).as_bytes(),
+    )
+    .unwrap();
+    let preview = rename_preview(root.path(), no_labels, unread, NOW).unwrap();
+    assert!(!preview.shared(&Nickname::parse("Blue Heron").unwrap()));
+    assert!(preview.shared(&Nickname::parse("OTTER").unwrap()));
+    set_nick(
+        root.path(),
+        &NickTo::Word(Nickname::parse("Blue Heron").unwrap()),
+        ByKind::Person,
+        unread,
+        NOW,
+        false,
+    )
+    .unwrap();
+    assert!(
+        set_nick(
+            root.path(),
+            &NickTo::Word(Nickname::parse("otter").unwrap()),
+            ByKind::Person,
+            unread,
+            NOW,
+            false
+        )
+        .is_err()
+    );
+
+    let signed = entry(&other, &record(&other, Some(86), 5, Some("Puffin")));
+    let tampered = signed.replace("m9.local", "m10.local");
+    assert_ne!(tampered, signed);
+    write_private(root.path(), PEERS_FILE, tampered.as_bytes()).unwrap();
+    let preview = rename_preview(root.path(), no_labels, unread, NOW).unwrap();
+    assert!(!preview.shared(&Nickname::parse("Puffin").unwrap()));
+    set_nick(
+        root.path(),
+        &NickTo::Word(Nickname::parse("Puffin").unwrap()),
+        ByKind::Person,
+        unread,
+        NOW,
+        false,
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_exhausted_default_name_pool_leaves_first_creation_unwritten() {
+    let root = state();
+    let why = ensure(root.path(), || Ok(None), |_| true, NOW).unwrap_err();
+    assert_eq!(why.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(file::read(root.path()).unwrap(), None);
+}
+
+#[test]
+fn an_exhausted_random_name_pool_cannot_save_a_duplicate() {
+    let root = state();
+    node_identity(root.path()).unwrap();
+    let (before, _) = ensure(root.path(), label("m7"), never, NOW).unwrap();
+    let mut books = [String::new(), String::new()];
+    for (index, noun) in nouns::NOUNS.iter().enumerate() {
+        let number = u32::try_from(index + 1).unwrap();
+        let other = NodeIdentity::from_seed(&format!("{number:032x}"), &[0x22; 32]).unwrap();
+        books[index % books.len()]
+            .push_str(&entry(&other, &record(&other, Some(number), 1, Some(noun))));
+    }
+    for (file, book) in [PEERS_FILE, ISSUER_BOOK_FILE].into_iter().zip(books) {
+        write_private(root.path(), file, book.as_bytes()).unwrap();
+    }
+    let why = set_nick(
+        root.path(),
+        &NickTo::Random,
+        ByKind::Person,
+        unread,
+        NOW,
+        false,
+    )
+    .unwrap_err();
+    assert!(why.to_string().contains("already used"), "{why}");
+    assert_eq!(file::read(root.path()).unwrap(), Some(before));
 }
 
 #[test]
@@ -686,7 +890,7 @@ fn a_newer_wrapper_cannot_roll_back_or_strip_a_verified_number() {
     let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("another identity");
     let mut latest = record(&other, Some(86), 3, Some("Otter"));
     latest.eseq = 20;
-    let mut stale = record(&other, Some(40), 2, Some("Otter"));
+    let mut stale = record(&other, Some(40), 2, Some("Puffin"));
     stale.eseq = 10;
     write_private(root.path(), PEERS_FILE, entry(&other, &latest).as_bytes())
         .expect("the latest record");
@@ -706,6 +910,24 @@ fn a_newer_wrapper_cannot_roll_back_or_strip_a_verified_number() {
             (peer.line() + "\n").as_bytes(),
         )
         .expect("a newer wrapper with a stale or stripped record");
+        let preview = rename_preview(root.path(), no_labels, unread, NOW).unwrap();
+        assert!(preview.shared(&Nickname::parse("OTTER").unwrap()));
+        assert!(!preview.shared(&Nickname::parse("Puffin").unwrap()));
+        assert!(
+            set_name(
+                root.path(),
+                &NameTo {
+                    num: num(8),
+                    nick: Some(Nickname::parse("otter").unwrap())
+                },
+                no_labels,
+                ByKind::Person,
+                unread,
+                NOW,
+                false,
+            )
+            .is_err()
+        );
         assert!(
             set_name(
                 root.path(),
@@ -753,7 +975,9 @@ fn choosing_the_held_seeded_number_never_weakens_its_claim_against_a_rival() {
     assert!(same.changed);
     assert_eq!(same.name.class, Class::Chosen);
     let node = node_of(node_identity(root.path()).expect("our identity").node()).expect("a node");
-    let mut view = rename_view(root.path(), NOW).expect("reads the signed rival");
+    let mut view = rename_books(root.path(), NOW)
+        .expect("reads the signed rival")
+        .view;
     view.insert(node, Entry::Record(current_record(&same.name)));
     assert_eq!(
         settle(&view).standings.get(&node),
@@ -811,7 +1035,7 @@ fn an_upgraded_machine_keeps_its_older_name_pending_migration() {
     assert_eq!(origin, Origin::Evidence);
     assert_eq!(
         name.title(),
-        "m12 Studio",
+        "m12 studio",
         "the roster's NAME, the fleet name's word"
     );
     assert_eq!(name.nick_class, NickClass::Chosen);
@@ -957,6 +1181,12 @@ fn a_nickname_in_view_is_one_in_any_case() {
     let taken = [Nickname::parse("Heron").expect("a nickname")];
     assert!(in_view(&taken, "heron") && in_view(&taken, "HERON"));
     assert!(!in_view(&taken, "otter"), "control");
+    let taken = [
+        Nickname::parse("Blue Heron").unwrap(),
+        Nickname::parse("Élan").unwrap(),
+    ];
+    assert!(in_view(&taken, " BLUE\t heron "));
+    assert!(in_view(&taken, "ÉLAN"));
 }
 
 #[test]

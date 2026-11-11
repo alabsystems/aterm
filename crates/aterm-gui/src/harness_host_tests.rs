@@ -4446,7 +4446,6 @@ fn every_supervisor_key_reaches_the_engine_and_only_those_restart_it() {
         ("continue_text", "go"),
         ("rules_file", "/r"),
         ("retry_api_errors", "false"),
-        ("model_fallback", ""),
         ("compact_on_context_wall", "false"),
         ("question_priority", "long-term"),
         ("approve", "safe"),
@@ -4464,7 +4463,6 @@ fn every_supervisor_key_reaches_the_engine_and_only_those_restart_it() {
         opts.policy.rules_file.as_deref(),
         Some(std::path::Path::new("/r"))
     );
-    assert_eq!(opts.policy.model_fallback, None);
     assert!(!opts.policy.compact_on_context_wall);
     assert_eq!(
         opts.policy.question_priority,
@@ -9402,8 +9400,8 @@ fn the_limits_named_reset_is_read_from_the_kept_conversation() {
     kept(&codex);
     assert_eq!(codex.limit_until(), None, "a Codex names none");
     assert_eq!(asked.lock().unwrap().len(), 1, "and is not asked");
-    // An agy quota wall arms the relaunch park where an upgrade is due ([`Acts::due`]); with none
-    // due it arms none.
+    // An agy names its reset without a conversation, and reading it arms no relaunch park,
+    // whatever an upgrade read ([`Acts::due`]) answers.
     let agy_under = |hooks: Hooks| {
         let agy = idle_host("s-reset", Program::Agy, switched(&on()), hooks);
         agy.kept.lock().unwrap().snapshot = Some(Snapshot {
@@ -9417,8 +9415,8 @@ fn the_limits_named_reset_is_read_from_the_kept_conversation() {
     not_due.acts.due = Arc::new(|_| Due::No);
     assert!(!agy_under(not_due), "no upgrade due arms no relaunch park");
     assert!(
-        agy_under(hooks.clone()),
-        "an agy quota wall with a rotation due arms the relaunch park"
+        !agy_under(hooks.clone()),
+        "an upgrade due arms no relaunch park at an agy quota wall either"
     );
     assert_eq!(*asked.lock().unwrap(), ["c0ffee", "", ""]);
 
@@ -30191,8 +30189,6 @@ fn unasked_term(end: EndBy, local_id: u64) -> UnaskedTerm {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -36572,12 +36568,28 @@ fn the_startup_deadline_marks_no_off_worker() {
         "an Off worker is neither marked nor badged"
     );
     let cruise = word(Autopilot::Cruise);
+    // No Off look occurs in this gap; other sessions keep the host active.
+    let resumed = late + DISK_TICK;
+    let due = resumed + STARTUP_DEADLINE;
     assert_eq!(
-        look_at_startups(&mut books, late, true, &cruise, &hooks),
-        Some(late + STARTUP_DEADLINE)
+        look_at_startups(&mut books, resumed, true, &cruise, &hooks),
+        Some(due)
     );
     assert!(w.marks().is_empty(), "not on the clock it had before Off");
-    look_at_startups(&mut books, late + STARTUP_DEADLINE, true, &cruise, &hooks);
+    for now in [
+        resumed + STARTUP_DEADLINE / 2,
+        due - Duration::from_nanos(1),
+    ] {
+        assert_eq!(
+            look_at_startups(&mut books, now, true, &cruise, &hooks),
+            Some(due)
+        );
+        assert!(
+            w.marks().is_empty(),
+            "an active look neither spends the Off sampling gap nor restarts the clock"
+        );
+    }
+    look_at_startups(&mut books, due, true, &cruise, &hooks);
     assert_eq!(
         w.marks(),
         [stalled(
@@ -36590,10 +36602,10 @@ fn the_startup_deadline_marks_no_off_worker() {
     w.set(vec![startup(
         "s-a",
         StartupState::StalledAtStartup,
-        late + STARTUP_DEADLINE,
+        due,
         StartupSeen::Started,
     )]);
-    let again = late + 2 * STARTUP_DEADLINE;
+    let again = due + STARTUP_DEADLINE;
     look_at_startups(&mut books, again, true, &off, &hooks);
     assert!(w.marks().is_empty(), "no `working` mark while Off");
     look_at_startups(&mut books, again, true, &cruise, &hooks);
@@ -38621,12 +38633,13 @@ fn the_held_deadline_judges_started_workers_and_no_off_one() {
         w.marks().is_empty(),
         "an Off worker is neither marked nor badged"
     );
+    let resumed = late + DISK_TICK;
     assert_eq!(
-        look_at_startups(&mut books, late, true, &none, &hooks),
-        Some(late + short),
+        look_at_startups(&mut books, resumed, true, &none, &hooks),
+        Some(resumed + short),
         "back from Off: not on the clock it had before"
     );
-    look_at_startups(&mut books, late + short, true, &none, &hooks);
+    look_at_startups(&mut books, resumed + short, true, &none, &hooks);
     assert_eq!(
         w.marks(),
         [("s-c".to_string(), Marked::Held("unknown".to_string()))]
@@ -38636,7 +38649,7 @@ fn the_held_deadline_judges_started_workers_and_no_off_one() {
         StartupState::StalledHeld,
         held_at("busy", still),
     )]);
-    look_at_startups(&mut books, late + short, true, &off, &hooks);
+    look_at_startups(&mut books, resumed + short, true, &off, &hooks);
     assert!(w.marks().is_empty(), "no `working` mark while Off");
     let mut books = Startups::held_after(short);
     w.set(vec![held_worker(
@@ -40401,8 +40414,7 @@ fn a_managed_worker_at_a_point_its_loop_is_spent_at_wakes_await_task() {
     use aterm_agent::supervise::policy::outlook::ExceptionKind;
     let bucket = Exception {
         kind: ExceptionKind::Bucket,
-        why: "The model has no reset time, and this tab has no other model to fall back on."
-            .to_string(),
+        why: "The model has no reset time, so this limit does not end by itself.".to_string(),
         action: "Run /model in this tab and pick another model.".to_string(),
         clears: "the agent working",
         ..Exception::refused(None, "")
@@ -46897,10 +46909,9 @@ fn agents_auto_prime_off_leaves_the_claude_settings_byte_identical() {
 #[test]
 fn an_agents_launch_is_the_command_start_its_process_began_at_or_after() {
     const START: &str = "Thu Sep 24 01:02:03 2026";
-    let began = i64::try_from(
-        aterm_agent::harness::upgrade_models::parse_lstart(START).expect("the start"),
-    )
-    .expect("unix seconds");
+    let began =
+        i64::try_from(aterm_agent::harness::unix_time::parse_lstart(START).expect("the start"))
+            .expect("unix seconds");
     let ms = began * 1000;
     let launch = |mark: Option<i64>, kept: bool| {
         let world = Arc::new(World::default());
@@ -48040,7 +48051,7 @@ fn a_work_read_goes_by_the_snapshot_followed_first() {
 }
 
 #[test]
-fn agy_limit_until_reads_quota_without_a_session_and_parks_only_when_rotation_is_due() {
+fn agy_limit_until_reads_quota_without_a_session() {
     let world = Arc::new(World::default());
     let mut h = hooks(&world, parking_body(&world));
     let due = Arc::new(Mutex::new(Due::No));
@@ -48064,14 +48075,14 @@ fn agy_limit_until_reads_quota_without_a_session_and_parks_only_when_rotation_is
     );
     assert!(
         !idle.park.load(Ordering::SeqCst),
-        "when no rotation/upgrade is due (Pick::Keep / Pick::Wait), park stays false"
+        "reading the reset parks nothing"
     );
 
     *due.lock().unwrap() = Due::Yes;
     assert_eq!(idle.limit_until(), Some(1_900_004_200));
     assert!(
-        idle.park.load(Ordering::SeqCst),
-        "when rotation is due (Pick::Rotate), park is set so host_steps_here rotates immediately"
+        !idle.park.load(Ordering::SeqCst),
+        "CONTROL: with an upgrade read that answers due, reading the reset still parks nothing"
     );
 }
 

@@ -733,6 +733,17 @@ fn launched_successor_command(
         .args(running_successor_args(None))
         .env("ATERM_UPDATED_FROM", build.to_string())
         .env(aterm_update::RELAUNCH_OF_RUNNING_ENV, "1");
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    {
+        // LaunchServices merges its own environment, not this process's. Keep
+        // the private lab's same-image and launch-hold probes across that lane.
+        if let Some(value) = aterm_types::dev_seam!("ATERM_DEBUG_SEAMLESS_REEXEC") {
+            command.env("ATERM_DEBUG_SEAMLESS_REEXEC", value);
+        }
+        if let Some(value) = aterm_types::dev_seam!("ATERM_DEBUG_LOOP_BUILD_HOLD") {
+            command.env("ATERM_DEBUG_LOOP_BUILD_HOLD", value);
+        }
+    }
     #[cfg(target_os = "macos")]
     if renewal {
         command.env(
@@ -2015,7 +2026,7 @@ fn send_post_failure_reconcile_facts(
     }) {
         let _ = proxy.send_event(Wake::NativeUpdateReconcileFinished {
             purpose: crate::app_native::NativeUpdateReconcilePurpose::Startup,
-            facts,
+            facts: Ok(facts),
         });
     }
 }
@@ -3876,7 +3887,17 @@ fn launch_environment(
 }
 
 #[cfg(target_os = "macos")]
-const CONTROL_DIR_KEYS: [&str; 2] = ["XDG_RUNTIME_DIR", "HOME"];
+const LAUNCH_ROOT_KEYS: [&str; 9] = [
+    "XDG_RUNTIME_DIR",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "ATERM_STATE_HOME",
+    "TMPDIR",
+    "SHELL",
+];
 
 #[cfg(target_os = "macos")]
 fn launch_environment_over(
@@ -3891,7 +3912,7 @@ fn launch_environment_over(
             None => (),
         }
     }
-    for key in CONTROL_DIR_KEYS {
+    for key in LAUNCH_ROOT_KEYS {
         if pairs.iter().any(|(set, _)| set == key) {
             continue;
         }
@@ -3936,9 +3957,9 @@ fn run_handoff_decision(
                 "update apply: the successor ended or closed the readiness channel without proving \
                  adoption. A REFUSAL, a CRASH and a STARVED child look identical here — read \
                  this log just above for the successor's own `seamless handoff refused:` / \
-                 `overlap handoff:` line, which names the reason (most often: it never became \
-                 the authorized build because its boot apply could not swap), and just below \
-                 for the death this process could witness (`observed …`)."
+                 `overlap handoff:` lines for any recorded refusal or startup progress, and \
+                 just below for the death this process could witness (`observed …`). The \
+                 readiness channel alone does not identify the cause."
             );
         }
         let rejected = worker_reject_and_reap_handoff_child(
@@ -7228,7 +7249,7 @@ impl App {
         }
         let _ledger_write = keep_landed_park(park_at.elapsed());
         let activity_epoch = self.update_handoff_activity_epoch;
-        let proof_deadline = handoff_proof_deadline(mode, prior_physical_failures, park_at);
+        let proof_deadline = handoff_proof_deadline(park_at);
         self.pending_update_handoff = Some(crate::PendingUpdateHandoff {
             attempt_id,
             park_at,
@@ -10288,14 +10309,12 @@ const _: () = assert!(
     crate::native_update_auto_intent::LANDS_WITHIN.as_secs() + 10 < PRELAUNCH_HOLD_MAX.as_secs()
 );
 
+#[cfg(unix)]
+const HANDOFF_HANG_DETECTOR_MS: u64 = 60_000;
+
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
-fn handoff_proof_deadline(
-    mode: crate::native_updater_service::ApplyMode,
-    prior_physical_failures: u8,
-    park_at: std::time::Instant,
-) -> std::time::Instant {
-    use crate::native_updater_service::ApplyMode;
+fn handoff_proof_deadline(park_at: std::time::Instant) -> std::time::Instant {
     let ms = aterm_types::dev_seam!("ATERM_HANDOFF_PROOF_TIMEOUT_MS")
         .and_then(|value| {
             let s = value.to_str()?;
@@ -10303,13 +10322,10 @@ fn handoff_proof_deadline(
                 .then(|| s.parse::<u64>().ok())
                 .flatten()
         })
-        .unwrap_or(match mode {
-            ApplyMode::Immediate => 30_000,
-            ApplyMode::Automatic | ApplyMode::AutomaticPastGrace => match prior_physical_failures {
-                0 => 3_000,
-                _ => 6_000,
-            },
-        })
+        // Adoption has one hang detector for every request. A short UI latency
+        // budget must not abort a healthy successor or spend the retry budget.
+        // Native launch work finishes before the parent parks its readers.
+        .unwrap_or(HANDOFF_HANG_DETECTOR_MS)
         .clamp(1_000, 120_000);
     park_at + std::time::Duration::from_millis(ms)
 }
@@ -10324,7 +10340,7 @@ fn handoff_ready_deadline() -> std::time::Instant {
                 .then(|| s.parse::<u64>().ok())
                 .flatten()
         })
-        .unwrap_or(30_000)
+        .unwrap_or(HANDOFF_HANG_DETECTOR_MS)
         .clamp(1_000, 120_000);
     std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms)
 }

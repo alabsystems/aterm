@@ -330,7 +330,7 @@ const AFRESH_SPAN_S: u64 = relaunch::STOPPED_OWN_S;
 /// the same shell, the agent another than the one it ended and born after that one was seen gone
 /// and by the landing, within [`AFRESH_SPAN_S`] of it.
 fn started_afresh(st: &St, click: &Click, snap: &Snapshot) -> bool {
-    let born = super::upgrade_models::parse_lstart(&snap.start);
+    let born = super::unix_time::parse_lstart(&snap.start);
     matches!(st.phase, upgrade::Phase::Done)
         && relaunch::starts_afresh(&st.cause)
         && st.tab == click.tab

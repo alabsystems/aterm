@@ -21,6 +21,7 @@ pub mod rustc_movers;
 pub mod rustup;
 pub mod stall;
 pub mod stat_digest;
+mod stock_pin;
 #[cfg(test)]
 mod test_script;
 pub mod trust_lock;

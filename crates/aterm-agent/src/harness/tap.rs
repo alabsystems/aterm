@@ -1057,12 +1057,12 @@ pub struct Armed {
     pub listed: Vec<String>,
 }
 
-/// Model evidence and tap identities derived from one recovered account roster.
-/// An unavailable roster or clock excludes account file evidence and all taps.
+/// The roster's cardinality and tap identities derived from one recovered account roster.
+/// An unavailable roster or clock arms no tap and reads as several logins.
 /// This is a read snapshot, not a lease on later changes to the account pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPolicy {
-    /// Exclude model and billing file evidence, also when the pool is unknown.
+    /// Whether the roster lists two or more accounts; also true when the pool is unknown.
     pub several_logins: bool,
     /// The tap and account directories admitted by that same roster.
     pub usage_tap: Option<Armed>,

@@ -826,6 +826,7 @@ mod macos {
             ),
         );
 
+        println!("\n=== VERDICT ===");
         if v.findings == 0 {
             println!(
                 "objc-frame-clock-drive: PASS — the real link ran the deck's clock at the \

@@ -155,6 +155,41 @@ fn service_details(
     })
 }
 
+/// The same details from a typed tap record, when no API
+/// object answered: placeholders substitute identically.
+fn typed_service_details(
+    info: &super::formula::ServiceInfo,
+    prefix: &Prefix,
+    home: &Path,
+) -> Option<ServiceDetails> {
+    if info.run.is_empty() || info.run.iter().all(|a| a.is_empty()) {
+        return None;
+    }
+    let cellar = prefix.cellar();
+    let subst = |t: &str| substitute(t, &prefix.root, &cellar, home);
+    let mut parts: Vec<String> = info
+        .environment_variables
+        .iter()
+        .filter(|(k, _)| k != "PATH")
+        .map(|(k, v)| format!("{k}=\"{}\"", subst(v)))
+        .collect();
+    parts.extend(info.run.iter().map(|a| sh_quote(&subst(a))));
+    let field = |v: &Option<String>| {
+        v.as_deref()
+            .map(|t| substitute(t, &prefix.root, &cellar, home))
+            .filter(|s| !s.is_empty())
+    };
+    Some(ServiceDetails {
+        command: parts.join(" "),
+        working_dir: field(&info.working_dir),
+        root_dir: field(&info.root_dir),
+        log_path: field(&info.log_path),
+        error_log_path: field(&info.error_log_path),
+        interval: info.interval,
+        cron: info.cron.clone().filter(|c| !c.trim().is_empty()),
+    })
+}
+
 /// The loaded path from `launchctl print` output
 /// (`launchctl list` output carries none).
 pub fn loaded_file_of(output: &str, print: bool) -> Option<String> {
@@ -171,8 +206,17 @@ pub fn loaded_file_of(output: &str, print: bool) -> Option<String> {
 
 /// The plist names brew probes for a formula: an explicit
 /// service `name macos:` stands alone; otherwise the canonical
-/// `sh.brew.<name>` plus the legacy `homebrew.mxcl.<name>`.
-pub fn plist_names(name: &str, raw_service: Option<&Value>) -> Vec<String> {
+/// `sh.brew.<name>` plus the legacy `homebrew.mxcl.<name>`. A
+/// typed override (from a tap record) wins over the raw API
+/// object's.
+pub fn plist_names(
+    name: &str,
+    raw_service: Option<&Value>,
+    override_name: Option<&str>,
+) -> Vec<String> {
+    if let Some(explicit) = override_name.filter(|n| !n.is_empty()) {
+        return vec![explicit.to_string()];
+    }
     if let Some(explicit) = raw_service.and_then(|s| s.get("name")) {
         let macos = match explicit {
             Value::String(one) => Some(one.clone()),
@@ -325,6 +369,7 @@ fn service_row(
     name: &str,
     keg_base: &Path,
     raw_service: Option<&Value>,
+    typed: Option<&super::formula::ServiceInfo>,
     domains: &[String],
     user_path: &Path,
     boot_path: &Path,
@@ -333,7 +378,7 @@ fn service_row(
     root: bool,
 ) -> ServiceRow {
     let name = name.to_string();
-    let names = plist_names(&name, raw_service);
+    let names = plist_names(&name, raw_service, typed.and_then(|i| i.name.as_deref()));
     let keg_base = keg_base.to_path_buf();
     let keg_files: Vec<PathBuf> = names
         .iter()
@@ -445,7 +490,8 @@ fn service_row(
         pid,
         registered: present,
         loaded_file: loaded_file_of(&output, print),
-        details: service_details(&name, raw_service, prefix, home),
+        details: service_details(&name, raw_service, prefix, home)
+            .or_else(|| typed.and_then(|i| typed_service_details(i, prefix, home))),
         name,
         status,
         user,
@@ -586,12 +632,14 @@ impl Ctx {
         name: &str,
         keg_base: &Path,
         raw_service: Option<&Value>,
+        typed: Option<&super::formula::ServiceInfo>,
     ) -> ServiceRow {
         service_row(
             prefix,
             name,
             keg_base,
             raw_service,
+            typed,
             &self.domains,
             &self.user_path,
             &self.boot_path,
@@ -801,24 +849,45 @@ pub fn cmd_services(prefix: &Prefix, rest: &[String]) -> ExitCode {
         root,
     };
     let api = Api::new(prefix.clone());
-    let service_installed: Vec<(String, Option<Value>)> = prefix
+    let service_installed: Vec<(
+        String,
+        Option<Value>,
+        Option<Box<super::formula::ServiceInfo>>,
+    )> = prefix
         .installed(Kind::Formula)
         .iter()
         .filter_map(|installed| {
             let raw = raw_service_of(&api, &installed.name);
-            let record_service = api
+            let resolved = api
                 .formula(&installed.name)
                 .ok()
-                .or_else(|| tap::lookup(prefix, &installed.name))
-                .is_some_and(|f| f.service.is_some());
-            (record_service || raw.is_some()).then(|| (installed.name.clone(), raw))
+                .or_else(|| tap::lookup(prefix, &installed.name));
+            // Brew's list silently skips untrusted
+            // tap service formulae.
+            if resolved
+                .as_ref()
+                .is_some_and(|f| super::commands::formula_load_would_refuse(prefix, f))
+            {
+                return None;
+            }
+            let record_service = resolved.as_ref().is_some_and(|f| f.service.is_some());
+            let typed = resolved.and_then(|f| f.service);
+            (record_service || raw.is_some()).then(|| (installed.name.clone(), raw, typed))
         })
         .collect();
 
     if sub == "list" {
         let mut rows: Vec<ServiceRow> = service_installed
             .iter()
-            .map(|(name, raw)| ctx.row(prefix, name, &keg_base_for(prefix, name), raw.as_ref()))
+            .map(|(name, raw, typed)| {
+                ctx.row(
+                    prefix,
+                    name,
+                    &keg_base_for(prefix, name),
+                    raw.as_ref(),
+                    typed.as_deref(),
+                )
+            })
             .collect();
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         if rows.is_empty() {
@@ -839,27 +908,45 @@ pub fn cmd_services(prefix: &Prefix, rest: &[String]) -> ExitCode {
 
     // info: targets are --all (every available service) or the
     // named formulae, installed or not.
-    let targets: Vec<(String, Option<Value>)> = if all {
+    let targets: Vec<(
+        String,
+        Option<Value>,
+        Option<Box<super::formula::ServiceInfo>>,
+    )> = if all {
         let mut all_targets = service_installed;
         all_targets.sort_by(|a, b| a.0.cmp(&b.0));
         all_targets
     } else {
         let mut targets = Vec::new();
         for name in &named {
-            let known = api.formula(name).is_ok() || tap::lookup(prefix, name).is_some();
-            if !known {
+            // Brew resolves the formula first: the row, its
+            // plist label and its keg path all key off the
+            // resolved leaf name, qualified input included.
+            let Some(f) = api.formula(name).ok().or_else(|| tap::lookup(prefix, name)) else {
                 return super::failed(&format!(
                     "Error: {}",
                     super::commands::formula_unavailable(&api, name)
                 ));
+            };
+            if let Some(code) = super::commands::formula_load_refusal(prefix, &f) {
+                return code;
             }
-            targets.push((name.clone(), raw_service_of(&api, name)));
+            let raw = raw_service_of(&api, &f.name);
+            targets.push((f.name.clone(), raw, f.service));
         }
         targets
     };
     let rows: Vec<ServiceRow> = targets
         .iter()
-        .map(|(name, raw)| ctx.row(prefix, name, &keg_base_for(prefix, name), raw.as_ref()))
+        .map(|(name, raw, typed)| {
+            ctx.row(
+                prefix,
+                name,
+                &keg_base_for(prefix, name),
+                raw.as_ref(),
+                typed.as_deref(),
+            )
+        })
         .collect();
     if json {
         println!("{}", to_info_json(&rows));
@@ -974,7 +1061,7 @@ mod tests {
     #[test]
     fn plist_names_default_and_explicit() {
         assert_eq!(
-            plist_names("mysql", None),
+            plist_names("mysql", None, None),
             vec![
                 "sh.brew.mysql".to_string(),
                 "homebrew.mxcl.mysql".to_string()
@@ -982,8 +1069,13 @@ mod tests {
         );
         let raw = aterm_json::json!({"name": {"macos": "com.example.d", "linux": "d"}});
         assert_eq!(
-            plist_names("d", Some(&raw)),
+            plist_names("d", Some(&raw), None),
             vec!["com.example.d".to_string()]
+        );
+        assert_eq!(
+            plist_names("d", Some(&raw), Some("sh.tap.d")),
+            vec!["sh.tap.d".to_string()],
+            "a tap record's explicit name wins over the API object's"
         );
     }
 

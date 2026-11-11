@@ -232,10 +232,8 @@ impl Store {
             return;
         }
         if std::fs::create_dir_all(&self.dir).is_ok() {
-            let _ = super::upgrade_models::write_atomic(
-                &self.model_path(),
-                &format!("{now} {clean}\n"),
-            );
+            let _ =
+                super::atomic_write::write_atomic(&self.model_path(), &format!("{now} {clean}\n"));
         }
     }
 
@@ -257,7 +255,7 @@ impl Store {
     pub(super) fn note_failure(&self, why: &str, now: i64) {
         if std::fs::create_dir_all(&self.dir).is_ok() {
             let one_line = why.replace(['\r', '\n'], " ");
-            let _ = super::upgrade_models::write_atomic(
+            let _ = super::atomic_write::write_atomic(
                 &self.failed_path(),
                 &format!("{now} {one_line}\n"),
             );
@@ -270,8 +268,7 @@ impl Store {
 
     fn note_wall_read(&self, now: i64) {
         if std::fs::create_dir_all(&self.dir).is_ok() {
-            let _ =
-                super::upgrade_models::write_atomic(&self.wall_read_path(), &format!("{now}\n"));
+            let _ = super::atomic_write::write_atomic(&self.wall_read_path(), &format!("{now}\n"));
         }
     }
 
@@ -324,7 +321,7 @@ impl Store {
         o.insert("schema".to_owned(), Value::from(1u64));
         o.insert("as_of".to_owned(), Value::from(reading.as_of));
         o.insert("doc".to_owned(), Value::from(reading.doc.clone()));
-        super::upgrade_models::write_atomic(
+        super::atomic_write::write_atomic(
             &self.last_path(),
             &aterm_json::to_string(&Value::Object(o)).unwrap_or_default(),
         )?;
@@ -345,7 +342,7 @@ impl Store {
         }
         let mut kept = lines.join("\n");
         kept.push('\n');
-        super::upgrade_models::write_atomic(&path, &kept)
+        super::atomic_write::write_atomic(&path, &kept)
     }
 
     /// Every sample of the history, oldest first.
@@ -1070,8 +1067,9 @@ pub fn rotate_launch(
 
 /// [`rotate_launch`] with `at_wall`: when `true` (a running `agy` session is stopped at a quota
 /// wall on screen), a kept reading at least [`WALL_FORCE_FLOOR_S`] old is refreshed and
-/// [`agy_quota::pick_at_wall`] decides the model. One wall makes one read
-/// ([`WALL_READ_SPENT_S`]): the loop's later looks at it decide on that reading.
+/// [`agy_quota::pick_at_wall`] answers on it, the answer the wall-reset read takes the session's
+/// resume time from. One wall makes one read ([`WALL_READ_SPENT_S`]): the loop's later looks at it
+/// decide on that reading.
 #[must_use]
 pub fn rotate_launch_at(
     asked: Option<&str>,
@@ -1114,8 +1112,8 @@ pub fn rotate_launch_at(
         let (reading, got) = current_res.ok()?;
         (reading, got, asking)
     };
-    // At a live quota wall, a stale reading past any recorded refill cannot justify restarting the
-    // running session.
+    // At a live quota wall, a stale reading past any recorded refill cannot say when the running
+    // session may resume.
     if got == Got::Stale && at_wall && (reading.refill_passed(now) || reading.refill_crossed(now)) {
         return None;
     }
@@ -1192,48 +1190,6 @@ fn decide(
         named,
         got,
     })
-}
-
-/// What the reading on record says of a running session's model (`asked`, or the default last
-/// read), asking agy nothing: a session between turns is no launch and no wall, so it may rotate
-/// on what launches and walls last read, never read for itself. `None` when rotation is off or
-/// nothing is on record.
-#[must_use]
-pub fn rotate_on_record(
-    asked: Option<&str>,
-    store: &Store,
-    rotation: &agy_quota::Rotation,
-    now: i64,
-) -> Option<LaunchPick> {
-    if !rotation.enabled {
-        return None;
-    }
-    let reading = store.last()?;
-    let got = on_record(&reading, now, rotation.low);
-    let (model, named) = match asked {
-        Some(model) => (model.to_owned(), true),
-        None => (store.last_default()?, false),
-    };
-    decide(reading, got, model, named, rotation, now, false)
-}
-
-/// [`rotate_on_record`] for a worker running under `env` and `flags`.
-#[must_use]
-pub fn rotate_worker_on_record(
-    asked: Option<&str>,
-    env: &[(String, String)],
-    flags: &[String],
-    now: i64,
-) -> Option<LaunchPick> {
-    let state = machine_state()?;
-    let home = env
-        .iter()
-        .find(|(n, _)| n == super::upgrade_agy::HOME_ENV)
-        .map(|(_, v)| v.as_str());
-    let store = Store::new(&state, &launch_key(home, flags));
-    let (rotation, _) =
-        agy_quota::Rotation::from_path(aterm_types::dirs::aterm_config_path().as_deref());
-    rotate_on_record(asked, &store, &rotation, now)
 }
 
 /// When an agy launch for `asked` (or the kept default model when `None`) that [`rotate_launch`]

@@ -5,7 +5,7 @@
 
 use super::*;
 
-/// A current-entry check distinguishes temporary contention from a changed or
+/// A current-source check distinguishes temporary contention from a changed or
 /// unavailable source. None of the refusal variants invokes the callback.
 #[derive(Debug)]
 pub enum EntryAdmission<T> {
@@ -15,8 +15,8 @@ pub enum EntryAdmission<T> {
     /// A vault writer holds the state lock, or the lock path changed during its
     /// acquisition. Retry after releasing any application writer.
     Busy,
-    /// No authenticated, safely materialized entry is currently available in
-    /// the captured trust context. No state or missing lock file was created.
+    /// No authenticated entry or recipient view is currently available in the
+    /// requested trust context. No state or missing lock file was created.
     Unavailable,
     /// A readable entry no longer continues the captured bytes, policy,
     /// recipient or history. Replan from a fresh observation.

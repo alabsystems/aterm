@@ -55,6 +55,9 @@ impl KimiOauth {
         match result.outcome {
             login_drive::Outcome::SignedIn { .. } => Execution::Completed,
             login_drive::Outcome::NotRun(why) => Execution::NotStarted(why),
+            login_drive::Outcome::PreparationFailed(stage) => {
+                Execution::NotStarted(stage.reason().into())
+            }
             login_drive::Outcome::PageNotOpened(why) | login_drive::Outcome::Unverified(why) => {
                 Execution::Unknown(why)
             }

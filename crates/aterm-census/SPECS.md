@@ -96,7 +96,7 @@ Result: **65 specs**, covering the **180 tests** of §2.
   other upper-case names are the crate's own const tables, quantified as they stand.
 - `CENSUSES`: the 6-row table (mainloop, locks, wasm, scope, lazy-init, guards) in declaration order.
 - **Gaps.** `blocking_gaps` numbers are rows of the gap table in
-  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7: 1 non-scalar carriers, 2 certified
+  `docs/TRUST-LANE.md` (Blocking gaps): 1 non-scalar carriers, 2 certified
   `&self`/`&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5 quantified clauses,
   7 loops, 8 effects, 11 generics, 13 threads and closures. Gap 0, a seal that publishes
   Clean-discharged rows, precedes every row and is left out of the column.
@@ -376,19 +376,6 @@ wasm_cfg.rs	the_platforms_wasm32_is_not_are_false_and_its_own_are_true	census-wa
 wasm_cfg.rs	what_the_target_does_not_settle_is_unknown	census-wasm-verdict	
 ```
 
-## 3. Coverage
-
-- 180 tests map to the 65 specs.
-- 39 specs are the primary spec of exactly one test, and one (`census-blank-non-code`) is primary
-  for none: it only shares a test (`also` in §2). Several of the one-test specs are lemmas the
-  larger specs build on (`census-guard-hits`, `census-cfg-entails`, `census-split-commas`), so
-  their value is above their test count.
-- The biggest collapses (primary tests): `census-wasm-verdict` (16), `census-lock-hold-edges` (15), `census-lock-site-classification` (11), `census-lock-order-verdict` (10), `census-mainloop-verdict` (10), `census-scan-set-closure` (10), `census-scan-set-patch-registry` (10).
-- Seven tests sample two specs each (`also` in §2): the lex code-view test, the missed-floor test,
-  the renamed-patch-row test, the two keys phrase tests, the lazy-init re-entry table and the
-  body-less declaration test.
-- Gap histogram (specs blocked by each gap): gap 1: 65, gap 2: 6, gap 3: 65, gap 4: 11, gap 5: 61, gap 7: 55, gap 8: 14, gap 11: 1, gap 13: 6.
-
 ## 4. Tests that are not spec samples
 
 None: every test in §2 samples a spec.
@@ -415,41 +402,3 @@ None: every test in §2 samples a spec.
    It now looks up `"rustfmt breaks a long chain: receiver and work on different lines"` by label rather than
    `MUST_FIRE[14]` and checks across every `MUST_FIRE` entry that each reported 1-based line carries the blocked
    method call or cold-codec touch.
-
-## 6. Proof order (easiest high-value first)
-
-Every row needs string carriers (gap 1) and a widened body (gap 3). The order starts with the rows
-that need least beyond those, then the lemmas the rule and census rows build on.
-
-1. **`census-key-file-name`** and **`census-launcher-source`** (gaps 1, 3): equality with string
-   literals, `ends_with`, `starts_with`, `strip_prefix` and `split_once`, with no loops.
-2. **`census-key-synthetic`** (gaps 1, 3, 5, 7): `u8` modular arithmetic over a slice window. With
-   `census-key-phrases` it retires both keys phrase tests.
-3. **`census-shell-word`**, **`census-scope-returns-token`** and **`census-lazy-field-cell-name`**
-   (gaps 1, 3, 5): short straight-line string predicates.
-4. **`census-guard-hits`** and **`census-guard-calls`**: the word-bound and call-site lemmas behind
-   every rule row's match.
-5. **`census-lex-spans-refine`**, then **`census-lex-views`** and **`census-blank-non-code`**: a
-   loop-heavy tokenizer (gap 7), but `Code` and `Text` are the views every rule, lock and lazy-init
-   row is stated over.
-6. **`census-cfg-entails`**, **`census-split-commas`**, then **`census-mask-gated-items`**: the
-   `Shipped` lemma.
-7. The pure line scans: the lock-order helpers (`census-impl-self-type`, `census-guard-final-value`,
-   `census-return-type-guard`, `census-lock-receiver-identity`), the lazy-init helpers,
-   `census-wasm-term-hops`, `census-term-hop`, `census-cli-parse` (gap 11), then the `census-rule-*`
-   rows over `Corpus::of`.
-8. Last, the effectful whole-census verdicts (gap 8, plus 4 and often 13): `census-scan-set-*`,
-   `census-lock-hold-edges`, `census-lock-site-classification`, `census-lock-order-verdict`,
-   `census-lazy-init-verdict` (pure over `&[(path, text)]`, so first of these),
-   `census-held-guard-scan`, `census-wasm-verdict`, `census-mainloop-verdict`, `census-scope-verdict`
-   (after §5.1), `census-run-censuses` and `census-guard-run-rules`. Factoring each census into a pure
-   core over an in-memory tree, with the fs walk as a thin shell, moves most of them off gap 8, and
-   typed findings (§5.2) make the verdicts statable without parsing prose.
-
-Seal `150efe4a` refused `trust_contract_fn!` contracts on `key_file_name`, `launcher_source` and
-`guards::is_word`: E6 minted no kernel import for their bodies (`AutoBoundHeadOverApplied`), and an
-`ensures` over `&str` did not lower, `&str` having no clause type. The same seal charged
-`UnmodeledThreadSpawnEffect` to most of the crate's fns through `guards::run_rules`'s
-`std::thread::scope` spawn; until Trust stops charging a pure callee its callers' effects, no fn here
-certifies. Written as `matches!(b, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_')`, `is_word` does
-import, and its theorem closes when stated in the import's `<=` form.

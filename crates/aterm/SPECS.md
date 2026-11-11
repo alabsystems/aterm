@@ -35,7 +35,7 @@ conformance check (gap 10). The aterm test goes once both exist.
   `unknown`, `wall:<kind>`}.
 - `Decide(screen, cfg, session_meta, history)`: `aterm_agent::supervise`'s approval, question and
   turn-end policy. Its value is a sequence of key/text actions, or `Escalate`.
-- `blocking_gaps` lists gap numbers from §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`.
+- `blocking_gaps` lists gap numbers from `docs/TRUST-LANE.md` (Blocking gaps).
   Gap 0 (an installed seal that publishes Lean-discharged rows) blocks every row and is left out.
 
 ## 1. Specs (TSV)
@@ -308,26 +308,3 @@ version skew, the stale windowed image) is an instance of one of the specs above
 4. **`nests_inside_aterm` is compiled `#[cfg(any(windows, test))]`.** Off Windows it has no
    production caller, so its table test runs test-only code on the mac/linux gate. The spec still
    holds for the Windows production caller, so prove it with the Windows cfg.
-
-## 6. Proof order
-
-Fewest and smallest gaps first, then tests retired, then reuse as a lemma.
-
-1. **`nests-inside-aterm`** (gap 3): four bools, the cheapest end-to-end exercise for this crate.
-   PM-1 refuses the `aterm` unit while its normal graph reaches `aterm-serde-derive` (through
-   `aterm-agent`, `aterm-gui`, `atpkg` and others); after that, `nests_inside_aterm` also needs
-   `trust_verify` in its cfg for the seal to compile it on macOS.
-2. **`windowed-sibling-staleness`** and **`trustc-parenthetical`** (gaps 1, 3); the latter is a
-   lemma of `rustc-vv-parse`.
-3. **`strip-flags-payload-boundary`** (gaps 1, 3, 5, 7), the lemma under `take-no-reroute`,
-   `plain-launch-request` and `update-successor-stays-window`.
-4. **`detect-flavor-characterization`** with **`rustc-vv-parse`** (gaps 1, 3, 5, 7). They retire
-   the `compiler_probe` tests and make `build-stamp-domain` a short composition.
-5. **`front-door-forward-lines`** and **`alias-route-table`** (gaps 1, 3, 5; 12 for the
-   cross-crate `Verb`). `alias-route-table` is the target half of `spawn-handoff-round-trip`.
-6. **`is-windowish`**, **`window-host-for`**, then **`update-verb-lines`**.
-7. The live family through its pure deciders in their home crates: `worker-phase-classifier`
-   (aterm-phase) and `Classify` for the agent-verdict lane, `Decide`'s approval, question and
-   turn-end arms (aterm-agent) for `host_live` and `supervise_turn_end`, and the resize ledger and
-   undo (aterm-gui, aterm-grid) for `render_desync`. A live test goes once its decider is proved
-   and the shell's conformance check (gap 10) exists.

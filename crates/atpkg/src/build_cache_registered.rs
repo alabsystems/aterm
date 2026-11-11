@@ -3407,7 +3407,7 @@ fn reclaim_selected_on<'policy>(
                 }
             }
             if !dead_only && same(home, &receipt) {
-                let _ = sweep.prune(&cache.root, &cache.root);
+                let _ = sweep.prune(&cache.root, &cache.root, None);
             }
         }
     }

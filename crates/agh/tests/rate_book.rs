@@ -152,6 +152,38 @@ mod files {
         )
     }
 
+    #[test]
+    fn attribution_keeps_each_retry_and_omits_untrusted_failure_details() {
+        use agh::wire::scripted::Scripted;
+        use agh::wire::{Phase, WireError, WireKind};
+        use aterm_json::Value;
+
+        let root = common::scratch("rate-attempts");
+        let book = RateBook::at(Dirs::under(root.path()).rate());
+        let transport = Arc::new(ScriptedTransport::new());
+        transport.push(Scripted::Fail(WireError {
+            phase: Phase::Sent,
+            kind: WireKind::Reset,
+            detail: "untrusted-failure-canary".into(),
+        }));
+        transport.answer(200, &[], b"{}");
+        let gh = client(&transport, book.clone());
+        gh.call(&repo_get().retry(Some(RetryPolicy::STANDARD)))
+            .unwrap();
+        let rows = book.calls_in_hour(NOW / 3600).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["wire_error"], Value::from("reset"));
+        assert_eq!(rows[0]["wire_phase"], Value::from("sent"));
+        assert!(rows[0]["status"].is_null());
+        assert_eq!(rows[1]["status"], Value::from(200));
+        assert!(rows[1]["rate"].is_null());
+        assert!(
+            !Value::Array(rows)
+                .to_string()
+                .contains("untrusted-failure-canary")
+        );
+    }
+
     fn mode(path: &std::path::Path) -> u32 {
         std::fs::metadata(path)
             .expect("metadata")

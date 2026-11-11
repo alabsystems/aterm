@@ -1199,7 +1199,7 @@ impl SignIn {
         if let Some(until) = self.spaced(store, now)? {
             return Err(Refused::Spaced { until });
         }
-        super::upgrade_models::write_atomic(
+        super::atomic_write::write_atomic(
             &spacing_path(store),
             &Started::new(super::accounts::Cli::Codex, label, now).text(),
         )
@@ -1244,7 +1244,7 @@ impl SignIn {
         if let Some(until) = self.spaced(store, now)? {
             return Err(Refused::Spaced { until });
         }
-        super::upgrade_models::write_atomic(
+        super::atomic_write::write_atomic(
             &spacing_path(store),
             &Started::new(cli, label, now).text(),
         )

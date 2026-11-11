@@ -14,7 +14,7 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 use aterm_agent::machine_name::{InFleet, NameTo, NickTo};
@@ -25,15 +25,16 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 
+mod discovery;
 pub(crate) mod naming;
 #[cfg(test)]
 mod publication_tests;
 
-type SystemNameApply = fn(Number) -> Result<(), String>;
-static SYSTEM_NAME_APPLY: OnceLock<SystemNameApply> = OnceLock::new();
-
-pub(crate) fn on_system_name_apply(apply: SystemNameApply) {
-    let _ = SYSTEM_NAME_APPLY.set(apply);
+pub(crate) fn on_system_name_apply(
+    apply: fn(&Path, &Path, &aterm_types::machine_name::GeneratedNames) -> Result<(), String>,
+    authorization: fn(&Path, &Path) -> Result<bool, String>,
+) {
+    aterm_agent::machine_name::publish::on_system_name_apply(apply, authorization);
 }
 
 struct MacSystemNames;
@@ -43,10 +44,17 @@ impl aterm_agent::machine_name::publish::SystemNames for MacSystemNames {
         aterm_agent::machine_name::publish::read_system_names()
     }
 
-    fn apply(&self, number: Number) -> Result<(), String> {
-        SYSTEM_NAME_APPLY
-            .get()
-            .ok_or("macOS naming is unavailable in this application")?(number)
+    fn apply(
+        &self,
+        state: &Path,
+        config: &Path,
+        names: &aterm_types::machine_name::GeneratedNames,
+    ) -> Result<(), String> {
+        aterm_agent::machine_name::publish::apply_registered(state, config, names)
+    }
+
+    fn authorization(&self, state: &Path, config: &Path) -> Result<bool, String> {
+        aterm_agent::machine_name::publish::registered_authorization(state, config)
     }
 }
 
@@ -55,11 +63,11 @@ impl aterm_agent::machine_name::publish::SystemNames for MacSystemNames {
 pub(crate) struct MachineView {
     /// The name file's revision, for snapshot equality; a new identity or file may reset it.
     pub(crate) rev: u64,
-    /// The NAME: `m8`, or `m0` while unnumbered.
+    /// The NAME: `m8`, or `unnumbered` while unnumbered.
     pub(crate) name: String,
     /// The nickname as the menu bar shows it (`Heron`).
     pub(crate) nick: String,
-    /// The nickname as stored, which the Nickname field starts with (`heron`).
+    /// The display spelling the Name field starts with (`Heron`).
     pub(crate) word: String,
     /// Whether this machine is in a fleet: its vault's standing, or a fleet key that reads
     /// ([`InFleet`], §11.85).
@@ -84,15 +92,15 @@ pub(crate) fn machine_menu_bar_title(view: &MachineView) -> String {
     }
 }
 
-/// The menu's first row: `m8 · Heron · in a fleet`, or `· joining a fleet`, `· not in a fleet`,
+/// The menu's first row: `m8 · Heron · in ALab`, or `· joining ALab`, `· not in a fleet`,
 /// `· fleet not read` ([`InFleet::phrase`]).
 pub(crate) fn machine_menu_info_row(view: &MachineView) -> String {
-    format!(
-        "{} \u{00B7} {} \u{00B7} {}",
-        view.name,
-        view.nick,
-        view.fleet.phrase()
-    )
+    let fleet = match &view.fleet {
+        InFleet::In => "in ALab",
+        InFleet::Joining => "joining ALab",
+        state => state.phrase(),
+    };
+    format!("{} \u{00B7} {} \u{00B7} {}", view.name, view.nick, fleet)
 }
 
 fn clipped(text: &str, most: usize) -> String {
@@ -217,8 +225,8 @@ fn read(
     Ok(MachineView {
         rev: name.rev,
         name: name.name(),
-        nick: name.nick.display(),
-        word: name.nick.as_str().to_owned(),
+        nick: name.display_nick(),
+        word: name.display_nick(),
         fleet: InFleet::read(state, vault),
     })
 }
@@ -299,6 +307,8 @@ enum NameChange {
     Nickname(NickTo),
     Name(NameTo),
     Synchronize(Number),
+    /// A successful explicit permission tab: reread canonical targets, never an old panel name.
+    SynchronizeCurrent,
 }
 
 /// What Rename's answer `to` sets: a nickname alone, another number
@@ -307,7 +317,7 @@ enum NameChange {
 fn rename_change(to: crate::machine_rename_sheet::RenameTo) -> Option<NameChange> {
     use crate::machine_rename_sheet::RenameTo;
     match to {
-        RenameTo::Keep => None,
+        RenameTo::Keep | RenameTo::Authorize => None,
         RenameTo::Nick(nick) => Some(NameChange::Nickname(NickTo::Word(nick))),
         RenameTo::Name(to) => Some(NameChange::Name(to)),
         RenameTo::Synchronize(number) => Some(NameChange::Synchronize(number)),
@@ -335,8 +345,7 @@ pub(crate) struct Asked {
 
 /// Rename This Mac…'s text, above its fields: why the last answer took no effect (`why`) first.
 pub(crate) fn rename_alert_body(why: Option<&str>) -> String {
-    let lead =
-        "Use one number across aterm, the fleet and macOS. Empty fields keep their current values.";
+    let lead = "Choose a unique numeric ID and name. Display spelling is kept; matching ignores case and repeated spaces. macOS names are generated below. Empty fields keep their current values.";
     match why {
         Some(why) => format!("{why}\n\n{lead}"),
         None => lead.to_owned(),
@@ -376,12 +385,13 @@ struct NameJob {
 impl NameWriter {
     fn start(proxy: EventLoopProxy<Wake>) -> io::Result<Self> {
         let (jobs, queued) = mpsc::channel();
+        let discovery = discovery::start().map_err(|why| why.to_string());
         std::thread::Builder::new()
             .name("aterm-name-writer".to_owned())
             .spawn(move || {
                 write_changes(queued, |job| match job {
                     Job::Change(job) => apply_change(&proxy, job),
-                    Job::Preview(press) => read_preview(press),
+                    Job::Preview(press) => read_preview(press, &discovery),
                 });
             })?;
         Ok(Self { jobs })
@@ -431,11 +441,12 @@ fn queue(writer: &mut Option<NameWriter>, proxy: EventLoopProxy<Wake>, job: Job)
 /// Read what Rename This Mac… judges a number by ([`aterm_agent::machine_name::rename_preview`])
 /// off the window thread, and bring it to press `press`'s alert through the main queue, which
 /// AppKit's modal loop serves while the alert is up.
-fn read_preview(press: u64) {
+fn read_preview(press: u64, discovery: &Result<mpsc::Sender<u64>, String>) {
     use crate::machine_rename_sheet::Snapshot;
     use aterm_agent::machine_name::{
         lab_labels, rename_preview, standing_vault, vault_roster_label,
     };
+    let mut browse = false;
     let snapshot = match aterm_types::dirs::state_dir() {
         None => Snapshot::Unread("aterm has no state folder".to_owned()),
         Some(state) => {
@@ -449,12 +460,15 @@ fn read_preview(press: u64) {
             ) {
                 Ok(preview) => match aterm_types::dirs::aterm_config_path() {
                     Some(config) => {
+                        let membership = InFleet::read(&state, vault.as_ref());
+                        browse = !matches!(membership, InFleet::In | InFleet::Joining);
                         let names = naming::NamingStatus::read(
                             &state,
                             &config,
                             preview.name(),
                             &MacSystemNames,
-                        );
+                        )
+                        .with_fleet_membership(membership);
                         Snapshot::named(preview, names)
                     }
                     None => Snapshot::Unread("aterm has no configuration path".into()),
@@ -467,6 +481,17 @@ fn read_preview(press: u64) {
         }
     };
     aterm_objc::run_on_main(move |_| crate::machine_rename_sheet::deliver(press, snapshot));
+    if browse {
+        let queued = discovery
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|sender| sender.send(press).map_err(|why| why.to_string()));
+        if let Err(why) = queued {
+            aterm_objc::run_on_main(move |_| {
+                crate::machine_rename_sheet::deliver_discovery(press, Err(why));
+            });
+        }
+    }
 }
 
 /// A canonical edit and any publication that still needs the person's explicit retry.
@@ -501,11 +526,77 @@ fn change_number(
     })
 }
 
+/// Save a nickname and synchronize its generated OS targets without choosing a number again.
+fn change_nickname(
+    state: &Path,
+    config: &Path,
+    to: &NickTo,
+    system: &dyn aterm_agent::machine_name::publish::SystemNames,
+    roster: impl FnOnce() -> io::Result<Option<String>>,
+    stamp: u64,
+) -> Result<NameEdit, String> {
+    use aterm_agent::machine_name::{file, publish, set_nick};
+    use aterm_net::fleet_member::name_record::ByKind;
+    let current = file::read(state).map_err(|why| why.to_string())?;
+    let number = current
+        .as_ref()
+        .filter(|name| {
+            name.class == aterm_types::machine_name::Class::Chosen
+                && name.migration != Some(file::Migration::Waiting)
+        })
+        .and_then(|name| name.num);
+    let policy = number
+        .map(|number| publish::Policy::read(config, number))
+        .transpose()?;
+    let set =
+        set_nick(state, to, ByKind::Person, roster, stamp, false).map_err(|why| why.to_string())?;
+    let publication = policy
+        .as_ref()
+        .and_then(|policy| publish::publish(state, config, policy, Some(system)).err());
+    Ok(NameEdit {
+        name: set.name,
+        changed: set.changed,
+        shared: set.shared,
+        publication,
+    })
+}
+
+/// Resume only after an explicit naming-permission operation actually finished successfully.
+/// The permission request carries no name: capture the current saved choice here, after it.
+fn synchronize_current(
+    state: &Path,
+    config: &Path,
+    system: &dyn aterm_agent::machine_name::publish::SystemNames,
+) -> Result<NameEdit, String> {
+    use aterm_agent::machine_name::file;
+    if !system.authorization(state, config)? {
+        return Err("macOS naming permission is not current after authorization".into());
+    }
+    let saved = file::read(state)
+        .map_err(|why| why.to_string())?
+        .ok_or("this Mac's saved name is unavailable")?;
+    let number = saved
+        .num
+        .filter(|_| {
+            saved.class == aterm_types::machine_name::Class::Chosen
+                && saved.migration != Some(file::Migration::Waiting)
+        })
+        .ok_or("choose this Mac's canonical number before synchronizing its name")?;
+    let publication = naming::synchronize(state, config, number, system).err();
+    let name = file::read(state)
+        .map_err(|why| why.to_string())?
+        .ok_or("this Mac's saved name is unavailable")?;
+    Ok(NameEdit {
+        name,
+        changed: false,
+        shared: false,
+        publication,
+    })
+}
+
 /// Apply one queued edit off the window thread, releasing its persistence locks before
 /// `post_read` serializes the resulting snapshot with the file watcher.
 fn apply_change(proxy: &EventLoopProxy<Wake>, job: NameJob) {
-    use aterm_agent::machine_name::set_nick;
-    use aterm_net::fleet_member::name_record::ByKind;
     let Some(state) = aterm_types::dirs::state_dir() else {
         report_unset(proxy, &job, "aterm has no state folder".to_owned());
         return;
@@ -514,19 +605,23 @@ fn apply_change(proxy: &EventLoopProxy<Wake>, job: NameJob) {
     let vault = aterm_agent::machine_name::standing_vault();
     let stamp = aterm_netplace::unix_ms_now();
     let set = match &job.to {
-        NameChange::Nickname(to) => set_nick(&state, to, ByKind::Person, roster, stamp, false)
-            .map(|set| NameEdit {
-                name: set.name,
-                changed: set.changed,
-                shared: set.shared,
-                publication: None,
+        NameChange::Nickname(to) => {
+            let config = aterm_types::dirs::aterm_config_path()
+                .ok_or_else(|| "aterm has no configuration path".to_owned());
+            config.and_then(|config| {
+                change_nickname(&state, &config, to, &MacSystemNames, roster, stamp)
             })
-            .map_err(|why| why.to_string()),
+        }
         NameChange::Name(to) => (|| {
             let config =
                 aterm_types::dirs::aterm_config_path().ok_or("aterm has no configuration path")?;
             let lab = || aterm_agent::machine_name::lab_labels(vault.as_ref());
             change_number(&state, &config, to, &MacSystemNames, lab, roster, stamp)
+        })(),
+        NameChange::SynchronizeCurrent => (|| {
+            let config =
+                aterm_types::dirs::aterm_config_path().ok_or("aterm has no configuration path")?;
+            synchronize_current(&state, &config, &MacSystemNames)
         })(),
         NameChange::Synchronize(number) => (|| {
             let config =
@@ -633,6 +728,13 @@ impl crate::App {
                 nick: typed_nick,
             };
             let change = match requested {
+                Ok(crate::machine_rename_sheet::RenameTo::Authorize) => {
+                    end(press);
+                    self.machine_unset = None;
+                    self.machine_sets = self.machine_sets.wrapping_add(1);
+                    self.open_machine_name_authorization(self.machine_sets);
+                    return;
+                }
                 Ok(to) => rename_change(to),
                 Err(refusal) => {
                     why = Some(refusal);
@@ -690,6 +792,38 @@ impl crate::App {
                     asked,
                 }),
             );
+        }
+    }
+
+    /// The existing person-owned tab adapter calls this only for its actual terminal result
+    /// while the originating window/session is still eligible. No captured target crosses it.
+    pub(crate) fn machine_name_authorization_finished(
+        &mut self,
+        generation: u64,
+        result: Result<(), String>,
+    ) {
+        if generation != self.machine_sets {
+            return;
+        }
+        let asked = Asked {
+            number: None,
+            nick: None,
+        };
+        if let Err(why) = result {
+            return self.machine_name_not_set(unset_of(generation, &asked, &why));
+        }
+        if let Some(proxy) = self.proxy.clone() {
+            queue(
+                &mut self.machine_writer,
+                proxy,
+                Job::Change(NameJob {
+                    to: NameChange::SynchronizeCurrent,
+                    generation,
+                    asked,
+                }),
+            );
+        } else {
+            self.machine_name_not_set(unset_of(generation, &asked, NAME_NOT_ASKED));
         }
     }
 

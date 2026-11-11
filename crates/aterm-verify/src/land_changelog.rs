@@ -1,57 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The CHANGELOG entries a landing adds stay under `## [Unreleased]`.
+//! Complete-entry decisions for the landing's own CHANGELOG merges.
 //!
-//! A release cut writes its version heading directly under `## [Unreleased]`, above the entries
-//! it ships, so a branch that merges main after the cut has each entry it wrote into the old
-//! `[Unreleased]` body merged under that version: its change reads as shipped by a release cut
-//! before it landed. git merges by line and cannot tell; the landing can ([`rehome`]).
+//! `merge_entries` reads strict original base/branch/main sections before Git's union driver
+//! combines their lines. It preserves byte-exact entry bodies and main's released text; unknown
+//! Markdown structure, competing replacements and divergent released-tail edits require an
+//! explicit resolution. Git integration checks exact authored additions/restorations in history.
+//! The semantic result is judged normally, never an independence exception for composition.
 //!
-//! An entry is settled only when the landing adds it whole beside main's file ([`added_lines`]:
-//! a change that rewrites none of main's lines), and by where its words came from
-//! ([`Written`]: the entries the branch's own commits wrote, each with the release headings the
-//! changelog held when they wrote or moved it under `[Unreleased]`, if they did):
-//! - a copy the file holds more often than main's does goes (a branch's copy of main's unreleased
-//!   entry, stranded beside main's own);
-//! - one the branch wrote under `[Unreleased]` that sits under a release main cut since (a heading
-//!   main holds and the changelog did not at that write, so a release that cannot have shipped
-//!   it) moves to the top of its `### <kind>` under `## [Unreleased]`, which gains that
-//!   subsection, in Keep a Changelog's order, where it has none. A move down writes nothing, so a
-//!   cut replayed on the branch (a squash or rebase of main) strands no entry for good;
-//! - one no commit of the branch wrote, whose words main does not hold, goes: main rewrote or
-//!   removed them and a merge brought them back. `CHANGELOG.md` merges with git's union driver,
-//!   which keeps both sides of a hunk, so a branch's entry inserted beside one main rewrote lands
-//!   with the old words and the new (measured 2026-11-08, git 2.56).
-//!
-//! What stays where it is: an entry main holds (moved or reordered among the releases), one the
-//! branch wrote only under released versions (a restored or backfilled entry), one it moved
-//! under a release cut before it wrote it (until main re-dates or renames that heading), one
-//! under a release heading main does not hold (a cut of the branch's own), one a rebase of the
-//! branch's own commits replayed onto the cut (the replayed commit writes it under the release,
-//! as a backfill does, and the commit that wrote it under `[Unreleased]` is gone), one the
-//! branch rewords under the release after a merge stranded it (its new words are first written
-//! there), a rewritten line of a released entry, an entry added in the same change as a rewrite
-//! of main's line next to it, an entry whose next non-blank line starts at the margin but opens
-//! nothing (a code fence), which leaves its end unclear, and two rewrites of one entry, main's
-//! and the branch's, which no rule here can choose between.
-//!
-//! A `### <kind>` subsection under `## [Unreleased]` that the landing adds whole beside main's file
-//! (its heading and every non-blank line of it), where the section holds another of that kind and
-//! more `### <kind>` headings than main's does, joins it ([`joinable`]): the first of the kind the
-//! landing does not add whole (main's), else the first. The lines it adds go to the top of that one
-//! where it sat above it, after its last line where it sat below, and its heading goes; a blank
-//! line main holds stays. Git's diff may give an added run any of the equal places where the lines
-//! around it repeat (one directly above a subsection of its kind takes the lower of two identical
-//! headings), so the run is read at the earliest ([`slid_up`]). `CHANGELOG.md` merges with git's
-//! union driver, which keeps both sides of a conflicting hunk, so a branch that reordered
-//! `[Unreleased]` while main wrote into it had its merge open a kind main's side already held,
-//! above or below main's (measured 2026-11-10 on 7d1464cf8bb, which landed `### Changed` twice),
-//! and a release ships the section as it stands. Only lines the landing adds move, so no line main
-//! holds is rewritten, and a release cut that lands mid-run strands the moved lines as any other
-//! added ones, for the rules above. A kind said twice by main's own lines, or by a second
-//! subsection the landing adds only in part, stays, as does a section holding an HTML comment or a
-//! code fence at the margin, where a `### ` line is not a heading.
+//! The older `rehome` path remains for already-committed hand merges and one-sided changes.
+//! It uses added-line and historical word reporting to relocate entries a release cut stranded,
+//! suppress surplus copies and join added duplicate subsections. Its whitespace-normalised
+//! identity is not used to grant authority to the owned three-way entry merge.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -68,6 +29,306 @@ const KINDS: [&str; 6] = [
     "Fixed",
     "Security",
 ];
+
+/// An intentionally strict view for three-way merging. Entry identity includes every byte of
+/// its body; the whitespace-normalised reporting helpers below cannot grant merge authority.
+struct MergeSection<'a> {
+    prefix: &'a str,
+    released: &'a str,
+    entries: BTreeMap<&'a str, Vec<&'a str>>,
+}
+
+impl<'a> MergeSection<'a> {
+    fn parse(text: &'a str) -> Result<Self, &'static str> {
+        if text.contains('\r') || !text.ends_with('\n') {
+            return Err("CHANGELOG needs LF lines and a final newline for entry merging");
+        }
+        let marker = "## [Unreleased]\n";
+        let start = text.find(marker).ok_or("missing Unreleased heading")?;
+        if start != 0 && !text[..start].ends_with('\n') {
+            return Err("Unreleased heading is not at the margin");
+        }
+        if text[start + marker.len()..].contains(marker) {
+            return Err("repeated Unreleased heading");
+        }
+        let body_start = start + marker.len();
+        if text[..start].lines().any(|line| {
+            line.contains("```")
+                || (line.contains("<!--") && !line.starts_with("<!-- SPDX-License-Identifier:"))
+        }) {
+            return Err("ambiguous markup before Unreleased");
+        }
+        let rest = &text[body_start..];
+        let end = rest
+            .find("\n## ")
+            .map_or(text.len(), |at| body_start + at + 1);
+        let mut entries = BTreeMap::<&str, Vec<&str>>::new();
+        let mut kind = None;
+        let mut entry_start = None;
+        let mut offset = body_start;
+        fn finish<'a>(
+            text: &'a str,
+            entries: &mut BTreeMap<&'a str, Vec<&'a str>>,
+            until: usize,
+            kind: Option<&'a str>,
+            begin: &mut Option<usize>,
+        ) {
+            if let Some(begin) = begin.take() {
+                // Structural blank separators are not part of an entry. Interior whitespace,
+                // including indentation and spaces in code, remains byte-exact.
+                let body = text[begin..until].trim_end_matches('\n');
+                entries
+                    .get_mut(kind.expect("entry has a subsection"))
+                    .expect("known kind")
+                    .push(body);
+            }
+        }
+        for line in text[body_start..end].split_inclusive('\n') {
+            let content = line.strip_suffix('\n').expect("LF line");
+            if let Some(name) = content.strip_prefix("### ") {
+                finish(text, &mut entries, offset, kind, &mut entry_start);
+                if !KINDS.contains(&name) || entries.contains_key(name) {
+                    return Err("unknown or repeated Unreleased subsection");
+                }
+                entries.insert(name, Vec::new());
+                kind = Some(name);
+            } else if content.starts_with("- ") {
+                finish(text, &mut entries, offset, kind, &mut entry_start);
+                if kind.is_none() {
+                    return Err("entry outside a known subsection");
+                }
+                entry_start = Some(offset);
+            } else if !content.is_empty()
+                && (entry_start.is_none()
+                    || !content.starts_with("  ")
+                    || content.contains("```")
+                    || content.contains("<!--"))
+            {
+                return Err("ambiguous Unreleased prose or entry boundary");
+            }
+            offset += line.len();
+        }
+        finish(text, &mut entries, end, kind, &mut entry_start);
+        for bodies in entries.values() {
+            if bodies.iter().copied().collect::<BTreeSet<_>>().len() != bodies.len() {
+                return Err("repeated entry in one subsection");
+            }
+        }
+        Ok(Self {
+            prefix: &text[..body_start],
+            released: &text[end..],
+            entries,
+        })
+    }
+}
+
+/// Merge complete entries before git's union driver can lose their boundaries. A release main
+/// already cut stays byte-for-byte main's. Competing edits without exact correspondence stop.
+pub(super) fn merge_entries(base: &str, branch: &str, main: &str) -> Result<String, &'static str> {
+    if branch == base || branch == main {
+        return Ok(main.to_owned());
+    }
+    if main == base {
+        return Ok(branch.to_owned());
+    }
+    let (base, branch, main) = (
+        MergeSection::parse(base)?,
+        MergeSection::parse(branch)?,
+        MergeSection::parse(main)?,
+    );
+    if branch.prefix != base.prefix
+        || main.prefix != base.prefix
+        || branch.released != base.released
+    {
+        return Err(
+            "divergent changelog structure or released-entry edits need explicit resolution",
+        );
+    }
+    let mut result = main.prefix.to_owned();
+    let newly_released = main.released.strip_suffix(base.released)
+        .ok_or("main changed existing released text while the branch changed Unreleased; resolve explicitly")?;
+    result.push('\n');
+    for kind in KINDS {
+        let empty = Vec::new();
+        let old = base.entries.get(kind).unwrap_or(&empty);
+        let ours = branch.entries.get(kind).unwrap_or(&empty);
+        let theirs = main.entries.get(kind).unwrap_or(&empty);
+        let ours_added: Vec<_> = ours.iter().filter(|entry| !old.contains(entry)).collect();
+        let theirs_added: Vec<_> = theirs.iter().filter(|entry| !old.contains(entry)).collect();
+        for entry in old {
+            let shipped = released_contains(newly_released, kind, entry)?;
+            if !ours.contains(entry)
+                && !theirs.contains(entry)
+                && !shipped
+                && ours_added != theirs_added
+            {
+                return Err("both sides replaced an entry without an unambiguous successor");
+            }
+        }
+        let mut bodies: Vec<&str> = theirs
+            .iter()
+            .copied()
+            .filter(|entry| !old.contains(entry) || ours.contains(entry))
+            .collect();
+        for entry in ours_added {
+            if format!("\n{}", base.released).contains(&format!("\n{entry}\n")) {
+                return Err(
+                    "branch entry bytes already occur in an existing release; resolve the intended duplication explicitly",
+                );
+            }
+            if !bodies.contains(entry) && !released_contains(newly_released, kind, entry)? {
+                bodies.push(entry);
+            }
+        }
+        if !bodies.is_empty() {
+            result.push_str(&format!("### {kind}\n\n"));
+            for body in bodies {
+                result.push_str(body);
+                result.push_str("\n\n");
+            }
+        }
+    }
+    result.push_str(main.released);
+    Ok(result)
+}
+
+/// Base entries removed or replaced on the branch. Git checks these against explicit authored
+/// restorations on main before applying a deletion to main's otherwise unchanged entry.
+pub(super) fn removed_entries(
+    base: &str,
+    branch: &str,
+) -> Result<Vec<(String, String)>, &'static str> {
+    let (base, branch) = (MergeSection::parse(base)?, MergeSection::parse(branch)?);
+    Ok(base
+        .entries
+        .iter()
+        .flat_map(|(kind, entries)| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    !branch
+                        .entries
+                        .get(kind)
+                        .is_some_and(|entries| entries.contains(entry))
+                })
+                .map(|entry| ((*kind).to_owned(), (*entry).to_owned()))
+        })
+        .collect())
+}
+
+pub(super) fn added_entries(
+    base: &str,
+    branch: &str,
+) -> Result<Vec<(String, String)>, &'static str> {
+    removed_entries(branch, base)
+}
+
+pub(super) fn holds_entry(text: &str, kind: &str, body: &str) -> Result<bool, &'static str> {
+    Ok(MergeSection::parse(text)?
+        .entries
+        .get(kind)
+        .is_some_and(|entries| entries.contains(&body)))
+}
+
+fn released_contains(mut tail: &str, kind: &str, entry: &str) -> Result<bool, &'static str> {
+    while !tail.is_empty() {
+        let (_, body) = tail.split_once('\n').ok_or("incomplete release heading")?;
+        if !tail.starts_with("## ") {
+            return Err("ambiguous release boundary");
+        }
+        let section = format!("## [Unreleased]\n{body}");
+        let parsed = MergeSection::parse(&section)?;
+        if parsed
+            .entries
+            .get(kind)
+            .is_some_and(|entries| entries.contains(&entry))
+        {
+            return Ok(true);
+        }
+        // Continue on the original bytes, not a normalised or reconstructed release body.
+        let consumed = section.len() - parsed.released.len() - "## [Unreleased]\n".len();
+        tail = &body[consumed..];
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod entry_merge_tests {
+    use super::merge_entries;
+
+    fn log(entries: &str) -> String {
+        format!(
+            "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n{entries}## [1.0.0]\n\n### Fixed\n\n- Shipped.\n"
+        )
+    }
+
+    #[test]
+    fn complete_entries_replace_without_stranding_the_old_multiline_tail() {
+        let old = "- Old.\n  Shared tail.\n\n";
+        let new = "- New.\n  Shared tail.\n\n";
+        assert_eq!(
+            merge_entries(&log(old), &log(new), &log(&format!("- Main.\n\n{old}"))),
+            Ok(log(&format!("- Main.\n\n{new}")))
+        );
+    }
+
+    #[test]
+    fn competing_rewrite_and_delete_refuse_without_title_matching() {
+        assert!(
+            merge_entries(&log("- Base.\n\n"), &log("- One.\n\n"), &log("- Two.\n\n")).is_err()
+        );
+        assert!(merge_entries(&log("- Base.\n\n"), &log(""), &log("- Two.\n\n")).is_err());
+    }
+
+    #[test]
+    fn byte_significant_code_whitespace_is_not_duplicate_identity() {
+        let base = log("");
+        assert_eq!(
+            merge_entries(&base, &log("- `a  b`.\n\n"), &log("- `a b`.\n\n")),
+            Ok(log("- `a b`.\n\n- `a  b`.\n\n"))
+        );
+    }
+
+    #[test]
+    fn main_release_cut_keeps_shipped_bytes_and_branch_replacement_unreleased() {
+        let base = log("- Old.\n\n");
+        let main = base.replace("### Changed\n", "## [2.0.0]\n\n### Changed\n");
+        let merged = merge_entries(&base, &log("- New.\n\n"), &main).expect("release cut");
+        assert_eq!(
+            merged,
+            main.replace(
+                "## [Unreleased]\n\n",
+                "## [Unreleased]\n\n### Changed\n\n- New.\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn an_identical_addition_main_already_shipped_is_not_added_again() {
+        let base = log("");
+        let branch = log("- Same complete entry.\n\n");
+        let main = branch.replace("### Changed\n", "## [2.0.0]\n\n### Changed\n");
+        assert_eq!(merge_entries(&base, &branch, &main), Ok(main));
+    }
+
+    #[test]
+    fn copying_an_existing_released_entry_requires_explicit_resolution() {
+        assert!(merge_entries(&log(""), &log("- Shipped.\n\n"), &log("- Main.\n\n")).is_err());
+    }
+
+    #[test]
+    fn unsupported_markup_refuses_instead_of_truncating() {
+        let base = log("- Base.\n\n");
+        assert!(
+            merge_entries(
+                &base,
+                &log("- Branch.\n\n```\n### Fixed\n```\n\n"),
+                &log("- Main.\n\n")
+            )
+            .is_err()
+        );
+    }
+}
 
 /// The 0-based new-side lines of `diff` (one file's `git diff`) that a change adds without
 /// replacing a non-blank line of the old side. A change is a run of `-` and `+` lines between

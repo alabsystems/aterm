@@ -895,8 +895,9 @@ fn the_nvml_gpu_is_named_by_nvml() {
 }
 
 /// A4 §4 (N2, heat): an NVIDIA card's board power rides its reading as NVML gave it, or the
-/// reason it did not; a card NVML is not asked about carries its busy figure's reason. CONTROL: a
-/// card no power reader reads (amdgpu here) carries none, never a zero.
+/// reason it did not; a card NVML is not asked about (its runtime PM unsettled, or asleep) carries
+/// its busy figure's reason. CONTROL: a card no power reader reads (amdgpu here) carries none,
+/// never a zero.
 #[test]
 fn an_nvidia_cards_power_is_nvmls() {
     fn gb10(_: &str) -> linux::NvidiaCard {
@@ -919,6 +920,18 @@ fn an_nvidia_cards_power_is_nvmls() {
     assert_eq!(power(&spark, linux::no_nvml), Some(Err(Why::NotRead)));
     let laptop = nvidia_card("auto\n", "0\n");
     assert_eq!(power(&laptop, nvml_never), Some(Err(Why::NotRead)));
+    // Asleep, NVML is not asked either, and the power says why: asleep, as the busy figure does.
+    let asleep = tree(&[
+        (
+            "sys/class/drm/card1/device/uevent",
+            "DRIVER=nvidia\nPCI_SLOT_NAME=000f:01:00.0\n",
+        ),
+        (
+            "sys/class/drm/card1/device/power/runtime_status",
+            "suspended\n",
+        ),
+    ]);
+    assert_eq!(power(&asleep, nvml_never), Some(Err(Why::Asleep)));
     let amd = tree(&[
         ("sys/class/drm/card0/device/uevent", "DRIVER=amdgpu\n"),
         (

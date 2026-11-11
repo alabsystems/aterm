@@ -437,7 +437,7 @@ impl EntrySnapshot {
                     &selected.opened.entries,
                     Some(&old),
                     &self.config,
-                    &claim.name,
+                    claim.name == crate::SWARM_ROSTER_ENTRY,
                     self.recipient,
                 );
             #[cfg(test)]

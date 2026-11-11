@@ -421,9 +421,9 @@ impl Verb {
                 "(`aterm help workers`). Unix only.",
             ],
             Verb::Name => &[
-                "This machine's name: its NAME (m8, or m0 until",
-                "it is numbered) and nickname, made by the first",
-                "read; `set` chooses its number, `nick` its nickname.",
+                "This machine's numeric ID and display name, made",
+                "by the first read; `set` chooses its ID and name,",
+                "and `nick` changes its name.",
                 "`--json` gives one object. Unix only.",
             ],
             Verb::Node => &[

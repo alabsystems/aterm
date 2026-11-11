@@ -100,7 +100,10 @@ fn standin_live_run() {
         EnvSnapshot::default(),
         scratch,
     )
-    .with_halt(crate::halt_of(false, armed));
+    .with_halt(crate::halt_of(&crate::cli::Args {
+        fail_fast: armed,
+        ..crate::cli::Args::default()
+    }));
     let mut r = crate::ladder::Report::new("test");
     let planned = RunPlan::fixture(vec![a, b], 1);
     crate::testrun::run_planned(&ctx, &mut r, "test", planned, crate::checks::Check::Test);

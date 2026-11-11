@@ -10,6 +10,9 @@ use std::time::Instant;
 use super::{Enrollment, GNU_RIGHTS_MARKER, GnuIdentity, OUTPUT_RIGHTS_MARKER, OutputAttachment};
 use crate::{Channel, FileIdentity};
 
+mod source;
+pub use source::{check_source, receive_source, send_source};
+
 fn time(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline { Err(io::ErrorKind::TimedOut.into()) } else { Ok(()) }
 }

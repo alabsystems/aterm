@@ -636,7 +636,9 @@ fn connect_browser(
     notify: &mut impl FnMut(String),
 ) -> Result<Account, String> {
     notify("Connecting to Proton Mail…".into());
-    aterm_agent::harness::mail_browser::shared_mailbox(home, credentials).map(Account::Proton)
+    aterm_agent::harness::mail_browser::shared_mailbox(home, credentials)
+        .map(Account::Proton)
+        .map_err(|error| error.to_string())
 }
 
 fn permits_browser_fallback(kind: aterm_mail::proton_error::Kind) -> bool {

@@ -18,7 +18,7 @@ impl PrefreezeFixture {
     pub fn new() -> Self {
         let fixture = Fixture::new();
         let real = Self::real(fixture.root.path());
-        let cache = real.release.join("cutter-cache");
+        let cache = cutter_cache_dir(&real.release);
         let source = fixture.root.path().join("prepared");
         aterm_tempfile::stand_in(&source, &format!(
             "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '{}'; else printf '%s\\n' 'R policy passes'; fi\n",
@@ -103,7 +103,7 @@ impl PrefreezeFixture {
 fn repeated_prefreeze_uses_the_record_without_taking_the_held_workspace() {
     let fixture = PrefreezeFixture::new();
     let mut real = PrefreezeFixture::real(fixture.fixture.root.path());
-    let cache = real.release.join("cutter-cache");
+    let cache = cutter_cache_dir(&real.release);
     let before = std::fs::read(cache.join("workspace-running")).unwrap();
     let prepared = prepare_cached_cutter(&mut real, &fixture.fixture.candidate).unwrap();
     assert_eq!(prepared.commit, fixture.fixture.candidate);

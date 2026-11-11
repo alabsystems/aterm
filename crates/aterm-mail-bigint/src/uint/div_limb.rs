@@ -275,18 +275,5 @@ pub(crate) const fn div_rem_limb_with_reciprocal<const L: usize>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Reciprocal, div2by1};
-    use crate::{Limb, Word};
-    #[test]
-    fn div2by1_overflow() {
-        // A regression test for a situation when in div2by1() an operation (`q1 + 1`)
-        // that is protected from overflowing by a condition in the original paper (`r >= d`)
-        // still overflows because we're calculating the results for both branches.
-        let r = Reciprocal::new(Limb(Word::MAX - 1)).unwrap();
-        assert_eq!(
-            div2by1(Word::MAX - 2, Word::MAX - 63, &r),
-            (Word::MAX, Word::MAX - 65)
-        );
-    }
-}
+#[path = "div_limb_tests.rs"]
+mod tests;

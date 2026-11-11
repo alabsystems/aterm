@@ -5,6 +5,7 @@
 //! This module grants no provider, process, credential or session assignment authority.
 
 use super::accounts::{self, Binding};
+use super::login_drive::NativePreparationStage;
 #[path = "codex_catalogue_witness.rs"]
 mod catalogue_witness;
 #[path = "codex_owner_witness.rs"]
@@ -128,6 +129,8 @@ struct Record {
     row_publication: Option<super::codex_native_row::PublicationReceiptData>,
     status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation_stage: Option<NativePreparationStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     staging: Option<Staging>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     retired: bool,
@@ -236,6 +239,19 @@ impl RecoveryOwnership {
     }
 }
 impl Record {
+    fn preparation_failure_valid(&self) -> bool {
+        self.preparation_stage.is_none()
+            || (self.request.is_some()
+                && self.rejected.is_none()
+                && self.status.phase == Phase::Refused
+                && self.status.generation.is_none()
+                && self.grant_reference.is_none()
+                && self.owner_witness.is_none()
+                && self.row_publication.is_none()
+                && self.sealed_digest.is_none()
+                && self.recovery.is_none())
+    }
+
     fn catalogue_only_change(&self, old: &Self) -> bool {
         let mut unchanged = self.clone();
         unchanged.catalogue_witness = old.catalogue_witness.clone();
@@ -452,6 +468,7 @@ pub struct Operations(
     #[serde(skip)] BTreeMap<String, RecoveryOwnership>,
     #[serde(skip)] std::collections::BTreeSet<String>,
     #[serde(skip)] BTreeMap<String, (Option<CatalogueWitness>, CatalogueWitness)>,
+    #[serde(skip)] BTreeMap<String, NativePreparationStage>,
 );
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -648,6 +665,24 @@ impl Operations {
         })
     }
 
+    /// Eligibility for metadata-only completion of a refused preparation. The
+    /// catalogue must additionally prove its independent no-attempt high-water.
+    pub(super) fn refused_catalogue_preparation(&self, request: &Request) -> Result<bool, String> {
+        self.catalogue_staging(request)?;
+        let record = self
+            .0
+            .get(&request.id)
+            .ok_or("catalogue record unavailable")?;
+        Ok(record.status.phase == Phase::Refused
+            && record.status.generation.is_none()
+            && record.catalogue_witness.is_none()
+            && record.grant_reference.is_none()
+            && record.owner_witness.is_none()
+            && record.row_publication.is_none()
+            && record.sealed_digest.is_none()
+            && record.recovery.is_none())
+    }
+
     pub(super) fn cas_catalogue_witness(
         &mut self,
         transition: &super::codex_grant_owner::CatalogueTransition,
@@ -710,6 +745,7 @@ impl Operations {
             || book.0.len() > MAX_OPERATIONS
             || book.0.iter().any(|(id, record)| {
                 record.intent().is_none_or(|intent| id != &intent.id)
+                    || !record.preparation_failure_valid()
                     || (record.catalogue_required && !record.native_required)
                     || record.catalogue_witness.as_ref().is_some_and(|witness| {
                         !witness.valid()
@@ -821,6 +857,20 @@ impl Operations {
             .ok_or_else(|| "unknown enrollment operation".into())
     }
 
+    /// Exact-caller diagnostic metadata grants no admission, recovery or publication rights.
+    pub fn diagnostics(
+        &self,
+        id: &str,
+        caller: &str,
+    ) -> Result<(RejectedIntent, Status, Option<NativePreparationStage>), String> {
+        let (intent, status) = self.retained(id, caller)?;
+        let record = self.0.get(id).ok_or("unknown enrollment operation")?;
+        if !record.preparation_failure_valid() {
+            return Err("invalid enrollment diagnostic".into());
+        }
+        Ok((intent, status, record.preparation_stage))
+    }
+
     /// Recover only an existing row-resolved record. An opaque refusal cannot
     /// supply a row, workflow or checkpoint identity.
     pub fn admitted(&self, id: &str, caller: &str) -> Result<Request, String> {
@@ -882,6 +932,7 @@ impl Operations {
                 catalogue_witness: None,
                 row_publication: None,
                 status: status.clone(),
+                preparation_stage: None,
                 staging: None,
                 retired: false,
                 sealed_digest: None,
@@ -927,6 +978,7 @@ impl Operations {
                     phase: Phase::Running,
                     generation: None,
                 },
+                preparation_stage: None,
             },
         );
         Ok(true)
@@ -1210,6 +1262,21 @@ impl Operations {
             .expect("checked record")
             .status
             .phase = phase;
+        Ok(())
+    }
+
+    pub(super) fn refuse_preparation(
+        &mut self,
+        request: &Request,
+        stage: NativePreparationStage,
+    ) -> Result<(), String> {
+        self.finish(request, Phase::Refused)?;
+        let record = self.0.get_mut(&request.id).expect("checked record");
+        record.preparation_stage = Some(stage);
+        if !record.preparation_failure_valid() {
+            return Err("preparation refusal conflicts with enrollment custody".into());
+        }
+        self.8.insert(request.id.clone(), stage);
         Ok(())
     }
 
@@ -1749,6 +1816,11 @@ impl Operations {
                         || new.rejected != old.rejected
                         || new.native_required != old.native_required
                         || new.catalogue_required != old.catalogue_required
+                        || (new.preparation_stage != old.preparation_stage
+                            && !(old.preparation_stage.is_none()
+                                && old.status.phase == Phase::Running
+                                && new.preparation_failure_valid()
+                                && new.preparation_stage == self.8.get(id).copied()))
                         || (new.grant_reference != old.grant_reference
                             && !(old.status.phase == Phase::Running
                                 && old.grant_reference.is_none()
@@ -1821,7 +1893,9 @@ impl Operations {
             }
         }
         for (id, record) in &mut self.0 {
-            if record.intent().is_none_or(|intent| id != &intent.id) {
+            if record.intent().is_none_or(|intent| id != &intent.id)
+                || !record.preparation_failure_valid()
+            {
                 return Err("invalid enrollment operation".into());
             }
             if let Some(staging) = &record.staging
@@ -1899,6 +1973,7 @@ impl Operations {
                     || record.staging.is_some()
                     || record.sealed_digest.is_some()
                     || record.recovery.is_some()
+                    || record.preparation_stage.is_some()
                 {
                     return Err("new enrollment has no retired native attempt".into());
                 }
@@ -2012,6 +2087,16 @@ impl Operations {
                 return Err("invalid catalogue witness mutation evidence".into());
             }
         }
+        for (id, stage) in &self.8 {
+            if !before.0.get(id).is_some_and(|old| {
+                old.status.phase == Phase::Running && old.preparation_stage.is_none()
+            }) || !self.0.get(id).is_some_and(|new| {
+                new.preparation_stage == Some(*stage) && new.preparation_failure_valid()
+            }) {
+                return Err("invalid preparation refusal evidence".into());
+            }
+        }
+        self.8.clear();
         self.7.clear();
         self.6.clear();
         self.4.clear();
@@ -2222,6 +2307,20 @@ pub fn owned_work(request: Request, scope: super::account_work::Scope) -> (Work,
 }
 
 impl Work {
+    #[cfg(all(test, unix))]
+    pub(in crate::harness) fn with_native_context<R>(
+        &self,
+        env: &super::cli::Env,
+        run: impl FnOnce(&NativeContext<'_>) -> R,
+    ) -> R {
+        let retirement = std::sync::Mutex::new(None);
+        run(&NativeContext {
+            env,
+            runtime: &self.native,
+            scope: &self.scope,
+            retirement: &retirement,
+        })
+    }
     /// Inert provider injection for native account-management controls.
     #[cfg(any(test, debug_assertions))]
     pub fn run_with_host(
@@ -2602,6 +2701,10 @@ pub use source_proof_fixture::{
     NativeSourceProofWorld, SOURCE_PROOF_TASK, SourceProofAdvance, SourceProofLaunch,
     SourceProofSettlement,
 };
+
+#[cfg(test)]
+#[path = "codex_enrollment_diagnostics_tests.rs"]
+mod diagnostics_tests;
 
 #[cfg(test)]
 mod tests {

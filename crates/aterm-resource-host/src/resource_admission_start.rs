@@ -30,6 +30,7 @@ impl Owner {
                     .as_ref()
                     .ok_or_else(|| refused("missing admitted recipe"))?;
                 let mut command = recipe.command(&pending.submission.request);
+                recipe.configure_ay(&mut command)?;
                 let resolver = matches!(recipe.kind, recipe::Kind::Resolver);
                 if matches!(recipe.kind, recipe::Kind::BootstrapGraph) {
                     let sdk = service_sdk
@@ -143,6 +144,7 @@ impl Owner {
                     "child preparation refused before launch",
                 );
                 self.failed.push(Failed {
+                    _ay: pending.recipe.as_ref().and_then(|r| r.ay.clone()),
                     _primary: pending.primary.take(),
                     _compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
                     binding: pending.submission.request.binding,
@@ -184,6 +186,7 @@ impl Owner {
                 // An unbound or unknown native outcome has no affirmative
                 // Refused/Started fact. Closing yields transport-unknown.
                 self.failed.push(Failed {
+                    _ay: pending.recipe.as_ref().and_then(|r| r.ay.clone()),
                     _primary: pending.primary.take(),
                     _compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
                     binding: pending.submission.request.binding,
@@ -259,6 +262,7 @@ impl Owner {
             || matches!(&original_deadline, Ok(Some(deadline)) if *deadline > started)
                 && timeout.is_some_and(|timeout| started.checked_add(timeout).is_some());
         let mut job = Job {
+            ay: pending.recipe.as_ref().and_then(|r| r.ay.clone()),
             #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
             control_eof_before_reap_test: false,
             workload,
@@ -335,26 +339,33 @@ impl Owner {
                 self.jobs.insert((binding.session, binding.attempt), job);
                 return;
             }
-            let running = self
-                .journal
-                .update(&binding, "running", aterm_json::json!({}));
-            if running.is_ok() && job::inspection(&self.fence, &self.debt, &mut job).is_ok() {
-                // Sample before GO: an immediately exiting child can publish
-                // its exit stamp before the resume syscall returns. All queue,
-                // probe and durable handoff waits have already ended.
-                if let Ok((monotonic_ns, unix_ns)) = clocks() {
-                    let started = Instant::now();
+            if let Ok((monotonic_ns, unix_ns)) = clocks() {
+                // Commit this exact authorization clock before GO. A durable
+                // record alone does not prove that the stopped child ran.
+                let started = Instant::now();
+                let running = self.journal.update(
+                    &binding,
+                    "running",
+                    aterm_json::json!({"monotonic_ns":monotonic_ns,"unix_ns":unix_ns}),
+                );
+                if running.is_ok() && job::inspection(&self.fence, &self.debt, &mut job).is_ok() {
                     let remaining = match &original_deadline {
                         Ok(Some(deadline)) => remaining_workload_timeout(*deadline, started),
                         _ => job.timeout,
                     };
-                    let clock_current = job.workload.is_none()
-                        || matches!(&original_deadline, Ok(Some(deadline)) if *deadline > started)
-                            && remaining
-                                .is_some_and(|timeout| started.checked_add(timeout).is_some());
-                    // A durable running write may have waited while the
-                    // caller cancelled or disconnected. Recheck at GO.
-                    if clock_current
+                    let image_current = job
+                        .ay
+                        .as_ref()
+                        .is_none_or(|ay| ay.validate_loaded(pid).is_ok());
+                    // Neither durable IO nor image checks may renew a selected
+                    // deadline or dispatch work after it has already expired.
+                    let now = Instant::now();
+                    let clock_current = match remaining {
+                        Some(timeout) => started.checked_add(timeout).is_some_and(|end| now < end),
+                        None => job.workload.is_none() && job.timeout.is_none(),
+                    };
+                    if image_current
+                        && clock_current
                         && !job.events.cancelled()
                         && job.child.child_mut().resume().is_ok()
                     {

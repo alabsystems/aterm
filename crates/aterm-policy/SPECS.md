@@ -17,7 +17,7 @@ from running it.
 Result: **21 specs**; every test is a sample of one of them.
 
 Gap numbers in the `blocking_gaps` column refer to the table in §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap 0 (the installed seal publishes no
+`docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (the installed seal publishes no
 Lean-discharged row) blocks every spec, so it is listed on every row.
 
 ## 0. Notation used in the statements
@@ -82,44 +82,6 @@ limiter-slot-resolution	equivalence	RateLimiterSet::{slot,try_consume,try_consum
 bucket-snapshot-restore	contract	TokenBucket::{snapshot,restore_snapshot}, RateLimiterSet::{snapshots,restore_snapshots,earliest_refill}, PolicyEngine::{bucket_snapshots,restore_bucket_snapshots,earliest_refill}	snapshot(b) = BucketSnapshot{b.tokens, b.last_refill}. restore_snapshot(b,s) sets b.tokens := clamp(s.tokens, 0.0, C as f64) normalized so −0.0 ↦ +0.0 when s.tokens.is_finite(), else +0.0, and b.last_refill := s.last_refill, framing (C, R, M). snapshots/bucket_snapshots map snapshot over buckets in first-declaration order; restore_snapshots/restore_bucket_snapshots zip-restore prefix min(|buckets|, |snaps|) and frame trailing buckets; earliest_refill = min{b.last_refill : b ∈ buckets, b.last_refill = Some(_)}.	limits.rs::snapshot_restore_clamps_invalid_balances_and_tracks_earliest_refill	MEDIUM: f64 is_finite/clamp and −0.0 normalization; Option<Instant> Ord; Vec iter/zip/filter_map/min; PolicyEngine delegation.	0,1,2,3,4,7,12
 policy-scalar-helpers	contract	Profile::{as_str,strictness_rank,is_at_least_as_strict_as}, Response::{as_str,allows_execution,is_drop}, RateLimit::{encode_params_le,decode_params_le}	Profile::as_str/strictness_rank map (Permissive, Standard, Hardened) to ("Permissive"/0, "Standard"/1, "Hardened"/2) and is_at_least_as_strict_as(a,b) ⇔ rank(a) ≥ rank(b). Response::as_str maps to snake_case; allows_execution(r) ⇔ r ∈ {Execute, Rewrite}; is_drop(r) ⇔ r ∈ {Drop, Warn}. decode_params_le(encode_params_le(c,r,m,v)) = (c,r,m,v) in 4×4-byte little-endian order.	tests.rs::profile_response_and_rate_limit_scalar_helpers_match_contracts	EASY: const fn enum matches returning &'static str / u8 / bool; fixed [u8; 16] array indexing, shifts and casts.	0,1,3,5
 ```
-
-### Distribution by kind (21)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 12 | origin-dominates-order, selector-param-matches, bucket-key-projection, selector-matches-denotation, selector-parse-denotation, builtin-profile-denotation, token-bucket-guards, token-bucket-refill-debit, limiter-set-from-policy, limiter-set-consume-slot, bucket-snapshot-restore, policy-scalar-helpers |
-| table-property | 3 | origin-rank-table, selector-alias-expansion, builtin-profiles-wellformed |
-| refinement | 2 | engine-evaluate-first-match, policy-decode-schema |
-| invariant | 2 | profile-refinement, token-bucket-rate-safety |
-| round-trip | 1 | policy-toml-roundtrip |
-| equivalence | 1 | limiter-slot-resolution |
-
-### Gap histogram (specs blocked by each audit §7 gap)
-
-| gap | specs | note |
-|---|---|---|
-| 0 | 21 | seal prerequisite; no spec is blocked by gap 0 alone |
-| 1 | 21 | every spec states something about an enum, String, Vec, Option, array or struct |
-| 2 | 12 | `&self`/`&mut self` views, two-state frames |
-| 3 | 17 | calls, casts, loops and enum matches in bodies |
-| 4 | 12 | composition of callee ensures |
-| 5 | 9 | quantified clauses |
-| 7 | 11 | loops |
-| 9 | 2 | serde proc-macro boundary |
-| 11 | 5 | generic `T: TimeSource` |
-| 12 | 4 | cross-crate citation (`aterm_toml`, `aterm_time`) |
-
-### Proof dependency order
-
-`origin-rank-table` → `origin-dominates-order`; `selector-param-matches` →
-`selector-matches-denotation`; `selector-parse-denotation` → `selector-alias-expansion`;
-`bucket-key-projection` + the selector specs + `origin-dominates-order` →
-`engine-evaluate-first-match` → `builtin-profile-denotation` → `profile-refinement`.
-`builtin-profiles-wellformed` is independent. `token-bucket-guards` + `token-bucket-refill-debit`
-→ `token-bucket-rate-safety`; the bucket specs + `limiter-set-from-policy` →
-`limiter-set-consume-slot` → `limiter-slot-resolution`. The two serde specs are last and
-independent; `policy-decode-schema` implies `policy-toml-roundtrip` once `to_toml` is shown to
-emit schema-fitting text.
 
 ## 2. Test → spec map (TSV)
 
@@ -205,23 +167,3 @@ tests/serde_corpus.rs	policy_documents_answer_as_recorded	policy-decode-schema	p
 10. **Resolved: `Profile::Hardened` doc no longer claims `User` origin rules.** `src/lib.rs` describes
     `Profile::Hardened` simply as `"Maximum restriction."`, while `hardened_rules_only_admit_host_configfile_or_user`
     and `builtin-profiles-wellformed` state the admitted origin set.
-
-## 5. Proof order (easiest, high value first)
-
-1. `origin-rank-table`, `policy-scalar-helpers`, then `origin-dominates-order`: const fns over
-   finite enums and `[u8; 16]`, decidable by enumeration/bit-blasting, and the origin-gate lemma
-   `engine-evaluate-first-match` needs.
-2. `bucket-key-projection` and `selector-param-matches`: the matcher's leaves, with no loops.
-3. `token-bucket-guards`: u64 comparisons with an unchanged-state frame and an unread clock.
-4. `builtin-profiles-wellformed`: evaluation of three constant constructors.
-5. `selector-matches-denotation`, `token-bucket-refill-debit`, `bucket-snapshot-restore`,
-   `limiter-set-from-policy`, then `limiter-set-consume-slot` and `limiter-slot-resolution`
-   (loops, f64, frames).
-6. `selector-parse-denotation` → `selector-alias-expansion` → `engine-evaluate-first-match` →
-   `builtin-profile-denotation` → `profile-refinement`: the highest-value chain, and the hardest
-   (string parsing, and the bucket invariant `PolicyEngine::new` establishes). Once
-   `engine-evaluate-first-match` holds, `builtin-profile-denotation` is a finite case split and
-   `profile-refinement` follows at once.
-7. `token-bucket-rate-safety`: trace induction under f64 over the two bucket step lemmas.
-8. `policy-decode-schema`, then `policy-toml-roundtrip`, which it implies once `to_toml` is
-   shown to emit schema-fitting text. Both wait on gaps 9 and 12.

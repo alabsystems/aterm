@@ -11,6 +11,9 @@
 #[path = "../aterm-spec-anchor/anchor_rules.rs"]
 mod anchor_rules;
 
+#[path = "../aterm-toolchain/link_rules.rs"]
+mod link_rules;
+
 /// Ordinal of both the icon and the manifest; resources are keyed by (type, id).
 const RESOURCE_ID: u16 = 1;
 
@@ -22,6 +25,7 @@ const VS_VERSION_INFO_ID: u16 = 1;
 
 fn main() {
     anchor_rules::emit();
+    link_rules::emit();
     build_stamp::emit();
     let compiler_flavor = compiler::emit();
     chained_fixups();

@@ -1029,6 +1029,94 @@ fn clt_landing_install_opens_the_tab_on_a_press() {
     assert!(!app.press_developer_tools_install(), "one tab at a time");
     app.headless = true;
     assert_eq!(tabs(&app), before + 1);
+
+    // The menu's fixed permission-only child uses this same landing/custody
+    // path, but never borrows a tools attempt, install report or durable ask.
+    #[cfg(target_os = "macos")]
+    for (changed_origin, closed_origin) in [(false, false), (true, false), (false, true)] {
+        let (mut app, wid) = page();
+        app.headless = false;
+        app.frontmost_window = Some(wid);
+        app.machine_sets = 7;
+        let origin = app.palette_menu_origin(wid).unwrap();
+        let original_tab = app.windows[&wid].tab_set.active_id().unwrap();
+        let install = app.workstation_setup.developer_tools;
+        let attempt = app.workstation_setup.developer_tools_attempt;
+        let before = tabs(&app);
+        let id = test_support::book_unasked(&mut app, wid, name_rule_tab_then(7, origin));
+        if changed_origin {
+            app.switch_tab_in(wid, 0);
+        }
+        let (landed, read) = land(&mut app, wid, id);
+        assert_eq!(landed, !changed_origin);
+        assert_eq!(tabs(&app), before + usize::from(!changed_origin));
+        assert_eq!(
+            drain(&read),
+            if changed_origin {
+                Vec::new()
+            } else {
+                go_line()
+            }
+        );
+        assert_eq!(app.workstation_setup.developer_tools, install);
+        assert_eq!(app.workstation_setup.developer_tools_attempt, attempt);
+        if !changed_origin {
+            assert!(
+                app.developer_tools_install_active(),
+                "the exact tab holds prompt custody"
+            );
+            assert!(
+                app.developer_tools_tab().is_none(),
+                "this is not a tools install tab"
+            );
+            assert!(
+                app.developer_tools_install_holds_handoff(),
+                "an unreceipted permission child is not transferred"
+            );
+            assert_eq!(
+                step(&mut app),
+                None,
+                "the permission child supplies no tools readiness/status"
+            );
+            let terminal = app
+                .workstation_setup
+                .developer_tools_session
+                .last()
+                .unwrap();
+            assert!(matches!(
+                terminal.purpose,
+                TerminalPurpose::NameRule { generation: 7, .. }
+            ));
+            let session = terminal.session;
+            if closed_origin {
+                assert!(
+                    app.windows
+                        .get_mut(&wid)
+                        .unwrap()
+                        .tab_set
+                        .remove(original_tab)
+                        .is_some()
+                );
+            }
+            app.developer_tools_install_ended(
+                session,
+                Some(aterm_pty::ChildExit::Code(if closed_origin {
+                    0
+                } else {
+                    1
+                })),
+            );
+            assert!(
+                app.machine_unset.is_some(),
+                "failed or origin-lost completion remains pending"
+            );
+            assert_eq!(
+                tabs(&app),
+                before + 1 - usize::from(closed_origin),
+                "the result stays available in its tab"
+            );
+        }
+    }
 }
 
 /// A person's Install… never waits behind a helper panel they cannot see (e2e145: with aterm in

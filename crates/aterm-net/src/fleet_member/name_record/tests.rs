@@ -48,6 +48,18 @@ fn plain(me: &NodeIdentity) -> NameRecord {
     }
 }
 
+#[test]
+fn zero_and_an_absent_id_have_distinct_wire_records() {
+    let me = identity(1);
+    let mut absent = plain(&me);
+    absent.claim.num = None;
+    let mut zero = absent.clone();
+    zero.claim.num = Some(Number::new(0).unwrap());
+    assert_ne!(zero.encode(), absent.encode());
+    assert_eq!(NameRecord::decode(&zero.encode()), Ok(zero));
+    assert_eq!(NameRecord::decode(&absent.encode()), Ok(absent));
+}
+
 /// Every field present at its widest: 16-byte node ids, eight `was` entries with both flags,
 /// a 64-byte nickname.
 fn widest(me: &NodeIdentity) -> NameRecord {
@@ -182,25 +194,19 @@ fn bytes_the_encoder_would_not_write_are_no_record() {
         Err(Malformed::Short)
     );
 
-    let mut zero = plain(&me);
-    let bytes = zero.encode();
+    let mut record = plain(&me);
+    let bytes = record.encode();
     // num sits at 3..7 in a record that carries one.
-    let mut unnumbered = bytes.clone();
-    unnumbered[3..7].copy_from_slice(&0u32.to_be_bytes());
-    assert_eq!(
-        NameRecord::decode(&unnumbered),
-        Err(Malformed::Field("num"))
-    );
     let mut past = bytes.clone();
     past[3..7].copy_from_slice(&1_000_000u32.to_be_bytes());
     assert_eq!(NameRecord::decode(&past), Err(Malformed::Field("num")));
 
-    zero.claim.was = vec![Was {
+    record.claim.was = vec![Was {
         num: num(7),
         retired: false,
         lost: false,
     }];
-    let bytes = zero.encode();
+    let bytes = record.encode();
     let at = bytes.len() - 1 - 16 - 4;
     let mut flagged = bytes.clone();
     flagged[at] |= 0x08;
@@ -218,7 +224,7 @@ fn a_nickname_outside_its_grammar_is_no_record() {
     let good = record.encode();
     assert!(NameRecord::decode(&good).is_ok(), "control");
     let at = good.len() - 17 - 5;
-    for bad in [*b"1eron", *b"her!n"] {
+    for bad in [*b"1eron", *b"her!n", *b"her\tn", *b"hero ", *b" hern"] {
         let mut bytes = good.clone();
         bytes[at..at + 5].copy_from_slice(&bad);
         assert_eq!(NameRecord::decode(&bytes), Err(Malformed::Field("nick")));

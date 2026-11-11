@@ -7,6 +7,7 @@
 //! keeps the profile lock until its idle lease expires. Native Proton parsing,
 //! identity validation and message decryption remain in each caller.
 
+use super::MailboxOpenError;
 use super::native::{BrowserTransport, Credentials, HeadlessMail, StoredCredentials, digest};
 use aterm_json::{Value, json};
 use aterm_mail::proton::{ApiError, ApiResponse, ApiTransport, Proton};
@@ -76,11 +77,22 @@ impl Write for DeadlineStream<'_> {
     }
 }
 
-fn failure(message: impl Into<String>) -> ApiError {
+fn failure(kind: Kind, message: impl Into<String>) -> ApiError {
     ApiError {
-        kind: Kind::Network,
+        kind,
         message: message.into(),
     }
+}
+
+fn io_failure(error: io::Error) -> ApiError {
+    let kind = match error.kind() {
+        io::ErrorKind::PermissionDenied => Kind::AccessDenied,
+        io::ErrorKind::InvalidInput => Kind::Configuration,
+        io::ErrorKind::InvalidData => Kind::Protocol,
+        io::ErrorKind::TimedOut => Kind::Timeout,
+        _ => Kind::Network,
+    };
+    failure(kind, error.to_string())
 }
 
 fn remaining(end: Instant) -> io::Result<Duration> {
@@ -296,16 +308,12 @@ impl RemoteTransport {
     ) -> Result<(Value, Zeroizing<Vec<u8>>), ApiError> {
         let hang = started + OPERATION;
         let end = self.end.map_or(hang, |end| end.min(hang));
-        remaining(end).map_err(|error| failure(error.to_string()))?;
-        let stream = self
-            .connect(end)
-            .map_err(|error| failure(error.to_string()))?;
-        let left = remaining(end).map_err(|error| failure(error.to_string()))?;
-        stream
-            .set_nonblocking(true)
-            .map_err(|error| failure(error.to_string()))?;
+        remaining(end).map_err(io_failure)?;
+        let stream = self.connect(end).map_err(io_failure)?;
+        let left = remaining(end).map_err(io_failure)?;
+        stream.set_nonblocking(true).map_err(io_failure)?;
         let Value::Object(mut request) = request else {
-            return Err(failure("Invalid mail owner request"));
+            return Err(failure(Kind::Configuration, "Invalid mail owner request"));
         };
         request.insert("version".into(), json!(1));
         request.insert(
@@ -323,7 +331,7 @@ impl RemoteTransport {
             json!(monotonic_ms()?.saturating_add(left.as_millis() as u64)),
         );
         let header = aterm_json::to_vec(&Value::Object(request))
-            .map_err(|error| failure(error.to_string()))?;
+            .map_err(|error| failure(Kind::Configuration, error.to_string()))?;
         let mut raw_stream = stream;
         let mut stream = DeadlineStream {
             stream: &mut raw_stream,
@@ -335,16 +343,27 @@ impl RemoteTransport {
             write_frame(&mut stream, &header, MAX_HEADER)?;
             write_frame(&mut stream, body, MAX_BODY)?;
             let header = read_frame(&mut stream, MAX_HEADER)?;
-            let reply: Value = aterm_json::from_slice(&header).map_err(io::Error::other)?;
+            let reply: Value = aterm_json::from_slice(&header)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             let body = read_frame(&mut stream, MAX_BODY)?;
             Ok((reply, body))
         })()
         .map_err(|error| {
-            failure(format!(
-                "Mail owner exchange interrupted; outcome is unknown: {error}"
-            ))
+            let mut error = io_failure(error);
+            error.message = format!(
+                "Mail owner exchange interrupted; outcome is unknown: {}",
+                error.message
+            );
+            error
         })?;
-        if let Some(message) = result.0["error"].as_str() {
+        let reply = result
+            .0
+            .as_object()
+            .ok_or_else(|| failure(Kind::Protocol, "Invalid mail owner response"))?;
+        if let Some(message) = reply.get("error") {
+            let message = message
+                .as_str()
+                .ok_or_else(|| failure(Kind::Protocol, "Invalid mail owner error response"))?;
             return Err(ApiError {
                 kind: decode_kind(result.0["kind"].as_str().unwrap_or("Protocol")),
                 message: message.into(),
@@ -368,7 +387,7 @@ impl ApiTransport for RemoteTransport {
         let body = body
             .map(|body| aterm_json::to_vec(&body))
             .transpose()
-            .map_err(|error| failure(error.to_string()))?
+            .map_err(|error| failure(Kind::Configuration, error.to_string()))?
             .unwrap_or_default();
         let (reply, body) = self.exchange(
             json!({"operation":"request", "method":method.as_str(), "path":path}),
@@ -377,10 +396,16 @@ impl ApiTransport for RemoteTransport {
         let status = reply["status"]
             .as_u64()
             .and_then(|status| u16::try_from(status).ok())
-            .ok_or_else(|| failure("Invalid mail owner response"))?;
+            .filter(|status| (100..=599).contains(status))
+            .ok_or_else(|| failure(Kind::Protocol, "Invalid mail owner response"))?;
+        let retry_after = match reply.get("retry_after") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            _ => return Err(failure(Kind::Protocol, "Invalid mail owner retry deadline")),
+        };
         Ok(ApiResponse {
             status,
-            retry_after: reply["retry_after"].as_str().map(str::to_owned),
+            retry_after,
             body: body.to_vec(),
         })
     }
@@ -394,7 +419,7 @@ pub(super) fn mailbox(
     home: &Path,
     credentials: Credentials<'_>,
     end: Option<Instant>,
-) -> Result<Proton, String> {
+) -> Result<Proton, MailboxOpenError> {
     let email = credentials.email.to_owned();
     let transport = RemoteTransport {
         home: home.into(),
@@ -414,10 +439,16 @@ pub(super) fn mailbox(
         }
         mailbox.unlock_mailbox_with_key_password(&key)
     };
-    if let Some(end) = end {
-        mailbox.run_until(end, unlock)?;
+    let opened = if let Some(end) = end {
+        mailbox.run_until(end, unlock)
     } else {
-        unlock(&mut mailbox)?;
+        unlock(&mut mailbox)
+    };
+    if let Err(message) = opened {
+        return Err(MailboxOpenError {
+            message,
+            proton_failure: mailbox.last_failure(),
+        });
     }
     Ok(mailbox)
 }
@@ -425,7 +456,8 @@ pub(super) fn mailbox(
 fn monotonic_ms() -> Result<u64, ApiError> {
     // All local processes share this boot-relative clock. Wall-clock adjustment
     // must not extend a queued write beyond its caller's original deadline.
-    aterm_uds::process::awake_ms().ok_or_else(|| failure("Mail operation clock unavailable"))
+    aterm_uds::process::awake_ms()
+        .ok_or_else(|| failure(Kind::Configuration, "Mail operation clock unavailable"))
 }
 
 fn request_end(request: &Value, account: &str) -> Result<Instant, ApiError> {
@@ -445,13 +477,16 @@ fn request_end_started(
     }
     let left = request["expires"]
         .as_u64()
-        .unwrap_or(0)
+        .ok_or_else(|| failure(Kind::Protocol, "Invalid mail owner deadline"))?
         .saturating_sub(monotonic_ms()?);
     if left == 0 {
-        return Err(failure("Mail operation deadline expired"));
+        return Err(failure(Kind::Timeout, "Mail operation deadline expired"));
     }
-    let end = (Instant::now() + Duration::from_millis(left)).min(started + OPERATION);
-    remaining(end).map_err(|error| failure(error.to_string()))?;
+    let end = Instant::now()
+        .checked_add(Duration::from_millis(left))
+        .ok_or_else(|| failure(Kind::Protocol, "Invalid mail owner deadline"))?
+        .min(started + OPERATION);
+    remaining(end).map_err(io_failure)?;
     Ok(end)
 }
 
@@ -497,7 +532,7 @@ impl Owner {
         let transport = self
             .transport
             .as_mut()
-            .ok_or_else(|| failure("Mail transport unavailable"))?;
+            .ok_or_else(|| failure(Kind::Configuration, "Mail transport unavailable"))?;
         transport.set_deadline(Some(end));
         Ok(transport)
     }
@@ -529,17 +564,17 @@ impl Owner {
                     Some("PATCH") => aterm_http::Method::Patch,
                     Some("PUT") => aterm_http::Method::Put,
                     Some("DELETE") => aterm_http::Method::Delete,
-                    _ => return Err(failure("Invalid mail API method")),
+                    _ => return Err(failure(Kind::Protocol, "Invalid mail API method")),
                 };
                 let path = request["path"]
                     .as_str()
-                    .ok_or_else(|| failure("Missing mail API path"))?;
+                    .ok_or_else(|| failure(Kind::Protocol, "Missing mail API path"))?;
                 let body = if body.is_empty() {
                     None
                 } else {
                     Some(
                         aterm_json::from_slice(body)
-                            .map_err(|_| failure("Invalid mail API body"))?,
+                            .map_err(|_| failure(Kind::Protocol, "Invalid mail API body"))?,
                     )
                 };
                 let response = transport.request(method, path, body)?;
@@ -548,7 +583,7 @@ impl Owner {
                     Zeroizing::new(response.body),
                 ))
             }
-            _ => Err(failure("Invalid mail owner operation")),
+            _ => Err(failure(Kind::Protocol, "Invalid mail owner operation")),
         }
     }
 }
@@ -574,7 +609,8 @@ pub(super) fn serve(home: &Path, account: &str) -> Result<(), String> {
 
 fn serve_inner(home: &Path, account: &str) -> io::Result<()> {
     let bootstrap = read_frame(&mut std::io::stdin().lock(), MAX_HEADER)?;
-    let value: Value = aterm_json::from_slice(&bootstrap).map_err(io::Error::other)?;
+    let value: Value = aterm_json::from_slice(&bootstrap)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let Value::Object(mut value) = value else {
         return Err(io::Error::other("Invalid mail owner bootstrap"));
     };
@@ -679,7 +715,8 @@ fn serve_connections(
                 end: Instant::now() + Duration::from_secs(2),
             };
             let bytes = read_frame(&mut input, MAX_HEADER)?;
-            let request: Value = aterm_json::from_slice(&bytes).map_err(io::Error::other)?;
+            let request: Value = aterm_json::from_slice(&bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             let body = read_frame(&mut input, MAX_BODY)?;
             Ok((request, body))
         })();
@@ -723,6 +760,10 @@ fn serve_connections(
 #[cfg(test)]
 #[path = "owner/native_wait_tests.rs"]
 mod native_wait_tests;
+
+#[cfg(test)]
+#[path = "owner/open_error_tests.rs"]
+mod open_error_tests;
 
 #[cfg(test)]
 mod tests {

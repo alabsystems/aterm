@@ -34,7 +34,7 @@ Trust/Clean about the compiled function, the tests it subsumes are deleted.
   Alignment is decided before slop, so an empty non-ZST `src` whose address is under-aligned for
   `B` is an `Err`, not `Ok(empty)`.
 - `blocking_gaps` numbers are rows of the gap table in
-  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (an installed seal that publishes
+  `docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (an installed seal that publishes
   Clean rows) blocks every row.
 
 ## 1. Specs (TSV)
@@ -67,10 +67,6 @@ src/lib.rs	empty_slice_cast	try-cast-slice-classify	cast-slice-refines-try, cast
 src/lib.rs	zeroed_returns_all_zero_bits	zeroed-is-all-zero-bits	bytes-of-view
 ```
 
-## 3. Coverage
-
-- All 7 `#[test]` functions in `src/lib.rs` map to one of the 6 specs in §1.
-
 ## 4. Tests that are not spec samples
 
 None.
@@ -93,25 +89,3 @@ None.
    model for `ptr::is_null` (or a const-compatible lowering) rather than `ptr as usize == 0`.
 6. **Cleanup on retirement:** delete the `panic_message` helper (`catch_unwind` + downcast)
    together with `exact_panic_message_matches_display` once `cast-slice-refines-try` is proved.
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone. Each needs gap 1 (slice/enum/`&str` carriers) and most need
-gap 11 (generics).
-
-1. **`pod-cast-error-display-table`**. A three-arm enum match to string literals with no generics,
-   loops or unsafe code. The match itself needs only gap 1 (`&str` content); gaps 3 and 4 enter only
-   through the `f.write_str` call and `ToString`. It is the cheapest Clean theorem in the crate, and the lemma
-   `cast-slice-refines-try` uses for its message.
-2. **`try-cast-slice-classify`** at concrete instances (`<u8, u32>`, `<u32, u8>`, `<f32, u8>`,
-   `<u8, f32>`, `<(), u8>`), then generic once gap 11 lands. The body is straight-line integer
-   arithmetic and branches written for Trust (the code comments say so). The hard part is the "same
-   bytes" clause over `from_raw_parts` (gap 8). Proving the length/address/`Err` part first is
-   gap 1 + 3 work. This retires 2 tests and makes `cast-slice-bytes-round-trip` (2 more) free.
-3. **`cast-slice-refines-try`**. Composition (gap 4) of the previous spec with a match whose arms are
-   static panics. It retires `exact_panic_message_matches_display` and needs a panic-payload
-   observation in the spec language.
-
-Then `cast-slice-bytes-round-trip` (free), `bytes-of-view` (same shape as branch 4 of the classify
-spec once `ptr::is_null` is modelled for `const fn`, §4.5), and
-`zeroed-is-all-zero-bits` (needs a `core::mem::zeroed` intrinsic model).

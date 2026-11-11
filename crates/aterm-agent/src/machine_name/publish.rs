@@ -10,27 +10,22 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::OnceLock;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use aterm_toml::edit::{DocumentMut, Item, Table, Value};
-use aterm_types::machine_name::{Class, Number, OsSlot};
+use aterm_types::machine_name::{Class, GeneratedNames, Number, OsSlot};
 use aterm_uds::atomic_file::ConfigFile;
 
 use super::file::{self, MachineName, Migration};
 
-/// The root step's whole bound: its password sheets and sudo's own retries.
-pub const SYSTEM_RENAME_WAIT: Duration = Duration::from_secs(600);
-
-/// macOS's three system names, in the order they are read and set: one operation, one approval.
+/// macOS's three system names, in the order they are read and set.
 pub const SYSTEM_NAMES: [&str; 3] = ["ComputerName", "LocalHostName", "HostName"];
 
 /// Bound for an optional `scutil --get` observation.
 #[cfg(target_os = "macos")]
 const SCUTIL_READ_WAIT: Duration = Duration::from_secs(10);
-
-/// Hang detector for the required system-name setter.
-#[cfg(target_os = "macos")]
-const SCUTIL_SET_HANG: Duration = Duration::from_secs(60);
 
 /// What a request a newer set replaced says (`aterm name set`'s words).
 const SUPERSEDED: &str = "a newer machine name replaced this request";
@@ -174,6 +169,34 @@ pub fn check_current(state: &Path, config: &Path, number: Number) -> Result<(), 
     policy.map_err(Pending::Policy)
 }
 
+/// The generated names of the saved canonical choice, without reading any OS name.
+/// # Errors
+/// The saved name is unread or no longer holds `number`.
+pub fn system_names(state: &Path, number: Number) -> Result<GeneratedNames, Pending> {
+    let name = file::read(state).map_err(|why| Pending::NameUnread(why.to_string()))?;
+    match name {
+        Some(name) if name.num == Some(number) => Ok(GeneratedNames::new(number, &name.nick)),
+        _ => Err(Pending::Superseded(SUPERSEDED.into())),
+    }
+}
+
+/// Fence both parts of an OS-name request after any potentially blocking read.
+/// # Errors
+/// As [`check_current`], or a newer nickname replaced the captured choice.
+pub fn check_system_current(
+    state: &Path,
+    config: &Path,
+    names: &GeneratedNames,
+) -> Result<(), Pending> {
+    check_current(state, config, names.number())?;
+    if system_names(state, names.number())? != *names {
+        return Err(Pending::Superseded(
+            "a newer machine number or nickname replaced this request".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The current policy keys that do not name `number`.
 fn missing_policy_keys(doc: &DocumentMut, number: &str) -> Vec<&'static str> {
     POLICY_KEYS
@@ -200,57 +223,90 @@ fn judged(state: &Path, number: Number, why: String, step: fn(String) -> Pending
     }
 }
 
-/// The root half's four words for `number`: `exe` (this program, canonical), `name`,
-/// `apply-system` and the number (`m59`).
-///
-/// # Errors
-/// `this program's path is not UTF-8`.
-pub fn apply_system_words(exe: &Path, number: Number) -> Result<Vec<String>, String> {
-    let exe = exe.to_str().ok_or("this program's path is not UTF-8")?;
-    Ok(vec![
-        exe.to_owned(),
-        "name".to_owned(),
-        "apply-system".to_owned(),
-        number.to_string(),
-    ])
-}
-
-/// The number `words` ask the root half to set, where they are exactly [`apply_system_words`]
-/// for `exe` and that number; `None` for any other words.
+/// Whether every observed OS name exactly matches its generated target.
 #[must_use]
-pub fn is_apply_system(words: &[String], exe: &Path) -> Option<Number> {
-    let number = Number::parse(words.get(3)?).ok()?;
-    (apply_system_words(exe, number).ok()? == words).then_some(number)
-}
-
-/// Whether each of `names` ([`SYSTEM_NAMES`]' values) accepts `number`'s OS projection.
-#[must_use]
-pub fn all_read(names: &[Option<String>; 3], number: Number) -> bool {
-    let number = number.to_string();
+pub fn all_read(names: &[Option<String>; 3], expected: &GeneratedNames) -> bool {
     SYSTEM_NAMES
         .into_iter()
         .zip(names)
-        .all(|(field, name)| accepts_system_name(field, &number, name.as_deref()))
+        .all(|(field, name)| exact_system_name(field, expected, name.as_deref()))
 }
 
-fn accepts_system_name(field: &str, number: &str, observed: Option<&str>) -> bool {
+fn exact_system_name(field: &str, names: &GeneratedNames, observed: Option<&str>) -> bool {
     observed.is_some_and(|observed| {
-        OsSlot::from_macos_preference(field)
-            .is_some_and(|slot| slot.accepts_projection(number, observed))
+        OsSlot::from_macos_preference(field).is_some_and(|slot| names.exact(slot, observed))
     })
 }
 
-/// The only way [`publish`] reads or sets macOS's three system names: `aterm name set` asks
-/// through `aterm ctl sudo`, and a test's arm is a fake.
+fn all_accepted(names: &[Option<String>; 3], expected: &GeneratedNames) -> bool {
+    SYSTEM_NAMES.into_iter().zip(names).all(|(field, value)| {
+        OsSlot::from_macos_preference(field).is_some_and(|slot| {
+            value
+                .as_deref()
+                .is_some_and(|value| expected.accepts(slot, value))
+        })
+    })
+}
+
+/// The publisher's macOS names port. Production applies use the same registered,
+/// noninteractive naming rule for the CLI and the menu; test arms are inert.
 pub trait SystemNames {
     /// Each of [`SYSTEM_NAMES`], in that order: `None` where it is unset or unread.
     fn read(&self) -> [Option<String>; 3];
 
-    /// Set all three to `number` under one approval.
+    /// Apply through existing noninteractive authorization, retaining the supplied source fences.
     ///
     /// # Errors
     /// Why they were not set, worded for the person.
-    fn apply(&self, number: Number) -> Result<(), String>;
+    fn apply(&self, state: &Path, config: &Path, names: &GeneratedNames) -> Result<(), String>;
+
+    /// Read whether the exact current naming permission is present. This is presentation
+    /// information only; apply still checks its current intent and actual authorization.
+    /// # Errors
+    /// The current fixed permission cannot be read safely in this process.
+    fn authorization(&self, _state: &Path, _config: &Path) -> Result<bool, String> {
+        Err("macOS naming authorization could not be checked".into())
+    }
+}
+
+type SystemNameApply = fn(&Path, &Path, &GeneratedNames) -> Result<(), String>;
+struct SystemNameOperations {
+    apply: SystemNameApply,
+    authorization: fn(&Path, &Path) -> Result<bool, String>,
+}
+static SYSTEM_NAME_APPLY: OnceLock<SystemNameOperations> = OnceLock::new();
+
+/// Register the application's narrowly authorized, noninteractive naming operation.
+/// Main installs it before any CLI or window dispatch. Missing authority is pending;
+/// publication never opens a new password episode.
+pub fn on_system_name_apply(
+    apply: fn(&Path, &Path, &GeneratedNames) -> Result<(), String>,
+    authorization: fn(&Path, &Path) -> Result<bool, String>,
+) {
+    let _ = SYSTEM_NAME_APPLY.set(SystemNameOperations {
+        apply,
+        authorization,
+    });
+}
+
+/// Apply through the application's existing naming authorization.
+/// # Errors
+/// The operation is unavailable, its current intent moved, or its rule could not apply.
+pub fn apply_registered(state: &Path, config: &Path, names: &GeneratedNames) -> Result<(), String> {
+    let operations = SYSTEM_NAME_APPLY
+        .get()
+        .ok_or("macOS naming is unavailable in this process")?;
+    (operations.apply)(state, config, names)
+}
+
+/// Read the existing rule for an explicit name-menu presentation, without a setter or prompt.
+/// # Errors
+/// This process has no registered reader, or the current rule cannot be read safely.
+pub fn registered_authorization(state: &Path, config: &Path) -> Result<bool, String> {
+    let operations = SYSTEM_NAME_APPLY
+        .get()
+        .ok_or("macOS naming is unavailable in this process")?;
+    (operations.authorization)(state, config)
 }
 
 /// macOS's three system names as Apple's `scutil --get` reads each within 10 seconds: `None`
@@ -271,61 +327,6 @@ fn read_system_name(field: &str) -> Option<String> {
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// Read each of [`SYSTEM_NAMES`] and set an unaccepted projection to `number` with Apple's
-/// fixed `/usr/sbin/scutil --set`, with a bounded read and a required setter hang detector,
-/// reading no configuration,
-/// registry or user path: `aterm name apply-system`'s root half, once it has checked that it
-/// runs as root. Answers the fields scutil did not set.
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn set_as_root(number: Number) -> Vec<&'static str> {
-    set_system_names(number, read_system_name, set_system_name)
-}
-
-#[cfg(target_os = "macos")]
-fn set_system_name(field: &str, number: &str) -> bool {
-    set_system_name_with(
-        field,
-        number,
-        std::time::Instant::now(),
-        aterm_uds::deadline::output_until,
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn set_system_name_with(
-    field: &str,
-    number: &str,
-    started: std::time::Instant,
-    run: impl FnOnce(
-        &mut aterm_uds::spawnfd::Command,
-        std::time::Instant,
-    ) -> Result<std::process::Output, aterm_uds::deadline::RunError>,
-) -> bool {
-    let deadline = started + SCUTIL_SET_HANG;
-    if std::time::Instant::now() >= deadline {
-        return false;
-    }
-    let mut command = aterm_uds::spawnfd::command("/usr/sbin/scutil");
-    command.args(["--set", field, number]);
-    matches!(run(&mut command, deadline), Ok(out) if out.status.success())
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn set_system_names(
-    number: Number,
-    mut read: impl FnMut(&str) -> Option<String>,
-    mut set: impl FnMut(&str, &str) -> bool,
-) -> Vec<&'static str> {
-    let number = number.to_string();
-    SYSTEM_NAMES
-        .into_iter()
-        .filter(|field| {
-            !accepts_system_name(field, &number, read(field).as_deref()) && !set(field, &number)
-        })
-        .collect()
-}
-
 /// The step of [`publish`] that did not finish, with why in that step's own words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pending {
@@ -333,7 +334,7 @@ pub enum Pending {
     Policy(String),
     /// The fleet name was not written.
     FleetName(String),
-    /// macOS's three names were not set, or did not keep the number.
+    /// macOS's names are not exactly aligned with their generated targets.
     SystemNames(String),
     /// The name file could not be read to say whether it still holds the number.
     NameUnread(String),
@@ -363,7 +364,7 @@ impl Pending {
             Self::Policy(why) => format!("aterm.toml does not name it yet ({why})"),
             Self::FleetName(why) => format!("its fleet name is not published yet ({why})"),
             Self::SystemNames(why) => {
-                format!("macOS still calls this Mac by its old name ({why})")
+                format!("macOS names are not fully aligned ({why})")
             }
             Self::NameUnread(why) => format!("its name could not be read back ({why})"),
             Self::Superseded(_) => "a newer machine name replaced it".to_owned(),
@@ -378,11 +379,11 @@ impl Pending {
 ///    the aterm.toml at `config` among the machines that may already answer to it and checks
 ///    the committed policy and number again under the fleet writer's lock; then the holder's
 ///    signed membership Name, under the same writer's canonical-number fence;
-/// 3. with `system`, macOS's three names: read, and where any does not read the number, set
-///    under one approval and read again.
+/// 3. with `system`, macOS's generated names: read, and where an actionable target differs, set
+///    through the shared noninteractive naming operation and read again.
 ///
-/// The name file is read again after the fleet name, and again once macOS's names read the
-/// number or have been set; a file that holds another number (or none) then ends publication
+/// The name file is read again after the fleet name and each OS operation; a file that holds
+/// another number or nickname (or none) then ends publication
 /// as [`Pending::Superseded`]. The current naming policy is checked alongside it after each
 /// step, before an OS apply and before success; a changed naming key or hold retires this work
 /// without undoing an earlier step or overwriting the newer configuration.
@@ -438,29 +439,60 @@ fn publish_through(
     fleet: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), Pending> {
     let number = policy.number;
+    let expected = system_names(state, number)?;
     write_policy(state, policy)
         .map_err(|e| judged(state, number, e.to_string(), Pending::Policy))?;
-    check_current(state, config, number)?;
+    check_system_current(state, config, &expected)?;
     fleet().map_err(|why| judged(state, number, why, Pending::FleetName))?;
-    check_current(state, config, number)?;
+    check_system_current(state, config, &expected)?;
     let Some(system) = system else {
         return Ok(());
     };
+    synchronize_system_names(state, config, &expected, system, &|| {
+        check_system_current(state, config, &expected)
+    })
+}
+
+/// Read, align and read back only the three generated macOS names. The caller supplies
+/// its existing source and current-policy fence; this writes no policy or fleet record.
+/// Every apply still uses the supplied noninteractive system port.
+/// # Errors
+/// The source moved, the existing permission refused, or exact alignment remains pending.
+pub fn synchronize_system_names(
+    state: &Path,
+    config: &Path,
+    expected: &GeneratedNames,
+    system: &dyn SystemNames,
+    current: &dyn Fn() -> Result<(), Pending>,
+) -> Result<(), Pending> {
+    current()?;
     let observed = system.read();
-    check_current(state, config, number)?;
-    if all_read(&observed, number) {
+    current()?;
+    if all_read(&observed, expected) {
         return Ok(());
     }
-    system
-        .apply(number)
-        .map_err(|why| judged(state, number, why, Pending::SystemNames))?;
-    check_current(state, config, number)?;
+    if all_accepted(&observed, expected) {
+        return Err(Pending::SystemNames(
+            "Bonjour retains a numeric collision alias; its actual name is shown in the name menu"
+                .into(),
+        ));
+    }
+    if let Err(why) = system.apply(state, config, expected) {
+        current()?;
+        return Err(Pending::SystemNames(why));
+    }
+    current()?;
     let observed = system.read();
-    check_current(state, config, number)?;
-    if !all_read(&observed, number) {
+    current()?;
+    if !all_read(&observed, expected) {
+        if all_accepted(&observed, expected) {
+            return Err(Pending::SystemNames(
+                "Bonjour retains a numeric collision alias; its actual name is shown in the name menu".into(),
+            ));
+        }
         return Err(judged(
             state,
-            number,
+            expected.number(),
             "macOS did not retain all three system names".to_owned(),
             Pending::SystemNames,
         ));
@@ -574,10 +606,11 @@ pub fn publication_of(
         owed.push(Owed::FleetName(fleet_name.map(str::to_owned)));
     }
     if let Some(names) = names {
+        let expected = GeneratedNames::new(number, &name.nick);
         let differ: Vec<(&'static str, Option<String>)> = SYSTEM_NAMES
             .into_iter()
             .zip(names)
-            .filter(|(field, value)| !accepts_system_name(field, &word, value.as_deref()))
+            .filter(|(field, value)| !exact_system_name(field, &expected, value.as_deref()))
             .map(|(field, value)| (field, value.clone()))
             .collect();
         if !differ.is_empty() {

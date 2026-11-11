@@ -49,8 +49,6 @@ fn opts(dir: &std::path::Path) -> Opts {
         background: false,
         aterm_state: None,
         ask: true,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -3276,8 +3274,8 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     );
     std::fs::remove_file(state_dir(&o)).expect("unblock");
     std::fs::create_dir_all(state_dir(&o)).expect("state dir");
-    crate::harness::upgrade_drive::set_models(&o, "claude-opus-5-5")
-        .expect("a model priority cache beside the records");
+    std::fs::write(state_dir(&o).join("other.json"), "{}")
+        .expect("a document that is no record beside the records");
     save(
         &o,
         "aaa",
@@ -3456,15 +3454,11 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     assert!(status.is_empty(), "symlinked upgrade dir reads no records");
     assert!(!whole, "symlinked upgrade dir is not whole");
     assert!(
-        crate::harness::upgrade_drive::set_models(&o, "claude-opus-5-5").is_err(),
-        "symlinked upgrade dir refused on set_models"
-    );
-    assert!(
         crate::harness::upgrade_drive::save_checked(&o, "bbb", &St::default()).is_err(),
         "symlinked upgrade dir refused on save_checked"
     );
     assert!(
-        !outside.path().join("models.json").exists() && !outside.path().join("bbb.json").exists(),
+        !outside.path().join("bbb.json").exists(),
         "nothing written into symlink target"
     );
     std::fs::remove_file(state_dir(&o)).expect("remove symlink");
@@ -3673,16 +3667,16 @@ fn a_row_stands_only_while_its_conversation_is_live_and_behind_in_its_tab() {
     let unproven = [holder(s, "2.1.281", None)];
     assert!(!row.standing(&unproven, false), "the host proves the tab");
     assert!(row.standing(&unproven, true), "the CLI cannot disprove it");
-    let model = Row {
+    let in_place = Row {
         from: "2.1.282".to_string(),
         ..row.clone()
     };
     assert!(
-        model.standing(&[holder(s, "2.1.282", Some(TAB))], false),
-        "a model restart on the build it runs"
+        in_place.standing(&[holder(s, "2.1.282", Some(TAB))], false),
+        "a restart in place on the build it runs"
     );
-    assert!(!model.standing(&[holder(s, "2.1.283", Some(TAB))], false));
-    assert!(!model.standing(
+    assert!(!in_place.standing(&[holder(s, "2.1.283", Some(TAB))], false));
+    assert!(!in_place.standing(
         &[holder(s, "2.1.282", Some("s-4906566e7ab0a0c15ee3"))],
         false
     ));
@@ -3769,7 +3763,6 @@ fn every_owners_word_arms_a_new_round() {
             version: to.clone(),
             source: upgrade::Source::Managed,
         },
-        None,
         super::super::Proc::default(),
         now_s(),
     );
@@ -7250,8 +7243,8 @@ fn the_manual_resume_keeps_its_flags_under_every_line_the_harness_builds() {
             .chain(flags.iter().copied())
             .map(ToString::to_string)
             .collect();
-        let told = crate::harness::upgrade_drive::resume_command_kept(None, &launch, session)
-            .expect("a line");
+        let told =
+            crate::harness::upgrade_drive::resume_command_kept(&launch, session).expect("a line");
         assert_ne!(told, format!("claude --resume {session}"), "{flags:?}");
         let args: Vec<String> = flags
             .iter()
@@ -7655,18 +7648,12 @@ fn the_ask_count_survives_a_retarget_and_the_state_file() {
         start: "Thu Sep 24 08:00:00 2026",
         started_s: t0 - 600,
     };
-    let mut st = St::for_target(None, &running, &build("2.1.284"), None, who, t0);
+    let recorded = Version::parse("2.1.282").expect("the build the round recorded");
+    let mut st = St::for_target(None, &recorded, &build("2.1.284"), who, t0);
     st.tab = TAB.to_string();
     st.announced("m1".to_string(), t0 + 60, 1);
     st.announced("m2".to_string(), t0 + 1_860, 2);
-    let (mut st, how) = St::retarget(
-        Some(st),
-        &running,
-        &build("2.1.285"),
-        Some("claude-opus-4-1"),
-        who,
-        NOW - 3 * day,
-    );
+    let (mut st, how) = St::retarget(Some(st), &running, &build("2.1.285"), who, NOW - 3 * day);
     assert_eq!(how, super::super::Retarget::Anew, "the round starts over");
     assert_eq!(st.phase, Phase::Pending);
     for ask in 1..=4_u32 {
@@ -7691,7 +7678,7 @@ fn the_ask_count_survives_a_retarget_and_the_state_file() {
         start: "Fri Oct  2 09:00:00 2026",
         started_s: NOW - 60,
     };
-    let anew = St::for_target(Some(st), &running, &build("2.1.285"), None, other, NOW);
+    let anew = St::for_target(Some(st), &running, &build("2.1.285"), other, NOW);
     assert_eq!(anew.notices, 0, "{anew:?}");
 }
 

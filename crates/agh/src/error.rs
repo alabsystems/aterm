@@ -511,6 +511,13 @@ pub enum Sub {
         /// The key.
         key: String,
     },
+    /// Unsent complete inventory race outside the requested refs. Their old
+    /// values still match, and main is unchanged or provably fast-forward.
+    /// A caller may retry only after rechecking all its own preconditions.
+    GitInventoryChanged {
+        /// The final observed main, which a retry must not rewind.
+        main: String,
+    },
 }
 
 impl Sub {
@@ -554,6 +561,7 @@ impl Sub {
             Sub::NotOpen { .. } => "not_open",
             Sub::Git { .. } => "git",
             Sub::GitConfig { .. } => "git_config",
+            Sub::GitInventoryChanged { .. } => "git_inventory_changed",
         };
         Some(std::borrow::Cow::Borrowed(fixed))
     }

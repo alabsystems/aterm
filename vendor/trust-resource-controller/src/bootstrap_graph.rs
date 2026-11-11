@@ -31,17 +31,19 @@ pub const HOST_STORE_TARGET_FD: u32 = 7;
 /// completed-runtime, SDK, launch or graph-retirement authority. The actual
 /// declaration is emitted only by the integrated native entry/client.
 pub const BOOTSTRAP_GRAPH_PROTOCOL_MARKER: [u8; 64] = marker();
-pub mod query;
 pub mod object;
+pub mod query;
+pub mod source;
+pub use source::{SourceAttachment, SourceRecord, SourceReply};
 const fn marker() -> [u8; 64] {
     let mut bytes = [0; 64];
-    let magic = *b"TRUSTBGRAPH00001";
+    let magic = *b"TRUSTBGRAPH00002";
     let mut index = 0;
     while index < 16 {
         bytes[index] = magic[index];
         index += 1;
     }
-    let fields = [3_u64, 71, 72, 73, 74, 1];
+    let fields = [3_u64, 71, 72, 73, 74, 2];
     let mut field = 0;
     while field < fields.len() {
         let value = fields[field].to_be_bytes();

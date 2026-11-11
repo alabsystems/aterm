@@ -7,8 +7,17 @@ use std::ffi::OsStr;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::time::Duration;
+
+#[cfg(target_vendor = "apple")]
+pub(crate) use aterm_uds::spawnfd::Stdio;
+#[cfg(target_vendor = "apple")]
+use aterm_uds::spawnfd::{Child, Command};
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) use std::process::Stdio;
+#[cfg(not(target_vendor = "apple"))]
+use std::process::{Child, Command};
 
 /// Names the test the child was started for. Set only on that child, so a
 /// child of the child (a stand-in it spawns, another test run alone) never
@@ -72,7 +81,7 @@ pub(crate) fn spawn_alone_with(env: &[(&str, &OsStr)]) -> Running {
 
 /// A helper test of this binary, about to run as a process of its own: the test binary with `--exact <helper> --test-threads=1`, its output in files, and whatever the caller adds ([`Self::command`]).
 ///
-/// It starts with SIGHUP, SIGINT, SIGQUIT and SIGTERM at their default actions, set between its fork and exec, not this test binary's: a `&` or `nohup` runner starts the binary with some ignored, which every exec keeps, and a stand-in that is sent one, sends itself one, or arms only the ones it was not started ignoring would never end by it. One that should ignore one sets it itself.
+/// It starts with SIGHUP, SIGINT, SIGQUIT and SIGTERM at their default actions. A `&` or `nohup` runner can leave these ignored; a stand-in that should ignore one sets it itself.
 pub(crate) struct StandIn {
     test: String,
     how: &'static str,
@@ -112,7 +121,9 @@ impl StandIn {
             .stdin(Stdio::null())
             .stdout(output.file("stdout"))
             .stderr(output.file("stderr"));
-        #[cfg(unix)]
+        #[cfg(target_vendor = "apple")]
+        command.default_signals();
+        #[cfg(all(unix, not(target_vendor = "apple")))]
         {
             use std::os::unix::process::CommandExt as _;
             // SAFETY: the hook runs in the forked child before its exec and makes only
@@ -139,19 +150,49 @@ impl StandIn {
         &mut self.command
     }
 
+    /// Map the same original descriptor into this stand-in at its own number.
+    #[cfg(unix)]
+    #[track_caller]
+    pub(crate) fn hand(&mut self, var: &str, fd: RawFd) {
+        #[cfg(not(target_vendor = "apple"))]
+        hand(&mut self.command, var, fd);
+        #[cfg(target_vendor = "apple")]
+        {
+            let named =
+                descriptor(fd).unwrap_or_else(|why| panic!("hand over descriptor {fd}: {why}"));
+            let copy = aterm_uds::kept_out(|| {
+                // SAFETY: fcntl duplicates an open descriptor or reports failure;
+                // the caller holds the original and this does not mutate it.
+                let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+                if copy < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: a successful duplication returned a fresh owned slot.
+                Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+            })
+            .expect("copy the stand-in guard");
+            self.command
+                .append_guards_at(vec![(copy, fd)])
+                .expect("map the stand-in guard");
+            self.command
+                .env(var, fd.to_string())
+                .env(is_var(var), named);
+        }
+    }
+
     /// Start it.
     /// # Panics
     /// When the test binary cannot be spawned.
     pub(crate) fn spawn(mut self) -> Running {
-        // std's spawn copies every descriptor not yet marked close-on-exec. Holding the spawn lock
-        // across it, a socket another test's thread makes through `aterm_uds::kept_out` is marked
-        // before the stand-in can copy it, so a listener that test closes stops answering then.
-        let spawning = aterm_uds::spawn_lock::spawning();
+        // Apple's native spawn protects descriptor placement itself. In
+        // particular there is no fork/exec-status pipe for a parallel parked
+        // fork to retain while the spawn lock is held.
+        #[cfg(not(target_vendor = "apple"))]
+        let _spawning = aterm_uds::spawn_lock::spawning();
         let child = self
             .command
             .spawn()
             .unwrap_or_else(|e| panic!("spawn `{}` {}: {e}", self.test, self.how));
-        drop(spawning);
         Running {
             test: self.test,
             how: self.how,
@@ -200,12 +241,12 @@ fn descriptor(fd: RawFd) -> Result<String, String> {
     ))
 }
 
-/// Hand `fd` to the child `command` starts (a stand-in's, [`StandIn::command`], or an `exec` replacing this process) at its own number, which the child finds in `var` and takes with [`handed`].
+/// Hand `fd` to a std command (including an `exec` replacing this process) at its own number, which the child finds in `var` and takes with [`handed`].
 /// # Panics
 /// When `fd` is not open in this process.
 #[cfg(unix)]
 #[track_caller]
-pub(crate) fn hand(command: &mut Command, var: &str, fd: RawFd) {
+pub(crate) fn hand(command: &mut std::process::Command, var: &str, fd: RawFd) {
     use std::os::unix::process::CommandExt as _;
     let named = descriptor(fd).unwrap_or_else(|why| panic!("hand over descriptor {fd}: {why}"));
     command.env(var, fd.to_string()).env(is_var(var), named);

@@ -203,6 +203,7 @@ fn host(unknown: bool) {
         b"fixture-root".to_vec(),
     ];
     pending.recipe = Some(recipe::Recipe {
+        ay: None,
         kind: recipe::Kind::Targo,
         compiler: Some(compiler::Selection::NativeFixture {
             execution: sdk.clone(),

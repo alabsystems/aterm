@@ -824,9 +824,8 @@ fn a_switch_keeps_the_session_s_context_variant() {
 
 /// A build's top as the resolver reads it: `model` the list's best the build offers, the
 /// build's catalog saying each model's efforts.
-fn top_of(model: &str, efforts: &[(&str, &[&str])]) -> aterm_agent::harness::upgrade_models::Top {
-    use aterm_agent::harness::upgrade_catalog::{Baked, BakedModel};
-    use aterm_agent::harness::upgrade_models::{Priority, top};
+fn top_of(model: &str, efforts: &[(&str, &[&str])]) -> aterm_agent::harness::switch_top::Top {
+    use aterm_agent::harness::switch_top::{Baked, BakedModel, top};
     let baked = Baked {
         latest_per_family: vec![("opus".to_owned(), model.to_owned())],
         models: efforts
@@ -840,11 +839,7 @@ fn top_of(model: &str, efforts: &[(&str, &[&str])]) -> aterm_agent::harness::upg
             })
             .collect(),
     };
-    let list = Priority {
-        ids: vec![model.to_owned()],
-        history: Vec::new(),
-    };
-    top(&list, "2.1.400", Some(baked))
+    top(&[model.to_owned()], Some(baked))
 }
 
 const ALL: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -859,8 +854,8 @@ fn the_switch_s_target_is_the_build_s_top_model_at_its_highest_effort() {
     assert_eq!(
         (unread.model.as_str(), unread.effort),
         (
-            aterm_agent::harness::upgrade_models::SEED[0],
-            aterm_agent::harness::upgrade_models::TOP_EFFORT_UNREAD
+            aterm_agent::harness::switch_top::SEED[0],
+            aterm_agent::harness::switch_top::TOP_EFFORT_UNREAD
         )
     );
     let newer = top_of("claude-opus-6", &[("claude-opus-6", ALL)]);
@@ -938,7 +933,7 @@ fn the_claude_footer_setting_overrides_the_switch_s_target() {
         of(Some("claude-fable-7"), None),
         (
             "claude-fable-7".to_owned(),
-            aterm_agent::harness::upgrade_models::TOP_EFFORT_UNREAD
+            aterm_agent::harness::switch_top::TOP_EFFORT_UNREAD
         ),
         "a model the build's catalog does not list"
     );

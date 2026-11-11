@@ -93,7 +93,7 @@ pub struct Cutter {
 }
 
 pub fn cutter_record_path(release: &Path) -> PathBuf {
-    release.join(CUTTER_RECORD)
+    release.join(aterm_tempfile::QUIET).join(CUTTER_RECORD)
 }
 
 impl Cutter {
@@ -111,13 +111,14 @@ impl Cutter {
             || !release.is_absolute()
             || self.tool.path
                 != release
-                    .join("tools")
+                    .join(".ubd/tools")
                     .join(&self.tool.sha256)
                     .join("aterm-release")
         {
             return Err("invalid frozen cutter binding".into());
         }
-        real_directory(&release.join("tools"), "frozen-tool root")?;
+        real_directory(&release.join(".ubd"), "frozen-tool quiet parent")?;
+        real_directory(&release.join(".ubd/tools"), "frozen-tool root")?;
         real_directory(
             self.tool.path.parent().ok_or("no cutter directory")?,
             "frozen cutter directory",
@@ -197,12 +198,13 @@ pub fn stage_cutter(
         let _phase = crate::cut_timing::Timer::start(log, "cutter-source-hash");
         crate::dmg::sha256_file(source)?
     };
-    let root = release.join("tools");
+    let root = release.join(".ubd/tools");
     let dir = root.join(&digest);
     if !release.is_absolute() || !aterm_codec::hex::is_lower(commit, 40) {
         return Err("the cutter needs an absolute release root and full commit".into());
     }
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    real_directory(&release.join(".ubd"), "frozen-tool quiet parent")?;
     real_directory(&root, "frozen-tool root")?;
     let cutter = Cutter {
         schema: CUTTER_SCHEMA,
@@ -290,7 +292,7 @@ impl ToolSet {
         {
             return Err("the frozen-tool record's set digest is invalid".into());
         }
-        let dir = release.join("tools").join(&self.set_sha256);
+        let dir = release.join(".ubd/tools").join(&self.set_sha256);
         for (name, tool) in [
             ("aterm-release", &self.cutter),
             ("aterm-verify", &self.verify),
@@ -314,6 +316,12 @@ impl ToolSet {
         let tools_dir = final_dir
             .parent()
             .ok_or("the frozen-tool set has no tools directory")?;
+        real_directory(
+            tools_dir
+                .parent()
+                .ok_or("the frozen-tool root has no quiet parent")?,
+            "frozen-tool quiet parent",
+        )?;
         real_directory(tools_dir, "frozen-tool root")?;
         real_directory(final_dir, "frozen-tool set")?;
         for (name, tool) in [
@@ -363,7 +371,7 @@ pub(crate) fn set_digest(cutter: &str, verify: &str) -> String {
 
 #[must_use]
 pub fn record_path(release: &Path) -> PathBuf {
-    release.join(RECORD)
+    release.join(aterm_tempfile::QUIET).join(RECORD)
 }
 
 /// Read and authenticate the frozen tools for `commit`.
@@ -409,7 +417,7 @@ pub fn stage(
             sha256: verify_sha,
         },
     );
-    let tools_dir = release.join("tools");
+    let tools_dir = release.join(".ubd/tools");
     let final_dir = tools_dir.join(&prototype.set_sha256);
     let tools = ToolSet {
         cutter: Tool {
@@ -425,6 +433,7 @@ pub fn stage(
     tools.validate_shape(release)?;
     std::fs::create_dir_all(&tools_dir)
         .map_err(|e| format!("create {}: {e}", tools_dir.display()))?;
+    real_directory(&release.join(".ubd"), "frozen-tool quiet parent")?;
     real_directory(&tools_dir, "frozen-tool root")?;
     match std::fs::symlink_metadata(&final_dir) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -691,7 +700,11 @@ fn proved_cutter(exe: &Path, record: &Path) -> Result<Cutter, String> {
     if !record.is_absolute() || record.file_name().and_then(|n| n.to_str()) != Some(CUTTER_RECORD) {
         return Err("the frozen-tool proof does not name an absolute cutter.toml".into());
     }
-    let release = record
+    let quiet = record
+        .parent()
+        .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new(aterm_tempfile::QUIET)))
+        .ok_or("the frozen-tool proof has no quiet parent")?;
+    let release = quiet
         .parent()
         .ok_or("the frozen-tool proof has no release directory")?;
     let text = crate::durable::read_text(record)
@@ -1170,7 +1183,7 @@ mod tests {
             tools.set_sha256,
             set_digest(&tools.cutter.sha256, &tools.verify.sha256)
         );
-        let frozen = release.join("tools").join(&tools.set_sha256);
+        let frozen = release.join(".ubd/tools").join(&tools.set_sha256);
         assert_eq!(tools.cutter.path, frozen.join("aterm-release"));
         assert_eq!(tools.verify.path, frozen.join("aterm-verify"));
         for (source, tool) in [(&cutter, &tools.cutter), (&verify, &tools.verify)] {
@@ -1273,12 +1286,18 @@ mod tests {
         assert!(recorded(&release, COMMIT).is_err(), "set digest mutation");
 
         let mut mutant = tools.clone();
-        mutant.cutter.path = release.join("tools").join(&tools.set_sha256).join("other");
+        mutant.cutter.path = release
+            .join(".ubd/tools")
+            .join(&tools.set_sha256)
+            .join("other");
         write_record(&release, &mutant);
         assert!(recorded(&release, COMMIT).is_err(), "cutter path mutation");
 
         let mut mutant = tools.clone();
-        mutant.verify.path = release.join("tools").join(&tools.set_sha256).join("other");
+        mutant.verify.path = release
+            .join(".ubd/tools")
+            .join(&tools.set_sha256)
+            .join("other");
         write_record(&release, &mutant);
         assert!(recorded(&release, COMMIT).is_err(), "verify path mutation");
 
@@ -1428,8 +1447,8 @@ mod tests {
             let cutter = tool_source(temp.path(), "source-cutter", CUTTER_VERSION, 0);
             let verify = tool_source(temp.path(), "source-verify", VERIFY_VERSION, 0);
             if link_root {
-                std::fs::create_dir_all(&release).unwrap();
-                symlink(&outside, release.join("tools")).unwrap();
+                std::fs::create_dir_all(release.join(".ubd")).unwrap();
+                symlink(&outside, release.join(".ubd/tools")).unwrap();
             } else {
                 let prototype = ToolSet::new(
                     COMMIT,
@@ -1442,8 +1461,12 @@ mod tests {
                         sha256: crate::dmg::sha256_file(&verify).unwrap(),
                     },
                 );
-                std::fs::create_dir_all(release.join("tools")).unwrap();
-                symlink(&outside, release.join("tools").join(prototype.set_sha256)).unwrap();
+                std::fs::create_dir_all(release.join(".ubd/tools")).unwrap();
+                symlink(
+                    &outside,
+                    release.join(".ubd/tools").join(prototype.set_sha256),
+                )
+                .unwrap();
             }
 
             let error = stage(&release, COMMIT, &cutter, &verify).unwrap_err();

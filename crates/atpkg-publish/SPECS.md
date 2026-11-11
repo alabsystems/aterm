@@ -24,140 +24,10 @@ could-not-run results without retries. The real-Git and fake-API controls
 transport from a mirror-only commit, preserve unrelated refs, and refuse invalid
 API results before the fetch changes an existing record ref.
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 27 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-17: the candidate gate (D27) no longer gates `publish-group rustc` (Trust
-> DECISION_QUEUE D27, amended 2026-10-17: the proof comparison no longer gates publishing a seal).
-> `channel::candidate` is deleted, and with it the specs `candidate-command` and `candidate-refusals`,
-> their four tests,
-> `group-preflight`'s gate clause and `tests/channel/group.rs::the_candidate_gate_decides_a_publish_and_informs_a_stage`.
-> `a_head_whose_own_roster_pair_lapsed_is_refused_under_a_newer_local_roster` moved to
-> `tests/channel/index_publish.rs`. The spec and gap counts below are recounted (140 specs on
-> 2026-10-16, 138 now); the test counts were taken before.
-
-> Status 2026-10-24 (S17's window fit): a pack declares the smallest window that holds its tar
-> stream. `tarwrite::encode` sizes the stream from the plan (`stream_len`) before its first byte,
-> the `Compressor` port carries that length, and `tarwrite::options` makes a stream within 2^27
-> bytes a single segment whose window is the stream; a longer one keeps the options every pack
-> had. `tarwrite-roundtrip` states it, with three new tests and the oracle test's 8 MB decoder
-> limit. Test counts elsewhere were taken before.
-
-> Status 2026-10-23 (the init design's S17, row 18): every pack is compressed by aterm-zstd's
-> encoder (`tarwrite::Zstd`). The zstd CLI path (`ZstdCli`, `compressor_on_path`, `compressor_in`)
-> and the tests of its child process are deleted; the tarwrite rows' zstd stream is first-party
-> code with its own rows (aterm-zstd's SPECS §7). Test counts elsewhere were taken before.
-
-> Status 2026-10-24 (the harness rows, `docs/DESIGN-harness-repos-2026-10-24.md` §11 D16-D21): five
-> `harness(name, tool)` rows are Plain rows held to a stricter pack, and the Linux lane gives them the
-> `AppleOnly` class. `programs-table`, `pack-refuse-before-effects`, `pack-output` and `linux-decide` say
-> so and cite the new tests. `tests/artifact/pkgdoc.rs::the_writer_refuses_a_vendor_rows_tool_for_any_other_program`
-> and `tests/channel/index_plan.rs::each_harness_pins_under_its_own_repo_and_stays_out_of_the_default_set` are new
-> tests, not yet specs. Counts elsewhere were taken before. Amended the same day (§11 D24, D25): `index-plan-admission`
-> refuses every harness pin, named or carried, while `channel::index::READERS` is `SomeInstallEveryProgram`
-> (`tests/channel/index_plan.rs::no_harness_is_pinned_while_a_reader_would_install_it_unasked`; the admitted case runs
-> through the `plan_for` seam), and `pack-refuse-before-effects` refuses a harness whose `HEAD` is not on its repo's
-> `origin/main` (`tests/artifact/pack.rs::a_harness_pack_is_minted_only_from_its_repos_main`).
-
-> Status 2026-10-27 (owner ruling, verbatim: "everything must be ON BY DEFAULT in atpkg!!!" — "fix this";
-> `docs/DESIGN-harness-repos-2026-10-24.md` §11 D45): D17 and D24 are gone. A client's default set holds every
-> program the index lists, a harness included, so `index-plan-admission` pins and carries a harness like any row:
-> `channel::index::READERS`, `Readers`, `admit_harness_pins` and the `plan_for` seam are deleted, and
-> `tests/channel/index_plan.rs::each_harness_pins_under_its_own_repo_into_the_default_set` replaces the two tests the
-> 2026-10-24 note names. Pinning a harness stays a release-lane act.
-
-> Status 2026-10-31 (§11 D50, the first signed harness packs): when the public-release lookup is
-> unreachable, `pack-upload` permits private dev staging if `ReleaseHost::repo_seen` observes HTTP 404
-> both as this identity and anonymously. A missing repository and a private repository hidden from
-> both readers are indistinguishable; the result does not prove nonexistence. A repository visible to
-> either reader, an unanswered read or a host that cannot ask keeps the could-not-run in that branch.
-> This stages no public release
-> (`tests/artifact/pack.rs::an_upload_stages_when_neither_reader_observes_the_public_repository`,
-> `tests/channel/rest.rs::a_private_repository_hidden_from_both_readers_is_not_seen`).
-
-> Status 2026-10-31 (§11 D46, D49; the review of 2026-10-27, its findings F1 to F3): `pack-refuse-before-effects`
-> holds a harness's `HEAD` (and codex's package source, `check_source`) to the main the staging host serves, not the
-> checkout's `origin/main`, refuses a harness tree that is not a fresh clone's whatever git's config hides, and hands a
-> harness's build the version it signs
-> (`tests/artifact/pack.rs::{a_harness_is_held_to_the_hosts_main_not_its_checkouts_origin,a_harness_tree_is_a_fresh_clones_whatever_gits_config_hides}`).
-
-> Status 2026-10-31 (§11 D51, a hostile review of D44 to D50, then one of D51's first draft): a
-> harness's build number is its commit's `git rev-list --count`, and a count can name several commits
-> main holds: a merged branch's commit repeats one of the first-parent chain's, and a landing that
-> merges main into a branch and pushes moves main's former tip off that chain as a commit of the same
-> count joins it (grok-alab's `53295526`, main's tip, and `6cc031a0`, both count 15). No rule over the
-> count or the chain's shape names one commit over time, so `pack-refuse-before-effects` keeps the
-> ancestor check (the Apple lane packs a signed release's ledger commit, which such a merge can move off
-> the chain), and a harness build is held to one commit by its version, which names the commit
-> (`+g<sha9>`), and by `pack-upload`: an upload refuses to clobber a staged `pkg-<p>-<b>.toml`, or the
-> `pkg-<p>-<b>.toml.atpkg-staged` a cut-short REST replace left in its place, whose `version` differs
-> from the new manifest's or cannot be read, leaving the staged assets as they were, while the same
-> bytes or version converge; the public owner's copy was already immutable. A staging release deleted
-> by hand gives up that guard for its build, a plain program's version names no commit (for it the
-> guard holds one build to one version). The cross-host follow-up adds a create-only exact-version
-> reservation before payload uploads, shared by pack staging, the Linux lane's signed owner uploads,
-> immutable mirror, and managed raw staging uploads. Generic raw public managed-pack replacement is refused; the
-> validated Linux target-extension policy and immutable mirror remain their respective public routes
-> (`tests/artifact/pack.rs::{a_harness_build_is_one_commit_across_a_merge_that_moves_mains_first_parent_chain,a_staged_build_is_never_clobbered_by_another_version}`).
-
-> Status 2026-10-26 (the stale-publisher guard): `plan` refuses, for every program, a `[programs.<p>]`
-> whose repo moves while its pin does not rise above the head's, as `admit_alab_pin` did for the ALab rows
-> alone and as every client now refuses (`atpkg::succession`), and one whose repo moves while a target cell it
-> keeps does not rise above the head's cell. `status` names the head's producer from the verified index's
-> first line and flags the retired shell publisher's. New tests, not yet specs:
-> `tests/channel/index_plan.rs::a_repo_the_table_moves_needs_a_new_build_above_the_heads_pin`,
-> `tests/channel/index_plan.rs::a_repo_the_table_moves_needs_a_new_build_on_each_target_cell_it_keeps` and
-> `tests/channel/status.rs::the_head_names_its_producer_and_flags_the_retired_shell_publisher`;
-> `a_head_program_the_table_lacks_keeps_the_heads_block` now raises the pin of the row whose repo it moves.
-> Counts elsewhere were taken before.
-
-> Status 2026-11-05 (A14 and A16 of `docs/DESIGN-fast-build-release-2026-11-05.md`): `adopt trust=<N>` is
-> new. In the worktree `<repo>-adopt-trust-<N>` on `adopt/trust-<N>`, it writes the sealed `trust.lock` for
-> store build N: the build's recorded (or folded and recorded) tree root, which the verified head index must
-> sign for N, plus the compiler commit and receipt that its `LINEAGE` names and its `trustc -vV` must answer,
-> and the `[stock]` of the branch head's lock unless `--stock` names one. It also adds the lock's
-> `.gitattributes` row. `TRUST_STAGE2_BIN`, and a `RUSTC`, `CARGO_BUILD_RUSTC` or `build.rustc` naming another
-> compiler, are refused. When discovery there resolves the locked build and its compiler differs from the one
-> the branch's head compiles with, it runs `publish/config.sh`'s `TOOLCHAIN_ACCEPT_CMD_DEFAULT` on that build,
-> each `targo` step placed and admitted as the shim's hop would run it. It commits the lock only once that key
-> is green or skipped and the branch's head and changes are what it judged, and it pushes nothing. New tests,
-> not yet specs: the fourteen of `tests/adopt.rs`. Counts elsewhere were taken before.
-
-> Status 2026-11-07 (row symbols the code does not hold): `alab-release-verification` names
-> `lane::alab::{signed_release,signed_commit,resolve_dev}`; its `resolve_release` came with the row
-> (813c460348) and was never a function, and `resolve_dev` is what binds the signed commit to its dev
-> commit. `lineage-scan-tree` names `atpkg::lineage::scan_if_compiled_object`, which took
-> `artifact::lineage::is_compiled_output`'s name and header test into atpkg in 501869d0c5; its
-> statement now lists those names and headers.
-
-> Status 2026-11-07 (the qualified-path pass): `arch-gate-tree` names `artifact::arch::inspect_tree_file`,
-> which replaced `is_script` in 501869d0c5 so a tree's file is opened and its head read once, and says
-> `gate_tree` now applies `gate`'s refusals itself to the objects it read; `pkgdoc-names` names
-> `artifact::pkgdoc::manifest_name`, which `file_name` became in 9c52d69115.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 140 specs below is proved
-> through Trust/Clean about the compiled Rust function, then the tests it subsumes are deleted. The
-> 6 tests in §4 sample no spec and are deleted or moved to a bench now. Nothing here is proved yet.
-> The six `artifact::relocate` specs and `lineage-scan-tree`/`lineage-stamp-roundtrip`
-> (`artifact::lineage`), with their 13 tests, close §1 and §2.
->
-> Status 2026-10-16: the vendor-floor rows are gone from `programs::PROGRAMS` (a vendor-direct program is
-> never pinned), and with them the spec `programs-vendor-floors-match-client` and its test;
-> `tests/channel/index_publish.rs::a_vendor_yank_with_no_pin_behind_it_reaches_the_clients_policy` is new.
->
-> Status 2026-10-16 (managed codex): `codex` is a `Shape::Package` row (repo `codex-alab`, aarch64); the
-> index switches its block from the head's only on an explicit `--pin codex=<b>` inside the client's ALab
-> store window and above the head's pin, and only over a pack that verifies; `pack-package` is new. New
-> tests, not yet specs: `tests/channel/index_plan.rs::{a_routine_publish_carries_the_live_codex_row_and_routes_nothing_to_alab,
-> an_explicit_pin_switches_the_codex_row_to_alab_and_nothing_else_does}`, and the six of
-> `tests/artifact/package.rs`, and `tests/channel/status.rs::the_live_codex_row_is_said_carried_not_drift`. The `index-plan-admission` statement below holds for every vendor-direct
-> program but codex.
-
 Source: `crates/atpkg-publish` (read only). Every `#[test]` under `tests/` was read with the code it
 reaches (tests/shared, tests/artifact, tests/channel, tests/lane). Nothing was compiled or run; the claims
-come from reading the code. Plan: `PLAN-tests-to-specs-2026-10-15.md` (historical internal plan).
-Gap numbers are the rows of §7 of `AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit).
+come from reading the code. Plan: `docs/TRUST-LANE.md`.
+Gap numbers are the rows of `docs/TRUST-LANE.md` (Blocking gaps) (historical internal audit).
 Test paths below are relative to `crates/atpkg-publish/`.
 
 Result: **138 specs**, covering **326 tests**. **6 tests are not spec samples** (§4).
@@ -196,7 +66,7 @@ Result: **138 specs**, covering **326 tests**. **6 tests are not spec samples** 
 
 Columns: `id`, `kind`, `functions` (paths under `crates/atpkg-publish/src`), `statement`, `subsumes` (every
 test the spec retires; the primary owner is in §2; `-` for none), `difficulty` (Rust features the proof
-must handle), `blocking_gaps`: rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+must handle), `blocking_gaps`: rows of the gap table in `docs/TRUST-LANE.md` (Blocking gaps)
 §7 besides gap 0 (the seal upgrade), which blocks every row. 1 is non-scalar carriers, 2 `&self`/`&mut
 self` views, 3 E6 body widening, 4 callee-ensures composition, 5 quantified clauses, 6 plain-Rust clause
 publication, 7 loops, 8 effects, 9 the proc-macro boundary, 10 model-to-code refinement, 11 generics, 12
@@ -275,7 +145,7 @@ identity-signer-for	contract	identity::signer_for	signer_for(ctx, roster) checks
 index-plan-carry	contract	channel::index::plan	For all base, delta with plan(base, delta, m, s, vu) = Ok(p): p.index_build = p.channel.channel_build = base.index_build + 1; p.valid_until = vu; p.machine_id = m; p.roster_seq = s; every pin, overlay cell, yank, min_build and min_build_by_program entry of base that delta neither moves nor retires is carried unchanged into p.channel (nothing unnamed is dropped); an empty delta yields p.channel equal to base.channel except channel_build.	tests/channel/index_plan.rs::the_number_is_the_heads_plus_one_and_everything_unnamed_is_carried, tests/channel/index_plan.rs::per_target_overlays_render_carry_and_floor_their_own_cells, tests/channel/index_publish.rs::the_heads_yanks_floor_and_overlays_reach_the_signed_index	BTreeMap<String,u64> merges, nested maps, Vec<String>, &mut Log (an output-only writer)	1,2,5,7
 index-plan-monotone	contract	channel::index::plan	For every program p and target t: if delta pins p to b then plan = Err("REFUSING pin downgrade for p: head build h > requested b") when b < h = base.pin[p], p is carried (not moved) when b = h, and moved (h -> b) when b > h; likewise a target pin t:p = b against base.pin_by_target[t][p] = h is Err("REFUSING per-target pin downgrade for p on t: head h > requested b") when b < h, and an overlay never changes p.channel.pin. Restating one target's overlay keeps every other target's overlay.	tests/channel/index_plan.rs::a_pin_moves_up_never_down_and_an_equal_build_is_a_carry, tests/channel/index_plan.rs::per_target_overlays_render_carry_and_floor_their_own_cells	BTreeMap lookups and comparisons in a loop over the delta	1,5,7
 index-plan-retire	contract	channel::index::plan	A program leaves p.channel.pin only via delta.retire: retire(q) removes q from pin, from every overlay, from programs and, unless q is vendor-direct, every yank of q (said in the log); retiring a program the head does not pin is Err("the head does not pin q"); retiring and moving q is Err("both moved and retired"). retire_target(t) drops t's whole overlay and retire_target(t, q) drops one cell; retiring an absent overlay or cell is Err("nothing to retire"); retiring and pinning the same target cell is Err("both pinned and retired").	tests/channel/index_plan.rs::a_program_leaves_only_when_retired_by_name, tests/channel/index_plan.rs::an_overlay_leaves_only_when_retired_by_name, tests/channel/index_plan.rs::yanks_are_carried_added_lifted_and_held_to_the_pins	BTreeMap remove/retain, Vec filtering	1,5,7
-index-plan-admission	contract	channel::index::{plan,admit_alab_pin,block_of}	For a vendor-direct program q (atpkg::vendor_direct::is_vendor(q)): if programs::alab_package(q) = None, q is never pinned by --pin or --target-pin (Err("q is vendor-direct"), checked first); if programs::alab_package(q) = Some(def), --target-pin is always Err("an overlay never pins it") while --pin q=b is admitted iff admit_alab_pin(def, b, head_pin, head_block) succeeds (artifact::package::check_build(q, b) passes, and switching from another repo requires b > old when head_pin = Some(old)) and marks q switched to block_of(def). A program delta pins that the head lacks must be a PROGRAMS row (else Err("not a program this build knows")); a harness (atpkg::harness::is_harness(h)) pins and is carried like any other program (owner ruling 2026-10-27, D45); a target pin's program must be in the resulting pin (Err("names q, which this index does not pin")). A head pin of a non-ALab vendor-direct program is carried until retired (--retire q); an unswitched ALab-package head row (head_block.repo != def.repo and no --pin q=b) carries the head's block and pin unchanged. p.programs lists block_of(row) for each non-carried_alab PROGRAMS row in table order first, then head-carried programs; differences between a head block and the rendered block are logged as metadata moves, and any repo switch requires a strictly higher build on pin and every kept overlay cell.	tests/channel/index_plan.rs::a_new_program_is_a_table_row_and_a_vendor_program_is_never_pinned, tests/channel/index_plan.rs::per_target_overlays_render_carry_and_floor_their_own_cells, tests/channel/index_plan.rs::each_harness_pins_under_its_own_repo_into_the_default_set	lookups into a static table, ordered Vec<(String, Program)> construction	1,5,7,12
+index-plan-admission	contract	channel::index::{plan,admit_alab_pin,block_of}	For a vendor-direct program q (atpkg::vendor_direct::is_vendor(q)): if programs::alab_package(q) = None, q is never pinned by --pin or --target-pin (Err("q is vendor-direct"), checked first); if programs::alab_package(q) = Some(def), --target-pin is always Err("an overlay never pins it") while --pin q=b is admitted iff admit_alab_pin(def, b, head_pin, head_block) succeeds (artifact::package::check_build(q, b) passes, and switching from another repo requires b > old when head_pin = Some(old)) and marks q switched to block_of(def). A program delta pins that the head lacks must be a PROGRAMS row (else Err("not a program this build knows")); a harness (atpkg::harness::is_harness(h)) pins and is carried like any other program; a target pin's program must be in the resulting pin (Err("names q, which this index does not pin")). A head pin of a non-ALab vendor-direct program is carried until retired (--retire q); an unswitched ALab-package head row (head_block.repo != def.repo and no --pin q=b) carries the head's block and pin unchanged. p.programs lists block_of(row) for each non-carried_alab PROGRAMS row in table order first, then head-carried programs; differences between a head block and the rendered block are logged as metadata moves, and any repo switch requires a strictly higher build on pin and every kept overlay cell.	tests/channel/index_plan.rs::a_new_program_is_a_table_row_and_a_vendor_program_is_never_pinned, tests/channel/index_plan.rs::per_target_overlays_render_carry_and_floor_their_own_cells, tests/channel/index_plan.rs::each_harness_pins_under_its_own_repo_into_the_default_set	lookups into a static table, ordered Vec<(String, Program)> construction	1,5,7,12
 index-plan-yanks	contract	channel::index::{plan,yank_entry}	p.channel.yanked = sorted((base.yanked minus the entries of retired programs that are not vendor-direct minus delta.unyank) union {yank_entry(y) | y in delta.yanks}); each added yank's program must be pinned or vendor-direct (Err("which this index does not pin")), so a vendor yank binds its client with no pin behind it and outlives a retirement; an added Version yank, or a Build yank of a vendor-direct program in the vendor build tier, must decode (Version::parse / Version::from_build_id) to a version in its vendor-direct program's own grammar (has_revision() = spec(p).revision_versions), else Err("matches no version any client holds") — so muse@1.4.9, agy@1.4.0-R1, an out-of-range or wrong-tier vendor build id and ay@1.2.3 are refused, while a carried head entry is never judged; an unyank not in base.yanked is Err("the head does not yank it"); a build yank equal to the program's pinned build is accepted but logged as a TOMBSTONES warning.	tests/channel/index_plan.rs::yanks_are_carried_added_lifted_and_held_to_the_pins, tests/channel/index_publish.rs::a_vendor_yank_with_no_pin_behind_it_reaches_the_clients_policy	Vec<String> set operations, sort/dedup	1,5,7
 index-plan-floors	contract	channel::index::plan	p.channel.min_build = base.min_build unless delta names m: m >= base.min_build sets it; m < base.min_build is Err("REFUSING min_build m < the head's h") unless lower_min_build. plan(base, delta, _, s, _) = Err("REFUSING roster_seq s < the head's r") whenever s < base.roster_seq.	tests/channel/index_plan.rs::the_floor_is_carried_and_lowered_only_on_purpose, tests/channel/index_plan.rs::a_roster_older_than_the_heads_generation_is_refused	u64 comparisons, Option<u64>	1,3
 parse-yank	contract	channel::index::parse_yank	parse_yank(s, eq): split s at its last '@' into (name, v), or, when there is no '@' and eq, at its first '=' (else Err(Usage)). name must be non-empty over [A-Za-z0-9._-]. v all digits (non-empty, fits u64) -> Ok(Build(name, v)); atpkg::vendor_direct::Version::parse(v) = Some(_) (a.b.c with each part non-empty, at most 6 digits, all digits and without a leading zero unless it is "0", or a.b.c-R<n>[.<s>] in its narrower ranges) -> Ok(Version(name, v)), so the client's vendor policy reads every Version entry; otherwise Err(Usage). So ay=1 normalizes to Build(ay, 1) and codex@2.01.3, codex@2.1, codex@v2.1.3, codex@1.2.3.4, codex3 and ay-3 are refused.	tests/channel/index_plan.rs::yanks_are_carried_added_lifted_and_held_to_the_pins, tests/channel/index_publish.rs::a_vendor_yank_with_no_pin_behind_it_reaches_the_clients_policy	rsplit_once/split_once, char predicates, split into Vec<&str>, u64 parse	1,3,5,7
@@ -710,27 +580,3 @@ smoke.
 - **Resolved:** Removed tautological `assert_eq!(text, render(&p))` in `tests/channel/index_render.rs::the_rendered_index_reads_back_through_the_client_field_for_field`.
 - **Resolved:** `rest-error-map` replaced the retired `gh-classify` stderr substring matching with HTTP status classification.
 - **Resolved:** `tests/lane/alab.rs::a_horizon_inside_thirty_days_is_told` samples both sides of the exact `HORIZON_WARN_DAYS * 86_400` threshold relative to `testkit::NOW`.
-
-## 5. Proof order
-
-1. `disk-installed` (gaps 3, 6): `u64` `max` and `div_ceil`; the size lemma `tarwrite-roundtrip` cites.
-2. `error-exit-code`, `switch-policy`, `linux-row-state` (gap 1): enum matches, no loops. `switch-policy`
-   is the lemma `toolchain-admit`, `unproven-gate` and `linux-sign-gates` rest on.
-3. `pack-cpu-floor`, `pkgdoc-names`, `index-plan-floors`, `alab-decide` (gaps 1, 3): matches over
-   `(os, arch)`, `u64` comparisons, `String` concatenation. `pkgdoc-names` gives the asset-name
-   injectivity every upload spec cites.
-4. The table facts `triple-targets`, `triple-os-arch`, `triple-host-table`, `programs-table` (gaps 1 and
-   12, with 3, 5 or 7): constant evaluation once the cross-crate `TARGETS` can be cited.
-5. Pure parsers and renderers with one loop (gaps 1, 7, sometimes 3, 5 or 13): `parse-yank`,
-   `rest-error-map`, `parse-vv`, `alab-newest-signed-tag`, `report-columns`, `pack-check-build-env`,
-   `pack-looks-internal`, `pack-select`, `index-parse-delta`, `lane-run-flags`, `build-local-parse-args`,
-   `sign-run-args`, `units-render`, `seed-describe`.
-6. `arch-header-decode` after factoring `classify(h, pe)` out of the file read, then `arch-gate`.
-7. `pins-for-targets` and the `index-plan-*` family (`BTreeMap` merges with quantified carry and
-   monotonicity clauses).
-8. The round trips `index-render-roundtrip`, `pkgdoc-fresh-roundtrip`, `pkgdoc-merge` (gap 12, and 14 for
-   the first two): the client parser is the inverse.
-9. The effectful contracts (gap 8): `quad-verify`, `identity-signer-for`, `sign-*`, then the
-   orchestrations (`pack-*`, `bundle-*`, `mirror-*`, `index-publish-*`, `group-*`, `alab-*`, `linux-*`,
-   `install-*`), and last `index-publish-cas` (gap 10), which refines the `AtpkgIndexPublishWalk` model
-   (`crates/aterm-models-atpkg`).

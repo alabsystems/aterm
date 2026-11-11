@@ -782,25 +782,37 @@ impl Strip {
     /// on the same half pixel round the same way
     /// (`from_one_second_up_no_box_is_narrower_than_a_box_of_a_finer_band`).
     pub(crate) fn box_edges(self) -> Vec<(f64, f64)> {
-        let slots = self.spec.slots();
+        let mut edges = Vec::with_capacity(self.spec.slot_count());
+        edges.extend(self.slot_edges().map(|(_, edges)| edges));
+        edges
+    }
+
+    /// The shared weighted geometry, streamed for point queries or materialized for painters.
+    fn slot_edges(self) -> impl Iterator<Item = (aterm_vitals::ProgSlot, (f64, f64))> {
+        let slots = self.spec.iter_slots();
         let gaps: f64 = slots
-            .windows(2)
-            .map(|w| gap_between(w[0].band, w[1].band))
+            .clone()
+            .scan(None, |previous, slot| {
+                let gap = previous.map_or(0.0, |band| gap_between(band, slot.band));
+                *previous = Some(slot.band);
+                Some(gap)
+            })
+            .skip(1)
             .sum();
         let room = (self.width() - gaps).max(0.0);
         let total = f64::from(self.spec.total_weight());
-        let (mut before, mut weight) = (0.0, 0_u32);
-        let mut edges = Vec::with_capacity(slots.len());
-        for (j, slot) in slots.iter().enumerate() {
-            if j > 0 {
-                before += gap_between(slots[j - 1].band, slot.band);
+        let (mut before, mut weight, mut previous) = (0.0, 0_u32, None);
+        slots.map(move |slot| {
+            if let Some(band) = previous {
+                before += gap_between(band, slot.band);
             }
             let at = self.x + before;
             let left = at + room * f64::from(weight) / total;
             weight += u32::from(slot.weight);
-            edges.push((left, at + room * f64::from(weight) / total));
-        }
-        edges
+            let right = at + room * f64::from(weight) / total;
+            previous = Some(slot.band);
+            (slot, (left, right))
+        })
     }
 
     /// Where on the strip an age `age_ms` (`now - event_ms`) stands, pt: inside the box that
@@ -812,28 +824,22 @@ impl Strip {
             return None;
         }
         let age = age_ms.max(0);
-        let slots = self.spec.slots();
-        let edges = self.box_edges();
-        let n = slots.len().min(edges.len());
-        (0..n).find_map(|j| {
-            let slot = slots[j];
+        let mut edges = self.slot_edges().peekable();
+        let mut previous = None;
+        while let Some((slot, (left, right))) = edges.next() {
             if age > slot.age_hi_ms {
-                return None;
+                previous = Some(right);
+                continue;
             }
-            let lo = if j == 0 {
-                edges[0].0
-            } else {
-                (edges[j - 1].1 + edges[j].0) / 2.0
-            };
-            let hi = if j + 1 == n {
-                edges[j].1
-            } else {
-                (edges[j].1 + edges[j + 1].0) / 2.0
-            };
+            let lo = previous.map_or(left, |prev| (prev + left) / 2.0);
+            let hi = edges
+                .peek()
+                .map_or(right, |(_, (next, _))| (right + next) / 2.0);
             let span = (slot.age_hi_ms - slot.age_lo_ms).max(1) as f64;
             let into = ((age - slot.age_lo_ms) as f64 / span).clamp(0.0, 1.0);
-            Some(lo + (hi - lo) * into)
-        })
+            return Some(lo + (hi - lo) * into);
+        }
+        None
     }
 
     /// How fast its fine band moves right, pt a second: its first history box's pitch (its width

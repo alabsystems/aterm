@@ -85,7 +85,7 @@ pub fn scratch_root() -> Option<&'static Path> {
     }
 }
 
-/// This test binary's short root, `/tmp/aterm-tu-<uid>.noindex/<pid>-<stamp>`, made at the first
+/// This test binary's short root, `/tmp/.ubd/aterm-tu-<uid>.noindex/<pid>-<stamp>` on macOS, made at the first
 /// call and removed at exit as [`scratch_root`]'s is: a place for a Unix socket whose path must fit
 /// `sun_path` (104 bytes on macOS), which a root under the test `TMPDIR` does not. `None` in any
 /// other program, and off unix.
@@ -208,10 +208,11 @@ fn canonical(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
-/// `<temp>/aterm-tu-<uid>.noindex`, made `0700` or adopted when it is already this user's own
+/// `<temp>`'s quiet folder holding `aterm-tu-<uid>.noindex`, made `0700` or adopted when it is already this user's own
 /// ([`adoptable`]); `None` when it is not, or cannot be made.
 #[cfg(debug_assertions)]
 fn roots_dir(temp: &Path) -> Option<PathBuf> {
+    let temp = aterm_tempfile::quiet_in(temp);
     #[cfg(unix)]
     // SAFETY: `getuid` takes nothing and cannot fail.
     let me = unsafe { libc::getuid() };

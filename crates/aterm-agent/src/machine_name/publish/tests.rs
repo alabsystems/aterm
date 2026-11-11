@@ -18,93 +18,6 @@ fn num(n: u32) -> Number {
     Number::new(n).expect("a number")
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "owned setter child; the native system-name parent invokes this exact test"]
-fn owned_system_name_setter_child() {
-    let ready = std::env::var_os("ATERM_TEST_NAME_SET_READY").expect("owned ready path");
-    std::fs::write(ready, b"the actual name setter fixture ran\n").unwrap();
-    assert!(
-        std::env::var_os("ATERM_TEST_NAME_SET_REFUSES").is_none(),
-        "native name setter refusal"
-    );
-    println!("native name setter completed");
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn required_system_name_setter_waits_for_its_native_completion() {
-    for (age, refuses) in [(11, false), (61, false), (11, true)] {
-        let age = Duration::from_secs(age);
-        let expired = age >= aterm_spec::wait::MUST_HAPPEN;
-        let root = aterm_tempfile::tempdir().unwrap();
-        let ready = root.path().join("native-setter");
-        let calls = Cell::new(0);
-        let failed = set_system_names(
-            num(59),
-            |field| {
-                Some(
-                    if field == "HostName" {
-                        "previous-name"
-                    } else {
-                        "m59"
-                    }
-                    .to_owned(),
-                )
-            },
-            |field, number| {
-                set_system_name_with(
-                    field,
-                    number,
-                    std::time::Instant::now() - age,
-                    |command, deadline| {
-                        calls.set(calls.get() + 1);
-                        assert_eq!(command.get_program(), "/usr/sbin/scutil");
-                        let args: Vec<_> = command.get_args().collect();
-                        assert_eq!(args, ["--set", "HostName", "m59"]);
-                        let mut child =
-                            aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
-                        child
-                            .args([
-                                "machine_name::publish::tests::owned_system_name_setter_child",
-                                "--exact",
-                                "--ignored",
-                                "--nocapture",
-                            ])
-                            .env("ATERM_TEST_NAME_SET_READY", &ready);
-                        if refuses {
-                            child.env("ATERM_TEST_NAME_SET_REFUSES", "1");
-                        }
-                        aterm_uds::deadline::output_until(&mut child, deadline)
-                    },
-                )
-            },
-        );
-        if expired {
-            assert!(!ready.exists(), "an expired setter admits no new child");
-            assert_eq!(calls.get(), 0);
-        } else {
-            assert_eq!(
-                std::fs::read(&ready).unwrap(),
-                b"the actual name setter fixture ran\n"
-            );
-            assert_eq!(calls.get(), 1, "one required setter, no retry");
-        }
-        if expired || refuses {
-            assert_eq!(
-                failed,
-                ["HostName"],
-                "true expiry or a native nonzero exit remains a failed set"
-            );
-        } else {
-            assert!(
-                failed.is_empty(),
-                "a scheduled native setter did not fail: {failed:?}"
-            );
-        }
-    }
-}
-
 fn names(words: [Option<&str>; 3]) -> [Option<String>; 3] {
     words.map(|word| word.map(str::to_owned))
 }
@@ -138,7 +51,7 @@ fn chosen(state: &Path, n: u32) -> MachineName {
         state,
         &NameTo {
             num: num(n),
-            nick: None,
+            nick: Some(Nickname::parse("Heron").expect("a nickname")),
         },
         || Ok(LabLabels::default()),
         ByKind::Person,
@@ -196,8 +109,10 @@ impl SystemNames for FakeNames<'_> {
         self.names.borrow().clone()
     }
 
-    fn apply(&self, number: Number) -> Result<(), String> {
-        self.log.borrow_mut().push(format!("apply {number}"));
+    fn apply(&self, _: &Path, _: &Path, names: &GeneratedNames) -> Result<(), String> {
+        self.log
+            .borrow_mut()
+            .push(format!("apply {}", names.number()));
         (self.on_apply)();
         if let Some(after) = &self.after {
             *self.names.borrow_mut() = after.clone();
@@ -327,7 +242,11 @@ fn publish_writes_the_policy_then_the_fleet_name_then_asks_macos_once() {
         ));
     };
     let mut fake = FakeNames::new(names([Some("m184"), Some("m184"), None]), &during);
-    fake.after = Some(names([Some("m59"), Some("m59-2"), Some("m59")]));
+    fake.after = Some(names([
+        Some("m59 Heron"),
+        Some("m59-heron"),
+        Some("m59-heron"),
+    ]));
     assert_eq!(
         publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
         Ok(())
@@ -346,7 +265,11 @@ fn publish_writes_the_policy_then_the_fleet_name_then_asks_macos_once() {
             &scratch.state,
             &scratch.config,
             &name,
-            Some(&names([Some("m59"), Some("m59-2"), Some("m59")]))
+            Some(&names([
+                Some("m59 Heron"),
+                Some("m59-heron"),
+                Some("m59-heron")
+            ]))
         ),
         Ok(Publication::Current)
     );
@@ -357,47 +280,18 @@ fn names_macos_already_reads_ask_for_nothing() {
     let scratch = fresh();
     chosen(&scratch.state, 59);
     let policy = Policy::read(&scratch.config, num(59)).expect("a policy");
-    let fake = FakeNames::new(names([Some("m59"), Some("m59-2"), Some("m59")]), &nothing);
-    assert_eq!(
-        publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
-        Ok(())
+    let fake = FakeNames::new(
+        names([Some("m59 Heron"), Some("m59-heron-2"), Some("m59-heron")]),
+        &nothing,
     );
+    assert!(matches!(
+        publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
+        Err(Pending::SystemNames(_))
+    ));
     assert_eq!(*fake.log.borrow(), ["read"], "no apply");
     assert_eq!(
         read_primary_name(&scratch.state).expect("reads"),
         Some("m59".to_owned())
-    );
-
-    let calls = RefCell::new(Vec::new());
-    let failed = set_system_names(
-        num(59),
-        |field| {
-            calls.borrow_mut().push(format!("get {field}"));
-            Some(
-                match field {
-                    "ComputerName" => "drift",
-                    "LocalHostName" => "m59-2",
-                    "HostName" => "m59",
-                    _ => unreachable!(),
-                }
-                .to_owned(),
-            )
-        },
-        |field, number| {
-            calls.borrow_mut().push(format!("set {field} {number}"));
-            true
-        },
-    );
-    assert!(failed.is_empty());
-    assert_eq!(
-        *calls.borrow(),
-        [
-            "get ComputerName",
-            "set ComputerName m59",
-            "get LocalHostName",
-            "get HostName"
-        ],
-        "the actual root producer repairs one slot without resetting Bonjour"
     );
 }
 
@@ -441,16 +335,16 @@ fn publish_stops_at_the_first_step_that_did_not_finish() {
         "the policy, the step before, was written"
     );
 
-    // macOS's names: the password sheet cancelled.
+    // macOS's names: the existing noninteractive naming authorization refuses.
     let scratch = fresh();
     chosen(&scratch.state, 59);
     let policy = Policy::read(&scratch.config, num(59)).expect("a policy");
     let mut fake = FakeNames::new(names([Some("m184"); 3]), &nothing);
-    fake.answer = Err("the password sheet was cancelled, or its window closed".to_owned());
+    fake.answer = Err("the existing macOS naming authorization refused the request".to_owned());
     assert_eq!(
         publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
         Err(Pending::SystemNames(
-            "the password sheet was cancelled, or its window closed".to_owned()
+            "the existing macOS naming authorization refused the request".to_owned()
         ))
     );
     assert_eq!(*fake.log.borrow(), ["read", "apply m59"]);
@@ -486,25 +380,40 @@ fn a_request_a_newer_set_replaced_is_superseded_not_pending() {
         chosen(&scratch.state, 61);
     };
     let mut fake = FakeNames::new(names([Some("m184"); 3]), &during);
-    fake.after = Some(names([Some("m60"); 3]));
+    fake.after = Some(names([
+        Some("m60 Heron"),
+        Some("m60-heron"),
+        Some("m60-heron"),
+    ]));
     assert_eq!(
         publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
         Err(Pending::Superseded(SUPERSEDED.to_owned()))
     );
     assert_eq!(fake.applied(), ["apply m60"]);
 
-    // A set of m62 while the password sheet is cancelled: the sheet's words, superseded.
+    // A set of m62 while an old OS request fails: current identity wins over that error.
     let policy = Policy::read(&scratch.config, num(61)).expect("a policy");
     let during = || {
         chosen(&scratch.state, 62);
     };
     let mut fake = FakeNames::new(names([Some("m184"); 3]), &during);
-    fake.answer = Err("the password sheet was cancelled, or its window closed".to_owned());
-    assert_eq!(
+    fake.answer = Err("the existing macOS naming authorization refused the request".to_owned());
+    assert!(matches!(
         publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
-        Err(Pending::Superseded(
-            "the password sheet was cancelled, or its window closed".to_owned()
-        ))
+        Err(Pending::Superseded(_))
+    ));
+    assert_eq!(
+        crate::machine_name::file::read(&scratch.state)
+            .expect("reads the newer choice")
+            .expect("the newer choice remains")
+            .num,
+        Some(num(62)),
+        "a failed older OS request must not roll back the newer canonical choice"
+    );
+    assert_eq!(
+        *fake.log.borrow(),
+        ["read", "apply m61"],
+        "no later OS operation"
     );
 
     // With no system names to set (other Unix): m62, which the name file holds, is published.
@@ -605,7 +514,11 @@ fn system_reads_reject_newer_canonical_names_and_naming_policy() {
         }
     };
     let mut fake = FakeNames::new(names([Some("m184"); 3]), &nothing);
-    fake.after = Some(names([Some("m59"); 3]));
+    fake.after = Some(names([
+        Some("m59 Heron"),
+        Some("m59-heron"),
+        Some("m59-heron"),
+    ]));
     fake.on_read = &on_read;
     assert_eq!(
         publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
@@ -647,7 +560,11 @@ fn system_reads_reject_newer_canonical_names_and_naming_policy() {
                 }
             };
             let mut fake = FakeNames::new(names([Some("m184"); 3]), &nothing);
-            fake.after = Some(names([Some("m59"); 3]));
+            fake.after = Some(names([
+                Some("m59 Heron"),
+                Some("m59-heron"),
+                Some("m59-heron"),
+            ]));
             fake.on_read = &on_read;
             let result = publish(&scratch.state, &scratch.config, &policy, Some(&fake));
             if allowed {
@@ -675,6 +592,32 @@ fn system_reads_reject_newer_canonical_names_and_naming_policy() {
             );
         }
     }
+
+    // Even a spelling change whose generated targets coincide retires old work.
+    let scratch = fresh();
+    chosen(&scratch.state, 59);
+    let policy = Policy::read(&scratch.config, num(59)).unwrap();
+    let changed = Cell::new(false);
+    let on_read = || {
+        if !changed.replace(true) {
+            crate::machine_name::set_nick(
+                &scratch.state,
+                &crate::machine_name::NickTo::Word(Nickname::parse("heron").unwrap()),
+                ByKind::Person,
+                || Ok(None),
+                NOW + 1,
+                false,
+            )
+            .unwrap();
+        }
+    };
+    let mut fake = FakeNames::new(names([Some("m184"); 3]), &nothing);
+    fake.on_read = &on_read;
+    assert!(matches!(
+        publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
+        Err(Pending::Superseded(_)),
+    ));
+    assert!(fake.applied().is_empty());
 }
 
 #[test]
@@ -687,7 +630,11 @@ fn a_name_file_unread_after_the_apply_is_neither_superseded_nor_published() {
             .expect("damages the name file");
     };
     let mut fake = FakeNames::new(names([Some("m184"); 3]), &during);
-    fake.after = Some(names([Some("m59"); 3]));
+    fake.after = Some(names([
+        Some("m59 Heron"),
+        Some("m59-heron"),
+        Some("m59-heron"),
+    ]));
     let pending = publish(&scratch.state, &scratch.config, &policy, Some(&fake))
         .expect_err("cannot say the request still holds");
     assert!(
@@ -701,7 +648,10 @@ fn names_macos_did_not_keep_are_pending() {
     let scratch = fresh();
     chosen(&scratch.state, 59);
     let policy = Policy::read(&scratch.config, num(59)).expect("a policy");
-    let fake = FakeNames::new(names([Some("m184"), Some("m59"), Some("m59")]), &nothing);
+    let fake = FakeNames::new(
+        names([Some("m184"), Some("m59-heron"), Some("m59-heron")]),
+        &nothing,
+    );
     assert_eq!(
         publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
         Err(Pending::SystemNames(
@@ -731,7 +681,7 @@ fn publication_says_what_a_chosen_number_still_owes() {
         ]))
     );
     let published = policy_text("[font]\nsize = 14\n", "m59").expect("a policy");
-    let now = names([Some("m59"), Some("m59-2"), Some("m59")]);
+    let now = names([Some("m59 Heron"), Some("m59-heron"), Some("m59-heron")]);
     assert_eq!(
         publication_of(Some(&published), Some("m59"), &name, Some(&now)),
         Ok(Publication::Current)
@@ -741,7 +691,7 @@ fn publication_says_what_a_chosen_number_still_owes() {
             Some("[ai]\nmachine = \"m59\"\n[fleet]\nmachine = \"m158\"\n"),
             Some("m158"),
             &name,
-            Some(&names([Some("m59"), Some("m59"), None]))
+            Some(&names([Some("m59 Heron"), Some("m59-heron"), None]))
         ),
         Ok(Publication::Owed(vec![
             Owed::Policy(vec!["[identity] name", "[fleet] machine"]),
@@ -793,6 +743,35 @@ fn publication_says_what_a_chosen_number_still_owes() {
             .expect_err("invalid")
             .starts_with("invalid aterm.toml: ")
     );
+
+    // The stable fleet number and the descriptive OS names are one saved choice.
+    let mut dog = name.clone();
+    dog.num = Some(num(85));
+    dog.nick = Nickname::parse("dog").expect("a nickname");
+    let policy = policy_text("", "m85").expect("a policy");
+    assert_eq!(
+        publication_of(
+            Some(&policy),
+            Some("m85"),
+            &dog,
+            Some(&names([Some("m85 Dog"), Some("m85-dog"), Some("m85-dog"),])),
+        ),
+        Ok(Publication::Current),
+        "the saved number and nickname generate all three OS names"
+    );
+    assert!(matches!(
+        publication_of(
+            Some(&policy),
+            Some("m85"),
+            &dog,
+            Some(&names([
+                Some("m85 Dog"),
+                Some("m85-dog-2"),
+                Some("m85-dog"),
+            ])),
+        ),
+        Ok(Publication::Owed(_))
+    ));
 }
 
 #[test]
@@ -831,43 +810,23 @@ fn what_is_owed_reads_as_a_phrase() {
 }
 
 #[test]
-fn the_root_half_is_the_fixed_four_words() {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt as _;
-    let exe = Path::new("/x/aterm");
-    let words = apply_system_words(exe, num(59)).expect("UTF-8");
-    assert_eq!(words, ["/x/aterm", "name", "apply-system", "m59"]);
-    assert_eq!(is_apply_system(&words, exe), Some(num(59)));
-    let owned = |words: &[&str]| words.iter().map(|&w| w.to_owned()).collect::<Vec<_>>();
-    for other in [
-        owned(&["/y/aterm", "name", "apply-system", "m59"]),
-        owned(&["/x/aterm", "name", "apply-system", "m59", "m60"]),
-        owned(&["/x/aterm", "name", "apply-system"]),
-        owned(&["/x/aterm", "name", "--set", "m59"]),
-        owned(&["/x/aterm", "name", "apply-system", "59"]),
-        owned(&["/x/aterm", "name", "apply-system", "M59"]),
-        owned(&["/x/aterm", "name", "apply-system", "m0"]),
-        owned(&["/usr/sbin/scutil", "--set", "HostName", "m59"]),
-    ] {
-        assert_eq!(is_apply_system(&other, exe), None, "{other:?}");
-    }
-    let unnamed = Path::new(OsStr::from_bytes(b"/x/\xffaterm"));
-    assert_eq!(
-        apply_system_words(unnamed, num(59)),
-        Err("this program's path is not UTF-8".to_owned())
-    );
-    assert_eq!(is_apply_system(&words, unnamed), None);
-}
-
-#[test]
 fn all_three_names_must_read_the_number() {
-    assert!(all_read(&names([Some("m59"); 3]), num(59)));
-    assert!(!all_read(&names([Some("m59"), Some("m59"), None]), num(59)));
+    assert!(all_read(
+        &names([Some("m59"); 3]),
+        &GeneratedNames::number_only(num(59))
+    ));
+    assert!(!all_read(
+        &names([Some("m59"), Some("m59"), None]),
+        &GeneratedNames::number_only(num(59))
+    ));
     assert!(!all_read(
         &names([Some("m59"), Some("M59"), Some("m59")]),
-        num(59)
+        &GeneratedNames::number_only(num(59))
     ));
-    assert!(!all_read(&names([Some("m59"); 3]), num(5)));
+    assert!(!all_read(
+        &names([Some("m59"); 3]),
+        &GeneratedNames::number_only(num(5))
+    ));
 }
 
 #[test]
@@ -889,7 +848,7 @@ fn pending_keeps_the_cli_s_words_and_names_its_step() {
         ),
         (
             Pending::SystemNames("x".to_owned()),
-            "macOS still calls this Mac by its old name (x)",
+            "macOS names are not fully aligned (x)",
         ),
         (
             Pending::NameUnread("x".to_owned()),

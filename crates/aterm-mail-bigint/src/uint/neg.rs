@@ -37,20 +37,5 @@ impl<const LIMBS: usize> Uint<LIMBS> {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::U256;
-
-    #[test]
-    fn wrapping_neg() {
-        assert_eq!(U256::ZERO.wrapping_neg(), U256::ZERO);
-        assert_eq!(U256::MAX.wrapping_neg(), U256::ONE);
-        assert_eq!(
-            U256::from_u64(13).wrapping_neg(),
-            U256::from_u64(13).not().saturating_add(&U256::ONE)
-        );
-        assert_eq!(
-            U256::from_u64(42).wrapping_neg(),
-            U256::from_u64(42).saturating_sub(&U256::ONE).not()
-        );
-    }
-}
+#[path = "neg_tests.rs"]
+mod tests;

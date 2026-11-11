@@ -14,6 +14,177 @@ use aterm_core::terminal::Terminal;
 use aterm_gpu::{GpuRenderer, OverlayRefusal, TrayLayer, TrayQuad, WindowGpu};
 use aterm_render::RenderInput;
 
+// Frozen 56c76be53ae: a heap vector for the cards above the first visible card.
+fn previous_tray<'a>(
+    stack: Option<[Option<&'a SettingsCard>; 3]>,
+    card: Option<&'a SettingsCard>,
+    stamp: Option<(u64, Option<aterm_gpu::TrayDelta>)>,
+    floor: u32,
+    crop: u32,
+    layers: &'a mut Vec<TrayLayer<'a>>,
+) -> Option<TrayQuad<'a>> {
+    let lower = |mut quad: TrayQuad<'a>| {
+        quad.dy = quad.dy.saturating_add(crop);
+        if let Some(scrim) = quad.scrim.as_mut() {
+            scrim.top = scrim.top.saturating_add(crop);
+        }
+        quad
+    };
+    let Some([deck, lens, top]) = stack else {
+        return card
+            .and_then(|card| {
+                tray_quad_below_y(card, floor)
+                    .map(|quad| super::stamped_tray_quad(quad, card, stamp))
+            })
+            .map(lower);
+    };
+    let deck = deck.and_then(|card| {
+        tray_quad_below_y(card, floor).map(|quad| super::stamped_tray_quad(quad, card, stamp))
+    });
+    let mut quads = deck
+        .into_iter()
+        .chain([lens, top].into_iter().flatten().filter_map(|card| {
+            tray_quad_below_y(card, floor).map(|quad| TrayQuad {
+                serial: super::stack_card_generation(card, &quad),
+                delta: None,
+                ..quad
+            })
+        }))
+        .map(lower);
+    let base = quads.next()?;
+    layers.clear();
+    layers.extend(quads.map(|quad| TrayLayer {
+        quad,
+        opacity: 1.0,
+        offset_y: 0,
+    }));
+    Some(TrayQuad {
+        above: layers,
+        ..base
+    })
+}
+
+fn assert_quad_eq(a: TrayQuad<'_>, b: TrayQuad<'_>) {
+    assert_eq!(a.rgba, b.rgba);
+    assert_eq!(
+        (a.pw, a.ph, a.dx, a.dy, a.serial, a.delta),
+        (b.pw, b.ph, b.dx, b.dy, b.serial, b.delta)
+    );
+    assert_eq!(
+        a.scrim.map(|s| (s.top, s.rgba)),
+        b.scrim.map(|s| (s.top, s.rgba))
+    );
+    assert_eq!(a.above.len(), b.above.len());
+    for (a, b) in a.above.iter().zip(b.above) {
+        assert_eq!((a.opacity, a.offset_y), (b.opacity, b.offset_y));
+        assert_quad_eq(a.quad, b.quad);
+    }
+}
+
+#[test]
+fn inline_tray_preserves_missing_cropped_and_stamped_cards() {
+    let mut cards = [
+        card(vec![11; 4 * 7 * 5], (7, 5), (2, 3), 1),
+        card(vec![22; 4 * 4 * 3], (4, 3), (5, 8), 2),
+        card(vec![33; 4 * 2 * 7], (2, 7), (1, 1), 3),
+    ];
+    cards[0].scrim = Some([10, 20, 30, 40]);
+    for mask in 0..8 {
+        let stack = std::array::from_fn(|i| (mask & (1 << i) != 0).then_some(&cards[i]));
+        for floor in [0, 1, 3, 5, 7, 8, 10, 11, u32::MAX] {
+            for crop in [0, 4, u32::MAX] {
+                for stamp in [
+                    None,
+                    Some((42, None)),
+                    Some((
+                        43,
+                        Some(aterm_gpu::TrayDelta {
+                            since: 42,
+                            rows: (1, 4),
+                        }),
+                    )),
+                ] {
+                    // Include the single-card fallback as well as every stack occupancy.
+                    for stacked in [false, true] {
+                        let mut old = Vec::new();
+                        let mut new = aterm_alloc::ArrayVec::new();
+                        let a = previous_tray(
+                            stacked.then_some(stack),
+                            stack[0],
+                            stamp,
+                            floor,
+                            crop,
+                            &mut old,
+                        );
+                        let b = present_tray_quad(
+                            stacked.then_some(stack),
+                            stack[0],
+                            stamp,
+                            floor,
+                            crop,
+                            &mut new,
+                        );
+                        assert_eq!(a.is_some(), b.is_some());
+                        if let (Some(a), Some(b)) = (a, b) {
+                            assert_quad_eq(a, b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual paired allocation and retired-instruction measurement"]
+fn measure_tray_layers() {
+    use crate::link_target::caption_test_support::instructions;
+    use std::hint::black_box;
+    let cards = [
+        card(vec![11; 4 * 7 * 5], (7, 5), (2, 3), 1),
+        card(vec![22; 4 * 4 * 3], (4, 3), (5, 8), 2),
+        card(vec![33; 4 * 2 * 7], (2, 7), (1, 1), 3),
+    ];
+    for mask in [0, 1, 3, 7, 8, 9] {
+        let stack = std::array::from_fn(|i| (mask & (1 << i) != 0).then_some(&cards[i]));
+        for old in [true, false, false, true] {
+            let run = || {
+                if old {
+                    let mut layers = Vec::new();
+                    black_box(previous_tray(
+                        black_box((mask < 8).then_some(stack)),
+                        stack[0],
+                        None,
+                        0,
+                        0,
+                        &mut layers,
+                    ));
+                } else {
+                    let mut layers = aterm_alloc::ArrayVec::new();
+                    black_box(present_tray_quad(
+                        black_box((mask < 8).then_some(stack)),
+                        stack[0],
+                        None,
+                        0,
+                        0,
+                        &mut layers,
+                    ));
+                }
+            };
+            run();
+            let (_, allocations) = aterm_heap_count::allocations_in(run);
+            let before = instructions();
+            for _ in 0..20_000 {
+                run();
+            }
+            let work = before.zip(instructions()).map(|(a, b)| b.saturating_sub(a));
+            eprintln!(
+                "tray-layers mask={mask} old={old} iterations=20000 allocations={allocations} instructions={work:?}"
+            );
+        }
+    }
+}
+
 /// A Metal renderer that folds tray stacks, or the test could not run.
 fn gpu() -> GpuRenderer {
     let theme = aterm_render::Theme::default();
@@ -270,7 +441,7 @@ fn a_stacked_present_equals_the_fold() {
                         &input,
                         tray_quad_below_y(&folded, 0),
                     );
-                    let mut layers = Vec::new();
+                    let mut layers = aterm_alloc::ArrayVec::new();
                     let quad = present_tray_quad(Some(*stack), None, None, 0, 0, &mut layers)
                         .expect("the stack has a base");
                     assert_eq!(
@@ -305,7 +476,7 @@ fn a_stacked_present_equals_the_fold() {
 
 /// The serial of the first layer of the stack `deck` under `top` ([`present_tray_quad`]).
 fn top_layer_serial(deck: &SettingsCard, top: &SettingsCard) -> u64 {
-    let mut layers = Vec::new();
+    let mut layers = aterm_alloc::ArrayVec::new();
     let quad = present_tray_quad(
         Some([Some(deck), None, Some(top)]),
         None,
@@ -326,7 +497,7 @@ fn show_stack(
     deck: &SettingsCard,
     top: &SettingsCard,
 ) -> Vec<u8> {
-    let mut layers = Vec::new();
+    let mut layers = aterm_alloc::ArrayVec::new();
     let quad = present_tray_quad(
         Some([Some(deck), None, Some(top)]),
         None,

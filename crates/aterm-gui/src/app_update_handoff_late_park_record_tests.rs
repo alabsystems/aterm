@@ -545,20 +545,22 @@ fn a_park_half_failure_stands_the_held_successor_down_as_a_producer_failure() {
 }
 
 #[test]
-fn the_post_park_proof_deadline_widens_on_retries_and_for_an_explicit_apply() {
+fn adoption_gets_a_full_hang_detector_on_the_first_attempt() {
     if std::env::var_os("ATERM_HANDOFF_PROOF_TIMEOUT_MS").is_some() {
         aterm_spec::host::could_not_run(
-            "ATERM_HANDOFF_PROOF_TIMEOUT_MS is set here, and it replaces the ladder",
+            "ATERM_HANDOFF_PROOF_TIMEOUT_MS is set here, and it replaces the hang detector",
         );
     }
     let park_at = std::time::Instant::now();
-    let budget = |mode, prior| {
-        super::handoff_proof_deadline(mode, prior, park_at).saturating_duration_since(park_at)
-    };
+    let deadline = super::handoff_proof_deadline(park_at);
+    let delayed_paint = park_at + std::time::Duration::from_secs(20);
     assert!(
-        budget(ApplyMode::Automatic, 0) < budget(ApplyMode::AutomaticPastGrace, 1)
-            && budget(ApplyMode::AutomaticPastGrace, 1) < budget(ApplyMode::Immediate, 0),
-        "short on the automatic lane, wider after a failure, widest for a person"
+        delayed_paint < deadline,
+        "a healthy slow launch can prove adoption"
+    );
+    assert_eq!(
+        deadline.duration_since(park_at),
+        aterm_spec::wait::MUST_HAPPEN
     );
     assert!(matches!(
         crate::update_handoff_wake_class(&crate::Wake::UpdateHandoffAwaitingPark {

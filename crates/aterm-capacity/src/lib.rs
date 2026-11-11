@@ -312,14 +312,55 @@ pub enum Rank {
     Background,
 }
 
+/// One stable terminal Release holder whose end funds a critical waiter's memory reservation.
+///
+/// `order` names the sponsor's one terminal compiler claim at the look that made the proof.
+/// `bytes` is its immutable peak claim: ending returns the pages already in use and removes the
+/// reservation for the rest. A waiter in this sponsor's process tree is exempt from the retained
+/// turn only while that exact claim remains held, so work the sponsor must join cannot deadlock
+/// behind the memory it promises to return and a reused PID gains no exemption.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeadSponsor {
+    /// The sponsored holder's claim order (`start_ms`, `pid`, `seq`).
+    pub order: (u64, u32, u64),
+    /// The bytes this claim pledges by ending.
+    pub bytes: u64,
+}
+
+/// The append-only proof that lets a critical Release waiter retain memory its sponsors free.
+///
+/// At the proving look, the sponsors' whole claims cover `needed` bytes of the lead's shortage
+/// beside every other held claim at its immutable peak. Every unrelated later admission
+/// counts the lead, including after a sponsor record disappears, so it cannot refill the released
+/// room. A sponsor descendant may pass as the bounded ABBA escape; the lead continues to count
+/// that descendant's held claim until it ends. Critical claims cannot add numeric credits or
+/// duplicate or detach their custody after the proof, so this process-tree relation stays stable.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeadReservation {
+    /// How many sponsor bytes the proof needs.
+    pub needed: u64,
+    /// A conservative peak envelope for held non-sponsors at the proving look. A later waiter's
+    /// ancestor filtering may hide some of these claims, so critical virtual admission protects
+    /// them again before allowing any backfill.
+    pub holdback: u64,
+    /// An irredundant set of stable sponsors. Each one is necessary to cover [`Self::needed`].
+    pub sponsors: Vec<LeadSponsor>,
+}
+
+/// The most holder groups one lead reservation records. A proof that needs more stays on the
+/// snapshot-only rule instead of growing a claim record without bound.
+pub(crate) const LEAD_SPONSORS_MAX: usize = 32;
+
 /// The cutter marks its descendants with this environment variable.
 pub const RELEASE_RUN_ENV: &str = "ATERM_RELEASE_RUN";
 
 mod background;
 mod branch_shares;
 mod jobserver;
-pub use branch_shares::BranchShares;
-pub use jobserver::{Jobserver, POOL_ENV, Token};
+pub use branch_shares::{BranchShares, InitialReservation};
+pub use jobserver::{IMPLICIT_POOL_ENV, Jobserver, POOL_ENV, Token};
 
 /// What a claim needs. Sizes are bytes.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -356,6 +397,14 @@ pub struct Need {
     pub scratch: bool,
     /// It LEADS the waiters ([`Self::leads`]).
     pub leads: bool,
+    /// It is a terminal unit on the Release's critical path ([`Self::critical_path`]).
+    pub critical: bool,
+    /// Admission-written evidence that retains a critical Release waiter's funded memory.
+    ///
+    /// Callers cannot supply this authority: entering a ledger clears it, and a waiting lead
+    /// appends it only while holding the admissions turn.
+    #[doc(hidden)]
+    pub lead_reservation: Option<LeadReservation>,
     /// The memory its RUN PHASE claims ([`Self::run_mem`], [`mod@phase`], CAP3): what its holder
     /// steps it down to once its tree runs a program its build made ([`Claim::step_down`]).
     /// Less than [`Self::mem`] where set: a need whose run phase claims as much or more takes
@@ -476,6 +525,17 @@ impl Need {
         self
     }
 
+    /// Mark this terminal Release unit as critical-path work.
+    ///
+    /// Critical work leads, and while it waits it may retain the memory that already-admitted
+    /// terminal critical work in the same release checkout proves it will return. Admission,
+    /// not the caller, writes that retained evidence ([`LeadReservation`]).
+    #[must_use]
+    pub const fn critical_path(mut self) -> Need {
+        self.leads = true;
+        self.critical = true;
+        self
+    }
     /// The cores it would use.
     #[must_use]
     pub const fn cores(mut self, cores: u32) -> Need {

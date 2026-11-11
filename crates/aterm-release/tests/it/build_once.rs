@@ -371,7 +371,7 @@ fn the_verified_judge_reads_each_checks_record_of_the_tree_on_these_bytes() {
     let (yes, why) = judge(&other);
     assert!(!yes, "another tree: {why}");
 
-    let verified = repo.join(".git/aterm-release/verified");
+    let verified = crate::check_record::root(&g).unwrap();
     fs::write(
         crate::check_record::path(&verified, &tree, &inputs, "lint", None),
         "not a record",

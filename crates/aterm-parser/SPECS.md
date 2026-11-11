@@ -78,25 +78,6 @@ state-name-roundtrip	table-property	State::{ALL,name,from_name}, derive(Debug)	�
 tmux-passthrough-wrapper	equivalence	tmux::TmuxPassthrough::{is_open,name,from_name,after_head_byte}, Parser::{tmux_passthrough,advance_unwrapping}, process_byte_impl! tmux head/reset arms, carry/restore_carry/validate_carry tmux clauses	A non-nested ESC 'P' "tmux;" W ESC '\\' wrapper (opened from TmuxPassthrough::Off when 't' enters DcsIgnore with no params or intermediates, matched byte-by-byte through Head(1..=4) to Open) unwraps doubled escapes (ESC ESC -> payload ESC) and closes at an undoubled ESC '\\' (ending any open OSC/DCS/APC string as ST too), delivering the unwrapped payload to the state machine with the same ActionSink trace and final View as bare input across every chunk split and both C1 modes. A non-"tmux;" header falls back to Off inside DcsIgnore; an undoubled ESC followed by b ∉ {ESC, '\\'} stays Open and feeds ESC, b; CAN/SUB inside an Open wrapper cancels the inner payload while keeping the wrapper Open until ESC '\\' (whereas CAN/SUB during Head(1..=4) cancels the ignored DCS and resets to Off); RIS (ESC 'c') and Parser::reset reset tmux to Off; nested wrappers unwrap one layer; carry/restore_carry round-trip TmuxPassthrough (name/from_name bijection) and validate_carry accepts Head(k) iff state = DcsIgnore ∧ 1 ≤ k ≤ 4.	tmux::a_wrapped_sequence_reads_as_it_reads_bare, a_string_left_open_ends_with_its_wrapper, an_st_the_program_did_not_double_ends_its_string, a_reset_ends_the_wrapper, a_head_that_is_not_tmux_is_an_ignored_dcs, an_escape_the_program_did_not_double_keeps_its_sequence, a_cancel_inside_the_wrapper_cancels_the_payload_not_the_wrapper, a_wrapper_inside_a_wrapper_is_unwrapped_once, a_cancel_then_st_end_the_wrapper_from_where_it_stands, a_carry_inside_a_wrapper_continues_in_the_successor, a_head_outside_its_ignored_dcs_is_refused	MEDIUM-HARD: 4-state wrapper transducer composed with advance_plain, ESC lookahead across chunk boundaries, carry/restore invariant Head(1..=4) ⇒ DcsIgnore
 ```
 
-### Distribution by kind (40)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 22 | take-printable-split, utf8prefix-from-bytes, decode-multibyte-char, osc-bulk-copy-len, param-accumulator, csi-dispatch-denotation, dcs-header-denotation, vt-ground-and-esc-basics, introducers-terminate, osc-denotation, dcs-passthrough-denotation, apc-sos-pm-denotation, can-sub-cancel, esc-interrupts, c1-guard, string-st-0x9c-utf8-aware, reset-is-fresh, carry-projection, carry-lossy-swallow, restore-carry-validation, carry-for-older-builds, carry-swallows-predicate |
-| equivalence | 11 | scan-non-printable, scan-c0-control, scan-any-of, utf8prefix-after-fold, bulk-decode-run-refines-scalar, advance-fast-refines-utf8-step-fold, advance-fast-chunk-invariance, ground-utf8-lossy, carry-restore-continues, tmux-passthrough-wrapper, line-run-handoff |
-| table-property | 4 | dcs-ignore-bisimilar-passthrough, dcs-header-gr-ignored, hooked-string-carry-bisimilar, state-name-roundtrip |
-| invariant | 1 | type-invariant |
-| no-panic/bounds | 1 | no-panic-total |
-| other | 1 | linear-progress (loop variant) |
-
-### Proof dependency order
-
-`osc-bulk-copy-len`, `param-accumulator`, the `scan-*` scalar/NEON contracts, `decode-multibyte-char`,
-the table properties, `utf8prefix-*` → `bulk-decode-run-refines-scalar` → per-step contracts (`c1-guard`,
-`can-sub-cancel`, `esc-interrupts`, denotations on the per-byte state machine) → `type-invariant` →
-master simulation `advance-fast-refines-utf8-step-fold` → free corollaries (chunk invariance, the
-fast-path halves of the denotations) → carry specs.
-
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
@@ -222,18 +203,7 @@ tests/fuzz_parser.rs	fuzz_escape_shapes_never_panic	no-panic-total
 (`tests/*.rs` in the map means `src/tests/*.rs`, except `tests/fuzz_parser.rs`, which is the
 integration test file.)
 
-## 3. Coverage
-
-- 113 live tests mapped in §2 across the 40 specs (0 non-spec tests remain; 172 original tests read in the initial 2026-10-15 audit).
-- The biggest collapses: `csi-dispatch-denotation` (17 primary), `ground-utf8-lossy` (13),
-  `type-invariant` (12), `bulk-decode-run-refines-scalar` (11), `scan-c0-control` (6 primary, plus 2
-  shared).
-- `advance-fast-refines-utf8-step-fold` has only 1 primary test, but proving it makes the primary
-  tests of `advance-fast-chunk-invariance` and the fast-path halves of about 25 others free.
-
 ## 4. Tests that are not spec samples
-
-> Status 2026-10-28: `table_validity::transition_table_all_entries_valid`, `table_validity::transition_table_matches_generated`, `performance::parser_linear_scaling`, and the ten duplicate `batch::advance_batch_*` cases (along with the test-only batch API) have been deleted; `utf8_errors::fast_invalid_utf8_prefix_replays_escape_across_chunks` covers the shared UTF-8/control case on `advance_fast`, and `performance::parser_handles_pathological_input` + `parser_handles_large_osc` remain as the spec samples of `linear-progress`.
 
 | test | why | recommendation |
 |---|---|---|
@@ -256,9 +226,6 @@ fast/slow split) is an instance of one of the general specs above.
 6. **Resolved: the duplicated test oracle is removed.** `utf8_simd::tests::scalar_one` is deleted, and
    `ref_run` plus `bulk_first_sequence_matches_scalar_for_every_lead_and_continuation_class` call
    `Parser::decode_multibyte_char` directly across all `0..=u8::MAX` leads.
-7. **Resolved 2026-10-16: the two public entry points decoded Ground high bytes differently**
-   (`advance` as Latin-1, `advance_fast` as UTF-8). `advance` is deleted; the reference for the one
-   entry point is `foldl step_u`, and no function names that step today (§0).
 8. *(Resolved)* **`restore_carry` and `subparam_mask_fits` now exclude unreachable bit-0 subparameter
    masks, empty-list colons, and DCS colon state.** `csi::subparam_mask_fits` requires `(mask & 1) == 0`
    because `params[0]` cannot follow a colon, `validate_carry` rejects `last_was_colon` with `params`

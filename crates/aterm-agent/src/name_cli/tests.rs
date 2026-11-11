@@ -67,7 +67,7 @@ fn name_takes_json_or_help_and_refuses_every_other_word() {
     assert_eq!(parse(&args(&["--help", "set"])), Ok(Mode::Help));
     for refused in [
         &["--json", "--json"][..],
-        &["set", "m0"],
+        &["set", "-1"],
         &["--jsonx"],
         &["json"],
     ] {
@@ -117,7 +117,7 @@ fn set_takes_a_number_and_optional_exact_nickname_with_preview_flags() {
     assert_eq!(parse(&args(&["set", "m0", "--help"])), Ok(Mode::Help));
     for refused in [
         &["set"][..],
-        &["set", "m0"],
+        &["set", "-1"],
         &["set", "m086"],
         &["set", "m1000000"],
         &["set", "m86", "m7"],
@@ -214,7 +214,9 @@ fn a_first_read_makes_the_name_and_a_later_one_reads_it_back_with_no_roster_read
         "the roster read for the first name"
     );
     let (title, rest) = line.split_once("  ").expect("two spaces end the title");
-    let nick = title.strip_prefix("m0 ").expect("m0 while unnumbered");
+    let nick = title
+        .strip_prefix("unnumbered ")
+        .expect("unnumbered while unnumbered");
     assert!(
         nouns::NOUNS.contains(&nick.to_ascii_lowercase().as_str()),
         "{line}"
@@ -303,7 +305,7 @@ fn the_report_names_the_fleet_the_node_and_a_migration_not_finished() {
     for field in [
         "\"made\":\"drawn\"",
         "\"migration\":null",
-        "\"name\":\"m0\"",
+        "\"name\":\"unnumbered\"",
         "\"node\":null",
         "\"number\":null",
         "\"fleet\":\"out\"",
@@ -489,7 +491,7 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
     )
     .expect("sets it");
     assert!(
-        line.starts_with("m0 Blue Heron  class=auto fleet=out node="),
+        line.starts_with("unnumbered Blue Heron  class=auto fleet=out node="),
         "{line}"
     );
     assert!(notes.is_empty(), "{notes:?}");
@@ -569,7 +571,7 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
         NOW,
     )
     .expect("a dry run");
-    assert!(line.starts_with("m0 Blue Heron  "), "{line}");
+    assert!(line.starts_with("unnumbered Blue Heron  "), "{line}");
     assert_eq!(notes, [Note::DryRun]);
     assert_eq!(
         std::fs::read(root.path().join(file::FILE)).expect("reads"),
@@ -579,8 +581,8 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
 }
 
 #[test]
-fn a_nickname_another_machine_in_view_carries_is_set_and_said() {
-    use super::unix::{NickAsk, Note, renick};
+fn a_name_another_machine_in_view_carries_is_refused() {
+    use super::unix::{NickAsk, renick};
     use crate::machine_name::NickTo;
     use aterm_net::fleet::NodeIdentity;
     use aterm_net::fleet_member::name_record::ByKind;
@@ -593,11 +595,11 @@ fn a_nickname_another_machine_in_view_carries_is_set_and_said() {
         entry(&other, &record(&other, Some(11), 4, Some("Puffin"))).as_bytes(),
     )
     .expect("writes the book");
-    let (line, notes) = renick(
+    let refused = renick(
         root.path(),
         Some(&vault(root.path())),
         &NickAsk {
-            to: &NickTo::Word(nickname("Puffin")),
+            to: &NickTo::Word(nickname(" pUfFiN ")),
             kind: ByKind::Person,
             dry_run: false,
         },
@@ -605,7 +607,27 @@ fn a_nickname_another_machine_in_view_carries_is_set_and_said() {
         no_roster,
         NOW,
     )
-    .expect("sets it");
-    assert!(line.starts_with("m0 Puffin  "), "{line}");
-    assert_eq!(notes, [Note::Shared("Puffin".to_owned())]);
+    .expect_err("another machine holds this name");
+    assert!(refused.contains("already used"), "{refused}");
+    let before = crate::machine_name::file::read(root.path())
+        .unwrap()
+        .unwrap();
+    let refused = crate::machine_name::set_name(
+        root.path(),
+        &crate::machine_name::NameTo {
+            num: aterm_types::machine_name::Number::new(0).unwrap(),
+            nick: Some(nickname("PUFFIN")),
+        },
+        || Ok(aterm_secrets::client::LabLabels::default()),
+        ByKind::Person,
+        no_roster,
+        NOW,
+        false,
+    )
+    .expect_err("number and name must change atomically");
+    assert!(refused.to_string().contains("already used"));
+    assert_eq!(
+        crate::machine_name::file::read(root.path()).unwrap(),
+        Some(before)
+    );
 }

@@ -302,6 +302,12 @@ fn pending_manifest_metadata_rolls_forward_without_minting_a_native_admission() 
         .manifest
         .members
         .insert(intended.request().id.clone(), intended.clone());
+    assert!(intended.guarded_preparation);
+    authority
+        .manifest
+        .unattempted
+        .push(intended.request().id.clone());
+    authority.manifest.unattempted.sort();
     MANIFEST_CUT.with(|cut| cut.set(1));
     assert!(authority.save().is_err());
     drop(authority);

@@ -23,6 +23,18 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(target_os = "macos")]
 fn main() -> std::process::ExitCode {
+    if std::env::var_os(macos::TERMINATE_REENTRY_CHILD_ENV).is_some() {
+        return std::process::ExitCode::from(macos::terminate_reentry_child() as u8);
+    }
+    if std::env::var_os(macos::MODAL_EXIT_ORDER_CHILD_ENV).is_some() {
+        return std::process::ExitCode::from(macos::modal_exit_order_child() as u8);
+    }
+    if std::env::var_os(macos::PREPARED_EXIT_CHILD_ENV).is_some() {
+        return std::process::ExitCode::from(macos::prepared_exit_child() as u8);
+    }
+    if std::env::var_os(macos::DEFERRED_PANIC_CHILD_ENV).is_some() {
+        return std::process::ExitCode::from(macos::deferred_panic_child() as u8);
+    }
     std::process::ExitCode::from(macos::run() as u8)
 }
 
@@ -37,7 +49,7 @@ mod macos {
     use aterm_window::application::ApplicationHandler;
     use aterm_window::event::WindowEvent;
     use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
-    use aterm_window::platform::macos::MonitorHandleExtMacOS;
+    use aterm_window::platform::macos::{EventLoopExtMacOS as _, MonitorHandleExtMacOS};
     use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
     use aterm_window::window::{Theme, Window, WindowId};
 
@@ -46,6 +58,20 @@ mod macos {
     /// Long enough for macOS to launch its `NSApplication`, hand back a window
     /// and run every stage; past it the drive reports NOT RUN.
     const BUDGET: Duration = Duration::from_secs(60);
+    /// Re-executes this driver as the process that AppKit is expected to terminate.
+    pub const TERMINATE_REENTRY_CHILD_ENV: &str = "ATERM_OBJC_WINDOW_TERMINATE_REENTRY_CHILD";
+    /// Re-executes this driver around an API exit requested behind modal-deferred callbacks.
+    pub const MODAL_EXIT_ORDER_CHILD_ENV: &str = "ATERM_OBJC_WINDOW_MODAL_EXIT_ORDER_CHILD";
+    /// Re-executes this driver around exit requested by a prepared loop's first `Resumed`.
+    pub const PREPARED_EXIT_CHILD_ENV: &str = "ATERM_OBJC_WINDOW_PREPARED_EXIT_CHILD";
+    /// Re-executes this driver around the panic which a deferred callback must propagate.
+    pub const DEFERRED_PANIC_CHILD_ENV: &str = "ATERM_OBJC_WINDOW_DEFERRED_PANIC_CHILD";
+    /// A child either completes promptly or its native-loop control is hung.
+    const CHILD_WATCHDOG: Duration = Duration::from_secs(20);
+    /// Lets a deferred-handler child fail with its own diagnostic before the parent watchdog.
+    const DEFERRED_HANDLER_BUDGET: Duration = Duration::from_secs(10);
+    /// The exact payload which must return from the deferred handler through `pump_app_events`.
+    const DEFERRED_HANDLER_PANIC_MARKER: &str = "objc-window-drive deferred handler panic marker";
 
     /// `NSDragOperationCopy`, the value `draggingEntered:` must answer for a
     /// pasteboard carrying filenames.
@@ -409,6 +435,527 @@ mod macos {
         }
     }
 
+    /// Invoke the ported view's real AppKit drawing entry point.
+    ///
+    /// # Safety
+    /// `view` must be a live WinitView.
+    unsafe fn send_draw_rect(view: Id) {
+        // SAFETY: `-drawRect:` is `v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16`.
+        unsafe {
+            let draw: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::CGRect) = checked_msg();
+            draw(view, sel!(drawRect:), aterm_objc::CGRect::default());
+        }
+    }
+
+    aterm_objc::declare_class! {
+        /// Turns an object-only delayed selector into the `CGRect` argument `drawRect:` needs.
+        struct ATermDrawRectTarget: NSObject {
+            const NAME: &str = "ATermObjcWindowDriveDrawRectTarget";
+            type Ivars = Id;
+
+            @sel(drawWinitView:)
+            fn draw_winit_view(&self, _sender: Id) {
+                // SAFETY: the ivar is the live WinitView retained by its window.
+                unsafe { send_draw_rect(*self.ivars()) };
+            }
+        }
+    }
+
+    struct DeferredPanicChild {
+        window: Option<Window>,
+        attempted: bool,
+        panic_on_redraw: bool,
+        failed: Option<String>,
+    }
+
+    impl ApplicationHandler<()> for DeferredPanicChild {
+        fn resumed(&mut self, el: &ActiveEventLoop) {
+            if self.window.is_some() {
+                return;
+            }
+            let attrs = Window::default_attributes()
+                .with_title("objc-window-drive deferred-panic child")
+                .with_visible(false);
+            match el.create_window(attrs) {
+                Ok(window) => self.window = Some(window),
+                Err(error) => {
+                    self.failed = Some(format!("no child window could be created: {error}"));
+                    el.exit();
+                }
+            }
+        }
+
+        fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+            if self.attempted || self.failed.is_some() || self.window.is_none() {
+                return;
+            }
+            let view = self
+                .window
+                .as_ref()
+                .map_or(Id::NIL, aterm_objc::HasNsView::ns_view);
+            if view.is_null() {
+                self.failed = Some("the child window has no WinitView".to_owned());
+                el.exit();
+                return;
+            }
+
+            // The direct AppKit callback runs while AboutToWait owns the event handler. It must
+            // therefore enqueue RedrawRequested; invoking the handler inline would reborrow it.
+            self.attempted = true;
+            self.panic_on_redraw = true;
+            eprintln!("deferred-panic child: invoking drawRect: from AboutToWait");
+            // SAFETY: the child window owns this live WinitView.
+            unsafe { send_draw_rect(view) };
+        }
+
+        fn window_event(
+            &mut self,
+            _el: &ActiveEventLoop,
+            _window_id: WindowId,
+            event: WindowEvent,
+        ) {
+            if self.panic_on_redraw && matches!(event, WindowEvent::RedrawRequested) {
+                self.panic_on_redraw = false;
+                std::panic::panic_any(DEFERRED_HANDLER_PANIC_MARKER);
+            }
+        }
+    }
+
+    struct TerminateReentryChild {
+        window: Option<Window>,
+        attempted: bool,
+        destroyed: bool,
+        failed: Option<String>,
+    }
+
+    impl ApplicationHandler<()> for TerminateReentryChild {
+        fn resumed(&mut self, el: &ActiveEventLoop) {
+            if self.window.is_some() {
+                return;
+            }
+            let attrs = Window::default_attributes()
+                .with_title("objc-window-drive terminate-reentry child")
+                .with_visible(false);
+            match el.create_window(attrs) {
+                Ok(window) => self.window = Some(window),
+                Err(error) => {
+                    self.failed = Some(format!("no child window could be created: {error}"));
+                    el.exit();
+                }
+            }
+        }
+
+        fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+            if self.attempted || self.failed.is_some() || self.window.is_none() {
+                return;
+            }
+            self.attempted = true;
+            eprintln!("terminate child: entering modal alert from AboutToWait");
+            if let Err(why) = modal_terminate_attempt() {
+                self.failed = Some(why);
+                el.exit();
+            } else {
+                eprintln!("terminate child: modal alert returned; AboutToWait can now return");
+            }
+        }
+
+        fn window_event(
+            &mut self,
+            _el: &ActiveEventLoop,
+            _window_id: WindowId,
+            event: WindowEvent,
+        ) {
+            if matches!(event, WindowEvent::Destroyed) {
+                self.destroyed = true;
+            }
+        }
+
+        fn exiting(&mut self, _el: &ActiveEventLoop) {
+            if !self.destroyed {
+                eprintln!(
+                    "objc-window-drive terminate child: FAIL — LoopExiting arrived before the \
+                     child window's Destroyed event"
+                );
+                std::process::exit(FAIL);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct PreparedExitChild {
+        resumed: usize,
+        exiting: usize,
+        request_was_immediate: bool,
+    }
+
+    impl ApplicationHandler<()> for PreparedExitChild {
+        fn resumed(&mut self, el: &ActiveEventLoop) {
+            self.resumed += 1;
+            el.exit();
+            self.request_was_immediate = el.exiting();
+        }
+
+        fn window_event(
+            &mut self,
+            _el: &ActiveEventLoop,
+            _window_id: WindowId,
+            _event: WindowEvent,
+        ) {
+        }
+
+        fn exiting(&mut self, _el: &ActiveEventLoop) {
+            self.exiting += 1;
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ModalExitMarker {
+        DeferredFocus,
+        DeferredRedraw,
+        PrimaryDestroyed,
+        ProbeDestroyed,
+        LoopExiting,
+    }
+
+    struct ModalExitOrderChild {
+        primary: Option<Window>,
+        probe: Option<Window>,
+        attempted: bool,
+        ordering_armed: bool,
+        markers: Vec<ModalExitMarker>,
+        passed: bool,
+        unavailable: Option<String>,
+        ordering_failure: Option<String>,
+    }
+
+    impl ModalExitOrderChild {
+        fn primary_delegate(&self) -> Option<Id> {
+            let view = self
+                .primary
+                .as_ref()
+                .map_or(Id::NIL, aterm_objc::HasNsView::ns_view);
+            if view.is_null() {
+                return None;
+            }
+            // SAFETY: `view` is the primary window's live WinitView and `-window` is
+            // `@16@0:8` on NSView.
+            let window = unsafe {
+                let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+                get(view, sel!(window))
+            };
+            if window.is_null() {
+                return None;
+            }
+            // SAFETY: `window` is the live WinitWindow hosting `view`.
+            let delegate = unsafe { window_delegate(window) };
+            (!delegate.is_null()).then_some(delegate)
+        }
+
+        fn record_destroyed(&mut self, id: WindowId) {
+            if self.primary.as_ref().map(Window::id) == Some(id) {
+                self.markers.push(ModalExitMarker::PrimaryDestroyed);
+            } else if self.probe.as_ref().map(Window::id) == Some(id) {
+                self.markers.push(ModalExitMarker::ProbeDestroyed);
+            }
+        }
+    }
+
+    impl ApplicationHandler<()> for ModalExitOrderChild {
+        fn resumed(&mut self, el: &ActiveEventLoop) {
+            if self.primary.is_some() || self.unavailable.is_some() {
+                return;
+            }
+            let primary = Window::default_attributes()
+                .with_title("objc-window-drive modal-exit primary")
+                .with_visible(false);
+            let probe = Window::default_attributes()
+                .with_title("objc-window-drive modal-exit probe")
+                .with_visible(false);
+            match el.create_window(primary) {
+                Ok(window) => self.primary = Some(window),
+                Err(error) => {
+                    self.unavailable = Some(format!("no primary child window: {error}"));
+                    el.exit();
+                    return;
+                }
+            }
+            match el.create_window(probe) {
+                Ok(window) => self.probe = Some(window),
+                Err(error) => {
+                    self.unavailable = Some(format!("no probe child window: {error}"));
+                    el.exit();
+                    return;
+                }
+            }
+            let Some(delegate) = self.primary_delegate() else {
+                self.unavailable = Some("the primary child has no AppKit delegate".to_owned());
+                el.exit();
+                return;
+            };
+            let probe_view = self
+                .probe
+                .as_ref()
+                .map_or(Id::NIL, aterm_objc::HasNsView::ns_view);
+            if probe_view.is_null() {
+                self.unavailable = Some("the probe child has no WinitView".to_owned());
+                el.exit();
+                return;
+            }
+
+            self.attempted = true;
+            eprintln!("modal-exit child: entering modal alert from prepared-loop Resumed");
+            if let Err(why) = modal_exit_attempt(delegate, probe_view) {
+                self.unavailable = Some(why);
+                el.exit();
+                return;
+            }
+
+            // The forced delegate callback ran while this method owned the handler. It must be
+            // queued, not re-entered. The exit request is the FIFO boundary under test.
+            if !self.markers.is_empty() {
+                self.ordering_failure = Some(format!(
+                    "a modal callback re-entered Resumed: {:?}",
+                    self.markers
+                ));
+            }
+            self.ordering_armed = true;
+            el.exit();
+            if !el.exiting() {
+                self.ordering_failure = Some(
+                    "ActiveEventLoop::exiting() stayed false after exit() returned".to_owned(),
+                );
+            }
+        }
+
+        fn window_event(&mut self, _el: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+            if !self.ordering_armed {
+                return;
+            }
+            match event {
+                WindowEvent::Focused(false)
+                    if self.primary.as_ref().map(Window::id) == Some(window_id) =>
+                {
+                    self.markers.push(ModalExitMarker::DeferredFocus);
+                }
+                WindowEvent::RedrawRequested
+                    if self.probe.as_ref().map(Window::id) == Some(window_id) =>
+                {
+                    self.markers.push(ModalExitMarker::DeferredRedraw);
+                }
+                WindowEvent::Destroyed => self.record_destroyed(window_id),
+                _ => {}
+            }
+        }
+
+        fn exiting(&mut self, _el: &ActiveEventLoop) {
+            if !self.ordering_armed {
+                return;
+            }
+            self.markers.push(ModalExitMarker::LoopExiting);
+            let callback_len = self.markers.len().saturating_sub(3);
+            let (callbacks, tail) = self.markers.split_at(callback_len);
+            let callbacks_ordered = callbacks.iter().all(|marker| {
+                matches!(
+                    marker,
+                    ModalExitMarker::DeferredFocus | ModalExitMarker::DeferredRedraw
+                )
+            }) && callbacks.contains(&ModalExitMarker::DeferredFocus)
+                && callbacks.contains(&ModalExitMarker::DeferredRedraw);
+            let tail_ordered = matches!(
+                tail,
+                [
+                    ModalExitMarker::PrimaryDestroyed,
+                    ModalExitMarker::ProbeDestroyed,
+                    ModalExitMarker::LoopExiting,
+                ] | [
+                    ModalExitMarker::ProbeDestroyed,
+                    ModalExitMarker::PrimaryDestroyed,
+                    ModalExitMarker::LoopExiting,
+                ]
+            );
+            if callbacks_ordered && tail_ordered && self.ordering_failure.is_none() {
+                self.passed = true;
+            } else if self.ordering_failure.is_none() {
+                self.ordering_failure = Some(format!(
+                    "event order was {:?}, not one or more deferred focus/redraw callbacks \
+                     including both kinds, both Destroyed events, then LoopExiting",
+                    self.markers
+                ));
+            }
+        }
+    }
+
+    /// Queues Winit focus and redraw callbacks in an alert's nested modal loop. The outer
+    /// prepared-loop `Resumed` calls `ActiveEventLoop::exit` as soon as this returns.
+    fn modal_exit_attempt(delegate: Id, probe_view: Id) -> Result<(), String> {
+        let message = ns_string("Exercise API exit after a modal callback")
+            .ok_or_else(|| "Foundation rejected the modal-exit alert's message".to_owned())?;
+        let quit = ns_string("Exit")
+            .ok_or_else(|| "Foundation rejected the modal-exit alert's button".to_owned())?;
+        let mode = ns_string("NSModalPanelRunLoopMode")
+            .ok_or_else(|| "Foundation rejected the modal-exit run-loop mode".to_owned())?;
+
+        // SAFETY: `+new` answers a +1 NSAlert, the setters have their documented signatures,
+        // and the alert retains the button through `-runModal`.
+        let made = unsafe {
+            let new: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            let set: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+            let add: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
+            Obj::from_owned(new(class(c"NSAlert").as_id(), sel!(new))).and_then(|alert| {
+                set(alert.id(), sel!(setMessageText:), message.id());
+                let button = Obj::retain(add(alert.id(), sel!(addButtonWithTitle:), quit.id()))?;
+                Some((alert, button))
+            })
+        }
+        .ok_or_else(|| "AppKit did not make the modal-exit alert".to_owned())?;
+        let (alert, button) = made;
+        let mtm = aterm_objc::MainThread::new()
+            .ok_or_else(|| "the modal-exit child left the main thread".to_owned())?;
+        let draw_target = ATermDrawRectTarget::alloc_init(mtm, probe_view)
+            .ok_or_else(|| "AppKit did not make the modal-exit draw target".to_owned())?;
+
+        // SAFETY: every receiver remains live through `-runModal`. Delayed sends are restricted
+        // to the modal mode. `windowDidResignKey:`, `drawWinitView:`, and `performClick:` each
+        // accept one object; `abortModal` is the bounded fallback.
+        let answer = unsafe {
+            let one: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            let later: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64, Id) = checked_msg();
+            let run: unsafe extern "C-unwind" fn(Id, Sel) -> isize = checked_msg();
+            let cancel: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+            let modes = one(class(c"NSArray").as_id(), sel!(arrayWithObject:), mode.id());
+            let app = get(class(c"NSApplication").as_id(), sel!(sharedApplication));
+            later(
+                delegate,
+                sel!(performSelector:withObject:afterDelay:inModes:),
+                sel!(windowDidResignKey:),
+                Id::NIL,
+                0.1,
+                modes,
+            );
+            later(
+                draw_target.as_id(),
+                sel!(performSelector:withObject:afterDelay:inModes:),
+                sel!(drawWinitView:),
+                Id::NIL,
+                0.15,
+                modes,
+            );
+            later(
+                button.id(),
+                sel!(performSelector:withObject:afterDelay:inModes:),
+                sel!(performClick:),
+                Id::NIL,
+                0.2,
+                modes,
+            );
+            later(
+                app,
+                sel!(performSelector:withObject:afterDelay:inModes:),
+                sel!(abortModal),
+                Id::NIL,
+                5.0,
+                modes,
+            );
+            let answer = run(alert.id(), sel!(runModal));
+            cancel(
+                class(c"NSObject").as_id(),
+                sel!(cancelPreviousPerformRequestsWithTarget:),
+                app,
+            );
+            cancel(
+                class(c"NSObject").as_id(),
+                sel!(cancelPreviousPerformRequestsWithTarget:),
+                draw_target.as_id(),
+            );
+            answer
+        };
+        if answer == NS_ALERT_FIRST_BUTTON_RETURN {
+            Ok(())
+        } else {
+            Err(format!(
+                "the modal-exit alert answered {answer}, not {NS_ALERT_FIRST_BUTTON_RETURN}"
+            ))
+        }
+    }
+
+    /// Requests native termination from an alert's nested modal loop, while the caller's
+    /// `AboutToWait` handler still owns the event handler's mutable borrow.
+    fn modal_terminate_attempt() -> Result<(), String> {
+        let message = ns_string("Exercise termination inside a modal event callback")
+            .ok_or_else(|| "Foundation rejected the child alert's message".to_owned())?;
+        let quit = ns_string("Continue termination")
+            .ok_or_else(|| "Foundation rejected the child alert's button".to_owned())?;
+        let mode = ns_string("NSModalPanelRunLoopMode")
+            .ok_or_else(|| "Foundation rejected the modal run-loop mode".to_owned())?;
+
+        // SAFETY: `+new` answers a +1 `NSAlert`; both setters have their declared AppKit
+        // signatures, and the alert retains the button across `-runModal`.
+        let made = unsafe {
+            let new: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            let set: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+            let add: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
+            Obj::from_owned(new(class(c"NSAlert").as_id(), sel!(new))).and_then(|alert| {
+                set(alert.id(), sel!(setMessageText:), message.id());
+                let button = Obj::retain(add(alert.id(), sel!(addButtonWithTitle:), quit.id()))?;
+                Some((alert, button))
+            })
+        }
+        .ok_or_else(|| "AppKit did not make the child alert".to_owned())?;
+        let (alert, button) = made;
+
+        // SAFETY: all receivers remain live through `-runModal`; the delayed sends are confined
+        // to the alert's modal mode. `terminate:` and `performClick:` each take one object;
+        // `abortModal` is the bounded fallback if the click is not delivered.
+        let answer = unsafe {
+            let one: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            let later: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64, Id) = checked_msg();
+            let run: unsafe extern "C-unwind" fn(Id, Sel) -> isize = checked_msg();
+            let cancel: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+            let modes = one(class(c"NSArray").as_id(), sel!(arrayWithObject:), mode.id());
+            let app = get(class(c"NSApplication").as_id(), sel!(sharedApplication));
+            later(
+                app,
+                sel!(performSelector:withObject:afterDelay:inModes:),
+                sel!(terminate:),
+                Id::NIL,
+                0.1,
+                modes,
+            );
+            later(
+                button.id(),
+                sel!(performSelector:withObject:afterDelay:inModes:),
+                sel!(performClick:),
+                Id::NIL,
+                0.2,
+                modes,
+            );
+            later(
+                app,
+                sel!(performSelector:withObject:afterDelay:inModes:),
+                sel!(abortModal),
+                Id::NIL,
+                5.0,
+                modes,
+            );
+            let answer = run(alert.id(), sel!(runModal));
+            cancel(
+                class(c"NSObject").as_id(),
+                sel!(cancelPreviousPerformRequestsWithTarget:),
+                app,
+            );
+            answer
+        };
+        if answer == NS_ALERT_FIRST_BUTTON_RETURN {
+            Ok(())
+        } else {
+            Err(format!(
+                "the child alert answered {answer}, not {NS_ALERT_FIRST_BUTTON_RETURN}"
+            ))
+        }
+    }
+
     #[derive(Default)]
     struct Report {
         findings: Vec<String>,
@@ -432,6 +979,9 @@ mod macos {
 
     struct Driver {
         window: Option<Window>,
+        /// A permanently hidden Winit window whose view isolates the modal redraw probe from
+        /// AppKit redraws of the primary window.
+        redraw_probe: Option<Window>,
         proxy: Option<EventLoopProxy<u8>>,
         proxy_events: Vec<u8>,
         report: Report,
@@ -448,6 +998,9 @@ mod macos {
         /// Focus events delivered before the modal-reentry stage makes the winit window resign key
         /// while its `about_to_wait` handler is inside an alert's nested modal run loop.
         modal_focus_before: Option<usize>,
+        /// Probe-window redraw events delivered before that modal loop invokes its `drawRect:`.
+        modal_probe_redraw_before: Option<usize>,
+        probe_redraws: usize,
         /// The windows in `-[NSApp windows]` when the loop was told to exit, by class name.
         windows_at_exit: Vec<String>,
         /// The answered alert's own panel was one of [`Self::windows_at_exit`], by identity.
@@ -492,6 +1045,13 @@ mod macos {
                 .as_ref()
                 .map_or(Id::NIL, aterm_objc::HasNsView::ns_view)
         }
+
+        /// The hidden redraw probe's content `NSView`.
+        fn redraw_probe_view(&self) -> Id {
+            self.redraw_probe
+                .as_ref()
+                .map_or(Id::NIL, aterm_objc::HasNsView::ns_view)
+        }
     }
 
     impl ApplicationHandler<u8> for Driver {
@@ -509,11 +1069,36 @@ mod macos {
                     self.report.blocked = Some(format!("no window could be created: {e}"));
                     self.done = true;
                     el.exit();
+                    return;
+                }
+            }
+
+            let probe_attrs = Window::default_attributes()
+                .with_title("objc-window-drive redraw probe")
+                .with_inner_size(aterm_window::dpi::LogicalSize::new(32.0, 32.0))
+                .with_visible(false);
+            match el.create_window(probe_attrs) {
+                Ok(w) => self.redraw_probe = Some(w),
+                Err(e) => {
+                    self.report.blocked = Some(format!(
+                        "no hidden redraw-probe window could be created: {e}"
+                    ));
+                    self.done = true;
+                    el.exit();
                 }
             }
         }
 
-        fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, e: WindowEvent) {
+        fn window_event(&mut self, _el: &ActiveEventLoop, id: WindowId, e: WindowEvent) {
+            if self.redraw_probe.as_ref().map(|window| window.id()) == Some(id) {
+                if matches!(e, WindowEvent::RedrawRequested) {
+                    self.probe_redraws += 1;
+                }
+                return;
+            }
+            if self.window.as_ref().map(|window| window.id()) != Some(id) {
+                return;
+            }
             match e {
                 WindowEvent::Resized(_) => self.resized += 1,
                 WindowEvent::Moved(_) => self.moved += 1,
@@ -591,6 +1176,17 @@ mod macos {
                              outer handler returned ({} before, {} after)",
                             focus_before,
                             self.focused.len()
+                        ),
+                    );
+                    let redraw_before =
+                        self.modal_probe_redraw_before.unwrap_or(self.probe_redraws);
+                    self.report.check(
+                        self.probe_redraws == redraw_before + 1,
+                        &format!(
+                            "the hidden probe's drawRect callback raised inside the alert was \
+                             delivered exactly once after its outer handler returned ({} before, \
+                             {} after)",
+                            redraw_before, self.probe_redraws
                         ),
                     );
                     self.stage_alert_answered_in_the_exit_turn();
@@ -1379,10 +1975,22 @@ mod macos {
                     .check(false, "AppKit makes the modal-reentry alert");
                 return;
             };
+            let Some(mtm) = aterm_objc::MainThread::new() else {
+                self.report
+                    .check(false, "the modal-reentry stage runs on the main thread");
+                return;
+            };
+            let Some(draw_target) = ATermDrawRectTarget::alloc_init(mtm, self.redraw_probe_view())
+            else {
+                self.report
+                    .check(false, "the modal-reentry draw target can be made");
+                return;
+            };
 
             // SAFETY: these are the same selector signatures and live objects documented by the
             // exit-alert stage below. The delayed sends are restricted to the alert's modal mode;
-            // `windowDidResignKey:` ignores its notification argument, so nil is sufficient.
+            // `windowDidResignKey:` and the draw target ignore their object arguments, so nil is
+            // sufficient. The draw target adapts the delayed selector to `drawRect:`'s CGRect.
             let answer = unsafe {
                 let one: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
                 let later: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64, Id) = checked_msg();
@@ -1392,12 +2000,21 @@ mod macos {
                 let modes = one(class(c"NSArray").as_id(), sel!(arrayWithObject:), mode.id());
                 let app = get(class(c"NSApplication").as_id(), sel!(sharedApplication));
                 self.modal_focus_before = Some(self.focused.len());
+                self.modal_probe_redraw_before = Some(self.probe_redraws);
                 later(
                     delegate,
                     sel!(performSelector:withObject:afterDelay:inModes:),
                     sel!(windowDidResignKey:),
                     Id::NIL,
                     0.1,
+                    modes,
+                );
+                later(
+                    draw_target.as_id(),
+                    sel!(performSelector:withObject:afterDelay:inModes:),
+                    sel!(drawWinitView:),
+                    Id::NIL,
+                    0.15,
                     modes,
                 );
                 later(
@@ -1425,15 +2042,26 @@ mod macos {
                     sel!(cancelPreviousPerformRequestsWithTarget:),
                     app,
                 );
+                cancel(
+                    class(c"NSObject").as_id(),
+                    sel!(cancelPreviousPerformRequestsWithTarget:),
+                    draw_target.as_id(),
+                );
                 answer
             };
             self.report.check(
                 answer == NS_ALERT_FIRST_BUTTON_RETURN,
                 &format!("a click answered the modal-reentry alert ({answer}) without re-entry"),
             );
-            // Guarantee another outer turn in which the deferred focus event can precede the
-            // exit-alert stage.
-            self.w().request_redraw();
+            let redraw_before = self.modal_probe_redraw_before.unwrap_or(self.probe_redraws);
+            self.report.check(
+                self.probe_redraws == redraw_before,
+                &format!(
+                    "the hidden probe's drawRect callback did not re-enter its active outer \
+                     handler ({} before, {} inside)",
+                    redraw_before, self.probe_redraws
+                ),
+            );
         }
 
         /// A real `NSAlert` answered by a click in the turn that then exits the loop, as a Quit
@@ -1600,6 +2228,12 @@ mod macos {
             }
             let own = "WinitWindow";
             let closed = self.closed_at_exit.borrow().clone();
+            let own_at_exit = self
+                .windows_at_exit
+                .iter()
+                .filter(|class| *class == own)
+                .count();
+            let own_closed = closed.iter().filter(|class| *class == own).count();
             let foreign: Vec<&String> = self.windows_at_exit.iter().filter(|c| *c != own).collect();
             self.report.check(
                 self.alert_answer == Some(NS_ALERT_FIRST_BUTTON_RETURN),
@@ -1627,8 +2261,19 @@ mod macos {
                 ));
             }
             self.report.check(
-                closed.iter().any(|c| c == own),
-                &format!("the exit closed winit's own window (closed {closed:?})"),
+                own_at_exit == 2,
+                &format!(
+                    "the primary and hidden redraw-probe windows were both live at exit \
+                     ({own_at_exit} own windows in {:?})",
+                    self.windows_at_exit
+                ),
+            );
+            self.report.check(
+                own_closed == own_at_exit,
+                &format!(
+                    "the exit closed every winit window ({own_closed}/{own_at_exit}; closed \
+                     {closed:?})"
+                ),
             );
             self.report.check(
                 closed.iter().all(|c| c == own),
@@ -1637,6 +2282,505 @@ mod macos {
                      {foreign:?})"
                 ),
             );
+        }
+    }
+
+    enum ChildOutcome {
+        Exited(std::process::ExitStatus, String, String),
+        Hung(String, String),
+        CouldNotSpawn(String),
+    }
+
+    fn drain_text<R: std::io::Read + Send + 'static>(
+        stream: Option<R>,
+    ) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_string(&mut text);
+            }
+            text
+        })
+    }
+
+    fn run_child(mode_env: &str) -> ChildOutcome {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => {
+                return ChildOutcome::CouldNotSpawn(format!("current_exe: {error}"));
+            }
+        };
+        let mut child = match aterm_uds::spawnfd::command(exe)
+            .env(mode_env, "1")
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(aterm_uds::spawnfd::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return ChildOutcome::CouldNotSpawn(format!("spawn: {error}"));
+            }
+        };
+        let stdout = drain_text(child.stdout.take());
+        let stderr = drain_text(child.stderr.take());
+        let deadline = Instant::now() + CHILD_WATCHDOG;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return ChildOutcome::Exited(
+                        status,
+                        stdout.join().unwrap_or_default(),
+                        stderr.join().unwrap_or_default(),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout.join();
+                    let _ = stderr.join();
+                    return ChildOutcome::CouldNotSpawn(format!("waiting for child: {error}"));
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ChildOutcome::Hung(
+                    stdout.join().unwrap_or_default(),
+                    stderr.join().unwrap_or_default(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn child_diagnostic(stdout: &str, stderr: &str) -> String {
+        stderr
+            .lines()
+            .chain(stdout.lines())
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("no child diagnostic")
+            .trim()
+            .to_owned()
+    }
+
+    fn judge_terminate_reentry(report: &mut Report) {
+        println!("\n[15d] terminate: inside an NSAlert nested modal loop");
+        match run_child(TERMINATE_REENTRY_CHILD_ENV) {
+            ChildOutcome::Exited(status, stdout, stderr) if status.success() => {
+                report.check(
+                    true,
+                    "the child deferred native termination until its active handler returned",
+                );
+                if !stderr.trim().is_empty() {
+                    report.note(&format!(
+                        "child stderr: {}",
+                        child_diagnostic(&stdout, &stderr)
+                    ));
+                }
+            }
+            ChildOutcome::Exited(status, stdout, stderr) if status.code() == Some(NOT_RUN) => {
+                report.blocked = Some(format!(
+                    "the modal-termination child could not run: {}",
+                    child_diagnostic(&stdout, &stderr)
+                ));
+            }
+            ChildOutcome::Exited(status, stdout, stderr) => {
+                use std::os::unix::process::ExitStatusExt as _;
+                let how = status.signal().map_or_else(
+                    || format!("exit {:?}", status.code()),
+                    |signal| format!("signal {signal}"),
+                );
+                report.check(
+                    false,
+                    &format!(
+                        "the modal-termination child ended by {how}: {}",
+                        child_diagnostic(&stdout, &stderr)
+                    ),
+                );
+            }
+            ChildOutcome::Hung(stdout, stderr) => report.check(
+                false,
+                &format!(
+                    "the modal-termination child did not exit before its watchdog: {}",
+                    child_diagnostic(&stdout, &stderr)
+                ),
+            ),
+            ChildOutcome::CouldNotSpawn(why) => {
+                report.blocked = Some(format!("the modal-termination child could not run: {why}"));
+            }
+        }
+    }
+
+    fn judge_modal_exit_order(report: &mut Report) {
+        println!("\n[15e] API exit: behind callbacks queued by an NSAlert modal loop");
+        match run_child(MODAL_EXIT_ORDER_CHILD_ENV) {
+            ChildOutcome::Exited(status, stdout, stderr) if status.success() => {
+                report.check(
+                    true,
+                    "exit observed deferred focus/redraw callbacks of both kinds and both \
+                     Destroyed events before LoopExiting",
+                );
+                if !stderr.trim().is_empty() {
+                    report.note(&format!(
+                        "child stderr: {}",
+                        child_diagnostic(&stdout, &stderr)
+                    ));
+                }
+            }
+            ChildOutcome::Exited(status, stdout, stderr) if status.code() == Some(NOT_RUN) => {
+                report.blocked = Some(format!(
+                    "the modal-exit child could not run: {}",
+                    child_diagnostic(&stdout, &stderr)
+                ));
+            }
+            ChildOutcome::Exited(status, stdout, stderr) => {
+                use std::os::unix::process::ExitStatusExt as _;
+                let how = status.signal().map_or_else(
+                    || format!("exit {:?}", status.code()),
+                    |signal| format!("signal {signal}"),
+                );
+                report.check(
+                    false,
+                    &format!(
+                        "the modal-exit child ended by {how}: {}",
+                        child_diagnostic(&stdout, &stderr)
+                    ),
+                );
+            }
+            ChildOutcome::Hung(stdout, stderr) => report.check(
+                false,
+                &format!(
+                    "the modal-exit child did not exit before its watchdog: {}",
+                    child_diagnostic(&stdout, &stderr)
+                ),
+            ),
+            ChildOutcome::CouldNotSpawn(why) => {
+                report.blocked = Some(format!("the modal-exit child could not run: {why}"));
+            }
+        }
+    }
+
+    fn judge_prepared_exit(report: &mut Report) {
+        println!("\n[15f] API exit: from a prepared loop's first Resumed callback");
+        match run_child(PREPARED_EXIT_CHILD_ENV) {
+            ChildOutcome::Exited(status, stdout, stderr) if status.success() => {
+                report.check(
+                    true,
+                    "a prepared loop committed Resumed's exit in the same pump call",
+                );
+                if !stderr.trim().is_empty() {
+                    report.note(&format!(
+                        "child stderr: {}",
+                        child_diagnostic(&stdout, &stderr)
+                    ));
+                }
+            }
+            ChildOutcome::Exited(status, stdout, stderr) if status.code() == Some(NOT_RUN) => {
+                report.blocked = Some(format!(
+                    "the prepared-exit child could not run: {}",
+                    child_diagnostic(&stdout, &stderr)
+                ));
+            }
+            ChildOutcome::Exited(status, stdout, stderr) => {
+                use std::os::unix::process::ExitStatusExt as _;
+                let how = status.signal().map_or_else(
+                    || format!("exit {:?}", status.code()),
+                    |signal| format!("signal {signal}"),
+                );
+                report.check(
+                    false,
+                    &format!(
+                        "the prepared-exit child ended by {how}: {}",
+                        child_diagnostic(&stdout, &stderr)
+                    ),
+                );
+            }
+            ChildOutcome::Hung(stdout, stderr) => report.check(
+                false,
+                &format!(
+                    "the prepared-exit child did not exit before its watchdog: {}",
+                    child_diagnostic(&stdout, &stderr)
+                ),
+            ),
+            ChildOutcome::CouldNotSpawn(why) => {
+                report.blocked = Some(format!("the prepared-exit child could not run: {why}"));
+            }
+        }
+    }
+
+    fn judge_deferred_handler_panic(report: &mut Report) {
+        println!("\n[15g] panic: from a redraw deferred behind AboutToWait");
+        match run_child(DEFERRED_PANIC_CHILD_ENV) {
+            ChildOutcome::Exited(status, stdout, stderr) if status.success() => {
+                report.check(
+                    true,
+                    "the deferred handler panic returned through pump_app_events",
+                );
+                if !stderr.trim().is_empty() {
+                    report.note(&format!(
+                        "child stderr: {}",
+                        child_diagnostic(&stdout, &stderr)
+                    ));
+                }
+            }
+            ChildOutcome::Exited(status, stdout, stderr) if status.code() == Some(NOT_RUN) => {
+                report.blocked = Some(format!(
+                    "the deferred-panic child could not run: {}",
+                    child_diagnostic(&stdout, &stderr)
+                ));
+            }
+            ChildOutcome::Exited(status, stdout, stderr) => {
+                use std::os::unix::process::ExitStatusExt as _;
+                let how = status.signal().map_or_else(
+                    || format!("exit {:?}", status.code()),
+                    |signal| {
+                        if signal == 6 {
+                            "signal 6 (SIGABRT)".to_owned()
+                        } else {
+                            format!("signal {signal}")
+                        }
+                    },
+                );
+                report.check(
+                    false,
+                    &format!(
+                        "the deferred-panic child ended by {how}: {}",
+                        child_diagnostic(&stdout, &stderr)
+                    ),
+                );
+            }
+            ChildOutcome::Hung(stdout, stderr) => report.check(
+                false,
+                &format!(
+                    "the deferred-panic child did not exit before its watchdog: {}",
+                    child_diagnostic(&stdout, &stderr)
+                ),
+            ),
+            ChildOutcome::CouldNotSpawn(why) => {
+                report.blocked = Some(format!("the deferred-panic child could not run: {why}"));
+            }
+        }
+    }
+
+    /// The env-gated process AppKit itself terminates after the idle retry.
+    pub fn terminate_reentry_child() -> i32 {
+        if let Some(why) = aterm_gui::driver_display_unavailable() {
+            eprintln!("objc-window-drive terminate child: NOT RUN — {why}");
+            return NOT_RUN;
+        }
+        let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
+            Ok(el) => el,
+            Err(error) => {
+                eprintln!("objc-window-drive terminate child: NOT RUN — no event loop: {error}");
+                return NOT_RUN;
+            }
+        };
+        let mut driver = TerminateReentryChild {
+            window: None,
+            attempted: false,
+            destroyed: false,
+            failed: None,
+        };
+        let started = Instant::now();
+        loop {
+            let status = el.pump_app_events(Some(Duration::from_millis(8)), &mut driver);
+            if let Some(why) = driver.failed.take() {
+                eprintln!("objc-window-drive terminate child: NOT RUN — {why}");
+                return NOT_RUN;
+            }
+            if let PumpStatus::Exit(_) = status {
+                if driver.attempted {
+                    return PASS;
+                }
+                eprintln!("objc-window-drive terminate child: NOT RUN — exited before the alert");
+                return NOT_RUN;
+            }
+            if started.elapsed() > BUDGET {
+                eprintln!(
+                    "objc-window-drive terminate child: NOT RUN — AppKit did not terminate it"
+                );
+                return NOT_RUN;
+            }
+        }
+    }
+
+    /// The env-gated process proving API exit stays behind modal-deferred handler work.
+    pub fn modal_exit_order_child() -> i32 {
+        if let Some(why) = aterm_gui::driver_display_unavailable() {
+            eprintln!("objc-window-drive modal-exit child: NOT RUN — {why}");
+            return NOT_RUN;
+        }
+        let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
+            Ok(el) => el,
+            Err(error) => {
+                eprintln!("objc-window-drive modal-exit child: NOT RUN — no event loop: {error}");
+                return NOT_RUN;
+            }
+        };
+        el.prepare_launch();
+        let mut driver = ModalExitOrderChild {
+            primary: None,
+            probe: None,
+            attempted: false,
+            ordering_armed: false,
+            markers: Vec::new(),
+            passed: false,
+            unavailable: None,
+            ordering_failure: None,
+        };
+        let started = Instant::now();
+        loop {
+            let status = el.pump_app_events(Some(Duration::from_millis(8)), &mut driver);
+            if let Some(why) = driver.unavailable.take() {
+                eprintln!("objc-window-drive modal-exit child: NOT RUN — {why}");
+                return NOT_RUN;
+            }
+            if driver.ordering_armed && matches!(&status, PumpStatus::Continue) {
+                eprintln!(
+                    "objc-window-drive modal-exit child: FAIL — pump_app_events returned Continue \
+                     after exit() requested the ordered boundary"
+                );
+                return FAIL;
+            }
+            if let PumpStatus::Exit(0) = status {
+                if let Some(why) = driver.ordering_failure.take() {
+                    eprintln!("objc-window-drive modal-exit child: FAIL — {why}");
+                    return FAIL;
+                }
+                if driver.passed {
+                    eprintln!(
+                        "objc-window-drive modal-exit child: OK — deferred focus/redraw callbacks \
+                         of both kinds, both Destroyed events, then LoopExiting"
+                    );
+                    return PASS;
+                }
+                eprintln!(
+                    "objc-window-drive modal-exit child: FAIL — exited without proving the \
+                     callback/Destroyed/LoopExiting order"
+                );
+                return FAIL;
+            }
+            if started.elapsed() > DEFERRED_HANDLER_BUDGET {
+                eprintln!(
+                    "objc-window-drive modal-exit child: FAIL — pump_app_events did not finish \
+                     the ordered exit"
+                );
+                return FAIL;
+            }
+        }
+    }
+
+    /// The env-gated process whose prepared loop requests exit from its first real `Resumed`.
+    pub fn prepared_exit_child() -> i32 {
+        if let Some(why) = aterm_gui::driver_display_unavailable() {
+            eprintln!("objc-window-drive prepared-exit child: NOT RUN — {why}");
+            return NOT_RUN;
+        }
+        let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
+            Ok(el) => el,
+            Err(error) => {
+                eprintln!(
+                    "objc-window-drive prepared-exit child: NOT RUN — no event loop: {error}"
+                );
+                return NOT_RUN;
+            }
+        };
+        el.prepare_launch();
+
+        let mut driver = PreparedExitChild::default();
+        let status = el.pump_app_events(Some(Duration::from_millis(8)), &mut driver);
+        let (same_call_exit, status) = match status {
+            PumpStatus::Exit(code) => (code == 0, format!("Exit({code})")),
+            PumpStatus::Continue => (false, "Continue".to_owned()),
+        };
+        if same_call_exit
+            && driver.resumed == 1
+            && driver.request_was_immediate
+            && driver.exiting == 1
+        {
+            eprintln!(
+                "objc-window-drive prepared-exit child: OK — immediate request, one Resumed, \
+                 one LoopExiting, same-call Exit"
+            );
+            PASS
+        } else {
+            eprintln!(
+                "objc-window-drive prepared-exit child: FAIL — status {status}, Resumed {}, \
+                 immediate {}, LoopExiting {}",
+                driver.resumed, driver.request_was_immediate, driver.exiting
+            );
+            FAIL
+        }
+    }
+
+    /// The env-gated process whose deferred event handler panics with a known payload.
+    pub fn deferred_panic_child() -> i32 {
+        if let Some(why) = aterm_gui::driver_display_unavailable() {
+            eprintln!("objc-window-drive deferred-panic child: NOT RUN — {why}");
+            return NOT_RUN;
+        }
+        let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
+            Ok(el) => el,
+            Err(error) => {
+                eprintln!(
+                    "objc-window-drive deferred-panic child: NOT RUN — no event loop: {error}"
+                );
+                return NOT_RUN;
+            }
+        };
+        let mut driver = DeferredPanicChild {
+            window: None,
+            attempted: false,
+            panic_on_redraw: false,
+            failed: None,
+        };
+        let started = Instant::now();
+        loop {
+            let pumped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                el.pump_app_events(Some(Duration::from_millis(8)), &mut driver)
+            }));
+            match pumped {
+                Err(payload) => {
+                    let marker = payload.downcast_ref::<&'static str>().copied();
+                    if driver.attempted && marker == Some(DEFERRED_HANDLER_PANIC_MARKER) {
+                        eprintln!(
+                            "objc-window-drive deferred-panic child: OK — pump_app_events \
+                             returned the exact deferred handler panic marker"
+                        );
+                        return PASS;
+                    }
+                    eprintln!(
+                        "objc-window-drive deferred-panic child: FAIL — pump_app_events returned \
+                         a panic, but not the exact deferred handler panic marker"
+                    );
+                    return FAIL;
+                }
+                Ok(PumpStatus::Exit(_)) => {
+                    if let Some(why) = driver.failed.take() {
+                        eprintln!("objc-window-drive deferred-panic child: NOT RUN — {why}");
+                        return NOT_RUN;
+                    }
+                    eprintln!(
+                        "objc-window-drive deferred-panic child: FAIL — the event loop exited \
+                         before the deferred handler panic returned"
+                    );
+                    return FAIL;
+                }
+                Ok(PumpStatus::Continue) => {}
+            }
+            if let Some(why) = driver.failed.take() {
+                eprintln!("objc-window-drive deferred-panic child: NOT RUN — {why}");
+                return NOT_RUN;
+            }
+            if started.elapsed() > DEFERRED_HANDLER_BUDGET {
+                eprintln!(
+                    "objc-window-drive deferred-panic child: FAIL — pump_app_events did not \
+                     return the deferred handler panic"
+                );
+                return FAIL;
+            }
         }
     }
 
@@ -1655,6 +2799,7 @@ mod macos {
         };
         let mut driver = Driver {
             window: None,
+            redraw_probe: None,
             proxy: Some(el.create_proxy()),
             proxy_events: Vec::new(),
             report: Report::default(),
@@ -1667,6 +2812,8 @@ mod macos {
             posted_cmd_key_up: false,
             alert_answer: None,
             modal_focus_before: None,
+            modal_probe_redraw_before: None,
+            probe_redraws: 0,
             windows_at_exit: Vec::new(),
             alert_panel_listed: false,
             closed_at_exit: std::rc::Rc::default(),
@@ -1724,9 +2871,20 @@ mod macos {
 
         if driver.report.blocked.is_none() {
             driver.judge_exit_closes();
+            judge_terminate_reentry(&mut driver.report);
+            if driver.report.blocked.is_none() {
+                judge_modal_exit_order(&mut driver.report);
+            }
+            if driver.report.blocked.is_none() {
+                judge_prepared_exit(&mut driver.report);
+            }
+            if driver.report.blocked.is_none() {
+                judge_deferred_handler_panic(&mut driver.report);
+            }
         }
 
         drop(driver.window.take());
+        drop(driver.redraw_probe.take());
 
         if let Some(why) = driver.report.blocked {
             eprintln!("objc-window-drive: NOT RUN — {why}");

@@ -291,7 +291,7 @@ pub fn launch_facts_of(argv: &[String], env: &[String]) -> LaunchFacts {
     let model = flag
         .filter(|m| {
             crate::harness::upgrade::is_model_id(m)
-                && crate::harness::upgrade_models::family_version(m).is_some()
+                && crate::harness::claude_model::family_version(m).is_some()
         })
         .map(|m| model_display(&m));
     let resume = crate::harness::upgrade::launch_resume(argv)
@@ -494,7 +494,7 @@ pub fn parse_session_entry(text: &str, pid: u32, started: Option<u64>) -> Option
         session_id: session_id.to_owned(),
         cwd: PathBuf::from(cwd),
         version,
-        proc_start: recorded.and_then(crate::harness::upgrade_models::parse_lstart),
+        proc_start: recorded.and_then(crate::harness::unix_time::parse_lstart),
         started_at: obj
             .get("startedAt")
             .and_then(Value::as_u64)
@@ -1225,7 +1225,7 @@ fn rows_back(
 }
 
 fn chose_model_since(path: &Path, floor: u64) -> bool {
-    use crate::harness::upgrade_models::{ModelResultKind, model_result_of};
+    use crate::harness::claude_model::{ModelResultKind, model_result_of};
     use std::ops::ControlFlow::{Break, Continue};
     let mut chose = false;
     rows_back(path, |row| {
@@ -1247,7 +1247,7 @@ fn chose_model_since(path: &Path, floor: u64) -> bool {
         match obj
             .get("timestamp")
             .and_then(Value::as_str)
-            .and_then(crate::harness::upgrade_models::parse_utc)
+            .and_then(crate::harness::unix_time::parse_utc)
         {
             Some(at) if at < floor => return Break(()),
             Some(_) => {}
@@ -1289,7 +1289,7 @@ fn head_stamp(file: &mut File, own_rows: bool) -> Option<u64> {
             let at = value
                 .get("timestamp")
                 .and_then(Value::as_str)
-                .and_then(crate::harness::upgrade_models::parse_utc)?;
+                .and_then(crate::harness::unix_time::parse_utc)?;
             let message = matches!(
                 value.get("type").and_then(Value::as_str),
                 Some("user" | "assistant" | "system")
@@ -1326,7 +1326,7 @@ fn last_stamp(part: &[u8]) -> Option<u64> {
     let end = rest.iter().position(|&b| b == b'"')?;
     std::str::from_utf8(&rest[..end])
         .ok()
-        .and_then(crate::harness::upgrade_models::parse_utc)
+        .and_then(crate::harness::unix_time::parse_utc)
 }
 
 fn resumed_model(path: &Path, floor: u64, met_before: bool) -> Option<Said> {
@@ -1385,7 +1385,7 @@ fn conversation_model(path: &Path, before: u64) -> Option<Said> {
         let at = value
             .get("timestamp")
             .and_then(Value::as_str)
-            .and_then(crate::harness::upgrade_models::parse_utc);
+            .and_then(crate::harness::unix_time::parse_utc);
         found = Some(match at {
             Some(at) if at >= before => return Continue(()),
             Some(_) if is_word(model) => Said::Is(model_display(model)),
@@ -1746,7 +1746,7 @@ fn last_cwd_since<'a>(
             match obj
                 .get("timestamp")
                 .and_then(Value::as_str)
-                .and_then(crate::harness::upgrade_models::parse_utc)
+                .and_then(crate::harness::unix_time::parse_utc)
             {
                 Some(at) if at < since => return None,
                 Some(_) => {}
@@ -1989,7 +1989,7 @@ fn effort_result(content: &str) -> Option<EffortSaid> {
         .trim_start()
         .strip_prefix(COMMAND_STDOUT)?
         .trim_start();
-    let body = crate::harness::upgrade_models::strip_sgr(body);
+    let body = crate::harness::claude_model::strip_sgr(body);
     if let Some(rest) = past_key(&body) {
         if let Some(after) = rest.strip_prefix(aterm_phase::anchor!("effort.top_on")) {
             let stays = aterm_phase::anchor!("effort.stays");
@@ -2037,7 +2037,7 @@ struct Answered {
 }
 
 /// A local command's result row folded into `facts`, newest first. A model
-/// result ([`crate::harness::upgrade_models::model_result_of`]) names the model
+/// result ([`crate::harness::claude_model::model_result_of`]) names the model
 /// ([`TailFacts::meet_model`]) and any `with … effort`; without that clause the
 /// earlier effort stands only for the same model.
 #[cfg_attr(
@@ -2049,7 +2049,7 @@ struct Answered {
     )
 )]
 fn fold_result(content: &str, facts: &mut TailFacts) -> Answered {
-    use crate::harness::upgrade_models::model_result_of;
+    use crate::harness::claude_model::model_result_of;
     if let Some(result) = model_result_of(content) {
         let model = result
             .display
@@ -2143,7 +2143,7 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
             match obj
                 .get("timestamp")
                 .and_then(Value::as_str)
-                .and_then(crate::harness::upgrade_models::parse_utc)
+                .and_then(crate::harness::unix_time::parse_utc)
             {
                 Some(at) if at < since => return (facts, true),
                 Some(_) => {}
@@ -2726,7 +2726,6 @@ pub fn read_pid(
     tail: &mut TailCache,
     fold: &mut FooterCache,
     clock: &ReadClock<'_>,
-    state: Option<&Path>,
     user_home: Option<&Path>,
 ) -> Option<FooterFacts> {
     let Some(entry) = session_of_pid(claude_dir, pid, started) else {
@@ -2760,7 +2759,7 @@ pub fn read_pid(
         super::resume::home_env(user_home, launch.config.as_deref(), Some(claude_dir))
     });
     let home: Vec<(&str, &str)> = home.iter().map(|(n, v)| (*n, v.as_str())).collect();
-    facts.resume = super::resume::of_entry(&argv, &entry, started, state)
+    facts.resume = super::resume::of_entry(&argv, &entry, started)
         .and_then(|line| super::resume::with_env(&home, &line));
     Some(facts)
 }

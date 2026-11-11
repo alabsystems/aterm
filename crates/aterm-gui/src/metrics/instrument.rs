@@ -426,56 +426,79 @@ impl Windowed for MaxBy {
     }
 }
 
-/// 8 linear sub-buckets below 2^16 ns (8.2 µs grain), then 8 per octave up
-/// through 2^36 ns (~69 s): 168 buckets ≈ ±6% relative error, 1.3 KiB each.
-const H_SUB_BITS: u32 = 3;
-const H_MIN_SHIFT: u32 = 16;
-const H_OCTAVES: usize = 20;
-const H_BUCKETS: usize = (1 << H_SUB_BITS) * (H_OCTAVES + 1);
+const H_BUCKETS: usize = 168;
+/// Nanosecond buckets below 1024 ns, then 1024 per octave through 2^36 ns.
+/// The upper edge overestimates by at most max(1 ns, value/1024).
+pub(crate) const LATENCY_BUCKETS: usize = 27 * 1024;
 
-/// Lock-free fixed-bucket log-linear histogram.
-pub(crate) struct Histogram {
-    buckets: [AtomicU64; H_BUCKETS],
+/// Fixed-bucket log-linear histogram with atomic counters.
+pub(crate) type Histogram = HistogramBins<H_BUCKETS>;
+pub(crate) type LatencyDist = Distribution<LATENCY_BUCKETS>;
+
+pub(crate) struct HistogramBins<const N: usize> {
+    coarse: [AtomicU64; H_BUCKETS],
+    // Keep unused latency ledgers and local Metrics values small. Allocation is
+    // once per used latency distribution, outside warmed measurement regions.
+    latency: std::sync::OnceLock<Box<[AtomicU64]>>,
 }
 
-impl Histogram {
+impl<const N: usize> HistogramBins<N> {
+    const SUB_BITS: u32 = if N == LATENCY_BUCKETS { 10 } else { 3 };
+    const MIN_SHIFT: u32 = if N == LATENCY_BUCKETS { 10 } else { 16 };
+
     pub(crate) const fn new() -> Self {
+        assert!(N == H_BUCKETS || N == LATENCY_BUCKETS);
         Self {
-            buckets: [const { AtomicU64::new(0) }; H_BUCKETS],
+            coarse: [const { AtomicU64::new(0) }; H_BUCKETS],
+            latency: std::sync::OnceLock::new(),
         }
     }
 
     fn index(v_ns: u64) -> usize {
-        if v_ns < (1 << H_MIN_SHIFT) {
-            return (v_ns >> (H_MIN_SHIFT - H_SUB_BITS)) as usize;
+        if v_ns < (1 << Self::MIN_SHIFT) {
+            return (v_ns >> (Self::MIN_SHIFT - Self::SUB_BITS)) as usize;
         }
         let msb = 63 - v_ns.leading_zeros();
-        let octave = (msb - H_MIN_SHIFT + 1) as usize;
-        let sub = ((v_ns >> (msb - H_SUB_BITS)) & ((1 << H_SUB_BITS) - 1)) as usize;
-        ((octave << H_SUB_BITS) + sub).min(H_BUCKETS - 1)
+        let octave = (msb - Self::MIN_SHIFT + 1) as usize;
+        let sub = ((v_ns >> (msb - Self::SUB_BITS)) & ((1 << Self::SUB_BITS) - 1)) as usize;
+        ((octave << Self::SUB_BITS) + sub).min(N - 1)
     }
 
-    /// The EXCLUSIVE upper edge of bucket `idx` in ns — every value in the
-    /// bucket is strictly below it, so reporting it keeps percentiles
-    /// conservative (never under the true value).
+    /// The exclusive upper edge of bucket `idx` in ns. Below 2^36 ns this
+    /// keeps percentiles conservative; larger samples saturate in the last
+    /// bucket and have no relative-error guarantee.
     fn upper_edge(idx: usize) -> u64 {
-        let sub_count = 1u64 << H_SUB_BITS;
+        let sub_count = 1u64 << Self::SUB_BITS;
         let i = idx as u64;
-        if idx < (1 << H_SUB_BITS) {
-            return (i + 1) << (H_MIN_SHIFT - H_SUB_BITS);
+        if idx < (1 << Self::SUB_BITS) {
+            return (i + 1) << (Self::MIN_SHIFT - Self::SUB_BITS);
         }
-        let octave = i >> H_SUB_BITS;
+        let octave = i >> Self::SUB_BITS;
         let sub = i & (sub_count - 1);
-        let msb = H_MIN_SHIFT + u32::try_from(octave).unwrap_or(u32::MAX) - 1;
-        (1u64 << msb) + ((sub + 1) << (msb - H_SUB_BITS))
+        let msb = Self::MIN_SHIFT + u32::try_from(octave).unwrap_or(u32::MAX) - 1;
+        (1u64 << msb) + ((sub + 1) << (msb - Self::SUB_BITS))
     }
 
     pub(crate) fn record(&self, v_ns: u64) {
-        self.buckets[Self::index(v_ns)].fetch_add(1, Ordering::Relaxed);
+        let buckets: &[AtomicU64] = if N == H_BUCKETS {
+            &self.coarse
+        } else {
+            self.latency
+                .get_or_init(|| (0..N).map(|_| AtomicU64::new(0)).collect())
+        };
+        buckets[Self::index(v_ns)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn existing(&self) -> &[AtomicU64] {
+        if N == H_BUCKETS {
+            &self.coarse
+        } else {
+            self.latency.get().map_or(&[], |buckets| buckets)
+        }
     }
 
     pub(crate) fn reset(&self) {
-        for b in &self.buckets {
+        for b in self.existing() {
             b.store(0, Ordering::Relaxed);
         }
     }
@@ -483,14 +506,21 @@ impl Histogram {
     /// One copy of the buckets.
     #[must_use]
     pub(crate) fn copy_out(&self) -> HistCopy {
-        HistCopy::from_counts(std::array::from_fn(|i| {
-            self.buckets[i].load(Ordering::Relaxed)
-        }))
+        let counts: Box<[u64]> = self
+            .existing()
+            .iter()
+            .map(|cell| cell.load(Ordering::Relaxed))
+            .collect();
+        HistCopy {
+            n: counts.iter().sum(),
+            counts,
+            upper_edge: Self::upper_edge,
+        }
     }
 }
 
 #[cfg(test)]
-impl Probe for Histogram {
+impl<const N: usize> Probe for HistogramBins<N> {
     fn poke(&self) {
         self.record(POKE);
     }
@@ -501,17 +531,20 @@ impl Probe for Histogram {
 }
 
 /// The bucket counts one [`Histogram::copy_out`] took, and their sum.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct HistCopy {
-    counts: [u64; H_BUCKETS],
+    counts: Box<[u64]>,
     n: u64,
+    upper_edge: fn(usize) -> u64,
 }
 
 impl HistCopy {
-    fn from_counts(counts: [u64; H_BUCKETS]) -> Self {
+    #[cfg(test)]
+    fn from_counts<const N: usize>(counts: [u64; N]) -> Self {
         Self {
             n: counts.iter().sum(),
-            counts,
+            counts: Box::new(counts),
+            upper_edge: HistogramBins::<N>::upper_edge,
         }
     }
 
@@ -535,20 +568,22 @@ impl HistCopy {
                 seen += c;
                 seen >= target
             })
-            .map(Histogram::upper_edge)
+            .map(self.upper_edge)
     }
 }
 
 /// A distribution with its last and worst sample: every sample lands in all three, so a published max and its percentiles describe the same samples.
-pub(crate) struct Dist {
-    hist: Histogram,
+pub(crate) type Dist = Distribution<H_BUCKETS>;
+
+pub(crate) struct Distribution<const N: usize> {
+    hist: HistogramBins<N>,
     peak: Peak,
 }
 
-impl Dist {
+impl<const N: usize> Distribution<N> {
     pub(crate) const fn new() -> Self {
         Self {
-            hist: Histogram::new(),
+            hist: HistogramBins::new(),
             peak: Peak::new(),
         }
     }
@@ -581,7 +616,7 @@ impl Dist {
     }
 }
 
-impl Windowed for Dist {
+impl<const N: usize> Windowed for Distribution<N> {
     fn reset(&self) {
         Self::reset(self);
     }
@@ -744,6 +779,24 @@ impl Probe for Stamp {
 #[cfg(test)]
 mod tests {
     use super::{H_BUCKETS, HistCopy, Histogram, Stamp};
+
+    #[test]
+    fn latency_bucket_resolution() {
+        type Fine = super::HistogramBins<{ super::LATENCY_BUCKETS }>;
+        // Bound every bucket, not only the values in the control distribution.
+        // The final bucket saturates; no bound is claimed above 2^36 ns.
+        for idx in 0..super::LATENCY_BUCKETS {
+            let lower = if idx == 0 {
+                0
+            } else {
+                Fine::upper_edge(idx - 1)
+            };
+            let upper = Fine::upper_edge(idx);
+            assert_eq!(Fine::index(lower), idx);
+            assert_eq!(Fine::index(upper - 1), idx);
+            assert!(upper - lower <= (lower / 1024).max(1));
+        }
+    }
 
     /// Every representative value lands in a bucket whose edges contain it,
     /// and indices are monotone in the value — across the linear range, every

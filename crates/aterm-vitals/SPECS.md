@@ -3,12 +3,6 @@
 
 # aterm-vitals: specs behind the stuck-process engine's 147 tests
 
-> Status: specs for the stuck-process engine (`src/jobs/`, design
-> `docs/DESIGN-system-awareness-2026-10-16.md` §11 and `docs/DESIGN-hung-background-call-2026-10-20.md`
-> D2). Each spec below is held by the tests named in its `subsumes` column; none is proved through
-> Trust/Clean yet. The crate's Deck, explain, services, leftover and `sys` modules, and one test
-> in `src/jobs/units.rs`, carry further tests, named after §2's table.
-
 Source: `crates/aterm-vitals/src/jobs/` (`mod.rs`, `units.rs`, `step.rs`, `wait.rs`, `wire.rs`), with the
 tests in `src/jobs/tests.rs` (13), `src/jobs/activity_tests.rs` (3), `tests/stuck_scenarios.rs` (122)
 and `tests/conformance_stuck_verdict.rs` (9), and the scripted machine they share in
@@ -16,62 +10,6 @@ and `tests/conformance_stuck_verdict.rs` (9), and the scripted machine they shar
 
 Result, recounted from §1's and §2's rows and the test files on 2026-11-01: **23 specs** over
 **147 tests**. Every test is a spec sample (§2).
-
-> 2026-10-30: the leftover judge (`src/left.rs`, base design
-> `docs/DESIGN-leftover-processes-2026-10-16.md` §4) and its `sys left` view (`src/sys/left.rs`)
-> are held by their tests, not yet rows here. `left-judge`: `left::judge` lists a candidate only
-> when it is held, waiting behind a held one, orphaned or its owner gone, never one launchd
-> started; NEVER is a live run's member, a program launchd keeps by design, a spared pid, a live
-> session's foreground group, a tty whose master lives or an instance whose launcher lives; an
-> unread lineage or a held program is NAME with no token, and so is a sandboxed process or a row
-> whose sandbox check, listener table or aterm verb did not read; W-session ties an orphan (on
-> Linux, one init adopted) born in a tab's `(shell, horizon]` whose first unwithheld environment
-> (its own, else a group-mate's) names the tab's session; a listener is daemon-shaped unless
-> W-session ties it to a session it was born in after the agent's first call and it is no aterm
-> program's, and a group leader with no tty outside every root always is; only a dead run's
-> member its witness ties that runs the run's build waives the shape; AUTO is the record's own
-> A1–A7 verdict, and the row is that run's (`src/left_tests.rs`, 32 tests).
-> `left-view`: the view shows a pane or tab only its sessions' rows and runs, and `scope=aterm`
-> all; prints a token only for `offer` and `auto`, an exe word only when it is a plain name, and a
-> run's root path only to its own tab's caller or with no caller (`src/sys/left_tests.rs`, 8
-> tests, and the `sys` view corpus). The engine's held rows take a session-mate's tie
-> (`HeldProc::tab`) where no job names them (`S::the_held_row_tied_by_a_session_mate_counts_in_the_tabs_program_check`,
-> `S::a_held_row_with_no_mate_counts_for_no_tab`); the counts above were taken before.
->
-> 2026-10-31: a judged row says whether it is in a live session's foreground group
-> (`LeftRow::foreground`, `end`'s `why=foreground`) and gives its exe word (`LeftRow::exe_word`,
-> which the view and the `proc.` records print), and the view keeps the live tabs it was judged
-> against (`LeftView::live`), which `end`'s re-proof judges the one pid against again.
->
-> 2026-11-01: `left-entry` (held by its tests, not yet a row): `left::eligible(r, view, after)` iff
-> r's tier is `offer` or `auto`, `left::owner_gone_ms(r, view)` (`as_of_ms` less its closed tab's
-> `closed_ms`, or its dead run's `dead_ms`; `None` for a live tab's row or one nothing ties) is at
-> least `after`, and r is `launcher-dead` or `left::costs(r, view)` (CPU at least a second per hour
-> of its age, or its executable under one of `view.build_dirs`); `ENTRY_AFTER_MS` is an hour
-> (`src/left_tests.rs`: `a_dead_runs_leftover_an_hour_old_is_eligible_even_idle`,
-> `a_closed_tabs_idle_leftover_is_not_eligible`,
-> `a_closed_tabs_leftover_burning_a_second_an_hour_is_eligible`,
-> `an_executable_under_a_kept_build_dir_makes_a_closed_tabs_leftover_eligible`,
-> `an_orphan_of_a_live_tab_is_never_eligible`, `under_an_hour_nothing_is_eligible`). The view's
-> `link` rows print `target=gone|not-mounted`, and their checkout and path only with no caller
-> session; its JSON gives each `proc` its `owner_gone_ms` and `entry`
-> (`src/sys/left_tests.rs::a_dangling_links_row_names_its_target_and_paths_only_with_no_caller`).
->
-> 2026-11-04: `left-agent-rows` (held by its tests, not yet a row): a judged row records
-> `LeftRow::after_agent`, W-session's tie's (false with none): born in one of its tab's agent
-> stretches (`LiveTab::agent_spans`, `AgentSpan`). `left::fold_agent` keeps them: a reading that
-> names an agent opens a stretch from the least unique id it read (or reopens and widens the last
-> one that id falls in or before, merging what it then overlaps), one that names none closes the
-> open stretch at its horizon, at most `AGENT_SPANS_KEPT`. `left::left_of(view, row)` is the session
-> whose count holds an `offer` row: W-session's live tab (`Proof::Env`, `Source::Tab`) for one born
-> in a stretch, or after its shell where the tab has none, and a dead run's record's `sid`; never a
-> `name`, `never` or `auto` row, a closed tab's or an untied one. `agents_left(view, sid)` is the rows
-> it gives `sid`; `agents_left_read` and `agents_left_count` read none of a partial view
-> (`complete` false or `bounded`). `holds_an_offer` holds such a row too. `sys::left::status_field`
-> is `left=-` with no view, no sid or a partial view, `left=0:-` with no row, else
-> `left=<n>:<oldest + age | ->`, and `sys left` prints `left_of=<sid>` on each such row
-> (`src/left_tests.rs::{a_row_records_whether_it_was_born_after_its_agent,the_agents_rows_are_its_offered_session_rows_and_its_dead_runs,a_partial_view_counts_no_agents_rows,a_tabs_agent_stretches_open_close_and_merge,a_view_offering_a_gone_owners_row_asks_for_its_next_reading}`,
-> `src/sys/left_tests.rs::each_agents_left_row_says_whose_count_it_is_in`).
 
 ## 0. Notation used in the statements
 
@@ -91,7 +29,7 @@ Result, recounted from §1's and §2's rows and the test files on 2026-11-01: **
 ## 1. Specs (TSV)
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes`, `difficulty` (the Rust features a proof must
-handle), `blocking_gaps` (rows of §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`).
+handle), `blocking_gaps` (rows of `docs/TRUST-LANE.md` (Blocking gaps)).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -289,18 +227,6 @@ Every test in `U`, `A`, `S` and `C` is mapped. The job probe that feeds this eng
 has its own tests in that crate; `crates/aterm-sysprobe/examples/stuck_live.rs` checks both together,
 by hand.
 
-> 2026-11-01: §2 maps the eight tests it had not: the two memory-wait ticks (`JB-STEP`, which now
-> states them), the three build-front memory waits `JB-TIERA-MEMORY` already named, and three of
-> `JB-FINDINGS`'s held rows (a session-mate's tie, none, and an exec version proved only later:
-> `S::an_unproved_fallback_does_not_lend_its_wait_to_an_exec_version`), which `JB-FINDINGS`'s
-> `subsumes` now names too; `JB-UNITS-BLOCK` names its four nested-shell tests. The counts below are
-> recounted from the rows and the test files: the header's 132 was three short of the 135 rows §2
-> had, so the eight rows bring the count to the files' 143. Two stopped-unstarted rows came after
-> (a debugger's attach keeps the row's time, and the unstarted lists are by pid), which
-> `JB-FINDINGS` states and names: 145. Two stranded rows came after (a stranded row is named apart
-> and still counted held, and prints its own row with the daemon), which `JB-FINDINGS` states and
-> names, the second `JB-EXE` too: 147.
-
 - 147 tests (`src/jobs/tests.rs` 13, `src/jobs/activity_tests.rs` 3, `tests/stuck_scenarios.rs` 122,
   `tests/conformance_stuck_verdict.rs` 9), 23 specs, all in `src/jobs/` and the two integration tests above.
 - Not recovered here yet: the tests across the Deck, explain, services, leftover and `sys` modules
@@ -321,7 +247,7 @@ by hand.
 - JB-NOPROGRESS sums the members' own CPU only: children born and reaped between two readings are never
   members, so a call whose work runs only in such short forks under a sleeping parent can say the word
   while it uses CPU. Adding reaped children's CPU to the run would close it, but widens the design's
-  "Σ CPU over the suspect run" (an owner call).
+  "Σ CPU over the suspect run".
 - JB-NOPROGRESS applies the design's "a refused reading (unknown, never zero)" to the whole run: one
   refused reading hides the word until the clock restarts, however long the hang lasts after it.
 - JB-NOPROGRESS sits on `JobRow` and its `sys jobs` row; the design puts it on `JobFact` (system
@@ -331,13 +257,3 @@ by hand.
 - JB-TABLE reads a job in front with no key queued and a fresh mode word as its tty wait, never POLLING,
   against §11.5's rule order (rule 8 before rule 10): a silent Claude Code makes over a thousand system
   calls a second, which rule 8 would read as polling and then stuck.
-
-## 4. Proof order (easiest, high value first)
-
-1. JB-PHI, JB-CMDCLASS, JB-WORDS: scalar arithmetic and closed tables.
-2. JB-EXE: character predicates over a string; the property most worth proving, since it is the
-   foreign-text boundary.
-3. JB-TIERA-*: pure functions over descriptor lists.
-4. JB-STEP, JB-CLASSTABLE, JB-DEMAND, JB-NOPROGRESS: state machines; JB-MODEL already binds JB-STEP to a
-   checked model.
-5. JB-UNITS-*, JB-ROW, JB-TABLE, JB-FINDINGS: the whole engine across ticks; they stay tests.

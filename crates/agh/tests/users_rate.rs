@@ -25,6 +25,52 @@ fn fake_with_dev(root: &std::path::Path) -> FakeGithub {
 }
 
 #[test]
+fn rate_calls_hour_reads_local_attribution_without_a_github_request() {
+    let root = common::scratch("rate-attribution");
+    let fake = fake_with_dev(root.path());
+    let (mut ctx, _) = common::ctx(root.path(), &fake, common::env());
+    let dirs = ctx.dirs.clone().unwrap();
+    common::write_config(&dirs, &common::canonical_config(root.path()));
+    assert_eq!(
+        common::run_cli(
+            &mut ctx,
+            &["api", "/user?private=attribution-canary", "--as", "dev"]
+        ),
+        0
+    );
+    let book = RateBook::at(dirs.rate());
+    let hour = common::SIM_START / 3600;
+    let rows = book.calls_in_hour(hour).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].to_string().contains("attribution-canary"));
+    assert_eq!(rows[0]["path"], Value::from("/user"));
+    assert_eq!(rows[0]["method"], Value::from("GET"));
+    assert_eq!(rows[0]["status"], Value::from(200));
+    assert_eq!(rows[0]["as"], Value::from("dev"));
+    assert_eq!(rows[0]["pid"], Value::from(std::process::id()));
+    assert_eq!(rows[0]["rate"]["resource"], Value::from("core"));
+    assert_eq!(rows[0]["rate"]["used"], Value::from(1));
+    assert!(
+        book.calls_in_hour(hour + 1)
+            .unwrap_err()
+            .why
+            .contains("no rate attribution")
+    );
+
+    fake.clear_seen();
+    let (mut report, captured) = common::ctx(root.path(), &fake, common::env());
+    assert_eq!(
+        common::run_cli(
+            &mut report,
+            &["rate", "--calls-hour", &hour.to_string(), "--as", "dev"]
+        ),
+        0
+    );
+    assert_eq!(rows_of(&captured.stdout_text()), rows);
+    assert!(fake.seen().is_empty());
+}
+
+#[test]
 fn me_answers_the_profiles_login_and_identity_needs_as() {
     let root = common::scratch("users-me");
     let fake = fake_with_dev(root.path());

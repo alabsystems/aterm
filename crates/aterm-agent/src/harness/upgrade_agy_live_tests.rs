@@ -335,7 +335,7 @@ fn the_transcript_window_is_this_process_and_fails_closed() {
     ]);
     assert_eq!(quiet_transcript(&killed_before, false, START_MS), Ok(()));
     let slack_at = "2026-10-18T18:43:19Z";
-    assert!(super::super::upgrade_models::parse_utc(slack_at).unwrap() >= read_from());
+    assert!(super::super::unix_time::parse_utc(slack_at).unwrap() >= read_from());
     let within = log(&[task_started(23, "sleep 400", slack_at)]);
     assert_eq!(quiet_transcript(&within, false, START_MS), Err(Open::Task));
     let torn = format!("{}\n{{\"step_index\":5,\"sou", turn(AT));

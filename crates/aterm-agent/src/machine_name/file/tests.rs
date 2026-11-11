@@ -83,10 +83,21 @@ fn full() -> MachineName {
 
 #[test]
 fn the_file_spells_every_field_and_reads_back_whole() {
-    for name in [full(), MachineName::unnumbered(nick("otter"), NOW)] {
+    let mut zero = full();
+    zero.num = Some(num(0));
+    zero.nick = nick("blue Heron");
+    for name in [full(), zero, MachineName::unnumbered(nick("otter"), NOW)] {
         let text = name.to_toml().expect("serializes");
         assert_eq!(MachineName::from_toml(&text), Ok(name), "{text}");
     }
+}
+
+#[test]
+fn a_chosen_display_spelling_survives_a_reload() {
+    let mut chosen = full();
+    chosen.nick = nick("blue heron");
+    let reloaded = MachineName::from_toml(&chosen.to_toml().unwrap()).unwrap();
+    assert_eq!(reloaded.title(), "m8 blue heron");
 }
 
 #[test]
@@ -94,7 +105,7 @@ fn the_title_is_the_number_and_the_nickname() {
     assert_eq!(full().title(), "m8 Heron");
     assert_eq!(
         MachineName::unnumbered(nick("otter"), NOW).title(),
-        "m0 Otter",
+        "unnumbered Otter",
         "a drawn noun is capitalised; never numbered reads m0"
     );
 }
@@ -104,7 +115,7 @@ fn a_field_outside_its_grammar_is_refused() {
     let good = full().to_toml().expect("serializes");
     assert!(MachineName::from_toml(&good).is_ok(), "control");
     for (from, to) in [
-        ("num = 8", "num = 0"),
+        ("num = 8", "num = -1"),
         ("num = 8", "num = 1000000"),
         ("nick = \"Heron\"", "nick = \"m12\""),
         ("class = \"chosen\"", "class = \"person\""),
@@ -348,6 +359,6 @@ fn a_drawn_nickname_is_a_noun_none_in_view_uses() {
     assert!(
         MachineName::unnumbered(drawn, NOW)
             .title()
-            .starts_with("m0 ")
+            .starts_with("unnumbered ")
     );
 }

@@ -3,20 +3,13 @@
 
 # aterm-sandbox: spec recovery from its 18 unit tests
 
-> Status 2026-11-03: reconciled with current `main` across all 18 live `#[test]` functions
-> (`src/lib.rs` 9, `src/job_fold.rs` 1, `src/windows.rs` 8).
-
-> Status 2026-10-16: this file is the crate's migration worklist. Each of the 8 specs below is
-> proved through Trust/Clean about the compiled Rust function. Then the tests it subsumes are
-> deleted.
-
 Source: `crates/aterm-sandbox` (read only). Every `#[test]` is mapped
 (`src/lib.rs` 9, one of them `cfg(windows)`; `src/job_fold.rs` 1; `src/windows.rs` 8, all `cfg(windows)`, for 18) along with the code
 they reach: `src/unix.rs` (`apply_limits`, `set_limit`), `src/job_fold.rs` (`fold_job_limits`), `src/windows.rs` (`apply_limits`, `apply_to_job`,
 `apply_ui_restrictions`), `Sandbox::project_apply` (`aterm_models_core::sandbox_model`), and `aterm_cap::require` / `Cap::satisfies`.
 
 Result: **8 specs**, covering **18 tests**. **0 tests are non-spec** (§4).
-Gap numbers are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+Gap numbers are the rows of `docs/TRUST-LANE.md` (Blocking gaps).
 
 ## 0. Notation used in the statements
 
@@ -61,35 +54,6 @@ sandbox-job-write-protocol	contract	windows::apply_to_job, windows::apply_ui_res
 sandbox-apply-model-refinement	refinement	Sandbox::project_apply, Limits::apply, aterm_models_core::sandbox_model	∀ l: Limits, cap: Cap<Sandbox>, with req = (l ≠ Limits::inherit()), sup = Gate(cap): under Sandbox::project_apply(req, &l.apply(cap)) = (if req ∧ res.is_ok() {1} else {0}, 1), Limits::apply refines the Apply step of sandbox_model(Req=req, Sup=sup) (applied = 1 ⇔ req ∧ sup ∧ OS limits succeed), and distinguishes the Buggy ∈ {1, 2} model mutants.	lib.rs::apply_conforms_to_the_sandbox_model_and_rejects_mutants	MEDIUM: model→code refinement over ty_model! sandbox_model, StepEvidence step audit, composition with sandbox-apply-cap-gate and sandbox-apply-limits-best-effort	0,1,4,8,10,12
 ```
 
-### Distribution by kind (8)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 7 | sandbox-presets, sandbox-windows-apply-noop, sandbox-job-fold, sandbox-apply-cap-gate, sandbox-set-limit, sandbox-apply-limits-best-effort, sandbox-job-write-protocol |
-| refinement | 1 | sandbox-apply-model-refinement |
-
-### Gap histogram (specs blocked by each gap)
-
-| gap | specs |
-|---|---|
-| 0 | 8 |
-| 1 | 8 |
-| 2 | 2 |
-| 3 | 2 |
-| 4 | 5 |
-| 6 | 2 |
-| 7 | 1 |
-| 8 | 5 |
-| 10 | 1 |
-| 12 | 2 |
-
-### Proof dependency order
-
-`sandbox-presets`, `sandbox-job-fold` (after factoring), `sandbox-set-limit` → `sandbox-apply-limits-best-effort`
-(composes `set-limit`) → `sandbox-apply-cap-gate` (composes `aterm_cap::require` and both `imp` arms) →
-`sandbox-windows-apply-noop` (composes the gate), `sandbox-job-write-protocol` (composes `job-fold`
-and `presets`), and `sandbox-apply-model-refinement` (binds `Limits::apply` to `sandbox_model`).
-
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
@@ -116,14 +80,6 @@ src/windows.rs	shell_default_hardens_the_job	sandbox-job-write-protocol	sandbox-
 src/windows.rs	apply_to_job_fails_closed_on_invalid_handle	sandbox-job-write-protocol	sandbox-apply-cap-gate
 ```
 
-## 3. Coverage
-
-- 18 live tests mapped across the 8 specs. None is a non-spec test (§4).
-- 9 of the 18 tests are `cfg(windows)` (8 in `windows.rs`, plus `lib.rs::windows_apply_is_a_capgated_noop`),
-  so a macOS dev run never executes them. Their specs need a Windows-target Trust build to be proved.
-- The biggest collapses are `sandbox-job-fold` (5 primary), `sandbox-job-write-protocol` (4) and
-  `sandbox-set-limit` (3).
-
 ## 4. Tests that are not spec samples
 
 None. Every test samples one of the specs above, and none is a pure regression of a removed bug with
@@ -144,27 +100,3 @@ is proved, not kept as they are.
    `apply_conforms_to_the_sandbox_model_and_rejects_mutants` with `StepEvidence` and mutant checks.)*
 5. *(Resolved: `crates/aterm-sandbox/Cargo.toml` now describes `apply_limits` as a capability-gated
    no-op on Windows and `apply_to_job` as binding kernel32 Job Object APIs.)*
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone. Every one also needs gap 1 (struct/`Option` carriers). The order
-below goes by how few gaps beyond 0 and 1 each spec needs, weighted by the tests it retires.
-
-1. **`sandbox-presets`** (gaps 0, 1, 6). Three constant constructors with no loops, calls or effects;
-   it is decidable by evaluation once struct carriers and plain-Rust publication land. It retires one
-   test and is the lemma that `sandbox-job-write-protocol`'s `shell_default` corollary and the
-   `contained` half of `sandbox-set-limit` cite.
-2. **`sandbox-job-fold`** (gaps 0, 1, 2, 3), after the `Fold` factoring in §0. It is pure field updates,
-   bitwise OR and saturating casts, with no FFI. It retires 4 Windows tests and is the data core of
-   `sandbox-job-write-protocol`.
-3. **`sandbox-windows-apply-noop`** (gaps 0, 1, 4). The body is `Ok(())`; the only work is composing
-   the cap gate. It retires one test.
-4. **`sandbox-apply-cap-gate`** (gaps 0, 1, 4, 6, 8, 12). The denial half needs only the
-   `aterm_cap::require` contract across crates and an empty-effect claim. It retires 1 test outright and
-   shares one more.
-5. **`sandbox-set-limit`** (gaps 0, 1, 3, 8). This is the high-value POSIX spec (3 tests, and the
-   containment guarantee itself). It waits on the rlimit PlatformSpec.
-6. **`sandbox-apply-limits-best-effort`** (gaps 0, 1, 2, 4, 7, 8). It composes `set-limit` over a
-   4-element loop and retires 2 tests.
-7. **`sandbox-job-write-protocol`** (gaps 0, 1, 4, 8). It needs a Windows Job Object PlatformSpec, an FFI
-   assumption channel and a Windows-target Trust build. It retires 4 tests.

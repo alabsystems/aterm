@@ -3,59 +3,6 @@
 
 # aterm-cli: spec recovery (70 specs, 110 mapped unit tests)
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 36 tests it
-> deleted are gone, and the spec rows no longer cite those tests.
->
-> 2026-10-17: eight tests deleted since are out of §1 and §2. Doctor's unset-`$SHELL` test and the
-> session-limits table test carry their new names, and the deleted `Master` mode is out of the
-> session-limits specs. `every_topic_renders`, which kept the rust topic's alias routing, stands
-> in for the rust-topic test; `manual-text-roster-consistency` and `manual-page-width` subsume no
-> test now; §4 keeps only the two tests still in the tree.
->
-> 2026-10-22: `zone-offset-parse` is out with `parse_zone_offset` and its test: the local offset
-> is `aterm_uds::zone`'s (`localtime_r`, init-system design §6.1 row 9), held to `date` by
-> aterm-uds's own tests.
->
-> 2026-10-23: `instances-row` names a program whose binary the kernel marks deleted, adopted or
-> not, and `front-door-verb` answers the flags the front door handles before it routes a window.
->
-> 2026-10-23, later: `instances-row` names a deleted binary only from a build directory (an
-> installed one is what a Linux update leaves every running aterm), and `front-door-verb` reads
-> the front door's own `mode_free` and `asks_completions` and states `front_door_alias`, over
-> `alias_route`, which moved here from `crates/aterm`'s `main`.
->
-> 2026-10-28: `Verb::Node` (`aterm node [<cmd>]`, non-windowing) joins `Verb::ALL` and
-> `manual::EXTRA_PAGES` (`NODE_PAGE`) for `systems.alab.aterm-node` (C20).
->
-> 2026-10-28, fix unit G7: `src/manual/fabric_page_tests.rs` holds `FABRIC_PAGE` to the code it
-> describes and is not a spec sample. The mirror-word test (moved there) reads only the
-> `aterm ctl fabric status` row's `mirror=` slots. Three new tests hold THE SESSION LOG ON THE BUS
-> to aterm-slog (a dev-dependency): its `op=`/`k=` rows to `Rec::is_bus_class` over `Op::ALL` and
-> `Kind::ALL`, its body lines to `encode_mirror`, `cover_body` and a take's snapshot, and its
-> mapping of `ctl help log`'s line to `encode`. After G7's review, the body lines are read as
-> slots (each key's place, its brackets, and its value by the producer's own reader), and a
-> fourth test holds the page's snapshot cadence to `Log::bus_copy`.
->
-> 2026-10-29: added `push-utf16-unit` (`windowing::push_utf16_unit`), synced `manual-render-routing`
-> (`page_of`), `manual-generated-pages` (`theme_page`) and `rust-row-tables` (`rustup_unlinked_row`,
-> `trust_install_act`), added missing §2 rows (including `doctor_reads_the_live_wait_beside_the_list`),
-> and recomputed the kind, gap and coverage counts below.
->
-> 2026-11-07: `permission-steps` no longer names `initial_setup_permission_steps`, which
-> 1f3ffc62f7 deleted once nothing called it; it was `permission_steps_at` at the state root, and
-> `permission_steps_at` and `snapshot_from_observation` still give the value the row states.
->
-> 2026-11-07, the qualified-path pass: `build-rustc-in` names `aterm_toolchain::rustc_movers::build_rustc_in`,
-> where aeb3491720 moved `manual::build_rustc_in` with its test; the row and its §2 line cite the test in
-> `crates/aterm-toolchain/src/rustc_movers.rs`, and the statement holds of the moved code unchanged.
-> `rustc-movers` names `aterm_toolchain::rustc_movers::rustc_movers`, which moved there in the same
-> commit with its test; its statement now reads one file per directory (`config`, else `config.toml`,
-> as cargo does) and keeps a file only when it holds at most 1 MiB, as the code does.
-
-> Status 2026-10-16: this is aterm-cli's migration worklist. Each spec below is proved with
-> Clean through the Trust verifying compiler about the compiled Rust function. When a spec is
-> proved, the tests it subsumes are deleted. Nothing has been proved yet.
-
 Source: `crates/aterm-cli` (read only). The initial pass read `src/lib.rs`, `src/windowing.rs`,
 `src/manual.rs`, `src/driver_unix.rs` and `src/driver_windows.rs` (plus two `macos_doctor::initial`
 specs added later). This file replaces an earlier untracked pass and corrects three of its claims
@@ -99,7 +46,7 @@ code-doc guards in `src/manual/fabric_page_tests.rs`, and **680 newer `#[test]`s
   over a finite domain, decidable by evaluation), `round-trip` (an encoder followed by its decoder),
   `refinement` (the code agrees with a model or with another crate's rule), `invariant` (a loop or
   composition invariant), `other` (a liveness property, an effect-absence property or a platform axiom).
-- **Gaps** are the rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+- **Gaps** are the rows of the gap table in `docs/TRUST-LANE.md` (Blocking gaps).
   Gap 0 (no Lean-discharged row is published) blocks every spec.
 
 ## 1. Specs (TSV)
@@ -181,52 +128,6 @@ rust-page-pending-stub	other	manual::rust_page, atpkg::stub::is_pending_stub	Eff
 permission-steps	contract	macos_doctor::initial::{permission_steps,permission_steps_at,snapshot_from_observation}	For setup records R, with P their progress when it belongs to the saved plan and Q the plan every reader presents: Allowed iff the snapshot's permissions_allowed as it was (no Cancel, no Stop of the run, and either a saved plan's admitted run under decision Pending, Applied(true) or Stopped(Restored) whose Q selects Permissions, or no progress, no modern plan and Applied(true)); else Off iff a Cancel, a Stop of the run (on record or requested), a Restore's record a Cancel holds, or a saved plan's admitted run whose Q leaves Permissions out; else NotYet. The snapshot's access_steps is that value and permissions_allowed = (access_steps == Allowed); permission_steps_at (no vault, no ledger) gives the same value at the same root. With no saved plan the fallback plan never decides it.	crates/aterm-cli/src/macos_doctor/initial.rs::permission_steps_split_what_waits_from_what_a_person_holds	struct and enum matches, Option combinators, setup records read from files	0,1,8
 local-network-first-use	contract	macos_doctor::initial::Stage::subjects, aterm_types::macos_setup::Access	System State takes no Local Network step: Stage::subjects lists the access rows FullDiskAccess, DeveloperTools and Debugger under Permissions and Accessibility under Accounts, and no other, as aterm_types::macos_setup::Access has no Local Network row (Access::ALL is those four).	-	enum matches over cross-crate enums, &'static slices	0,1,12
 ```
-
-### Distribution by kind (70)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 45 | windowing-behavior-parse, parse-window-request-grammar, window-args, plain-launch-gate, push-utf16-unit, decide-leading-words, decide-diag-grammar, decide-run-options, tool-candidate, front-door-verb, help-text-layout, exceptions-reader, doctor-report-layout, doctor-shell-row, shell-check-fs, privacy-row, debugger-row, exceptions-row, instances-row, recovery-row, window-answer, local-day-words, prepend-path, session-path-env, reroute-dir-from-values, managed-agents-dir, font-reports, show-config-shape, explain-config-path, version-text, kitty-report-rows, run-exit-status, first-output-hook-once, config-shell-from-text, window-shell-source, manual-render-routing, trust-version-row, rust-toolchain-row, build-rustc-in, rustc-movers, rust-row-tables, build-of, is-toolchain-bin, permission-steps, local-network-first-use |
-| table-property | 11 | route-launch-table, verb-roster, diag-registry-dispatch, mark-table, agents-dir-mode, session-limits-table, poll-must-read, manual-generated-pages, manual-text-roster-consistency, manual-page-width, compare-toolchains |
-| other | 6 | doctor-probe-fence, poll-hangup-platform-axiom, run-ends-with-shell, run-resize-delivery, bounded-probe, rust-page-pending-stub |
-| refinement | 4 | devtools-hand-over-table, session-limits-actuation, shim-hop-agrees-with-sh, rust-page-measured-rows |
-| round-trip | 2 | control-request-framing, shim-parse-roundtrip |
-| invariant | 2 | doctor-exit-code, run-output-progress |
-
-### Blocking-gap histogram
-
-Each row gives the number of specs that list the gap. The gap names come from the audit, §7.
-
-| gap | name | specs blocked |
-|---|---|---|
-| 0 | Installed seal (2026-09-17) publishes no Lean-discharged row | 70 |
-| 1 | Non-scalar carriers and content models | 56 |
-| 2 | Certified `&self`/`&mut self` views and two-state `x'` | 2 |
-| 3 | E6 body widening | 41 |
-| 4 | Callee-ensures → caller-assert composition | 3 |
-| 5 | Quantified clauses | 13 |
-| 7 | Loops | 34 |
-| 8 | Effects | 27 |
-| 11 | Generics | 4 |
-| 12 | Cross-crate theorem citation | 38 |
-| 13 | Threads, async, closures | 11 |
-
-No spec is blocked by gap 0 alone. Every spec also needs at least one of gaps 1, 3 or 8. The
-narrowest are `route-launch-table` and `poll-must-read` (gaps 0 and 3), `window-args` (0 and 1) and
-`shell-check-fs` (0 and 8).
-
-### Proof dependency order
-
-1. `mark-table`, `exceptions-row`, `build-of` and `prepend-path` are leaf lemmas.
-2. Leaf lemmas lead to `privacy-row`, `debugger-row`, `instances-row`, `recovery-row` and `doctor-shell-row`.
-3. Those row specs lead to `doctor-exit-code`, which composes the rows' ensures (gap 4), and `doctor-report-layout`.
-4. `prepend-path` leads to `session-path-env`.
-5. `agents-dir-mode` leads to `managed-agents-dir`.
-6. `verb-roster` and `tool-candidate` lead to `decide-*`, then `help-text-layout` and `diag-registry-dispatch`.
-7. `parse-window-request-grammar` leads to `plain-launch-gate`, which states the agreement corollary.
-8. `build-rustc-in` leads to `rustc-movers`. `build-of` leads to `compare-toolchains`, then `rust-page-measured-rows`.
-9. `shim-parse-roundtrip` leads to `shim-hop-agrees-with-sh`.
-10. `exit_code` (inside `run-exit-status`) and the `run-output-progress` backlog bound come before the `run-*` liveness specs.
 
 ## 2. Test → spec map (TSV)
 
@@ -349,13 +250,6 @@ crates/aterm-cli/src/macos_doctor/initial.rs	permission_steps_split_what_waits_f
 crates/aterm-cli/src/macos_doctor/initial.rs	the_first_lan_use_waits_for_no_step	local-network-first-use	
 ```
 
-## 3. Coverage
-
-- 110 live tests map to the 70 specs in §1 (3 specs — `manual-text-roster-consistency`, `manual-page-width` and `rust-page-measured-rows` — currently subsume `-` after the 2026-10-16/17/27 test deletions in §4).
-- The crate currently has 796 `#[test]`s: 111 mapped in §2, 5 code-to-doc guards in `src/manual/fabric_page_tests.rs` (G7), and 680 newer `#[test]`s across `src/macos_doctor*` (586), `src/lib.rs` (26), `src/theme_author.rs` (15), `src/doctor.rs` (10), `src/theme_cmd.rs` (10), `src/clt_shim.rs` (9), `src/spotlight.rs` (9), `src/theme_pack_cmd.rs` (6), `src/manual.rs` (5), and `src/cli_text.rs` (4) that still need spec recovery.
-- The largest collapses, by primary tests: `manual-render-routing` (8), `decide-diag-grammar` (5), `parse-window-request-grammar` (4), `devtools-hand-over-table` (4), `managed-agents-dir` (4), `decide-run-options` (3), `verb-roster` (3), `doctor-report-layout` (3), `font-reports` (3), `window-shell-source` (3).
-- 13 tests sample more than one spec. A test is deleted only when all of its specs are proved.
-
 ## 4. Tests that are not spec samples
 
 Status 2026-10-16: deleted `help_names_the_shell_the_session_runs`, `windows_explain_config_names_the_starter_shell_and_font_px` and `checks_pin_is_the_repo_roots_pin`. `a_verbs_page_actually_mentions_that_verb`, `front_door_verbs_resolve_as_help_topics` and `the_pages_say_what_limit_reset_is_and_that_it_ships_off` were already gone from the tree.
@@ -366,79 +260,12 @@ Status 2026-10-27: deleted `reroute_env_names_match_atpkg` (aterm-cli now import
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **(Fixed 2026-10-28.) The doctor/exceptions grammar named the wrong token.** `doctor::args` and
-   `decide_args`'s `exceptions` branch now name the first offending token (`"x"` on
-   `aterm doctor --read-only x`, `"extra"` on `aterm exceptions --all extra`), asserted by
-   `doctor_operand_grammar_is_enforced_at_the_edge` and `exceptions_operand_grammar_is_enforced_at_the_edge`.
-2. **(Fixed 2026-10-28.) `list-themes` and `doctor` dispatch outside `diag_report`.** `DIAG_COMMANDS`'s
-   doc no longer claims `diag_report` handles every entry, and `diag-registry-dispatch` states the exact
-   three-way dispatch (`diag_report`, `theme_cmd::list_themes_alias` for `list-themes`, and
-   `crates/aterm/src/doctor.rs` for `doctor`) that `lib.rs::diag_commands_advertised_and_dispatchable` checks.
 3. **The earlier pass had two more errors.** Its font-and-theme-reports spec had a `list_themes_report`
    clause, but no such function exists in the crate. Its `verb-roster` said 15 variants (`Verb::ALL`
    had 16 then and now has 27). Both are corrected here (`font-reports`, `verb-roster`).
-4. **(Fixed 2026-10-28.) A repeated directory flag got two outcomes.** `plain_launch_dir_operand` now
-   returns the last `-d`/`--working-directory` operand (or `None` when a trailing flag dangles), matching
-   `parse_window_request`, and `the_plain_gate_only_knows_the_directory_flags_the_window_parses` checks
-   repeated directory flags.
-5. **(Fixed 2026-10-28.) `doctor_checks` wrapper deleted.** Every pure doctor test now calls
-   `doctor_checks_with_origin` directly, and `doctor_checks_pass_and_flag_each_failure` exercises
-   populated `DevtoolsFacts` and `MachineFacts` rows alongside absent ones.
-6. **(Fixed 2026-10-28.) The help text's SUBCOMMANDS lines are rendered from `DIAG_COMMANDS`.**
-   `help_text` iterates `DIAG_COMMANDS` through `diag_help_block` (`help_block`), so advertising every
-   `DIAG_COMMANDS` entry in `--help` holds by construction.
 7. **Resolved: no constant is restated.** lib.rs imports `REROUTE_DIR_ENV`, `PASSTHROUGH_ENV` and
    `AGENTS_DIR_ENV` from `atpkg::reroute`; manual.rs's `REROUTE_DIR_MARKER` is
    `atpkg::reroute::DIR_MARKER_FILE` and the rust page's exec roots are `atpkg::compat::roots_dir`.
    `the_shim_shape_matches_atpkg` and `routed_shims_resolve_to_where_the_shell_execs` police no copy.
-8. **(Fixed 2026-10-28.) A host precondition skips instead of failing.** `the_session_child_sees_the_posture_of_its_mode`
-   now calls `aterm_spec::host::could_not_run` when the inherited hard `RLIMIT_NOFILE` does not exceed
-   `cap + 1` (`8193`).
 9. **What a Windows test checks depends on the host.** `driver_windows.rs::window_shell_default_is_the_spawns_default`
     asserts the pwsh facts only when pwsh is on PATH.
-10. **(Fixed 2026-10-28.) A poll test used a 10 s latency budget.** `driver_unix.rs::closed_pipe_drains_buffered_bytes_then_consumes_hangup`
-    now uses a 60 s hang detector (`60_000`) per AGENTS.md.
-11. **(Fixed 2026-10-28.) `version_text_with_stamp` takes an explicit `Option<&Stamp>`.**
-    `version_text_names_the_running_copy_and_any_other` passes explicit `Stamp` inputs rather than
-    mutating the process-global `OnceLock`.
-12. **(Fixed 2026-10-28.) `bounded_output` drains pipes concurrently.** `manual::bounded_output`
-    delegates to `aterm_uds::deadline::output_until_complete_stdout`, draining stdout/stderr up to
-    `OUTPUT_KEEP` (1 MiB) while waiting and killing the child's process group on timeout.
-13. **(Fixed 2026-10-28.) Tests spawned children with a bare `Command::new`.** `driver_unix.rs` re-execs
-    and `manual.rs` probes now route through `aterm_uds::spawnfd::command` (only `driver_unix`'s
-    forgotten zombie decoy intentionally uses `std::process::Command` so drop does not reap it).
-14. **(Fixed 2026-10-28.) `push_utf16_unit` and repeated `plain_launch_dir_operand` had no test.**
-    `push_utf16_unit` now lives in `windowing.rs` (flushing any trailing unpaired surrogate at console EOF in
-    `driver_windows::pump_console_input`) and is tested across BMP, surrogate pairs and unpaired surrogates
-    by `push_utf16_unit_pairs_surrogates_and_replaces_unpaired_ones`; repeated `-d` flags are tested too.
-
-## 6. Proof order (easiest high-value first)
-
-Gap 0 blocks every spec. After it:
-
-1. **`route-launch-table` and `poll-must-read`** (gaps 0 and 3). Both are finite tables, decidable by
-   evaluation. `poll-must-read` is a `const fn` of i16 bit operations, so it is a `bv_decide` proof.
-   `route-launch-table` is a 16-cell enum table, and it decides whether a launch forwards to a running
-   window. Together they retire two tests and need only the E6 widening for bitwise ops and enum matches.
-2. **`mark-table`, `exceptions-row`, `build-of`, `compare-toolchains` and `windowing-behavior-parse`**
-   (gaps 0, 1 and 3). These are small pure matches over enums, `Option` and `&str`. `mark-table` and
-   `exceptions-row` are leaf lemmas for `doctor-exit-code`, the property that no row except shell: moves
-   doctor's exit code. `windowing-behavior-parse` guarantees that no typo selects Attach.
-3. **`window-args`** (gaps 0 and 1). This is a one-line Vec construction. It is the first test of the
-   non-scalar carriers.
-4. **`agents-dir-mode`** (gaps 0, 3 and 12). This is u32 bit arithmetic, and the security-relevant mode
-   rule for the agents directory. It is the first cross-crate citation, against `atpkg::store::Layout::ensure_dir`.
-5. **`doctor-shell-row`, `rust-toolchain-row`, then `privacy-row`, `debugger-row` and `instances-row`**
-   (gaps 0, 1, 3, and 12 or 7). Once these are proved, **`doctor-exit-code`** composes them (gaps 4 and 5)
-   and samples 7 tests.
-6. **`local-day-words`, `prepend-path`, `push-utf16-unit`, then `session-path-env`** (gaps 0, 1, 2, 3 and
-   4/5/7). These are pure functions over scalars, `&mut Option<u16>`, `Vec<u8>` and strings.
-7. **The `decide_args` family** (`decide-run-options`, `decide-diag-grammar`, `decide-leading-words` and
-   `tool-candidate`) and **`verb-roster`** (12 primary tests together). Needs loops over a generic iterator
-   (gaps 7 and 11).
-8. **`parse-window-request-grammar`, `control-request-framing` and `plain-launch-gate`**.
-9. **Manual specs**, which are decidable by evaluating constants once gap 7 lands (`manual-render-routing`
-   samples 9 tests). Then the FS specs (gap 8), and last the `run-*` driver liveness specs and
-   `devtools-hand-over-table` (gaps 8 and 13).
-
-Status 2026-10-31: `instances-row` names an unsupervised link broker and, where the leftover view's judge offers one (`offered_token`, over `aterm_uds::left::read_one`'s facts), the token to end it with; doctor learns which broker serves the fabric's socket from the `fabric:` row's probe (`DoctorSummary::serving`) and asks the token only of an unsupervised one (`FactReads::offered`). Two tests are added to §2.

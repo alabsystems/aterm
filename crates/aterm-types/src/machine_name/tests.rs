@@ -15,15 +15,15 @@ fn a_typed_number_reads_with_or_without_its_m() {
     }
     assert_eq!(n(8).to_string(), "m8");
     assert_eq!(Number::parse("m999999"), Ok(n(999_999)));
-    assert_eq!(Number::parse("m0"), Err(Refusal::Unnumbered));
-    assert_eq!(Number::parse("0"), Err(Refusal::Unnumbered));
+    assert_eq!(Number::parse("m0"), Ok(n(0)));
+    assert_eq!(Number::parse("0"), Ok(n(0)));
     assert_eq!(Number::parse("m08"), Err(Refusal::LeadingZero));
     assert_eq!(Number::parse("m1234567"), Err(Refusal::TooManyDigits));
     assert_eq!(Number::parse(""), Err(Refusal::Empty));
     for word in ["m", "x8", "m8a", "m 8", "m-8", "m8.2"] {
         assert_eq!(Number::parse(word), Err(Refusal::NotANumber), "{word:?}");
     }
-    assert_eq!(Number::new(0), None);
+    assert_eq!(Number::new(0), Some(n(0)));
     assert_eq!(Number::new(Number::MAX + 1), None);
 }
 
@@ -44,7 +44,7 @@ fn a_stored_word_gives_a_number_only_at_its_start() {
         ("m3a.local", None),
         ("10.0.1.20", None),
         ("8", None),
-        ("m0", None),
+        ("m0", Some(0)),
         ("m08-x", None),
         ("m1234567", None),
         ("", None),
@@ -56,10 +56,10 @@ fn a_stored_word_gives_a_number_only_at_its_start() {
 
 #[test]
 fn preference_words_are_m_number_dot_rank() {
-    for word in ["m2.2", "M2.10", "m40.1"] {
+    for word in ["m2.2", "M2.10", "m40.1", "m0.1"] {
         assert!(is_preference_word(word), "{word:?}");
     }
-    for word in ["m2.", "m0.1", "2.2", "m2.x", "m2", "studio.2"] {
+    for word in ["m2.", "2.2", "m2.x", "m2", "studio.2"] {
         assert!(!is_preference_word(word), "{word:?}");
     }
 }
@@ -84,16 +84,14 @@ fn nicknames_follow_their_grammar() {
     let refused = [
         ("", Refusal::Empty),
         ("Abcdefghijklmnopqrstuvwxy", Refusal::TooLong),
-        ("m0", Refusal::Unnumbered),
-        ("M0", Refusal::Unnumbered),
+        ("m0", Refusal::NumberShaped),
+        ("M0", Refusal::NumberShaped),
         ("m12", Refusal::NumberShaped),
         ("12", Refusal::NumberShaped),
         ("m8.2", Refusal::NumberShaped),
         ("m4 Studio", Refusal::NumberShaped),
         ("-dash", Refusal::StartsWithoutLetter),
         ("a@b", Refusal::Characters),
-        ("two  spaces", Refusal::Characters),
-        ("trailing ", Refusal::Characters),
         ("node-1a2b", Refusal::NodeWord),
         ("n-1a2b3c4d5e6f7a8b", Refusal::NodeWord),
         ("deadbeef", Refusal::HexRun),
@@ -111,6 +109,15 @@ fn nicknames_follow_their_grammar() {
     // Twenty-four two-byte letters are 48 bytes; twenty-five refuse by count.
     assert!(Nickname::parse(&"é".repeat(24)).is_ok());
     assert_eq!(Nickname::parse(&"é".repeat(25)), Err(Refusal::TooLong));
+}
+
+#[test]
+fn name_keys_fold_case_and_whitespace_but_keep_display_spelling() {
+    let nick = Nickname::parse("  Blue\t  Heron\n").unwrap();
+    assert_eq!(nick.as_str(), "Blue Heron");
+    assert_eq!(Nickname::canonical(nick.as_str()), "blue heron");
+    assert_eq!(Nickname::canonical("BLUE\u{2003}HERON"), "blue heron");
+    assert_eq!(Nickname::canonical("ÉLAN"), Nickname::canonical("élan"));
 }
 
 #[test]
@@ -141,7 +148,6 @@ fn aliases_are_dns_labels_that_shadow_no_node_or_number() {
         ("", Refusal::Empty),
         (".local", Refusal::Empty),
         ("m2.2", Refusal::PreferenceWord),
-        ("m0", Refusal::Unnumbered),
         ("m08", Refusal::LeadingZero),
         ("m1234567-x", Refusal::TooManyDigits),
         ("12", Refusal::NumberShaped),
@@ -227,24 +233,24 @@ fn nouns_are_well_formed() {
 }
 
 #[test]
-fn the_draw_skips_nouns_in_use_at_most_eight_times() {
+fn the_draw_skips_nouns_in_use_and_refuses_an_exhausted_pool() {
     let sequence = |values: Vec<u32>| {
         let mut values = values.into_iter();
         move || values.next().unwrap()
     };
-    assert_eq!(draw(sequence(vec![0]), |_| false), NOUNS[0]);
+    assert_eq!(draw(sequence(vec![0]), |_| false), Some(NOUNS[0]));
     // The index wraps at the list's length, so every u32 maps to one noun.
     assert_eq!(
         draw(
             sequence(vec![u32::try_from(NOUNS.len() + 3).unwrap()]),
             |_| false
         ),
-        NOUNS[3]
+        Some(NOUNS[3])
     );
     let taken = [NOUNS[1], NOUNS[2]];
     assert_eq!(
         draw(sequence(vec![1, 2, 5]), |noun| taken.contains(&noun)),
-        NOUNS[5]
+        Some(NOUNS[5])
     );
     let mut drawn = 0;
     let last = draw(
@@ -255,7 +261,19 @@ fn the_draw_skips_nouns_in_use_at_most_eight_times() {
         |_| true,
     );
     assert_eq!(drawn, DRAWS, "at most eight draws");
-    assert_eq!(last, NOUNS[DRAWS], "the last draw stands");
+    assert_eq!(last, None, "an occupied noun never stands");
+}
+
+#[test]
+fn a_free_noun_is_found_even_when_every_random_draw_misses_it() {
+    for (free, noun) in NOUNS.iter().enumerate() {
+        let occupied = (free + 1) % NOUNS.len();
+        assert_eq!(
+            draw(|| u32::try_from(occupied).unwrap(), |word| word != *noun),
+            Some(*noun),
+            "the only free noun at {free} is found across wraparound"
+        );
+    }
 }
 
 const GIB: u64 = 1 << 30;
@@ -532,22 +550,36 @@ fn each_os_gets_the_bare_number_where_it_addresses_and_the_long_form_where_it_de
         for (slot, value) in os_slots(os, n(999_999), &facts, true) {
             assert!(value.len() <= slot.limit(), "{slot:?} {value}");
             assert!(rule_v2_allows(&value), "{slot:?} {value}");
-            assert!(slot.accepts_projection(&value, &value));
-            assert_eq!(
-                slot.accepts_projection("m8", "m8-2"),
-                slot == OsSlot::MacLocalHostName,
-                "only the Bonjour slot accepts a numbered alias: {slot:?}"
-            );
         }
     }
-    for alias in ["m8-2", "m8-10", "m8-4294967295"] {
-        assert!(OsSlot::MacLocalHostName.accepts_projection("m8", alias));
+
+    let dog = Nickname::parse("dog").unwrap();
+    let generated = GeneratedNames::new(n(85), &dog);
+    assert_eq!(generated.number(), n(85));
+    assert_eq!(generated.nickname(), Some(&dog));
+    assert_eq!(generated.computer_name(), "m85 Dog");
+    assert_eq!(generated.host_name(), "m85-dog");
+    assert!(generated.exact(OsSlot::MacComputerName, "m85 Dog"));
+    assert!(generated.exact(OsSlot::MacHostName, "m85-dog"));
+    assert!(!generated.exact(OsSlot::MacLocalHostName, "m85-dog-2"));
+    assert!(generated.accepts(OsSlot::MacLocalHostName, "m85-dog-2"));
+    for alias in ["m85-dog-02", "m85-dog-1", "m85-dog-2.local", "m85-2"] {
+        assert!(!generated.collision(OsSlot::MacLocalHostName, alias));
     }
-    for alias in ["m8-+2", "m8-02", "m8-1", "m8-4294967296", "m8-2.local"] {
-        assert!(!OsSlot::MacLocalHostName.accepts_projection("m8", alias));
-    }
-    for target in ["8", "M8", "m08", " m8", "m8 "] {
-        assert!(!OsSlot::MacLocalHostName.accepts_projection(target, &format!("{target}-2")));
-        assert!(OsSlot::MacLocalHostName.accepts_projection(target, target));
-    }
+    assert!(!generated.collision(OsSlot::MacHostName, "m85-dog-2"));
+    let suffixed = GeneratedNames::new(n(85), &Nickname::parse("Dog-2").unwrap());
+    assert_eq!(suffixed.host_name(), "m85-dog-2");
+    assert!(!suffixed.collision(OsSlot::MacLocalHostName, "m85-dog-2"));
+    let unicode = GeneratedNames::new(n(85), &Nickname::parse("研究室").unwrap());
+    assert_eq!(unicode.computer_name(), "m85 研究室");
+    assert_eq!(unicode.host_name(), "m85-u7814-u7a76-u5ba4");
+    let long = GeneratedNames::new(n(999_999), &Nickname::parse(&"研".repeat(21)).unwrap());
+    assert!(long.computer_name().len() <= DNS_LABEL_MAX);
+    assert!(long.host_name().len() <= DNS_LABEL_MAX);
+    assert!(long.host_name().is_ascii());
+    assert!(!long.host_name().ends_with('-'));
+    let provisional = GeneratedNames::number_only(n(85));
+    assert_eq!(provisional.computer_name(), "m85");
+    assert_eq!(provisional.host_name(), "m85");
+    assert!(provisional.nickname().is_none());
 }

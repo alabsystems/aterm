@@ -28,6 +28,151 @@ impl<T: Read + Write + Send + ?Sized> Stream for T {}
 /// by its own deadline.
 pub type Dial<'a> = dyn Fn(&str) -> Result<Box<dyn Stream>> + Sync + 'a;
 
+/// One owned, cancellable connection preparation. It may establish its transport,
+/// but sends no admission request: its worker reads only the greeting, and the parent proves.
+pub trait Preparation: Send + Sync {
+    /// Establish the transport under its original deadline.
+    ///
+    /// # Errors
+    /// The route, connection setup, cancellation or original deadline refuses preparation.
+    fn connect(&self) -> Result<Box<dyn Stream>>;
+    /// Interrupt its pending connect, broker, TLS or greeting work.
+    fn cancel(&self);
+}
+
+/// Create a preparation for one address under the caller's captured route policy.
+pub type Prepare<'a> = dyn Fn(&str) -> Result<Box<dyn Preparation + 'a>> + Sync + 'a;
+
+enum Attempts<'r, 'p> {
+    Sequential(&'r Dial<'p>),
+    Prepared {
+        prepare: &'r Prepare<'p>,
+        until: std::time::Instant,
+    },
+}
+
+type PreparedStream = Result<(Box<dyn Stream>, Greeting)>;
+
+fn with_attempts<T>(
+    attempts: Attempts<'_, '_>,
+    ats: &[String],
+    current: &(dyn Fn() -> Result<()> + Sync),
+    run: impl FnOnce(&mut dyn FnMut() -> Option<(String, PreparedStream)>) -> T,
+) -> T {
+    match attempts {
+        Attempts::Sequential(dial) => {
+            let mut remaining = ats.iter();
+            run(&mut || {
+                let at = remaining.next()?.clone();
+                let prepared = (|| {
+                    current()?;
+                    let mut stream = dial(&at)?;
+                    let greeting = joiner::greeting(&mut stream)?;
+                    Ok((stream, greeting))
+                })();
+                Some((at, prepared))
+            })
+        }
+        Attempts::Prepared { prepare, until } => {
+            let preparations: Vec<_> = ats
+                .iter()
+                .map(|at| prepare(at).map_err(|error| error.to_string()))
+                .collect();
+            struct Cancel<'s, 'p>(&'s [std::result::Result<Box<dyn Preparation + 'p>, String>]);
+            impl Drop for Cancel<'_, '_> {
+                fn drop(&mut self) {
+                    for preparation in self
+                        .0
+                        .iter()
+                        .filter_map(|preparation| preparation.as_ref().ok())
+                    {
+                        preparation.cancel();
+                    }
+                }
+            }
+            std::thread::scope(|scope| {
+                // Receiver drops before cancellation and scope's joins on unwind too,
+                // so a worker publishing into a full bounded queue cannot strand the scope.
+                let cancel = Cancel(&preparations);
+                let (send, answers) = std::sync::mpsc::sync_channel::<(usize, PreparedStream)>(
+                    crate::discover::MAX_CANDIDATES,
+                );
+                let mut failed = Vec::new();
+                for (index, preparation) in preparations.iter().enumerate() {
+                    let send = send.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("member-prepare".into())
+                        .spawn_scoped(scope, move || {
+                            let prepared = match preparation {
+                                Err(why) => Err(Error::new(why.clone())),
+                                Ok(preparation) => {
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        current()?;
+                                        let mut stream = preparation.connect()?;
+                                        let greeting = joiner::greeting(&mut stream)?;
+                                        Ok((stream, greeting))
+                                    }))
+                                    .unwrap_or_else(|_| {
+                                        Err(Error::new("the member preparation stopped"))
+                                    })
+                                }
+                            };
+                            let _ = send.send((index, prepared));
+                        });
+                    if let Err(error) = spawned {
+                        failed.push((
+                            index,
+                            Err(Error::new(format!(
+                                "member preparation did not start: {error}"
+                            ))),
+                        ));
+                    }
+                }
+                drop(send);
+                let mut failed = failed.into_iter();
+                let mut pending: BTreeSet<usize> = (0..ats.len()).collect();
+                let mut ended = None;
+                let result = run(&mut || {
+                    if let Some((index, error)) = failed.next() {
+                        pending.remove(&index);
+                        return Some((ats[index].clone(), error));
+                    }
+                    if pending.is_empty() {
+                        return None;
+                    }
+                    if ended.is_none() {
+                        let left = until.saturating_duration_since(std::time::Instant::now());
+                        let answer = if left.is_zero() {
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        } else {
+                            answers.recv_timeout(left)
+                        };
+                        match answer {
+                            Ok((index, prepared)) => {
+                                pending.remove(&index);
+                                return Some((ats[index].clone(), prepared));
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                ended = Some("member preparation deadline expired");
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                ended = Some("member preparation ended without an answer");
+                            }
+                        }
+                    }
+                    // Account for every unanswered route without accepting a late greeting.
+                    // The receiver still drops before cancellation and the scoped joins.
+                    let index = pending.pop_first()?;
+                    Some((ats[index].clone(), Err(Error::new(ended.unwrap()))))
+                });
+                drop(answers);
+                drop(cancel);
+                result
+            })
+        }
+    }
+}
+
 /// One member that answered: where it is, its greeting, and what it said of this Mac.
 #[derive(Clone, Debug)]
 pub struct Heard {
@@ -492,7 +637,14 @@ pub fn prove_first(
     sign_node: joiner::SignNode<'_>,
     ats: &[String],
 ) -> std::result::Result<Joined, Missed> {
-    prove_first_with(paths, dial, joining, sign_node, ats, None)
+    prove_first_with(
+        paths,
+        Attempts::Sequential(dial),
+        joining,
+        sign_node,
+        ats,
+        None,
+    )
 }
 
 /// [`prove_first`] bound to the automatic caller's exact vault choice and current authority.
@@ -509,12 +661,43 @@ pub fn prove_first_admitted(
     ats: &[String],
     admission: &ProofAdmission<'_>,
 ) -> std::result::Result<Joined, Missed> {
-    prove_first_with(paths, dial, joining, sign_node, ats, Some(admission))
+    prove_first_with(
+        paths,
+        Attempts::Sequential(dial),
+        joining,
+        sign_node,
+        ats,
+        Some(admission),
+    )
+}
+
+/// Prepare independent numeric routes concurrently, then keep every admission proof on
+/// this parent. Cancelling and joining losing preparations precedes the return.
+///
+/// # Errors
+/// As [`prove_first_admitted`], or no preparation is usable by the original deadline.
+pub fn prove_first_prepared_admitted(
+    paths: &Paths,
+    prepare: &Prepare<'_>,
+    until: std::time::Instant,
+    joining: &Joining<'_>,
+    sign_node: joiner::SignNode<'_>,
+    ats: &[String],
+    admission: Option<&ProofAdmission<'_>>,
+) -> std::result::Result<Joined, Missed> {
+    prove_first_with(
+        paths,
+        Attempts::Prepared { prepare, until },
+        joining,
+        sign_node,
+        ats,
+        admission,
+    )
 }
 
 fn prove_first_with(
     paths: &Paths,
-    dial: &Dial<'_>,
+    attempts: Attempts<'_, '_>,
     joining: &Joining<'_>,
     sign_node: joiner::SignNode<'_>,
     ats: &[String],
@@ -556,97 +739,106 @@ fn prove_first_with(
         ats.retain(|at| at != &peer.at);
         ats.insert(0, peer.at.clone());
     }
-    let mut missed = Vec::new();
-    for at in &ats {
-        let mut sent = false;
-        let tried = (|| {
-            if let Some(admission) = admission {
-                admission.check(paths)?;
-            }
-            let mut stream = dial(at)?;
-            let greeting = joiner::greeting(&mut stream)?;
-            let ready = |request: &crate::commons::binding::Request| {
-                if let Some(admission) = admission {
-                    admission.check(paths)?;
-                    if admission.default_alab {
-                        if pinned.as_ref().is_some_and(|peer| {
-                            peer.key != greeting.key || &peer.binding != request.binding()
-                        }) {
-                            return Err(Error::new("another authenticated member may have signed"));
+    with_attempts(
+        attempts,
+        &ats,
+        &|| admission.map_or(Ok(()), |admission| admission.check(paths)),
+        |next| {
+            let mut missed = Vec::new();
+            while let Some((address, prepared)) = next() {
+                let at = &address;
+                let mut sent = false;
+                let tried = (|| {
+                    if let Some(admission) = admission {
+                        admission.check(paths)?;
+                    }
+                    let (mut stream, greeting) = prepared?;
+                    let ready = |request: &crate::commons::binding::Request| {
+                        if let Some(admission) = admission {
+                            admission.check(paths)?;
+                            if admission.default_alab {
+                                if pinned.as_ref().is_some_and(|peer| {
+                                    peer.key != greeting.key || &peer.binding != request.binding()
+                                }) {
+                                    return Err(Error::new(
+                                        "another authenticated member may have signed",
+                                    ));
+                                }
+                                client::with_proof_admission(paths, admission, || {
+                                    retained.set(true);
+                                    super::proof_retry::sending(
+                                        paths,
+                                        admission.proving,
+                                        joining,
+                                        at,
+                                        greeting.key,
+                                        request.binding(),
+                                        super::proof_retry::now_secs(),
+                                    )?;
+                                    admission.check(paths)
+                                })?;
+                            }
                         }
-                        client::with_proof_admission(paths, admission, || {
-                            retained.set(true);
-                            super::proof_retry::sending(
-                                paths,
-                                admission.proving,
-                                joining,
-                                at,
-                                greeting.key,
-                                request.binding(),
-                                super::proof_retry::now_secs(),
-                            )?;
-                            admission.check(paths)
-                        })?;
+                        Ok(())
+                    };
+                    let bundle = joiner::prove_guarded(
+                        &mut stream,
+                        &greeting,
+                        joining,
+                        sign_node,
+                        &mut sent,
+                        admission.is_some_and(|a| a.default_alab),
+                        &ready,
+                    )?;
+                    drop(stream);
+                    if !matches!(bundle.handed, Handed::Log { .. }) {
+                        return Err(Error::new(
+                            "a member handed files, not the log, for a proof",
+                        ));
+                    }
+                    // A seatless recipient holds the vault already and only takes its seat's records
+                    // (one-mesh S1); a new Mac writes the vault from the bundle, which a proof never
+                    // moves to another vault than the one it is configured for.
+                    let report = if let Some(admission) = admission {
+                        client::readmit_from_log_bundle_admitted(paths, &bundle, admission)?
+                    } else if client::seat(paths) == client::Seat::Seatless {
+                        client::take_seat(paths, &bundle)?
+                    } else {
+                        client::readmit_from_log_bundle(paths, &bundle)?
+                    };
+                    if let Some(admission) = admission.filter(|a| a.default_alab) {
+                        super::proof_retry::clear(paths, admission.proving)?;
+                    }
+                    // The verified log and its keys already admit this Mac. The
+                    // subscriber follows the saved Allowed and pending materialization;
+                    // reaching an HTTP source here would hold admission behind a
+                    // different server, even after the native handshake finished.
+                    Ok(Joined {
+                        member: greeting.name,
+                        name: bundle.allowed.name().to_owned(),
+                        report,
+                        admission: Admission::Logged,
+                    })
+                })();
+                match tried {
+                    Ok(joined) => return Ok(joined),
+                    Err(error) => {
+                        missed.push((at.clone(), error.to_string()));
+                        if sent {
+                            return Err(Missed {
+                                refused: missed,
+                                signed_maybe: true,
+                            });
+                        }
                     }
                 }
-                Ok(())
-            };
-            let bundle = joiner::prove_guarded(
-                &mut stream,
-                &greeting,
-                joining,
-                sign_node,
-                &mut sent,
-                admission.is_some_and(|a| a.default_alab),
-                &ready,
-            )?;
-            drop(stream);
-            if !matches!(bundle.handed, Handed::Log { .. }) {
-                return Err(Error::new(
-                    "a member handed files, not the log, for a proof",
-                ));
             }
-            // A seatless recipient holds the vault already and only takes its seat's records
-            // (one-mesh S1); a new Mac writes the vault from the bundle, which a proof never
-            // moves to another vault than the one it is configured for.
-            let report = if let Some(admission) = admission {
-                client::readmit_from_log_bundle_admitted(paths, &bundle, admission)?
-            } else if client::seat(paths) == client::Seat::Seatless {
-                client::take_seat(paths, &bundle)?
-            } else {
-                client::readmit_from_log_bundle(paths, &bundle)?
-            };
-            if let Some(admission) = admission.filter(|a| a.default_alab) {
-                super::proof_retry::clear(paths, admission.proving)?;
-            }
-            // The verified log and its keys already admit this Mac. The
-            // subscriber follows the saved Allowed and pending materialization;
-            // reaching an HTTP source here would hold admission behind a
-            // different server, even after the native handshake finished.
-            Ok(Joined {
-                member: greeting.name,
-                name: bundle.allowed.name().to_owned(),
-                report,
-                admission: Admission::Logged,
+            Err(Missed {
+                refused: missed,
+                signed_maybe: retained.get(),
             })
-        })();
-        match tried {
-            Ok(joined) => return Ok(joined),
-            Err(error) => {
-                missed.push((at.clone(), error.to_string()));
-                if sent {
-                    return Err(Missed {
-                        refused: missed,
-                        signed_maybe: true,
-                    });
-                }
-            }
-        }
-    }
-    Err(Missed {
-        refused: missed,
-        signed_maybe: retained.get(),
-    })
+        },
+    )
 }
 
 /// Why [`prove_first`] let this Mac in nowhere.
@@ -705,6 +897,30 @@ fn written(
 #[cfg(test)]
 mod proof_lock_tests {
     use super::*;
+
+    #[test]
+    fn expired_preparations_report_each_unanswered_address() {
+        let ats = vec!["one.invalid:1".into(), "two.invalid:2".into()];
+        let prepare =
+            |_: &str| -> Result<Box<dyn Preparation>> { Err(Error::new("transport unavailable")) };
+        let got = with_attempts(
+            Attempts::Prepared {
+                prepare: &prepare,
+                until: std::time::Instant::now(),
+            },
+            &ats,
+            &|| Ok(()),
+            |next| {
+                let mut got = Vec::new();
+                while let Some((address, result)) = next() {
+                    assert!(result.is_err());
+                    got.push(address);
+                }
+                got
+            },
+        );
+        assert_eq!(got, ats, "deadline must not erase failed member attempts");
+    }
 
     /// One proof of this Mac at a time: a second take sees the first and sends nothing, for one
     /// try and for a wait that ends while the first still holds it, and takes the lock once the

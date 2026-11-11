@@ -559,7 +559,7 @@ fn composed_dispatch_cannot_take_over_an_ancestor_request_after_writer_successio
     let fresh = source
         .dispatch_until(next, "example-v1", b"new request", deadline(), |_, _| None)
         .unwrap();
-    // A refusal after the full minute is the hang detector (ATERM-KI-1105-13).
+    // A refusal after the full minute is the hang detector.
     assert!(
         fresh.entered,
         "a fresh request was withheld after {:?}: {:?}",

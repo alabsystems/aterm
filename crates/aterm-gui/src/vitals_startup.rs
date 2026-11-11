@@ -5,7 +5,8 @@
 //! (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §6). A stop is dated by the stopped run's last
 //! checkpoint, which the strip's restore reads ([`aterm_vitals::Vitals::restore_strip_history`]),
 //! or, where the strip is older than the stop's evidence, by that evidence: a crash by the
-//! file its handler wrote at the crash ([`date_crash`]), and a kill by the killed run's launch
+//! event time its handler recorded, or the artifact's modification time when it has no event
+//! timestamp ([`date_crash`]), and a kill by the killed run's launch
 //! ([`date_unseen_kill`]).
 
 use std::path::Path;
@@ -20,18 +21,18 @@ use crate::vitals_host::VitalsHost;
 /// How the startup scan found the run before this one stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PriorStop {
-    /// A crash report or a fatal signal's written marker ([`CrashEvidence`]), with that file's
-    /// modification time where it read: its writer wrote it at the crash. A panic the run caught
-    /// and survived writes a report too, so the time dates a crash only where the strip is older
-    /// than the file ([`date_crash`]).
+    /// A crash report or a fatal signal's written marker ([`CrashEvidence`]), with its embedded
+    /// event time, or its modification time when the event timestamp did not read. A panic the
+    /// run caught and survived writes a report too, so the time dates a crash only where the
+    /// strip is older than that event ([`date_crash`]).
     Crashed(Option<i64>),
     /// A kill's marker alone ([`KillEvidence`]), with that file's modification time where it
     /// read: the killed run made it empty at its launch and nothing wrote it after, so the time
     /// is when that run started, not when it stopped. It dates a crash only where the strip holds
     /// no checkpoint of the killed run ([`date_unseen_kill`]).
     Killed(Option<i64>),
-    /// Both, each with its file's time as above, dated in the order they came ([`date_crash`],
-    /// [`date_unseen_kill`]), the crash only where its file is newer than the strip. One older than
+    /// Both, each with its evidence's time as above, dated in the order they came ([`date_crash`],
+    /// [`date_unseen_kill`]), the crash only where its event is newer than the strip. One older than
     /// the killed run's launch is an earlier run's crash, which the killed run never took (it died
     /// before its startup scan), and is dated before the kill; one newer than the launch dates the
     /// killed run's crash, after it.
@@ -41,7 +42,14 @@ pub(crate) enum PriorStop {
 impl PriorStop {
     /// The stop the startup scan's evidence names; `None` when it found neither.
     pub(crate) fn of(crash: Option<&CrashEvidence>, killed: Option<&KillEvidence>) -> Option<Self> {
-        let crashed = crash.map(|crash| written_ms(&crash.path));
+        let crashed = crash.map(|crash| {
+            crash
+                .head
+                .first()
+                .and_then(|first| crate::logging::panic_report_timestamp(first))
+                .and_then(|at| i64::try_from(at.as_millis()).ok())
+                .or_else(|| written_ms(&crash.path))
+        });
         let killed = killed.map(|killed| written_ms(&killed.marker));
         match (crashed, killed) {
             (Some(crashed), Some(killed)) => Some(Self::CrashedAndKilled(crashed, killed)),
@@ -110,11 +118,12 @@ impl StartupMarks {
 /// checkpoint before the hang. Where the strip holds no checkpoint of the killed run (no strip
 /// file, or only an earlier run's), the kill came before that run's first checkpoint, and the probe
 /// thread dates the crash from that run's launch ([`date_unseen_kill`]). A crash's time is its
-/// crash file's (a second before the launch where it did not read), and the probe thread then dates
+/// recorded event time, with artifact modification time as fallback ([`PriorStop::Crashed`]),
+/// or a second before the launch where neither read. The probe thread then dates
 /// the crash from it where the strip is older than it, in time order with a killed run's launch
 /// ([`date_crash`]): a crash after the crashed run's last checkpoint draws from that checkpoint,
 /// with its "aterm crash" event at the crash, and one before that run's first checkpoint from the
-/// crash, after the earlier run's stop. A strip no older than the crash file says its writer ran
+/// crash, after the earlier run's stop. A strip no older than the crash event says its writer ran
 /// past it (a panic it caught and survived, or another aterm's crash), and the restore draws the
 /// stop as it reads. A last checkpoint, a crash or a launch older than the strips' six hours draws
 /// no crash, as the restore dates no crash from a stop that old.
@@ -139,11 +148,11 @@ pub(crate) fn startup_marks(prior: PriorStop, launch_ms: i64) -> StartupMarks {
     }
 }
 
-/// `kept`, the strip a probe thread restores at `open_ms`, after a crash at `crash_ms`, its crash
-/// file's time ([`PriorStop::Crashed`]). A strip whose last saved reading is at or after the crash
-/// holds a checkpoint written since, so its writer ran past the crash file (a panic it caught and
+/// `kept`, the strip a probe thread restores at `open_ms`, after a crash at `crash_ms`, the
+/// evidence's event time ([`PriorStop::Crashed`]). A strip whose last saved reading is at or after the crash
+/// holds a checkpoint written since, so its writer ran past the crash (a panic it caught and
 /// survived, or another aterm's crash), and is left as it is (`vitals_host::open_strip` also leaves
-/// a clean one whose file was written at or after the crash file: only a quit writes a strip clean,
+/// a clean one whose file was written at or after the crash event: only a quit writes a strip clean,
 /// never a panic's unwind, and that write takes no reading of its own): the restore draws its stop
 /// as it reads, a clean one as a pause where it spans a 10 s bucket and an unclean one as a crash
 /// from that reading. A strip whose last reading is before the crash holds no checkpoint since, and

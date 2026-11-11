@@ -3092,7 +3092,7 @@ pub fn transact<R>(
         lease.check_volumes()?;
         let text = lease.encode();
         check_lease_bytes(&text)?;
-        super::super::upgrade_models::write_atomic_ordered(&dir.join(LEASE_FILE), &text)?;
+        super::super::atomic_write::write_atomic_ordered(&dir.join(LEASE_FILE), &text)?;
     }
     Ok(Some(out))
 }

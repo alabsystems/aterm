@@ -18,7 +18,8 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::{
-    Diagnostics, Reads, git, git_lossy, git_offline_answer, is_head, unattended_dir, work_status_in,
+    Diagnostics, Reads, RepoExcludes, git, git_as, git_lossy, git_offline_answer, is_head,
+    unattended_dir, work_status_in,
 };
 
 /// The most checkouts one read lists ([`HomeRepos::cut`] counts those past it).
@@ -227,7 +228,7 @@ fn read_one(
     let reads = reads(home, limit, held)?;
     let path = home.join(name);
     let root = unattended_dir(&path, Some(home), table)?;
-    let (origin, own_excludes) = local_config(&root, &reads)?;
+    let (origin, excludes_mode) = local_config(&root, &reads)?;
     let Some(origin) = origin
         .as_deref()
         .and_then(github_repo)
@@ -235,14 +236,19 @@ fn read_one(
     else {
         return Some((None, reads.starts.get()));
     };
-    let symbolic = git_lossy(
-        &root,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-        &reads,
-        Diagnostics::Permit,
-    )
-    .map(|b| b.trim().to_string())
-    .filter(|b| !b.is_empty());
+    let git_dir = root.join(".git");
+    let symbolic = match read_git_head_file(&git_dir) {
+        GitHeadFile::Branch(branch) => Some(branch),
+        GitHeadFile::Detached => None,
+        GitHeadFile::Fallback => git_lossy(
+            &root,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            &reads,
+            Diagnostics::Permit,
+        )
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty()),
+    };
     let head_ref = symbolic
         .as_deref()
         .filter(|b| !b.contains(['*', '?', '[', '\u{FFFD}']))
@@ -265,11 +271,10 @@ fn read_one(
         .and_then(|n| crate::parse_uint::<u32>(n.trim())),
         _ => None,
     };
-    let git_dir = root.join(".git");
     let dirty = work_status_in(
         &root,
         table,
-        Some(own_excludes),
+        excludes_mode,
         Some(&git_dir.join("index")),
         &reads,
     )
@@ -297,36 +302,95 @@ fn read_one(
     ))
 }
 
-/// Read `remote.origin.url` and whether the repository's own configuration sets a non-empty
-/// `core.excludesFile` in a single `git config` call. Returns `None` when the read was cut.
-fn local_config(root: &Path, reads: &Reads<'_>) -> Option<(Option<String>, bool)> {
-    let out = git(
+/// The most bytes [`read_git_head_file`] reads from `<git_dir>/HEAD`.
+const HEAD_FILE_MAX: u64 = 1024;
+
+/// What `<git_dir>/HEAD` names in a `files`-backend checkout.
+enum GitHeadFile {
+    /// `ref: refs/heads/<branch>` where `<branch>` is a plain UTF-8 branch name (not `reftable`'s
+    /// `.invalid` stub and free of `for-each-ref` glob characters).
+    Branch(String),
+    /// A detached commit SHA (`is_head`).
+    Detached,
+    /// Unreadable, non-UTF-8, `reftable` (`.invalid`), or an unusual symref target: fall back to
+    /// `git symbolic-ref`.
+    Fallback,
+}
+
+/// Read `<git_dir>/HEAD` directly to avoid spawning `git symbolic-ref` when `HEAD` names a
+/// `refs/heads/<branch>` target or a detached commit SHA.
+fn read_git_head_file(git_dir: &Path) -> GitHeadFile {
+    use std::io::Read as _;
+    let Ok((file, meta)) = aterm_uds::regular_file::open(&git_dir.join("HEAD")) else {
+        return GitHeadFile::Fallback;
+    };
+    if meta.len() > HEAD_FILE_MAX {
+        return GitHeadFile::Fallback;
+    }
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
+    if file.take(HEAD_FILE_MAX).read_to_string(&mut text).is_err() {
+        return GitHeadFile::Fallback;
+    }
+    let line = text.trim_end_matches(['\n', '\r']);
+    if let Some(branch) = line.strip_prefix("ref: refs/heads/") {
+        if !branch.is_empty()
+            && branch != ".invalid"
+            && !branch.contains(['*', '?', '[', '\u{FFFD}'])
+        {
+            return GitHeadFile::Branch(branch.to_owned());
+        }
+        return GitHeadFile::Fallback;
+    }
+    if is_head(line) {
+        return GitHeadFile::Detached;
+    }
+    GitHeadFile::Fallback
+}
+
+/// Read the repository's own `remote.origin.url` and classify `core.excludesFile` across local and
+/// global configuration scopes in a single `git config --show-scope` call. Returns `None` when the
+/// read was cut.
+fn local_config(root: &Path, reads: &Reads<'_>) -> Option<(Option<String>, RepoExcludes)> {
+    let out = git_as(
         root,
         &[
             "config",
+            "--show-scope",
             "--includes",
             "--null",
             "--get-regexp",
             "^(remote\\.origin\\.url|core\\.excludesfile)$",
         ],
         reads,
+        true,
     );
     if reads.cut.get() {
         return None;
     }
     let mut origin = None;
-    let mut own_excludes = false;
-    for entry in out.as_deref().unwrap_or_default().split('\0') {
+    let mut own_excludes = None;
+    let mut global_excludes = None;
+    let mut fields = out.as_deref().unwrap_or_default().split('\0');
+    while let (Some(scope), Some(entry)) = (fields.next(), fields.next()) {
         let Some((key, value)) = entry.split_once('\n') else {
             continue;
         };
-        match key {
-            "remote.origin.url" => origin = Some(value.to_owned()),
-            "core.excludesfile" if !value.trim().is_empty() => own_excludes = true,
+        match (scope, key) {
+            ("local" | "worktree", "remote.origin.url") => origin = Some(value.to_owned()),
+            ("local" | "worktree", "core.excludesfile") => own_excludes = Some(value),
+            ("global", "core.excludesfile") => global_excludes = Some(value),
             _ => {}
         }
     }
-    Some((origin, own_excludes))
+    let excludes = if own_excludes.is_some_and(|v| !v.trim().is_empty()) {
+        RepoExcludes::Own
+    } else if global_excludes.is_some_and(|v| !v.trim().is_empty()) {
+        RepoExcludes::ConfiguredGlobal
+    } else {
+        RepoExcludes::DefaultGlobal
+    };
+    Some((origin, excludes))
 }
 
 /// Resolve `HEAD` (when `head_ref` names a `refs/heads/<branch>` pattern without glob characters)

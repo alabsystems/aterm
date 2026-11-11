@@ -2820,7 +2820,8 @@ fn an_approver_starting_clears_its_own_pid_s_old_record_and_gone_ones() {
     for pid in [own, 999_999_999] {
         fsx::write_atomic(&paths.stuck_file(pid), b"old\n", 0o600).expect("record");
     }
-    let stop = AtomicBool::new(true);
+    let stop = aterm_uds::stop::Stop::new();
+    stop.set();
     approver_loop(&paths, &|_| {}, &stop);
     assert_eq!(approver_stuck(&paths, own), None);
     assert_eq!(approver_stuck(&paths, 999_999_999), None);
@@ -3031,7 +3032,7 @@ fn a_typed_join_password_is_let_in_with_no_nap_between() {
     let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
     let (admin, source, password) = team(root.path(), &server);
     let mb = Paths::for_home(&root.path().join("mb"));
-    let stop = AtomicBool::new(false);
+    let stop = aterm_uds::stop::Stop::new();
     let naps = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -3052,7 +3053,7 @@ fn a_typed_join_password_is_let_in_with_no_nap_between() {
                 HANG_DETECTOR,
             ),
         );
-        stop.store(true, Ordering::SeqCst);
+        stop.set();
         assert!(
             matches!(joined, Ok(JoinOutcome::Joined { .. })),
             "{joined:?}"

@@ -50,30 +50,5 @@ impl ShlAssign<usize> for Limb {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::Limb;
-
-    #[test]
-    fn shl1() {
-        assert_eq!(Limb(1) << 1, Limb(2));
-    }
-
-    #[test]
-    fn shl2() {
-        assert_eq!(Limb(1) << 2, Limb(4));
-    }
-
-    #[test]
-    fn shl_assign1() {
-        let mut l = Limb(1);
-        l <<= 1;
-        assert_eq!(l, Limb(2));
-    }
-
-    #[test]
-    fn shl_assign2() {
-        let mut l = Limb(1);
-        l <<= 2;
-        assert_eq!(l, Limb(4));
-    }
-}
+#[path = "shl_tests.rs"]
+mod tests;

@@ -350,7 +350,7 @@ impl Width {
     }
 }
 
-/// A model family, as the harness reads it from a model id (`harness::upgrade_models::
+/// A model family, as the harness reads it from a model id (`harness::claude_model::
 /// family_version`), closed: a family this build does not name is `other`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Family {

@@ -40,6 +40,9 @@ pub(crate) const IN_FLIGHT_RETRY: Duration = Duration::from_secs(60);
 /// Maximum consecutive in-flight retries before reverting to the base cadence.
 pub(crate) const IN_FLIGHT_CHECKS: u32 = 30;
 
+/// Retry acquiring this process's check lane without inheriting network backoff.
+pub(crate) const LANE_BUSY_RETRY: Duration = Duration::from_secs(5);
+
 /// Return [`IN_FLIGHT_RETRY`] for the first [`IN_FLIGHT_CHECKS`] checks, then `None`.
 pub(crate) fn in_flight_retry(checks: u32) -> Option<Duration> {
     (1..=IN_FLIGHT_CHECKS)
@@ -67,6 +70,16 @@ pub(crate) struct Cadence {
 }
 
 impl Cadence {
+    /// Choose this wait's schedule without changing the network outcome history.
+    /// A busy local lane made no request and may become available at any time.
+    pub(crate) fn after_lane(&self, busy: bool) -> Self {
+        if busy {
+            Self::new(self.base.min(LANE_BUSY_RETRY))
+        } else {
+            *self
+        }
+    }
+
     /// Create a healthy schedule with `base` interval.
     pub(crate) const fn new(base: Duration) -> Self {
         Self {
@@ -365,6 +378,41 @@ mod tests {
     use super::*;
     use crate::cadence_bounds::LONGEST_WAIT;
 
+    #[test]
+    fn local_contention_retries_without_consuming_or_resetting_network_backoff() {
+        let now = Instant::now();
+        let mut schedule = Cadence::new(Duration::from_secs(INTERVAL_SECS));
+        for _ in 0..8 {
+            schedule.failed();
+        }
+        schedule.hold_until(now + Duration::from_secs(600));
+        let before = schedule.delay_at(now, 128);
+        for entropy in [0, 128, 255] {
+            assert_eq!(
+                schedule.after_lane(true).delay_at(now, entropy),
+                jitter(LANE_BUSY_RETRY, entropy)
+            );
+            assert_eq!(
+                schedule.after_lane(false).delay_at(now, entropy),
+                schedule.delay_at(now, entropy)
+            );
+        }
+        assert_eq!(schedule.delay_at(now, 128), before);
+        assert_eq!(schedule.failures(), 8);
+        schedule.failed_offline();
+        assert!(schedule.retrying_offline());
+        assert_eq!(schedule.after_lane(true).nominal_at(now), LANE_BUSY_RETRY);
+        assert!(schedule.retrying_offline());
+        assert_eq!(schedule.after_lane(false).nominal_at(now), OFFLINE_RETRY[0]);
+        schedule.succeeded(1);
+        assert_eq!(schedule.after_lane(true).nominal_at(now), LANE_BUSY_RETRY);
+        assert_eq!(schedule.after_lane(false).nominal_at(now), IN_FLIGHT_RETRY);
+        let fast = Cadence::new(Duration::from_secs(1));
+        assert_eq!(
+            fast.after_lane(true).nominal_at(now),
+            Duration::from_secs(1)
+        );
+    }
     const BASE: Duration = Duration::from_secs(75);
 
     /// `max_wait` is what the heartbeat is judged against while the loop waits, so

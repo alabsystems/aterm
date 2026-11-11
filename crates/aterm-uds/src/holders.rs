@@ -859,6 +859,7 @@ impl TableCheck {
             "no absolute folder to bind the table check in",
         );
         for parent in dirs.iter().filter(|d| d.is_absolute()) {
+            let parent = aterm_tempfile::quiet_in(parent);
             let made = (0..4).find_map(|_| {
                 let dir = parent.join(format!("aterm-pcb-{}", crate::rand::hex_token::<6>().ok()?));
                 match std::fs::DirBuilder::new().mode(0o700).create(&dir) {

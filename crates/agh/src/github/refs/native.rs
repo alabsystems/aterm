@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use super::{AtomicRefBatch, Refs};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::git::ControlRefTransaction;
 use crate::git::{GitOut, GitRun};
 use crate::journal::IntentStore;
@@ -26,12 +26,9 @@ impl Refs<'_> {
         progress_window: Option<std::time::Duration>,
     ) -> Result<GitRun> {
         self.write_checks(permit)?;
-        let repo = self.writer_view(permit).push_repo()?;
-        if !self.slug.eq_full_name(&repo.full_name) {
-            return Err(Error::protocol(
-                "repository metadata names another repository",
-            ));
-        }
+        // The native runner authenticates the permit's writer against this exact
+        // repository URL. Receive-pack checks write permission itself. A REST
+        // metadata probe adds no authority and couples this write to core quota.
         let run = GitRun::push_control(&self.slug, dir, transaction.clone(), dry_run)
             .with_named(permit.named())
             .with_budget(budget);
@@ -131,12 +128,6 @@ impl Refs<'_> {
         progress_window: Option<std::time::Duration>,
     ) -> Result<GitRun> {
         self.write_checks(permit)?;
-        let repo = self.writer_view(permit).push_repo()?;
-        if !self.slug.eq_full_name(&repo.full_name) {
-            return Err(Error::protocol(
-                "repository metadata names another repository",
-            ));
-        }
         let run = GitRun::push_refs(&self.slug, dir, batch.clone(), dry)
             .with_named(permit.named())
             .with_budget(budget);

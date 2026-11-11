@@ -15,6 +15,10 @@ use crate::supervise::run::CtlReply;
 #[cfg(unix)]
 mod native_row_publication;
 
+#[cfg(unix)]
+#[path = "cli_native_preparation_tests.rs"]
+mod native_preparation;
+
 #[path = "cli_label_retention_tests.rs"]
 mod label_retention;
 
@@ -621,13 +625,6 @@ fn the_grammar_parses_what_the_help_text_advertises() {
         ("accounts use --auto", Cmd::Accounts(AccountsCmd::Auto)),
         ("accounts add help", Cmd::Help(HelpPage::Accounts)),
         ("accounts --help", Cmd::Help(HelpPage::Accounts)),
-        ("upgrade models", Cmd::UpgradeModels { set: None }),
-        (
-            "upgrade models set claude-opus-5-5,claude-fable-5-1",
-            Cmd::UpgradeModels {
-                set: Some("claude-opus-5-5,claude-fable-5-1".to_string()),
-            },
-        ),
         (
             "ledger upgrade 5 --json",
             Cmd::Ledger {
@@ -756,9 +753,7 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "limits @a @b",
         "ledger rm",
         "ledger recovery",
-        "upgrade models set",
-        "upgrade models frob",
-        "upgrade models set a b",
+        "upgrade models",
         "ledger statusline",
         "disk --apply everything",
         "usage --bogus",
@@ -8941,6 +8936,114 @@ fn the_report_says_what_a_claude_worker_takes_as_a_survey_does() {
     );
 }
 
+/// THE REPORT AND THE SURVEY SAY THE ACCOUNT A PLAIN START REALLY TAKES: the row of the account
+/// this home's login file names, never the row with no directory by assumption. Where the file
+/// names another row's account, that row is the launch row and the line says so beside the
+/// believed row; where it names an account no row lists, no row is, and the line names the
+/// account.
+/// NEGATIVE CONTROL: with `unstarted_launch_row` reading `judged_label` over an empty environment
+/// (the belief), the launch row of the home that holds unicorn is `main`: `left: ["main"] right:
+/// ["work-2"]`.
+#[test]
+fn the_report_and_the_survey_say_the_account_a_plain_start_really_takes() {
+    const BRONTO: &str = "bronto@example.test";
+    const UNICORN: &str = "unicorn@example.test";
+    let tmp = tmp_dir("accounts-report-worker-observed");
+    let env = env_at(&tmp);
+    let (work, pool) = three_accounts(&tmp, &env);
+    let rows = [
+        ("main", Class::Preferred, None, BRONTO),
+        ("work-2", Class::Preferred, Some(work), UNICORN),
+        ("pool-a", Class::Pool, Some(pool), "pool@example.test"),
+    ]
+    .map(|(label, class, dir, email)| accounts::Row {
+        label: label.to_owned(),
+        class,
+        dir,
+        email: Some(email.to_owned()),
+        ..accounts::Row::default()
+    });
+    std::fs::write(
+        env.accounts_roster().expect("a config dir"),
+        accounts::append_rows_for(Cli::Claude, "", &rows).expect("the rows admit"),
+    )
+    .expect("write");
+    let now = env.now;
+    let config = env.config.clone().expect("a config path");
+    crate::test_config::write(&config, "[harness]\naccounts = \"wall\"\n").expect("config");
+    let home = env.home.clone().expect("a home");
+    std::fs::create_dir_all(&home).expect("mkdir");
+    let places = (config.as_path(), env.state.as_path(), Some(home.as_path()));
+    let read = |email: Option<&str>| {
+        let profile = home.join(".claude.json");
+        match email {
+            Some(email) => std::fs::write(
+                &profile,
+                format!(r#"{{"oauthAccount":{{"emailAddress":"{email}"}}}}"#),
+            )
+            .expect("profile"),
+            None => {
+                let _ = std::fs::remove_file(&profile);
+            }
+        }
+        let (code, text, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+        assert_eq!(code, exit(0), "{err}");
+        let (code, json, err) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+        assert_eq!(code, exit(0), "{err}");
+        let doc: Value = aterm_json::from_str(json.trim()).expect("JSON");
+        let line = doc["next"]["worker"].as_str().expect("a line").to_owned();
+        assert!(text.lines().any(|said| said == line), "{line}: {text}");
+        let launches: Vec<String> = survey_accounts(Cli::Claude, places, now)
+            .expect("the pool reads")
+            .rows
+            .iter()
+            .filter(|row| row.launch)
+            .map(|row| row.label.clone())
+            .collect();
+        (line, launches)
+    };
+    let worker = "a Claude Code worker aterm starts";
+
+    let (line, launches) = read(Some(UNICORN));
+    assert_eq!(launches, ["work-2"]);
+    assert_eq!(
+        line,
+        format!(
+            "{worker} takes `work-2`, the row of {UNICORN}, the login this machine's home holds \
+             (not `main`, whose place that is in the roster), for a plain start"
+        )
+    );
+
+    let (line, launches) = read(Some("zed@example.test"));
+    assert_eq!(launches, Vec::<String>::new(), "no row is that account's");
+    assert_eq!(
+        line,
+        format!(
+            "{worker} takes no row: it runs on the login its starter carries, this machine's own \
+             (zed@example.test), which no row of the roster lists for a plain one"
+        )
+    );
+
+    let (line, launches) = read(Some(BRONTO));
+    assert_eq!(launches, ["main"], "CONTROL: the file agrees");
+    assert_eq!(
+        line,
+        format!(
+            "{worker} takes `main`, the row of {BRONTO}, the login this machine's home holds, \
+             for a plain start"
+        )
+    );
+
+    let (line, launches) = read(None);
+    assert_eq!(launches, ["main"], "CONTROL: nothing read, the belief");
+    assert_eq!(
+        line,
+        format!(
+            "{worker} takes `main`, the row this machine's own login counts as, for a plain start"
+        )
+    );
+}
+
 #[test]
 fn a_survey_of_a_mac_with_no_roster_reads_its_own_login() {
     let tmp = tmp_dir("accounts-survey-own");
@@ -12992,7 +13095,6 @@ fn the_agy_verb_parses_its_forms() {
     assert!(p("agy login ../outside").is_err());
     assert_eq!(p("agy --help").unwrap(), Cmd::Help(HelpPage::Agy));
     assert!(help_page(HelpPage::Agy).contains("agy pick [<model>]"));
-    assert!(help_page(HelpPage::Agy).contains("stopped at a quota wall rotates across pools"));
 }
 
 #[test]

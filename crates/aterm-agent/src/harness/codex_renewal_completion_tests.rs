@@ -108,8 +108,6 @@ impl Fixture {
             background: false,
             aterm_state: None,
             ask: false,
-            several_logins: false,
-            usage_credits: false,
             usage_tap: None,
             instances: upgrade_drive::Instances::Listed(vec![]),
             agents_off: vec![],

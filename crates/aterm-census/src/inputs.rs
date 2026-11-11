@@ -357,6 +357,27 @@ mod tests {
                 .unwrap()
                 .unwrap()
         });
+        for own_worker in [false, true] {
+            let read = || {
+                crate::memo::threads(|scope| {
+                    scope.spawn(|| crate::tree::read_to_string(&file)).join()
+                })
+                .unwrap()
+                .unwrap()
+            };
+            let (text, serial) = capture(root.path(), || {
+                if own_worker {
+                    crate::on_one_worker(read).unwrap()
+                } else {
+                    crate::without_parallel_workers(read)
+                }
+            });
+            assert_eq!(text, "one");
+            assert_eq!(
+                serial, carried,
+                "serial work retains identical input evidence"
+            );
+        }
         assert_eq!(packages(carried), ["tree crates/a"]);
         let (_, raw) = capture(root.path(), || {
             std::thread::scope(|s| s.spawn(|| crate::tree::read_to_string(&file)).join())

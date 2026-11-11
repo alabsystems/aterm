@@ -61,7 +61,7 @@ it.
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (the tests the spec retires, `-` for
 none; a test claimed by more than one spec is resolved in §2), `difficulty` (the Rust features the
 proof must handle) and `blocking_gaps`: rows of the gap table in §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap 0 (the installed seal publishes no
+`docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (the installed seal publishes no
 Lean-discharged row) blocks every spec and is listed first.
 
 ```tsv
@@ -204,7 +204,7 @@ status-latest-tag-guard	refinement	status::latest_tag, status::authorized_tag, s
 which-copy-lines	contract	which_copy::WhichCopy::lines, which_copy::WhichCopy::running_detail, which_copy::WhichCopy::other_detail	lines() = ["running: " ++ running_detail()] ++ ["another copy: " ++ other_detail(o) | o ← others]; running_detail() = display(running) ++ (kind = InertApp ? " (the updater leaves this copy alone)" : ""); other_detail(o) = display(o.path) ++ " (" ++ o.version.unwrap_or("version unknown") ++ ")" ++ (kind = InstalledApp ? " — the updater leaves it alone" : "").	-	format!, Path::display, Vec map/extend, enum match	0,1,5
 plausible-version	contract	which_copy::plausible_version	plausible_version(v) = Some(v) ⇔ 1 ≤ len(v) ≤ MAX_VERSION_CHARS (32) ∧ every byte is ASCII alphanumeric or one of '.', '+', '-'; otherwise None.	src/which_copy.rs::only_a_version_shaped_string_is_admitted	&str bytes().all, matches!, bool::then_some	0,1,7
 which-copy-survey	contract	which_copy::survey, which_copy::classify, which_copy::is_real_dir, which_copy::plist_short_version, which_copy::observe, which_copy::observe_from, which_copy::kind_of	survey(exe, cands): (running, kind) = classify(exe) (bundle root and InstalledApp when resolve_from admits it and it is not dev-marked, InertApp for any other bundle including a /Volumes launch, else (exe, Binary)); others = the candidates, in order, that are real directories (lstat is a directory, never a symlink), are not same_install_root as running or as an earlier kept one, each with version = plist_short_version filtered by plausible_version. Off macOS observe_from(exe) = {exe, Binary, []}; a non-bundle executable is always Binary with running = exe.	src/which_copy.rs::this_process_names_its_own_executable, src/which_copy.rs::survey::the_running_bundle_is_named_and_the_other_copies_carry_their_versions, src/which_copy.rs::survey::a_bare_binary_names_its_path_and_makes_no_updater_promise, src/which_copy.rs::survey::an_inert_bundle_says_the_updater_leaves_it_alone	fs::symlink_metadata, canonicalize, bounded plist read, cfg(target_os) arms, Vec loop with any()	0,1,7,8
-which-copy-caskroom-locations	contract	which_copy::caskroom_bundles, which_copy::app_locations	caskroom_bundles(c) = [] unless c is a real directory; else take the read_dir entries whose own file type is a directory (symlinks excluded), sort, truncate to MAX_CASKROOM_ENTRIES (16), map to <entry>/aterm.app and keep those that are real directories. app_locations(home, brew) = ["/Applications/aterm.app"] ++ (home ? [home/Applications/aterm.app] : []) ++ concat(caskroom_bundles(p/Caskroom/aterm) | p ← ["/opt/homebrew","/usr/local"] ++ (brew ∉ those ? [brew] : [])).	src/which_copy.rs::survey::the_usual_places_include_every_caskroom_bundle_once	fs::read_dir, flatten, sort, truncate, Option<&Path>, let-chains	0,1,7,8
+which-copy-caskroom-locations	contract	which_copy::caskroom_bundles, which_copy::app_locations	caskroom_bundles(c) = [] unless c is a real directory; else take the read_dir entries whose own file type is a directory (symlinks excluded), sort, truncate to MAX_CASKROOM_ENTRIES (16), map to <entry>/aterm.app and keep those that are real directories. app_locations(home, brew, install_dir) = ["/Applications/aterm.app"] ++ (home ? [home/Applications/aterm.app] : []) ++ (install_dir = Some(d) ∧ d ≠ "" ∧ d/aterm.app ∉ earlier ? [d/aterm.app] : []) ++ concat(caskroom_bundles(p/Caskroom/t) | p ← ["/opt/homebrew","/usr/local"] ++ (brew ∉ those ? [brew] : []), t ← ["aterm","alab"]).	src/which_copy.rs::survey::the_usual_places_include_every_caskroom_bundle_once	fs::read_dir, flatten, sort, truncate, Option<&Path>, let-chains	0,1,7,8
 apply-budget-stack	invariant	verify::ApplyBudget::start, verify::ApplyBudget::extend, verify::ApplyBudget::drop, verify::helper_deadline	APPLY_DEADLINE behaves as a per-thread LIFO: start(l) sets it to Some(now + l) and returns a guard whose drop restores exactly the value it replaced (None outside any budget); extend(e) adds e iff it is Some and is a no-op otherwise; helper_deadline() = (b, true) if the deadline b < now + HELPER_TIMEOUT, else (now + HELPER_TIMEOUT, false).	src/verify.rs::the_budget_guard_restores_the_previous_deadline, src/verify.rs::extending_the_budget_pays_back_disk_time	thread_local Cell<Option<Instant>>, Drop, Instant arithmetic, a read of the clock	0,1,2,8
 helper-timeout-refusal	contract	verify::output_until, verify::output_bounded, verify::output_within, verify::timed_out, verify::mark_passing	output_until(cmd, what, bound): a spawn failure is Err(spawn_refusal); a child that exits before the deadline yields Ok(its collected output); a child still running at the deadline is stopped through stop_helper_before(child, now + HELPER_REAP) and the result is Err(bound's text). For output_bounded that text is timed_out(what, bound_by_budget) and for output_within it is mark_passing("{what} did not finish within {limit}s; treating as a failure"). ∀ what, b: passing(timed_out(what,b)) ∧ (b ⇒ it names "verification budget"); ∀ m: mark_passing(m) = m ++ " (" ++ PASSING_REFUSAL_KEY ++ ")".	src/verify.rs::a_helper_timeout_is_a_passing_refusal, src/verify.rs::a_check_helper_past_its_limit_is_killed_and_reported	process spawn (spawnfd::Command), try_wait polling loop with sleep and doubling backoff, FnOnce bound closure, Result<Output,String>	0,7,8,13
 io-error-passing-table	table-property	verify::io_error_is_passing, verify::spawn_refusal, verify::lock_wait_refusal	io_error_is_passing(e) ⇔ e.kind() ∈ {TimedOut, WouldBlock, OutOfMemory} ∨ e.raw_os_error() ∈ {EAGAIN, ENOMEM, EMFILE, ENFILE}. spawn_refusal(w,e) = m or mark_passing(m) with m = "spawn {w}: {e}", marked iff io_error_is_passing(e); lock_wait_refusal(w,e) likewise with m = "{w}: {e}". So ENOENT, EACCES, ENOLCK, EINVAL are never passing.	src/verify.rs::only_a_moment_s_io_errors_are_passing	io::Error kind and raw_os_error, libc constants, matches!, format!	0,1,3,8
@@ -272,69 +272,6 @@ sh-uninstall-and-ownership	contract	tools/install.sh::uninstall_everything, tool
 sh-argument-gate	contract	tools/install.sh::argument parsing, tools/install.sh::no_toolchain persistence, tools/install.sh::config path, tools/install.sh::toolset lane	--token and --no-token are unknown arguments refused at the gate with nothing written; -v/--version requires a three-component release value, else exit 2; the env twins of --no-toolchain/--no-path opt out only on "1", keep the half when unset, empty or "0", and refuse any other value; --no-toolchain persists [packages] auto_install = false by creating, appending on its own line or inserting under the header, never over a value the person set nor into a form it cannot edit safely; the config path is ${XDG_CONFIG_HOME:-~/.config}/… with an empty XDG_CONFIG_HOME treated as unset; a toolchain-only run whose `pkg seed` exits 75 runs one seed, no update after it, names the rerun and exits 0 without naming the holder.	tests/install_sh/options.rs::retired_token_flags_are_unknown_arguments, tests/install_sh/options.rs::the_version_flag_pins_a_three_component_release, tests/install_sh/options.rs::only_one_opts_out_through_an_env_twin, tests/install_sh/options.rs::no_toolchain_persists_its_exclusion_without_overwriting, tests/install_sh/options.rs::the_config_path_is_atpkgs, tests/install_sh/guard.rs::a_toolset_stand_down_is_not_a_failure	NOT RUST: bash	0,8
 sh-cargo-gate	contract	tools/install.sh::find_cargo_and_rustup, tools/install.sh::cargo_honours_pin, tools/install.sh::cargo_build_pinned, tools/install.sh::gate_shim_target	A source build runs only under a cargo proved to honour rust-toolchain.toml: the aterm-managed store's targo first (found by `aterm pkg which`, a shim on PATH followed only in the decided shape — one exec, last, absolute and quoted, #!/bin/sh, no here-document or continuation, under the size cap — or a store bin dir via current; trustc beside it required, else refused naming the product's repair); else rustup's proxy proved to dispatch to the file's pin (wins over a Homebrew cargo first on PATH; symlinked or case-changed checkouts and an ambient RUSTUP_TOOLCHAIN change nothing; dist channels follow rustup's grammar, custom names do not); a stock pin never takes the store lane; any other cargo is refused naming exactly one remedy for its case; with no toolchain in reach the one remedy is the product's when an aterm can run it, else rustup plus the Trust tarballs. The build then runs exactly the proved cargo (targo's explicit unverified lane, RUSTUP_TOOLCHAIN scrubbed, the proved rustc or store bin first on PATH for that one command, no ambient compiler steer).	tests/install_sh/source_build.rs::rustup_dist_channels_follow_rustups_grammar, tests/install_sh/source_build.rs::the_rustup_lane_takes_the_proxy_and_proves_the_pin, tests/install_sh/source_build.rs::a_cargo_that_cannot_honour_the_pin_is_refused_naming_its_remedy, tests/install_sh/source_build.rs::a_build_runs_under_exactly_what_the_proof_chose, tests/install_sh/source_build.rs::the_managed_store_lane_comes_first_and_builds_on_targos_explicit_lane, tests/install_sh/source_build.rs::a_shim_is_followed_to_its_last_lines_exec_only_in_the_decided_shape, tests/install_sh/source_build.rs::the_store_is_found_past_a_stray_targo_and_a_damaged_one_is_refused, tests/install_sh/source_build.rs::a_stock_pin_never_takes_the_store_lane, tests/install_sh/source_build.rs::with_no_toolchain_in_reach_the_one_remedy_depends_on_an_aterm	NOT RUST: bash over PATH resolution and stub toolchains	0,8
 ```
-
-### Distribution by kind (204)
-
-| kind | specs |
-|---|---|
-| contract | 162 |
-| refinement | 17 |
-| invariant | 7 |
-| round-trip | 6 |
-| equivalence | 5 |
-| table-property | 4 |
-| other | 3 |
-
-### Gap histogram (specs blocked by each gap)
-
-| gap | specs |
-|---|---|
-| 0 | 204 |
-| 1 | 131 |
-| 2 | 32 |
-| 3 | 44 |
-| 4 | 20 |
-| 5 | 26 |
-| 7 | 44 |
-| 8 | 129 |
-| 9 | 41 |
-| 10 | 23 |
-| 11 | 6 |
-| 12 | 33 |
-| 13 | 48 |
-
-No spec is blocked by gap 0 alone. The smallest blocking sets are `{0,1}`, `{0,2}` and `{0,3}` (§6).
-
-### Proof dependency order
-
-- **Shared lemmas first.** `commit-matches` is used by `identity-binding`, `installed-receipt`,
-  `publishable-stage-covers` and `ready-publishable`. `plist-key-binding` and `ready-publishable`
-  state one `manifest::xml_plist_string` law; prove it once in `plist-key-binding` and cite it.
-  `network-unreachable-classifier` comes before `unreachable-before-the-channel`. `refusal-taxonomy`
-  rests on `io-error-passing-table`, `helper-timeout-refusal` and `status-bounded-stderr`.
-- **Cadence.** `jitter-band` and `cadence-nominal-closed-form` come before `cadence-deferral-hold`.
-  Those three come before `cadence-delay-bounded-by-max-wait` and `deferral-self-wake`, and
-  `deferral-self-wake` also needs `checker-skip-window` and `skip-timer-scatter`.
-  `failure-log-policy` comes before `wake-grace-failure-routing`.
-- **Checker supervision.** `checker-word-pack-roundtrip` and `streak-log` come before
-  `checker-watch-generation-protocol`. That comes before `checker-phase-classifier` (for
-  `standing_stall`), `holder-beat-liveness`, `checker-supersede-exit`, `settings-miss-streak`,
-  `lane-busy-behind-retired-holder` and `checker-lock-ungate-rule`.
-- **Floors.** `floor-sources-step` comes before `floor-after`. That comes before
-  `floor-commit-transaction` and `floor-observe-and-withdraw`, and those come before
-  `stage-admission-gates`, `roster-freshness-refinement` and the Linux `lx-roster-ratchet`.
-- **Health.** `capped-error` and `health-failure-streak-transition` come before
-  `health-success-laws`, `health-apply-lane-laws` and `health-persistent-class`. Those come before
-  `announcer-tick`, then `announced-health-word` and `overdue-pending-announcement`.
-- **Failed marks.** `failed-mark-backoff-schedule` and `failed-mark-suppression` come before
-  `failed-mark-persistence` and `quarantine-ledger`. Those come before `stage-backoff-gate` and
-  `stage-failure-booking`.
-- **Linux trial.** `trial-start-rule`, `trial-judged-now` and `trial-lanes` come before
-  `trial-verdict-bounded`. All four come before `lx-trial-refines-pure-rule`,
-  `lx-session-defer` and `lx-rollback-target-inheritance`. `linux-announcer-tick` comes before
-  `lx-outcome-booking`.
-- **Relaunch.** `relaunch-strip-pins` comes before `relaunch-window-successor`,
-  `relaunch-running-successor` and `reexec-command-shape`.
 
 ## 2. Test → spec map (TSV)
 
@@ -786,25 +723,7 @@ tests/install_sh/source_build.rs	a_stock_pin_never_takes_the_store_lane	sh-cargo
 tests/install_sh/source_build.rs	with_no_toolchain_in_reach_the_one_remedy_depends_on_an_aterm	sh-cargo-gate	
 ```
 
-## 3. Coverage
-
-- 546 of 555 tests are samples of a spec in §1, and 9 were deleted (§4; `zz_helper_entry` converted to a non-`#[test]` stage helper).
-  No test is unaccounted for.
-- 485 of the 546 are Rust tests that a proved spec can retire. The other 61 are the
-  `tests/install_sh` tests of the `sh-*` specs, which wait on the new shell gap described in §0.
-- The tests with the most weight on one spec are
-  `install_tests::native_update_disk_transaction_model_conforms_to_real_swap_recovery_and_health_guards`
-  (`disk-transaction-refinement`), `lib::status_reconciliation_exhaustively_refines_the_model` (32
-  cases, `status-reconciliation`) and the 12 Linux trial scenarios behind `lx-trial-refines-pure-rule`.
-  Each of these is a conformance test, so its spec needs gap 10, not just the pure lanes.
-
 ## 4. Tests that are not spec samples (0 left)
-
-> Status 2026-10-16: deleted the_healthy_note_says_how_often_and_nothing_about_how, roster_freshness_shipping_anchors_are_linked, status_reconciliation_shipping_anchor_is_linked, a_rollback_source_refusal_names_the_remedy, a_killed_end_is_worded_by_what_is_missing_not_by_a_handler_that_ran and failed_mark_suppression_shipping_anchors_are_linked. The other rows are still open.
-
-> Status 2026-10-17: two more are deleted (`an_unreadable_channel_is_loud_and_actionable_not_idle` and `the_notification_names_the_consequence_and_the_next_step`), and the rows of all eight are gone. `the_lifeline_flag_is_the_one_the_instance_parses` went on 2026-10-17 too: `LIFELINE_FLAG` is `aterm_uds::lifeline::FLAG` on unix, so the two cannot differ.
-
-> Status 2026-10-28: converted `src/exec_plain.rs::zz_helper_entry` into a non-`#[test]` stage entry helper called from `a_failed_plain_exec_leaves_sigpipe_ignored_where_command_exec_does_not`; 0 non-spec tests remain.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -852,52 +771,3 @@ tests/install_sh/source_build.rs	with_no_toolchain_in_reach_the_one_remedy_depen
    lane or audit gap row covers that (§0). The differential ones (grammar, linux_verify) are
    cross-language equivalences against aterm-update-core. They cannot be migrated as the plan
    defines until the new gap exists.
-
-## 6. Proof order (easiest high-value first)
-
-Dependencies:
-
-- **Shared lemmas.** `commit-matches` is used by `identity-binding`, `installed-receipt`,
-  `publishable-stage-covers` and `ready-publishable`. `plist-key-binding` and `ready-publishable`
-  state one `manifest::xml_plist_string` law; prove it once in `plist-key-binding` and cite it.
-  `network-unreachable-classifier` comes before `unreachable-before-the-channel`. `refusal-taxonomy`
-  rests on `io-error-passing-table`, `helper-timeout-refusal` and `status-bounded-stderr`.
-- **Cadence.** `jitter-band` and `cadence-nominal-closed-form` come before `cadence-deferral-hold`.
-  Those three come before `cadence-delay-bounded-by-max-wait` and `deferral-self-wake`, which also
-  needs `checker-skip-window` and `skip-timer-scatter`. `failure-log-policy` comes before
-  `wake-grace-failure-routing`.
-- **Checker supervision.** `checker-word-pack-roundtrip` and `streak-log` come before
-  `checker-watch-generation-protocol`, which comes before `checker-phase-classifier` (for
-  `standing_stall`), `holder-beat-liveness`, `checker-supersede-exit`, `settings-miss-streak`,
-  `lane-busy-behind-retired-holder` and `checker-lock-ungate-rule`.
-- **Floors.** `floor-sources-step`, then `floor-after`, then `floor-commit-transaction` and
-  `floor-observe-and-withdraw`, then `stage-admission-gates`, `roster-freshness-refinement` and the
-  Linux `lx-roster-ratchet`.
-- **Health.** `capped-error` and `health-failure-streak-transition` come before
-  `health-success-laws`, `health-apply-lane-laws` and `health-persistent-class`, then
-  `announcer-tick`, then `announced-health-word` and `overdue-pending-announcement`.
-- **Failed marks.** `failed-mark-backoff-schedule` and `failed-mark-suppression` come before
-  `failed-mark-persistence` and `quarantine-ledger`, then `stage-backoff-gate` and
-  `stage-failure-booking`.
-- **Linux trial.** `trial-start-rule`, `trial-judged-now` and `trial-lanes` come before
-  `trial-verdict-bounded`; all four come before `lx-trial-refines-pure-rule`, `lx-session-defer` and
-  `lx-rollback-target-inheritance`. `linux-announcer-tick` comes before `lx-outcome-booking`.
-- **Relaunch.** `relaunch-strip-pins` comes before `relaunch-window-successor`,
-  `relaunch-running-successor` and `reexec-command-shape`.
-
-No spec is blocked by gap 0 alone, so the order takes the smallest blocking sets first:
-
-1. **Gap 3 only.** `checker-word-pack-roundtrip` (u64 shifts and masks plus a `const fn` enum match;
-   the base lemma of the checker-watch protocol) and `skip-timer-scatter` (a saturating add and a
-   division).
-2. **Gap 1 only, near-scalar carriers.** `boot-health-lane` (bool and u32 to a two-arm enum),
-   `roster-authority-superseded` (`Option<u64>`) and `lx-check-cooldown` (two string inequalities
-   and an i64 compare): the first cases for gap 1's enum and `Option` carriers.
-3. **Gaps {1,3}.** `jitter-band`, `wake-gap-threshold`, `launch-burst`, `checker-phase-classifier`,
-   `failed-mark-backoff-schedule`, `trial-judged-now`, `span-words` and `posture-remedy-table`.
-   Then `trial-start-rule` (gaps 3, 10, 11), the pure core of `trial-verdict-bounded` and
-   `lx-trial-refines-pure-rule`.
-4. **Gap 2.** `streak-log` (with gap 3) and `strand-notice-latch`: the smallest `&mut self` machines.
-5. **Large retirements.** `cadence-nominal-closed-form` (gaps 1, 2, 3, 5) and
-   `failed-mark-suppression` (gaps 1, 3, 10), then `zip-extraction-claim`: once `zip_claim_of_bytes`
-   is factored out, it is a pure byte-slice parser blocked by gaps 1, 3, 5 and 7.

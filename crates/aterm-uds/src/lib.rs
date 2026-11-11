@@ -58,6 +58,39 @@ pub fn connect_tcp(
     std::net::TcpStream::connect_timeout(addr, timeout)
 }
 
+/// Connect with an owned caller's stop. On Unix, every pending socket and broker exchange
+/// waits beside the stop bell; cancellation closes its local owned descriptors. Elsewhere
+/// the existing bounded connect is checked before and after, without instantaneous cancellation.
+/// # Errors
+/// As [`connect_tcp`], or `Interrupted` when the stop is set.
+pub fn connect_tcp_stopped(
+    addr: &std::net::SocketAddr,
+    timeout: std::time::Duration,
+    stop: &stop::Stop,
+) -> std::io::Result<std::net::TcpStream> {
+    #[cfg(unix)]
+    {
+        connect::tcp_within_stopped(addr, timeout, stop)
+    }
+    #[cfg(not(unix))]
+    {
+        let check = || {
+            if stop.is_set() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "socket preparation cancelled",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        let connected = connect_tcp(addr, timeout);
+        check()?;
+        connected
+    }
+}
+
 /// Request that a supporting kernel exclude a socket from forked children (`FD_CLOFORK`).
 ///
 /// [`kept_out`] makes this request before a concurrent spawn can copy the descriptor table.

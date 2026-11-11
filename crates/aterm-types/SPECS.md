@@ -77,7 +77,7 @@ Shell model (`src/rust_lane.rs`)
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (count; the tests are in §2),
 `rust_features` (what the proof must handle), `blocking_gaps`: rows of the gap table in §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap 0 (the installed seal publishes no
+`docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (the installed seal publishes no
 Clean-discharged row) blocks every spec and is left out of the column; no spec is blocked by it
 alone. The rows use: 1 non-scalar carriers (`&str`/`String`/`Vec`/`Option`/enums/structs);
 2 certified `&self`/`&mut self` views and two-state `x'`; 3 E6 body widening (calls, casts, shifts,
@@ -481,11 +481,6 @@ src/xterm_keyboard.rs	test_default_matches_new_and_reset	xtk-state-machine	xtk-q
 src/macos_setup.rs	access_record_the_latest_of_any_revision_reads_every_revision_and_skips_unknown_lines	access-record-any-revision	
 ```
 
-## 3. Coverage
-
-- §2 maps 243 spec-sample test rows across the §1 specs (the crate currently holds 529 `#[test]`
-  functions); 0 non-spec tests remain after the 2026-10-15 retirement pass.
-
 ## 4. Tests that are not spec samples
 
 Status 2026-10-15: all 18 rows (including `src/scheme.rs::builtin_palette_values_are_canonical` and the now-empty test module in `src/paragraph_direction.rs`) are deleted; 0 non-spec tests remain. No test here is a regression
@@ -530,32 +525,3 @@ of a removed bug with no general property: every regression test found is an ins
 11. **Resolved — `KittyKeyboardStackEntry::VALID_BIT` removed.** `KittyKeyboardState` now stores
     `[KittyKeyboardFlags; 8]` directly in `main_stack` and `alt_stack` (and masks deserialized
     snapshot flags in `restore_snapshot`), making the stack abstraction exact (`entry = flags`).
-
-## 6. Proof order (easiest high-value first)
-
-The order starts with the specs blocked only by gap 3 and moves outward one gap at a time.
-
-1. **`fs-dir-safe-predicate`** (gap 3). `owner_uid == uid && mode & 0o022 == 0`: two scalar compares and one
-   bitwise and. It is the security decision under `ensure_private_dir`, retires 3 tests, and is the
-   pure core the plan wants factored out before the effectful `fs-ensure-private-dir` (gap 8).
-2. **`sel-linear` and `sel-block`** (gap 3). Scalar `i32`/`usize` comparisons, an if/else-if chain and
-   `min`/`max`. They retire 6 tests between them (plus the shared `containment_matches_the_normalized_shapes`),
-   under the normalized-anchor `requires` documented in §5.5.
-3. **`kb-wire-values`, `kb-mode-accessors`, `kb-mode-bit-layout`** (gap 3). u8 arithmetic and `contains`
-   on bitflags. They retire 7 tests and are the lemmas every keyboard encoder spec composes (modifier
-   parameter, modifyOtherKeys level, the 16-bit mode space of §5.1).
-4. **`mouse-button-codes`, `mouse-button-slot-injective`** (gap 3). Enum→u8 matches, decidable by
-   evaluation.
-5. The scalar specs that add only gap 1 for an enum/`Option` result: `cursor-style-from-param`,
-   `wheel-vertical-sense`, `sel-glyph-span`, `sel-side-total-order`, `vt-decscl-roundtrip`, `mouse-x10`,
-   `duration-to-nanos`, `kb-kitty-code-table`, `kb-termmode-projection`; then `palette-default-table`
-   (gaps 3, 7: a const loop) and the kitty flag specs (`kitty-flags-mask-accessors`,
-   `kitty-flags-apply`), then the `&mut self` state machines once gap 2 lands (`xtk-state-machine`,
-   `kitty-state-new-reset`, `kitty-switch-screen`, `palette-mutators`, `shell-block-*`).
-6. String and table specs after gap 1 (the `cs-*`, `cv-*`, `fab-*`, `app-*`, `x11-*`, `color-spec-*`,
-   `font-*`, `rfc3339-*`, `scheme-*` families), then the keyboard encoder (`kb-legacy-*`, `kb-kitty-*`,
-   `kb-xterm-mok`, `kb-win32-records`; gaps 1, 3, 4, 5, 7), then `rl-command-position-verdict`
-   (gap 10, a Clean model of POSIX command positions).
-7. Last: the float specs (`luminance-*`, `contrast-*`, `gray-aa-threshold`; gap 6 plus a pow model) and
-   the effectful ones (gap 8: `dev-seam-reads-env`, `fs-ensure-private-dir`, `mutex-lock-or-recover`,
-   `build-stamp-first-install-wins`, and the shells of the `dirs-*` resolvers).

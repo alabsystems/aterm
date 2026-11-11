@@ -138,7 +138,6 @@ impl ApprovalCtx {
         ctx.bypass_mode = facts.bypass;
         ctx.approve = config.approve;
         ctx.answer_questions = config.answer_questions;
-        ctx.model_fallback = config.model_fallback.is_some();
         ctx.limit_wait = config.limit_wait;
         ctx.autocompact_offer = config.autocompact_offer;
         ctx.limit_reset = config.limit_reset && !facts.limit_reset_passed;

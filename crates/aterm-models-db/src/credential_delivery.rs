@@ -31,9 +31,5 @@ pub fn credential_delivery_model() -> Model {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn every_delivery_guard_has_a_failing_mutant() {
-        aterm_spec::interp::prove_and_catch(&super::credential_delivery_model());
-    }
-}
+#[path = "credential_delivery_tests.rs"]
+mod tests;

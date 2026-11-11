@@ -53,32 +53,42 @@ pub(crate) enum TurnBy {
     Bridge,
     /// An edge-scoped connection (`by=<sid>`): the session its token was granted to, read from the target's edge table.
     Sid(String),
+    /// An authenticated remote drive, as the whole `fleet:<host>` actor token.
+    Fleet(String),
     /// Not attributable (`by=-`): no caller can be named — a record carried from a build before the field, an edge whose grant is gone.
     #[default]
     Unknown,
 }
 
 impl TurnBy {
-    /// The stable wire word (`harness|ctl|bridge|<sid>|-`).
+    /// The stable wire word (`harness|ctl|bridge|<sid>|fleet:<host>|-`).
     #[must_use]
     pub(crate) const fn as_wire(&self) -> &str {
         match self {
             TurnBy::Harness => "harness",
             TurnBy::Ctl => "ctl",
             TurnBy::Bridge => "bridge",
-            TurnBy::Sid(sid) => sid.as_str(),
+            TurnBy::Sid(sid) | TurnBy::Fleet(sid) => sid.as_str(),
             TurnBy::Unknown => "-",
         }
     }
 
     /// A carried record's word as this build names it: one of its own words, a sid of the shape
-    /// this build mints, else [`TurnBy::Unknown`].
+    /// this build mints, or a valid fleet actor token, else [`TurnBy::Unknown`].
     #[must_use]
     pub(crate) fn from_wire(word: &str) -> Self {
         match word {
             "harness" => TurnBy::Harness,
             "ctl" => TurnBy::Ctl,
             "bridge" => TurnBy::Bridge,
+            token
+                if matches!(
+                    aterm_slog::Actor::from_word(token),
+                    aterm_slog::Actor::Fleet(_)
+                ) =>
+            {
+                TurnBy::Fleet(token.to_string())
+            }
             sid if crate::keeper_link::valid_sid(sid) => TurnBy::Sid(sid.to_string()),
             _ => TurnBy::Unknown,
         }
@@ -429,11 +439,22 @@ mod tests {
             TurnBy::Ctl,
             TurnBy::Bridge,
             TurnBy::Sid(sid.as_str().to_string()),
+            TurnBy::Fleet("fleet:m72".to_string()),
             TurnBy::Unknown,
         ] {
             assert_eq!(TurnBy::from_wire(by.as_wire()), by, "{by:?}");
         }
-        for word in ["", "fleet", "human", "Harness", "s-", "s-xyz", "s-1 text=x"] {
+        for word in [
+            "",
+            "fleet",
+            "fleet:",
+            "fleet:m72 text=x",
+            "human",
+            "Harness",
+            "s-",
+            "s-xyz",
+            "s-1 text=x",
+        ] {
             assert_eq!(TurnBy::from_wire(word), TurnBy::Unknown, "{word:?}");
         }
         assert_eq!(TurnBy::default(), TurnBy::Unknown);

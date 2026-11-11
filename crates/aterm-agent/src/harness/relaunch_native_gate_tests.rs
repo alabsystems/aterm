@@ -31,8 +31,6 @@ fn options(world: &Path) -> Opts {
         background: false,
         aterm_state: None,
         ask: false,
-        several_logins: false,
-        usage_credits: false,
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
@@ -2184,7 +2182,6 @@ fn a_cold_line_past_the_twin_commands_the_build_it_types() {
         agent: std::process::id(),
         argv: &argv,
         exe: &twin,
-        model: None,
         mode: None,
         home: None,
         homedir: None,
@@ -2193,7 +2190,6 @@ fn a_cold_line_past_the_twin_commands_the_build_it_types() {
         serve: Serve::Judge,
         auth_observed: true,
         launch_env: None,
-        billing: ModelBilling::Keep,
     };
     let intent = || ColdIntent {
         login: None,

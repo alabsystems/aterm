@@ -395,15 +395,20 @@ pub fn test_looks_observed() -> usize {
 /// every currency, context and peer check the batch makes judges the vault as its admission did:
 /// each writer of the files the state lock guards takes it exclusively, so none of them changes
 /// within the batch, and what changes without it (the device age identity and claim, under the
-/// Commons custody locks; the fold mark, under none) is seen at the next admission, as the
+/// Commons custody locks; the fold mark, under none; any other file the custody pins, which its
+/// digests judge through the look as it first saw it) is seen at the next admission, as the
 /// admission's look already saw them once. As the batch decodes a record and probes the history
 /// it needs, the record's history and its key judge through it too: the lease of the log's
 /// history, its membership check and its read of the log (`Bootstrap::historicals_in`,
 /// `Bootstrap::holds_histories_in`), and the key's check as the batch takes it
 /// (`Historical::with_key_in`); a handoff a basis falls back to opens on its own calls, as it did.
-/// Custody digests, a store read batch's
-/// opening and closing fences (`Session::read_context`) and its closing check of the keys it
-/// reused (`ReadBatch::revalidate`) read afresh. A write batch's look observes the lock beside its
+/// Each store open's and store read batch's source read of the vault is the batch's own, which
+/// the look stands on, its
+/// custody judged through the look (`Bootstrap::local_source_read_in`): the lock file and the
+/// vault's folder are judged as the batch's source read found them. A store read batch's opening and
+/// closing fences (`Session::read_context`), its closing check of the custody
+/// (`Bootstrap::revalidate_custody`) and its closing check of the keys it reused
+/// (`ReadBatch::revalidate`) read afresh. A write batch's look observes the lock beside its
 /// source reads and ends before the batch runs, whose checks each observe the vault again.
 pub struct VaultLook<'a> {
     paths: &'a Paths,
@@ -445,6 +450,16 @@ impl<'a> VaultLook<'a> {
         self.paths
     }
 
+    /// Check that this look still retains the state lock at its current path.
+    /// This rechecks the filesystem rather than the look's memo and acquires
+    /// no replacement lock. Custody alone authenticates no data or membership.
+    #[must_use]
+    pub fn guards_source(&self) -> bool {
+        self.observation
+            .as_ref()
+            .is_some_and(|observation| observation.lock().observes(self.paths))
+    }
+
     /// The shared observation of the state lock this look holds, while it guards the lock at the
     /// vault's path as the look first saw that path ([`StateLock::observes_in`], through its
     /// glance), and the look at each file it takes: what a read under its caller's observation
@@ -464,7 +479,8 @@ impl<'a> VaultLook<'a> {
     }
 
     /// [`observe_commons_quiet`] through this look: a table session's check of its custody at its
-    /// open (`Bootstrap::revalidate_custody_in`).
+    /// open, and at each store open and store read batch of a read batch that keeps the look
+    /// (`Bootstrap::revalidate_custody_in`).
     ///
     /// # Errors
     /// As [`observe_commons`](super::observe_commons).

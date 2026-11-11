@@ -22,7 +22,7 @@ pub enum EntryRead {
 pub struct EntryReader<'a> {
     paths: &'a Paths,
     observation: &'a StateLock,
-    version: EntryVersion,
+    version: VaultVersion,
 }
 
 impl std::fmt::Debug for EntryReader<'_> {
@@ -31,18 +31,9 @@ impl std::fmt::Debug for EntryReader<'_> {
     }
 }
 
-fn same_vault(left: &EntryVersion, right: &EntryVersion) -> bool {
-    left.config == right.config
-        && left.recipient == right.recipient
-        && left.seq == right.seq
-        && left.envelope == right.envelope
-        && left.log_ids == right.log_ids
-        && left.mailbox_stamp == right.mailbox_stamp
-}
-
 impl EntryReader<'_> {
     /// Read an ordinary candidate under the same authenticated vault version
-    /// as the admitted entry, without acquiring another vault-state lock or fetching data.
+    /// that established this reader, without acquiring another vault-state lock or fetching data.
     /// `Absent` means absent from this recipient's verified view, not absent
     /// for every recipient. An unavailable result must not enable a fallback.
     ///
@@ -68,9 +59,9 @@ impl EntryReader<'_> {
             return Ok(EntryRead::Unavailable);
         };
         #[cfg(test)]
-        let same = MUTANT.get() == 4 || same_vault(&version, &self.version);
+        let same = MUTANT.get() == 4 || version.vault == self.version;
         #[cfg(not(test))]
-        let same = same_vault(&version, &self.version);
+        let same = version.vault == self.version;
         if !same {
             return Ok(EntryRead::Unavailable);
         }
@@ -82,6 +73,87 @@ impl EntryReader<'_> {
             None => EntryRead::Absent(Box::new(version)),
         })
     }
+}
+
+impl VaultLook<'_> {
+    /// Authenticate an ordinary entry reader without requiring a selected
+    /// entry. A valid view with no entries can therefore support an all-absent
+    /// decision. Unconfigured, incomplete or denied state does not enter the
+    /// callback. This acquires no additional vault-state lock.
+    /// Each candidate's materialization is checked by `EntryReader::observe`.
+    ///
+    /// Acquire the application writer before this look. The callback must read
+    /// every candidate relevant to its decision and compare those facts with
+    /// its prepared plan before persisting one bounded local intent. Do not
+    /// reenter the vault, acquire another writer or use the network inside it.
+    /// The caller retains the look after return, error or unwind; replay and
+    /// dispatch follow custody release. This grants neither native catalog
+    /// absence nor provider, budget or shared-table writing authority.
+    ///
+    /// # Errors
+    /// The configured local source cannot be safely read or authenticated.
+    /// A callback's durable effects remain its own.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbEntryView",
+            action = "Case",
+            reason = "The environment chooses candidate, custody and authentication state."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbEntryView",
+            action = "Read",
+            project = "aterm_secrets::client::entry::read_context::view_tests::transition"
+        )
+    )]
+    pub fn with_entry_reader<T>(
+        &self,
+        paths: &Paths,
+        expected: &Config,
+        admit: impl FnOnce(&EntryReader<'_>) -> T,
+    ) -> crate::Result<EntryAdmission<T>> {
+        if expected.signer.is_none() {
+            return Ok(EntryAdmission::Unavailable);
+        }
+        let Some((observation, _)) = self.held_at(paths) else {
+            #[cfg(test)]
+            if VIEW_MUTANT.get() == 2
+                && let StateObservation::Held(lock) = StateLock::observe_classified(paths)?
+            {
+                return read_view_borrowed(paths, expected, &lock, admit);
+            }
+            return Ok(EntryAdmission::Unavailable);
+        };
+        #[cfg(test)]
+        let current = VIEW_MUTANT.get() == 1 || observation.observes(paths);
+        #[cfg(not(test))]
+        let current = observation.observes(paths);
+        if !current {
+            return Ok(EntryAdmission::Unavailable);
+        }
+        read_view_borrowed(paths, expected, observation, admit)
+    }
+}
+
+fn read_view_borrowed<T>(
+    paths: &Paths,
+    expected: &Config,
+    observation: &StateLock,
+    admit: impl FnOnce(&EntryReader<'_>) -> T,
+) -> crate::Result<EntryAdmission<T>> {
+    let version = match view::read(paths, expected, view::Request::View, observation)? {
+        Some(view) => view.version,
+        None => return Ok(EntryAdmission::Unavailable),
+    };
+    let reader = EntryReader {
+        paths,
+        observation,
+        version,
+    };
+    Ok(EntryAdmission::Accepted(admit(&reader)))
 }
 
 impl EntrySnapshot {
@@ -170,7 +242,7 @@ impl EntrySnapshot {
         let reader = EntryReader {
             paths,
             observation,
-            version: entry.snapshot.version(),
+            version: entry.snapshot.version().vault,
         };
         Ok(EntryAdmission::Accepted(admit(&entry, &reader)))
     }
@@ -179,7 +251,10 @@ impl EntrySnapshot {
 #[cfg(test)]
 std::thread_local! {
     static MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static VIEW_MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod view_tests;

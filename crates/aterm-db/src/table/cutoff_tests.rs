@@ -368,7 +368,10 @@ fn the_removal_entry_point_cuts_each_held_table_once() {
         .open_store(&session, directory.catalog_scope())
         .unwrap();
     assert_eq!(
-        store::cut_removed_writer(&table.lab.paths[0], &m2, CutPass::BeforeRemove),
+        aterm_uds::file_lock::with_lock_wait_observer(
+            |_| panic!("a removal must retain its frontier without waiting for the writer"),
+            || store::cut_removed_writer(&table.lab.paths[0], &m2, CutPass::BeforeRemove),
+        ),
         0,
         "another local writer holds the journal and the catalog"
     );

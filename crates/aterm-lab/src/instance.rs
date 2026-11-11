@@ -779,7 +779,7 @@ impl Reply {
 }
 
 /// A terminal's explicit selector from the instance-local roster.
-fn terminal_selector(roster: &str) -> Option<String> {
+pub(crate) fn terminal_selector(roster: &str) -> Option<String> {
     roster
         .lines()
         .filter_map(|line| {

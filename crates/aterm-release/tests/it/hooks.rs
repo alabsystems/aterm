@@ -595,10 +595,10 @@ fn superproject(root: &Path, git: &Git, astream: &Path) -> (PathBuf, String) {
 fn export_fixture(export: &Path) -> String {
     let repo = aterm_tempfile::manifest_dir().join("../..");
     for f in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
-        std::fs::copy(repo.join(f), export.join(f)).unwrap();
+        aterm_tempfile::copy_to_new_file(repo.join(f), export.join(f)).unwrap();
     }
     std::fs::create_dir_all(export.join("crates/atpkg-publish/src/artifact")).unwrap();
-    std::fs::copy(
+    aterm_tempfile::copy_to_new_file(
         repo.join("crates/atpkg-publish/src/artifact/relocate.rs"),
         export.join("crates/atpkg-publish/src/artifact/relocate.rs"),
     )

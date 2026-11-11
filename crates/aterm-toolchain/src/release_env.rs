@@ -47,23 +47,5 @@ pub fn launcher_env(name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn overrides_go_but_locations_and_inert_diagnostics_stay() {
-        for key in [
-            "RUSTFLAGS",
-            "CARGO_TARGET_DIR",
-            "SDKROOT",
-            "TARGET_CC_arm64",
-            "CARGO_PROFILE_TEST_DEBUG",
-        ] {
-            assert!(clears(key), "{key}");
-        }
-        for key in ["HOME", "PATH", "RUST_BACKTRACE", "CARGO_TERM_COLOR"] {
-            assert!(!clears(key), "{key}");
-        }
-        assert!(launcher_env("TARGO_MANIFEST_DIR"));
-        assert!(!launcher_env("PATH"));
-    }
-}
+#[path = "release_env_tests.rs"]
+mod tests;

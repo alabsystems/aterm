@@ -662,7 +662,7 @@ fn write_record(record: &Path, entries: &BTreeMap<String, Failures>) {
         .iter()
         .map(|(digest, f)| format!("v1 {digest} {} {}\n", f.count, f.last))
         .collect();
-    let _ = super::upgrade_models::write_atomic_mode(record, &text, Some(0o600));
+    let _ = super::atomic_write::write_atomic_mode(record, &text, Some(0o600));
 }
 
 /// Until when (unix seconds) `login` is not tried on `source` ([`login_source`]), where its
@@ -1380,7 +1380,7 @@ pub fn run_import(
     };
     if plan.changed
         && !dry_run
-        && let Err(e) = super::upgrade_models::write_atomic_mode(&target, &plan.text, Some(0o600))
+        && let Err(e) = super::atomic_write::write_atomic_mode(&target, &plan.text, Some(0o600))
     {
         let _ = writeln!(
             err,

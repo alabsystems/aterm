@@ -12,7 +12,7 @@ Each row is a property its cited tests sample, stated so that a Trust/Clean proo
 compiled Rust function can retire those tests. Test paths under `../../vendor/astream/` are
 astream-digest's.
 
-Gap numbers refer to the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+Gap numbers refer to the gap table in `docs/TRUST-LANE.md` (Blocking gaps).
 Gap 0 (a seal that publishes Clean-discharged rows) blocks every spec, so every row lists it.
 
 ## 0. Notation used in the statements
@@ -36,7 +36,7 @@ Gap 0 (a seal that publishes Clean-discharged rows) blocks every spec, so every 
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary in §2),
 `difficulty` (Rust features the proof must handle), `blocking_gaps` (rows of §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`; gap 0, a seal that publishes Clean-discharged
+`docs/TRUST-LANE.md` (Blocking gaps); gap 0, a seal that publishes Clean-discharged
 rows, blocks every row).
 
 ```tsv
@@ -72,13 +72,6 @@ file	test	primary	also
 ../../vendor/astream/crates/astream-digest/tests/lengths_and_splits.rs	every_length_to_1024_is_the_recorded_answer	sha256-digest-refines-fips	sha256-streaming-equals-one-shot
 ```
 
-## 3. Coverage
-
-- `aterm-digest` itself is a pure re-export facade (0 local `#[test]` functions); 15 SHA-256 tests in
-  `vendor/astream/crates/astream-digest` map to the 6 rows above (`sha256-digest-refines-fips`
-  retires 7), plus the 2 tests in §4. `astream-digest`'s HMAC, HKDF, and `ct_eq` tests are mapped in
-  `vendor/astream/crates/astream-digest/SPECS.md`.
-
 ## 4. Tests that are not spec samples
 
 - `the_digest_still_evaluates_at_compile_time` pins that `update_slice`, `compress` and
@@ -106,22 +99,3 @@ file	test	primary	also
    takes `len * 8` with `wrapping_mul`, so messages ≥ 2^61 bytes silently diverge from FIPS. The
    `len` field's doc states the bound; no `requires` does. Add one (a ghost precondition on the
    abstraction) when the specs land.
-
-## 6. Proof order (easiest, high value first)
-
-No spec is blocked by gap 0 alone, so the order goes by fewest and smallest gaps, then by tests
-retired and by what each spec unlocks. `sha256-compress-refines-fips` is the one leaf the other
-`sha256-*` rows build on; `opaque-debug` is independent.
-
-1. **`sha256-compress-refines-fips`** (0,1,2,3,7,14). Fixed-size arrays, fixed-bound loops, no
-   heap and no data-dependent control flow: the best first target for gap 7 on bit-vector code.
-   It retires 1 test, and every other `sha256-*` row, and astream-digest's HMAC rows, build on it.
-2. **`sha256-finalize-pads`** (0,1,2,3,4,7). One branch and two `compress` calls (the first use
-   of gap 4). It retires `the_length_field_is_64_bits_wide`.
-3. **`sha256-state-invariant`** (0,1,2,3,4,5,7,11), then **`sha256-digest-refines-fips`** and
-   **`sha256-streaming-equals-one-shot`** as near-free corollaries. Together they retire 12
-   tests, including the 10^6-byte vector and the 100,000-byte sweep. `update_slice` and
-   `digest_slice` take a plain `&[u8]`, so gap 11 reaches only the `AsRef` wrappers `update` and
-   `digest`.
-4. **`opaque-debug`** (0,1,2,3,4,11). It is small once `Formatter` is modelled. Writing the impl
-   as `f.write_str("Sha256 { .. }")` drops the `debug_struct` model from the gap.

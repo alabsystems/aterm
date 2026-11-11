@@ -259,7 +259,11 @@ pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Inpu
         };
         if onto == main
             && nodes.get(parent).is_some_and(|c| c.tree == checked.tree)
-            && crate::land::receipt_composition(root, path, parent, onto, &commit.tree)?
+            // Historical receipts can predate the current entry grammar. Failure to
+            // establish composition grants no coverage; the ordinary source checks
+            // still judge these commits rather than being blocked by old evidence.
+            && crate::land::receipt_composition(root, path, parent, onto, &commit.tree)
+                .unwrap_or(false)
         {
             composed.insert(id.clone());
         }
@@ -357,7 +361,10 @@ fn judge_with_inputs(
         tools,
     )
     .with_quiet(Some(aterm_capacity::Admit::Now))
-    .with_halt(crate::halt_of(false, true))
+    .with_halt(crate::halt_of(&crate::cli::Args {
+        fail_fast: true,
+        ..crate::cli::Args::default()
+    }))
     .with_events(events)
     .with_memory(crate::memory::Book::live());
     ctx.input_paths = Some(input.paths.clone());
@@ -839,6 +846,66 @@ mod tests {
         let input = r.input(&base);
         assert_eq!(input.commits, [evil]);
         assert_eq!(input.paths, ["fix"]);
+    }
+
+    #[test]
+    fn semantic_changelog_result_cannot_borrow_its_parents_judgment() {
+        let r = Repo::new();
+        let notes = "## [Unreleased]\n\n### Fixed\n\n- Old claim.\n";
+        r.write("CHANGELOG.md", notes);
+        let base = r.commit("base notes");
+        r.write(
+            "CHANGELOG.md",
+            &notes.replace("Old claim.", "Corrected claim."),
+        );
+        let branch = r.commit("checked correction");
+        let mut receipt = Stated::of_trailers(&r.receipt(&base)).unwrap();
+        r.git(&["checkout", "--detach", &base]);
+        r.write("CHANGELOG.md", &format!("{notes}\n- Main addition.\n"));
+        let main = r.commit("main addition");
+        // Combine both entry edits without judging the resulting tree.
+        r.write(
+            "CHANGELOG.md",
+            &format!(
+                "{}\n- Main addition.\n",
+                notes.replace("Old claim.", "Corrected claim.")
+            ),
+        );
+        r.git(&["add", "."]);
+        let tree = r.git(&["write-tree"]);
+        receipt.composed_onto = Some(main.clone());
+        let landing = r.landing(&tree, &branch, &main, &receipt);
+        let input = r.input(&base);
+        assert!(input.commits.contains(&landing));
+        assert_eq!(input.paths, ["CHANGELOG.md"]);
+        // Actual judgment of this tree changes the verdict.
+        receipt.checked[0].tree = tree.clone();
+        r.landing(&tree, &branch, &main, &receipt);
+        assert!(r.input(&base).paths.is_empty());
+    }
+
+    #[test]
+    fn historical_changelog_ambiguity_owes_checks_instead_of_aborting_discovery() {
+        let r = Repo::new();
+        let notes = "## [Unreleased]\n\n### Fixed\n\n- First.\n\n### Fixed\n\n- Second.\n";
+        r.write("CHANGELOG.md", notes);
+        let base = r.commit("old repeated subsections");
+        r.write("branch", "checked\n");
+        let branch = r.commit("branch");
+        let mut receipt = Stated::of_trailers(&r.receipt(&base)).unwrap();
+        r.git(&["checkout", "--detach", &base]);
+        r.write("CHANGELOG.md", &notes.replace("Second.", "Main's change."));
+        let main = r.commit("main");
+        r.git(&["checkout", "--detach", &branch]);
+        r.git(&["merge", "--no-ff", "-m", "historical merge", &main]);
+        let tree = r.git(&["rev-parse", "HEAD^{tree}"]);
+        receipt.composed_onto = Some(main.clone());
+        let landing = r.landing(&tree, &branch, &main, &receipt);
+        // New rules cannot establish this old receipt. It grants no credit, but the
+        // ordinary source readers must still be able to judge the candidate.
+        let input = r.input(&base);
+        assert!(input.commits.contains(&landing));
+        assert_eq!(input.paths, ["CHANGELOG.md", "branch"]);
     }
 
     /// A composed landing carries only the checked branch's delta. Main that arrived while

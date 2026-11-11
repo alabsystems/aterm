@@ -528,7 +528,7 @@ impl Launch {
         let managed = bytes.starts_with(b"#!/bin/sh\n# atpkg shim ")
             || (managed_name
                 && (bytes.starts_with(b"#!") || exe.extension().is_some_and(|ext| ext == "cmd")));
-        let named = text.and_then(super::upgrade_catalog::twin_binary);
+        let named = text.and_then(super::twin::twin_binary);
         #[cfg(unix)]
         if managed || named.is_some() {
             let current =

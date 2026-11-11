@@ -12,13 +12,14 @@
 //! runtime (a window, a session lane, `aterm node serve`), never in a short command, and is
 //! marked done only once every note is in the spool. The flusher's holdings report (what this Mac
 //! runs that it does not prefer, published as `place` rows) is filled here too, from the lab this
-//! process holds and the rosters beside `aterm.toml` ([`holdings_in`]); a process that holds no
+//! process holds and what each login place holds ([`holdings_in`]); a process that holds no
 //! lab (every test, a debug build) reports nothing, so no place row is written.
 
 use aterm_agent::harness::{
     accounts::{self, Cli, Roster},
     alab_roster::{self, Lab},
     journal::{self, Note, Sink},
+    observe,
     provider_read::{self, ProbeEvent},
 };
 use aterm_db::alab::journal::{
@@ -117,15 +118,20 @@ pub(super) fn install() {
     let _ = provider_read::install(Box::new(probe));
     let _ = place::install_holdings(Box::new(|| {
         let lab = alab_roster::current()?;
-        holdings_in(&lab, &aterm_types::dirs::aterm_config_path()?)
+        holdings_in(
+            &lab,
+            &aterm_types::dirs::aterm_config_path()?,
+            user_home().as_deref(),
+        )
     }));
 }
 
 /// What this Mac runs that it does not prefer (`alab_roster::holdings`), over every pooled CLI's
-/// roster beside the `aterm.toml` at `config`: `None` where the lab names no machine for this Mac
-/// or a roster that is there does not read, so a passing failure ends no place row. A CLI with no
-/// roster holds nothing.
-fn holdings_in(lab: &Lab, config: &Path) -> Option<Vec<Holding>> {
+/// login places (`observe::places`: the roster beside the `aterm.toml` at `config`, and the
+/// default home under `home`, which holds a login whether or not a row names it): `None` where
+/// the lab names no machine for this Mac or a roster that is there does not read, so a passing
+/// failure ends no place row.
+fn holdings_in(lab: &Lab, config: &Path, home: Option<&Path>) -> Option<Vec<Holding>> {
     lab.me.as_ref()?;
     let mut out = Vec::new();
     for cli in Cli::ALL {
@@ -133,7 +139,8 @@ fn holdings_in(lab: &Lab, config: &Path) -> Option<Vec<Holding>> {
             continue;
         };
         let roster = Roster::load_for(cli, &path).ok()?;
-        for (pk, why) in alab_roster::holdings(lab, cli, &roster) {
+        let places = observe::places(cli, &roster, home);
+        for (pk, why) in alab_roster::holdings(lab, cli, &roster, &places) {
             out.push(Holding {
                 account: Pk::new(&pk)?,
                 why: Why::parse(why)?,
@@ -621,10 +628,93 @@ mod tests {
         );
     }
 
+    /// A Mac that lists no account holds the login its default home holds, and a default row
+    /// whose place holds another account's login reports that account, never its own.
+    /// NEGATIVE CONTROL: with `holdings_in` passing no home (`observe::places(cli, &roster,
+    /// None)`), the Mac with no roster reports nothing: `left: Some([]) right: Some([Holding {
+    /// .. Fill }])`.
+    #[test]
+    fn a_default_home_login_no_row_lists_is_held() {
+        use aterm_agent::harness::{
+            accounts::{Row, Vendor},
+            alab_roster::{LabAccount, MachineRef},
+        };
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let config = scratch.path().join("aterm.toml");
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let account = |email: &str, preferred: Option<&str>| LabAccount {
+            pk: aterm_db::typed::keys::account_pk("claude", email).unwrap(),
+            cli: Cli::Claude,
+            vendor: Vendor::default(),
+            label: "claude-aaaaaa".into(),
+            legacy_label: None,
+            email: email.into(),
+            identity: None,
+            browser: None,
+            joinable: true,
+            preferred: preferred
+                .map(|machine| {
+                    (
+                        MachineRef::from_registry(
+                            format!("fixture-{machine}"),
+                            Some(machine.into()),
+                        ),
+                        Some(1),
+                    )
+                })
+                .into_iter()
+                .collect(),
+        };
+        let (uni, ann) = ("uni@example.test", "ann@example.test");
+        let lab = Lab {
+            me: Some(MachineRef::from_registry("fixture-m22", Some("m22".into()))),
+            accounts: vec![account(uni, None), account(ann, Some("m3"))],
+            ..Lab::default()
+        };
+        let held = |why| {
+            Some(vec![Holding {
+                account: Pk::new(&lab.accounts[0].pk).unwrap(),
+                why,
+            }])
+        };
+        std::fs::write(
+            home.join(".claude.json"),
+            format!(r#"{{"oauthAccount":{{"emailAddress":"{uni}"}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(holdings_in(&lab, &config, Some(&home)), held(Why::Fill));
+        let roster = accounts::roster_beside_for(&config, Cli::Claude).unwrap();
+        let row = Row {
+            label: "m22".into(),
+            email: Some(ann.into()),
+            ..Row::default()
+        };
+        std::fs::write(
+            &roster,
+            accounts::append_rows_for(Cli::Claude, "", &[row]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            holdings_in(&lab, &config, Some(&home)),
+            held(Why::Fill),
+            "the default row's place holds another account"
+        );
+        std::fs::remove_file(home.join(".claude.json")).unwrap();
+        assert_eq!(
+            holdings_in(&lab, &config, Some(&home)),
+            Some(vec![Holding {
+                account: Pk::new(&lab.accounts[1].pk).unwrap(),
+                why: Why::Borrow,
+            }]),
+            "nothing read: the row, the belief"
+        );
+    }
+
     /// The flusher's holdings come from every pooled CLI's roster beside `aterm.toml`, keyed by
     /// the lab's account key with the harness's reason; a lab that names no machine for this Mac,
     /// or a roster that is there and does not read, reports nothing known (`None`), so no place
-    /// row ends on a passing failure; a CLI with no roster holds nothing.
+    /// row ends on a passing failure; a CLI with no roster and no login in its home holds nothing.
     /// NEGATIVE CONTROL: with `holdings_in` skipping a roster that does not read (`continue`
     /// instead of `?`), the broken roster reports `Some([])` and every place row would end
     /// (`left: Some([]) right: None`).
@@ -657,7 +747,11 @@ mod tests {
             }],
             ..Lab::default()
         };
-        assert_eq!(holdings_in(&lab, &config), Some(Vec::new()), "no roster");
+        assert_eq!(
+            holdings_in(&lab, &config, None),
+            Some(Vec::new()),
+            "no roster"
+        );
         let roster = accounts::roster_beside_for(&config, Cli::Claude).unwrap();
         let row = Row {
             label: "claude-aaaaaa".into(),
@@ -671,7 +765,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            holdings_in(&lab, &config),
+            holdings_in(&lab, &config, None),
             Some(vec![Holding {
                 account: Pk::new(&key).unwrap(),
                 why: Why::Borrow,
@@ -681,8 +775,8 @@ mod tests {
             me: None,
             ..lab.clone()
         };
-        assert_eq!(holdings_in(&unnamed, &config), None);
+        assert_eq!(holdings_in(&unnamed, &config, None), None);
         std::fs::write(&roster, "[[account]]\nlabel = 7\n").unwrap();
-        assert_eq!(holdings_in(&lab, &config), None, "a broken roster");
+        assert_eq!(holdings_in(&lab, &config, None), None, "a broken roster");
     }
 }

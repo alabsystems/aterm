@@ -4,6 +4,54 @@
 //! Models for update-check provenance, joins, lock release, and two-process staged-build apply.
 use aterm_spec::derive::Model;
 
+/// Confirmation must finish successfully before this boot chains another update.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_update_boot_health_confirmation_model() -> Model {
+    aterm_spec::ty_model! {
+        NativeUpdateBootHealthConfirmation {
+            const Buggy = 0;
+            var state = 0;
+            var outstanding = 0;
+            var missed = 0;
+            var retry = 0;
+            var applied = 0;
+            var health_at_apply = 0;
+
+            action Queue when ((state == 0 || (Buggy == 3 && state == 1)) && outstanding <= 1) {
+                state = 1;
+                outstanding = outstanding + 1;
+                missed = 0;
+                retry = 0;
+            }
+            action Unavailable when (state == 0) {
+                missed = 1;
+                retry = if Buggy == 2 { 0 } else { 1 };
+            }
+            action Failure when (state == 1) {
+                state = 0;
+                outstanding = 0;
+                missed = 1;
+                retry = 1;
+            }
+            action Confirm when (state == 1) {
+                state = 2;
+                outstanding = 0;
+                missed = 0;
+                retry = 0;
+            }
+            action Apply when (applied == 0 && (state == 2 || (Buggy == 1 && state == 1))) {
+                applied = 1;
+                health_at_apply = state;
+            }
+
+            invariant ConfirmedBeforeApply: applied == 0 || health_at_apply == 2;
+            invariant RetryAfterMiss: missed == 0 || state > 0 || retry == 1;
+            invariant OneConfirmationInFlight: outstanding <= 1;
+        }
+    }
+}
+
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_check_receipt_model() -> Model {

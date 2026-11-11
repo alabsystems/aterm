@@ -43,11 +43,11 @@ use astream_wire::summary::{Summary, Window};
 use aterm_agent::harness::{
     accounts::{self, Condition},
     agy_quota_store, claude_homes,
+    claude_model::family_version,
     cli::{SurveyAccount, survey_accounts},
     codex_rollout::{self, Rollouts, Turn},
     disk::discover::{ClaudeCensus, claude_dirs, looked_at, running_claude_census},
     spend::{self, Limits, PriceTable, Served, Spend},
-    upgrade_models::family_version,
 };
 use aterm_db::alab::journal::{self as journal, BookFacts, Pk, Spool};
 use aterm_metrics::row::{

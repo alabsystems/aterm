@@ -608,7 +608,7 @@ impl Guard<'_> {
                     )?);
                     Ok(vec![
                         accounts::Event::new(now, accounts::Kind::SignIn, &policy.row.label)
-                            .because("shared preparation begun"),
+                            .because(accounts::SHARED_PREPARATION_BEGUN),
                     ])
                 })?;
                 *token = begun;

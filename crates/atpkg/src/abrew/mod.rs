@@ -1217,7 +1217,6 @@ fn native_args(
             "edit",
             "extract",
             "irb",
-            "livecheck",
             "postinstall",
             "ruby",
             "sh",
@@ -1259,6 +1258,7 @@ fn native_args(
         )));
     }
     let disabled_cmd = match cmd {
+        "lc" => "livecheck",
         "ls" => "list",
         "-S" => "search",
         "up" => "update",
@@ -1385,6 +1385,7 @@ fn native_args(
     // declarations (used by the missing/needless-argument
     // parse errors).
     let value_flags: &[&str] = match cmd {
+        "livecheck" | "lc" => &["--tap"],
         "info" => &["--days", "--category", "--json"],
         "cleanup" => &["--prune"],
         "outdated" | "upgrade" => &["--minimum-version", "--min-version", "--severity", "--json"],
@@ -1428,6 +1429,11 @@ fn native_args(
         (name, &[])
     }
     let conflict_groups: &[&[ConflictMember]] = match disabled_cmd {
+        "livecheck" => &[
+            &[m("--tap"), m("--installed"), m("--eval-all")],
+            &[m("--json"), ("--debug", &["-d"])],
+            &[("--formula", &["--formulae"]), m("--extract-plist")],
+        ],
         "outdated" => &[
             &[("--quiet", &["-q"]), ("--verbose", &["-v"]), m("--json")],
             &[m("--vulnerable"), m("--cask")],
@@ -2392,6 +2398,33 @@ fn native_args(
             true,
         ),
         "cat" => (&["--cask", "--formula"], 1, usize::MAX, true),
+        "livecheck" | "lc" => (
+            &[
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
+                "--full-name",
+                "--tap",
+                "--installed",
+                "--newer-only",
+                "--json",
+                "--resources",
+                "-r",
+                "--quiet",
+                "-q",
+                "--extract-plist",
+                "--autobump",
+                "--eval-all",
+                "--verbose",
+                "-v",
+                "--debug",
+                "-d",
+            ],
+            0,
+            usize::MAX,
+            true,
+        ),
         "outdated" => (
             &[
                 "--formula",
@@ -3152,7 +3185,9 @@ fn native_args(
         // posture for qualified names.
         let read_only = matches!(
             cmd,
-            "info"
+            "livecheck"
+                | "lc"
+                | "info"
                 | "outdated"
                 | "cat"
                 | "home"
@@ -3178,9 +3213,9 @@ fn native_args(
             // tap/trust errors when they cannot resolve them.
             || (matches!(
                 cmd,
-                "info" | "outdated" | "deps" | "uses" | "home" | "homepage" | "missing"
+                "livecheck" | "lc" | "info" | "outdated" | "deps" | "uses" | "home" | "homepage" | "missing"
                     | "fetch" | "cat" | "log" | "options" | "--cache" | "gist-logs" | "tab"
-                    | "install"
+                    | "install" | "reinstall" | "upgrade"
             )
                 && !s.starts_with("homebrew/core/")
                 && !s.starts_with("homebrew/cask/")
@@ -3300,9 +3335,10 @@ fn native_args(
             "install" | "upgrade" | "reinstall" => {
                 Some("Error: Invalid usage: Options --cask and --formulae are mutually exclusive.")
             }
-            "info" | "outdated" | "uses" | "dependents" | "home" | "homepage" | "cat" | "deps"
-            | "pin" | "unpin" | "uninstall" | "remove" | "rm" | "fetch" | "link" | "ln"
-            | "unlink" | "log" | "tab" | "migrate" | "--cache" | "unpack" => {
+            "livecheck" | "lc" | "info" | "outdated" | "uses" | "dependents" | "home"
+            | "homepage" | "cat" | "deps" | "pin" | "unpin" | "uninstall" | "remove" | "rm"
+            | "fetch" | "link" | "ln" | "unlink" | "log" | "tab" | "migrate" | "--cache"
+            | "unpack" => {
                 Some("Error: Invalid usage: Options --formula and --cask are mutually exclusive.")
             }
             "desc" | "search" | "-S" | "list" | "ls" => None,
@@ -4207,6 +4243,20 @@ fn command_args(args: &[String]) -> std::borrow::Cow<'_, [String]> {
     }
 }
 
+fn dispatch_options<'a>(cmd: &str, rest: &'a [String]) -> &'a [String] {
+    if cmd == "bundle" {
+        &rest[..bundle_option_boundary(rest)]
+    } else {
+        rest
+    }
+}
+
+fn dispatch_dry_run(cmd: &str, rest: &[String]) -> bool {
+    dispatch_options(cmd, rest)
+        .iter()
+        .any(|s| matches!(s.as_str(), "--dry-run" | "-n"))
+}
+
 fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
     let args = command_args(args);
     let args: &[String] = &args;
@@ -4261,6 +4311,10 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
     let raw_rest = rest;
     let canonical = canonical_kind_switches(rest);
     let rest: &[String] = &canonical;
+    let help_flag = dispatch_options(cmd, rest)
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
     if via_reroute() {
         // Brew's help surface, intercepted before admission as
         // brew.rb does: `help <topic>`, and `--help`/`-h` anywhere
@@ -4316,10 +4370,6 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
                 }
             };
         }
-        let help_flag = rest
-            .iter()
-            .take_while(|arg| arg.as_str() != "--")
-            .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
         if help_flag && !shell_fast_path(cmd) {
             // `brew services list --help` prints the subcommand's
             // help (the recorded parser preamble), not the parent's.
@@ -4344,10 +4394,6 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
     } else {
         // Direct abrew answers `--help`/`-h` on a known command
         // with its own usage text, like `abrew help <cmd>`.
-        let help_flag = rest
-            .iter()
-            .take_while(|arg| arg.as_str() != "--")
-            .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
         if help_flag
             && !shell_fast_path(cmd)
             && command_names(true).contains(&canonical_help_command(cmd))
@@ -4542,9 +4588,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "--env" | "env" => return print_env(prefix, rest),
         _ => {}
     }
-    let dry_run = rest
-        .iter()
-        .any(|s| matches!(s.as_str(), "--dry-run" | "-n"));
+    let dry_run = dispatch_dry_run(cmd, rest);
     let bundle_install_requested = cmd == "bundle"
         && rest[..bundle_option_boundary(rest)]
             .iter()
@@ -4703,6 +4747,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "reinstall" => cmd_reinstall(prefix, &api, args, rest),
         "upgrade" => cmd_upgrade(prefix, &api, args, rest),
         "outdated" => cmd_outdated(prefix, &api, rest),
+        "livecheck" | "lc" => commands::cmd_livecheck(prefix, &api, rest),
         "update" => cmd_update(prefix, &api, args, rest),
         "cleanup" => cmd_cleanup(prefix, &api, rest),
         "autoremove" => cmd_autoremove(prefix, &api, rest),
@@ -5364,6 +5409,9 @@ fn help_for(cmd: &str) -> &'static str {
         }
         "outdated" => {
             "Usage: abrew outdated [--formula|--cask] [--greedy] [--verbose|-v|--quiet|-q] [--json[=v2]] [name…]\n"
+        }
+        "livecheck" | "lc" => {
+            "Usage: abrew livecheck [--formula|--cask] [--full-name] [--newer-only] [--json] [--quiet|-q] [--autobump] <name>…\n  Named formulae/casks only, with the Git, GithubLatest, Gnu and PageMatch\n  strategies; anything else (watchlist, --installed, --tap, resources, other\n  strategies, throttles, references) is not native and fails.\n"
         }
         "options" => {
             "Usage: abrew options [--compact] [--installed] [name…]\n  No names: every formula, as in brew; with names, --installed lists the\n  installed ones in their place. Tapped formulae, and the no-name listing\n  once a tap exists, are not supported natively and fail.\n"
@@ -6201,6 +6249,39 @@ mod admission_tests {
             native_args("bundle", &argv(&["exec", &flag])),
             Err(InstallError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn bundle_install_keeps_its_write_lock_when_child_requests_a_dry_run() {
+        for child_flag in ["-n", "--dry-run"] {
+            let rest = argv(&["exec", "--install", "/bin/echo", child_flag]);
+            assert!(!dispatch_dry_run("bundle", &rest));
+        }
+        assert!(dispatch_dry_run("install", &argv(&["--dry-run", "wget"])));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundle_exec_dispatch_passes_child_help_through() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = prefix::Prefix::at(&temp.path().join("prefix"));
+        let brewfile = temp.path().join("Brewfile");
+        let marker = temp.path().join("child-ran");
+        std::fs::write(&brewfile, "").unwrap();
+        let args = argv(&[
+            "bundle",
+            "exec",
+            "--file",
+            brewfile.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$2\" > \"$1\"",
+            "sh",
+            marker.to_str().unwrap(),
+            "--help",
+        ]);
+        assert_eq!(dispatch(&prefix, &args), std::process::ExitCode::SUCCESS);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "--help");
     }
 
     #[test]

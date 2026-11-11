@@ -42,7 +42,7 @@ proved. Paths are relative to `crates/aterm-search/`.
 ## 1. Specs (TSV)
 
 `subsumes` names the tests a proof retires; `gaps` the rows of the gap list in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7 that block it (gap 0, a seal that
+`docs/TRUST-LANE.md` (Blocking gaps) that block it (gap 0, a seal that
 publishes Clean rows, blocks every spec); `difficulty` the Rust features the proof must
 handle.
 
@@ -222,11 +222,6 @@ tests/index_release_memory.rs	release_reclaims_real_heap_that_clear_retains_with
 tests/search_vs_bruteforce.rs	verified_search_matches_bruteforce	index-literal-cs	
 ```
 
-## 3. Coverage
-
-- All 121 live `#[test]` functions across `src/` and `tests/` appear in §2: 117 spec samples across
-  the 39 specs in §1 + 4 `move-to-bench` rows in §4.
-
 ## 4. Tests that are not spec samples
 
 `move-to-bench` means the test asserts a statistical, capacity or heap budget, a measurement
@@ -245,29 +240,6 @@ rather than a universal property, so it belongs in `aterm-bench`:
 ## 5. Implied specs that look wrong, or disagree with the code
 
 1. **Vacuous assertions.**
-   - (Fixed 2026-10-17.) `case_sensitive_point_navigation_builds_no_owned_intersection` asserted
-     `take_owned_intersection_builds() == 0`, which no production path could increment; the
-     counter is deleted and the test, now `case_sensitive_point_navigation_stops_at_the_neighbouring_match`,
-     keeps its real candidate-count assertions (`index-candidate-cost`).
-   - (Fixed 2026-10-28.) `src/tests.rs::changed_row_reindex_matches_from_scratch_rebuild` now asserts
-     that overwritten substrings leave zero matches and includes a genuine negative control showing
-     that a stale row-0 index diverges from `fresh` under the `search_results_opts` oracle.
-   - (Fixed 2026-10-17.) `BudgetedSearch` has no batched feed API, so the slice-size loops of
-     `the_row_feed_equals_one_shot_across_all_modes` (was `any_slicing_…`) and the two eviction
-     tests issued the same `feed_row` sequence at every size; they feed once now, and the module
-     doc no longer claims slicings.
-2. **(Fixed 2026-10-17.) The generation counter could not be observed in production.**
-   `TerminalSearch::generation()` was `#[cfg(test)]`, so production bumped a field nothing read.
-   The field, its bumps, the `#[cfg(test)]` `invalidate` and the two tests that pinned it are
-   deleted.
-3. **(Fixed 2026-10-28.) The tests of `index-point-find` did not run the shipped code.**
-   `TerminalSearch::find_next` and `find_prev` (`#[cfg(test)]`) now delegate to `find_next_opts`
-   and `find_prev_opts` (`case_sensitive = true, is_regex = false`), so every `index-point-find`
-   unit test executes the shipped `TerminalSearch::find_direction_opts`.
-4. **(Fixed 2026-10-28.) `bloom_filter_rejection` no longer pins FNV-1a hash bits.**
-   `src/tests.rs::bloom_filter_rejection` checks rejection on an empty `SearchIndex` (where zero bits
-   are set, so every length >= 3 query is deterministically rejected) alongside positive and length < 3
-   queries after indexing.
 5. **Test-only code that exists only for its tests**, deletable with them:
    `SparseBitmap::{new, contains}` and the `SparseBitmapIntoIter` alias;
    `SearchIndex::{search, intersect_trigrams, intersect_posting_lists, get_line,
@@ -279,26 +251,3 @@ rather than a universal property, so it belongs in `aterm-bench`:
 6. **Budgets, not specs.** `src/bloom_tests.rs::bloom_false_positive_rate`, the regex capacity
    check in `src/index.rs`, and the two counting-allocator tests in `tests/` assert statistical,
    capacity or heap ratios. They move to `aterm-bench` (§4).
-
-## 6. Proof order
-
-Every spec needs at least one widening beyond gap 0. Easiest high-value first:
-
-1. **Scalar, gap 3 (plus 1, 2, 6 or 12):** `regex-line-budget` (a `u64` saturating multiply
-   and a clamp, `omega`-class, and the lemma under every regex spec), `bloom-layout` (`usize`
-   rounding and saturation with no loop; it fixes the sizes `index-bloom-dictionary` depends
-   on), `search-result-types`, `bloom-estimated-fpr`, and the closed forms of
-   `eviction-schedule` (its equality with the real index waits on `index-model`).
-2. **Small loops over slices:** `memchr-family`, `ascii-ci-matches`, `lower-fold`,
-   `lower-byte-map`, then `searcher-find-rfind` with `searcher-linear-time`.
-3. **`SparseBitmap`:** `bitmap-set-refinement` and `bitmap-canonical-encoding`, then
-   `bitmap-eviction-cost`.
-4. **Bloom filter:** `bloom-no-false-negatives`, `bloom-clear-count-empty`, `bloom-probe-cost`.
-5. **Coordinates:** `line-cells-model`, `column-map-walk`, `column-map-with-cells`,
-   `column-map-runs-compact`, `display-columns`, `line-cells-column-queries` (gap 12 for the
-   cross-crate `aterm_grapheme` calls).
-6. **The index:** `index-model`, `index-posting-invariant` and `index-bloom-dictionary`; then
-   `index-literal-cs`, `index-literal-ci`, `index-regex-batch`, `index-batch-cap`,
-   `regex-compile`; then `index-point-find`, `literal-candidate-bound`, `narrowed-search`,
-   `index-candidate-cost`; then `index-observational-equivalence`, a corollary.
-7. **Budgeted search:** `budgeted-refines-one-shot`, `budgeted-progressive`.

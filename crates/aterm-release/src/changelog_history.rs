@@ -21,6 +21,15 @@ const BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// branch before landing, so the final first-parent spine can omit a rewrite.
 /// Raw Git diffs name the exact before/after blobs. Each distinct blob is read
 /// once, in bounded batches, and reduced to candidate-entry membership bits.
+///
+/// A snapshot holds an entry it carries in any section (after a recut's roll, any but
+/// the next release's Unreleased), so a removal is the entry leaving the changelog:
+/// deleted or rewritten, not moved under another heading.
+///
+/// A merge that adds an entry against one parent resurrects it only when its copy
+/// comes from a line that never saw the removal: a parent that holds the entry and
+/// descends from the removal carries an author's later re-addition, which is the
+/// entry's current text, not a stale one.
 pub fn gate(
     git: &dyn crate::ledger::GitRunner,
     commit: &str,
@@ -90,6 +99,7 @@ pub fn gate(
     }
     let mut edges = Vec::new();
     let mut blobs = BTreeSet::new();
+    let mut parents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut at = "";
     let mut merge = false;
     for line in listing.lines().filter(|line| !line.is_empty()) {
@@ -108,6 +118,9 @@ pub fn gate(
         } else {
             at = fields[0];
             merge = fields.len() > 2;
+            if merge {
+                parents.insert(at, fields[1..].to_vec());
+            }
         }
     }
     if edges.len() > HISTORY_EDGES || blobs.len() > HISTORY_SNAPSHOTS {
@@ -174,7 +187,14 @@ pub fn gate(
                     .ok_or_else(|| Error::new("changelog history: incomplete batch body"))?;
                 let snapshot = std::str::from_utf8(body)
                     .map_err(|_| Error::new("changelog history: non-UTF-8 snapshot"))?;
-                let keys: BTreeSet<_> = note_keys(snapshot, "Unreleased").into_iter().collect();
+                // An entry leaves the notes only when it leaves the changelog: one a merge
+                // misplaces under a release heading is still held, and a shipped copy merged
+                // back is the release gate's repeated-entry refusal. A recut ships its
+                // existing version section, so after the roll Unreleased belongs to the next
+                // release and cannot witness this one's membership.
+                let skip = (section != "Unreleased" && super::has_section(snapshot, section))
+                    .then_some("Unreleased");
+                let keys = super::every_note_key(snapshot, skip);
                 membership.insert(
                     oid,
                     candidates
@@ -193,43 +213,107 @@ pub fn gate(
         }
     }
     let absent = vec![false; candidates.len()];
+    let held = |oid: &str| membership.get(oid).unwrap_or(&absent);
+    // Each restoring merge's parents' snapshots. A parent equal to the merge has no raw
+    // edge, so its blob is read by name; every such blob is one this audit already read.
+    let restoring: BTreeSet<&str> = edges
+        .iter()
+        .filter(|(_, merge, before, after)| {
+            *merge && held(before).iter().zip(held(after)).any(|(b, a)| *a && !*b)
+        })
+        .map(|(at, ..)| *at)
+        .collect();
+    let mut holders: BTreeMap<&str, Vec<(&str, &Vec<bool>)>> = BTreeMap::new();
+    if !restoring.is_empty() {
+        let mut queried = Vec::new();
+        for merge in &restoring {
+            let listed = parents
+                .get(merge)
+                .ok_or_else(|| Error::new("changelog history: a merge's parents are unlisted"))?;
+            queried.extend(listed.iter().map(|parent| (*merge, *parent)));
+        }
+        if queried.len() > HISTORY_EDGES {
+            return Err(Error::new(
+                "changelog history: exceeds 131072 restoring merge parents; increase the audited bound before cutting",
+            ));
+        }
+        let input: String = queried
+            .iter()
+            .map(|(_, parent)| format!("{parent}:{CHANGELOG_FILE}\n"))
+            .collect();
+        let rows = history_input(git, &["cat-file", "--batch-check"], input.as_bytes())?;
+        let rows = String::from_utf8(rows)
+            .map_err(|_| Error::new("changelog history: invalid parent snapshot listing"))?;
+        let rows: Vec<_> = rows.lines().collect();
+        if rows.len() != queried.len() {
+            return Err(Error::new(
+                "changelog history: incomplete parent snapshot listing",
+            ));
+        }
+        for (&(merge, parent), row) in queried.iter().zip(rows) {
+            let snapshot = match row.split_whitespace().collect::<Vec<_>>().as_slice() {
+                [_, "missing"] => &absent,
+                [oid, "blob", _] => membership.get(*oid).ok_or_else(|| {
+                    Error::new(format!(
+                        "changelog history: merge {merge}'s parent {parent} has a snapshot outside the audited listing"
+                    ))
+                })?,
+                _ => {
+                    return Err(Error::new(
+                        "changelog history: invalid parent snapshot listing",
+                    ));
+                }
+            };
+            holders.entry(merge).or_default().push((parent, snapshot));
+        }
+    }
     let mut restores: Vec<BTreeSet<&str>> = vec![BTreeSet::new(); candidates.len()];
     let mut ancestry_queries = 0;
+    let mut descends = |ancestor: &str, of: &str| -> Result<bool> {
+        ancestry_queries += 1;
+        if ancestry_queries > HISTORY_ANCESTRY_QUERIES {
+            return Err(Error::new(
+                "changelog history: exceeds 4096 ancestry queries; increase the audited bound before cutting",
+            ));
+        }
+        let ancestry = git.git_read(&history_args(&[
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            of,
+        ]))?;
+        match ancestry.status {
+            0 => Ok(true),
+            1 => Ok(false),
+            _ => Err(Error::new(format!(
+                "changelog history: ancestry unreadable: {}",
+                ancestry.stderr_utf8()
+            ))),
+        }
+    };
     for (at, merge, before, after) in edges {
-        let before = membership.get(before).unwrap_or(&absent);
-        let after = membership.get(after).unwrap_or(&absent);
+        let (before, after) = (held(before), held(after));
         for (idx, key) in candidates.iter().enumerate() {
             if merge && after[idx] && !before[idx] {
                 restores[idx].insert(at);
             }
             if before[idx] && !after[idx] {
                 for restored in &restores[idx] {
-                    ancestry_queries += 1;
-                    if ancestry_queries > HISTORY_ANCESTRY_QUERIES {
-                        return Err(Error::new(
-                            "changelog history: exceeds 4096 ancestry queries; increase the audited bound before cutting",
-                        ));
+                    if !descends(at, restored)? {
+                        continue;
                     }
-                    let ancestor = git.git_read(&history_args(&[
-                        "merge-base",
-                        "--is-ancestor",
-                        at,
-                        restored,
-                    ]))?;
-                    match ancestor.status {
-                        0 => {
-                            return Err(Error::new(format!(
-                                "{CHANGELOG_FILE}: [{section}] resurrects an entry removed or rewritten \
+                    let mut reauthored = false;
+                    for (parent, snapshot) in holders.get(restored).map_or(&[][..], Vec::as_slice) {
+                        if snapshot[idx] && descends(at, parent)? {
+                            reauthored = true;
+                            break;
+                        }
+                    }
+                    if !reauthored {
+                        return Err(Error::new(format!(
+                            "{CHANGELOG_FILE}: [{section}] resurrects an entry removed or rewritten \
                              by {at}, restored by merge {restored}: {key} — remove the stale entry"
-                            )));
-                        }
-                        1 => {}
-                        _ => {
-                            return Err(Error::new(format!(
-                                "changelog history: ancestry unreadable: {}",
-                                ancestor.stderr_utf8()
-                            )));
-                        }
+                        )));
                     }
                 }
             }

@@ -27,13 +27,15 @@
 //! - [`mail_targets`]: the addresses an alias's auth codes arrive at, for the mail routes, and
 //!   [`mailbox_labels`]: the labels (each lab label, and the legacy label a renamed row's
 //!   label-keyed sign-in secrets still name) the mailbox config maps to addresses.
-//! - [`holdings`]: what this Mac runs that it does not prefer, from its rosters, which the
-//!   journal publishes as `place` rows; [`Lab::places`] is what every Mac's rows say, and
+//! - [`holdings`]: what this Mac runs that it does not prefer, from what its login places hold
+//!   ([`observe::places`]), which the journal publishes as `place` rows; [`Lab::places`] is what every Mac's rows say, and
 //!   [`Lab::holders`] reads them beside the preferences ("which Macs hold A"), never as a limit.
 
 use super::account_sync_error::SyncError;
-use super::accounts::{self, Class, Cli, Roster, Row, Store, Vendor};
+use super::accounts::{self, Class, Cli, Reconciled, Roster, Row, Store, Vendor};
 use super::accounts_sync::{self, FleetAccount, FleetRoster};
+use super::observe;
+use crate::ai::connector::Region;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -242,6 +244,17 @@ impl LabAccount {
                 .flatten()
                 .any(|email| row.matches_email(email))
     }
+
+    /// Whether `email`, an address of `region`'s realm, is this account's: its address or its
+    /// provider identity.
+    #[must_use]
+    pub fn says(&self, region: Option<Region>, email: &str) -> bool {
+        accounts::same_provider_realm(self.cli, region, self.vendor.region)
+            && [Some(self.email.as_str()), self.identity.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|own| accounts::email_matches(own, email))
+    }
 }
 
 impl Lab {
@@ -288,6 +301,21 @@ impl Lab {
     #[must_use]
     pub fn account_of(&self, cli: Cli, row: &Row) -> Option<&LabAccount> {
         let mut found = self.of(cli).filter(|account| account.is_row(row));
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    }
+
+    /// The one account of `cli` whose address `email` is, in `region`'s realm: the account a
+    /// login file names, row or no row. `None` for an address the lab does not know, or one two
+    /// accounts answer to.
+    #[must_use]
+    pub fn account_saying(
+        &self,
+        cli: Cli,
+        region: Option<Region>,
+        email: &str,
+    ) -> Option<&LabAccount> {
+        let mut found = self.of(cli).filter(|account| account.says(region, email));
         let first = found.next()?;
         found.next().is_none().then_some(first)
     }
@@ -1454,22 +1482,46 @@ pub(super) fn migrate_held(
     Ok(planned)
 }
 
-/// What this Mac runs of `cli` that it does not prefer, from its `roster` and the lab: each row
-/// the lab knows as one account this Mac has no preference for, by account key, with the reason
-/// the journal's `place` row gives it (design §0, §4.17): `borrow` where another Mac prefers the
-/// account, else `fill` where it may be signed in (the default login, an account asked for by
-/// name, a row an earlier source gave this Mac), else `stranded` (the lab bars a sign-in: the row
-/// stays, as every row does). The journal says `probation` instead until it saw the account run
-/// or sign in here. A row the lab does not know, or one two accounts could be, is not reported.
-/// Empty where the lab names no machine for this Mac. Pure.
+/// What this Mac runs of `cli` that it does not prefer, from its login `places`
+/// ([`observe::places`] of `roster`) and the lab: the account each place's login is
+/// ([`accounts::reconcile`]), where the lab knows it as one account this Mac has no preference
+/// for, by account key, with the reason the journal's `place` row gives it (design §0, §4.17):
+/// `borrow` where another Mac prefers the account, else `fill` where it may be signed in (the
+/// default login, an account asked for by name, a row an earlier source gave this Mac), else
+/// `stranded` (the lab bars a sign-in: the row stays, as every row does). The journal says
+/// `probation` instead until it saw the account run or sign in here.
+///
+/// A place is held by the account its login file names, row or no row
+/// (`docs/DESIGN-account-discovery-2026-11-09.md`, decision 6: the row with no `dir` is never
+/// assumed to be the account found there): the row that address answers to, else the lab account
+/// whose address it is. Only a place nothing was read of (no file, a file that names no account,
+/// a CLI with no observer yet) is held by its row, the belief. An account the lab does not know,
+/// or one two accounts could be, is not reported. Empty where the lab names no machine for this
+/// Mac. Pure.
 #[must_use]
-pub fn holdings(lab: &Lab, cli: Cli, roster: &Roster) -> Vec<(String, &'static str)> {
+pub fn holdings(
+    lab: &Lab,
+    cli: Cli,
+    roster: &Roster,
+    places: &[observe::Place<'_>],
+) -> Vec<(String, &'static str)> {
     let Some(me) = lab.me.as_ref() else {
         return Vec::new();
     };
     let mut out: Vec<(String, &'static str)> = Vec::new();
-    for row in &roster.rows {
-        let Some(account) = lab.account_of(cli, row) else {
+    for place in places {
+        let held = match (place.login.reconciled(roster), place.login.seen.email()) {
+            (Reconciled::Agrees(row) | Reconciled::Other(row), _) => lab.account_of(cli, row),
+            // No row answers, the believed row names no address to answer by, or several rows
+            // answer: the observed address is the account's own.
+            (Reconciled::Unlisted(_) | Reconciled::Unread(_), Some(email)) => {
+                lab.account_saying(cli, place.row.and_then(|row| row.vendor.region), email)
+            }
+            (Reconciled::Unlisted(_) | Reconciled::Unread(_), None) => {
+                place.row.and_then(|row| lab.account_of(cli, row))
+            }
+        };
+        let Some(account) = held else {
             continue;
         };
         if account.preferred_on(&me.key).is_some() || out.iter().any(|(pk, _)| *pk == account.pk) {

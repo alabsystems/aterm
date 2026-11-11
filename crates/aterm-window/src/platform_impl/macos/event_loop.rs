@@ -260,6 +260,29 @@ impl<T> EventLoop<T> {
             Self::Headless(el) => el.create_proxy(),
         }
     }
+
+    pub(crate) fn prepare_launch(&mut self) {
+        let Self::AppKit(el) = self else { return };
+        if el.delegate.is_launched() {
+            return;
+        }
+        // Complete AppKit's launch without an application handler or any windows.
+        // The real run delivers Init/Resumed again after installing its handler.
+        el.delegate.set_event_handler(
+            |_, _| {},
+            || {
+                autoreleasepool(|_| {
+                    el.delegate.set_stop_on_launch();
+                    // SAFETY: the application's loop has not been entered yet.
+                    unsafe { send_v(el.app.id(), sel!(run)) };
+                    if let Some(panic) = el.panic_info.take() {
+                        resume_unwind(panic);
+                    }
+                    el.delegate.internal_exit();
+                });
+            },
+        );
+    }
 }
 
 pub struct AppKitEventLoop<T: 'static> {
@@ -307,10 +330,12 @@ impl<T> AppKitEventLoop<T> {
             Some(ActivationPolicy::Prohibited) => Some(NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED),
         };
         let (sender, receiver) = wake_queue::channel();
+        let panic_info: Rc<PanicInfo> = Default::default();
         let delegate = ApplicationDelegate::new(
             mtm,
             activation_policy,
             attributes.activate_ignoring_other_apps,
+            Rc::downgrade(&panic_info),
             receiver.armed(),
             receiver.drained(),
         );
@@ -324,7 +349,6 @@ impl<T> AppKitEventLoop<T> {
         // SAFETY: `app` owns a +1 reference to the live shared `NSApplication`.
         unsafe { override_send_event(app.id(), mtm) };
 
-        let panic_info: Rc<PanicInfo> = Default::default();
         // LOCAL PATCH (aterm): the `sendEvent:` override's panic guard is `stop_app_on_panic`, so
         // it gets the observers' slot.
         set_send_event_panic_info(mtm, Rc::downgrade(&panic_info));
@@ -425,7 +449,19 @@ impl<T> AppKitEventLoop<T> {
                     resume_unwind(panic);
                 }
 
-                if self.delegate.exiting() {
+                // `is_launched && !is_running` dispatches Init/Resumed without entering AppKit.
+                // If either callback requested exit, drive the armed FIFO barrier once before
+                // judging the pump. This also prevents any unexpected ordinary pump stop from
+                // returning ahead of work already owed at the exit boundary.
+                if self.delegate.exiting() && !self.delegate.exit_committed() {
+                    // SAFETY: `-run` is not entered re-entrantly; the user handler has returned.
+                    unsafe { send_v(self.app.id(), sel!(run)) };
+                    if let Some(panic) = self.panic_info.take() {
+                        resume_unwind(panic);
+                    }
+                }
+
+                if self.delegate.exit_committed() {
                     self.delegate.internal_exit();
                     PumpStatus::Exit(0)
                 } else {
@@ -634,40 +670,5 @@ fn app() -> Id {
 }
 
 #[cfg(test)]
-mod proxy_tests {
-    use super::*;
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        fn CFGetRetainCount(cf: *const c_void) -> CFIndex;
-    }
-
-    fn main_wakes() -> usize {
-        MAIN_WAKES.with(Cell::get)
-    }
-
-    fn retains(source: CFRunLoopSourceRef) -> CFIndex {
-        // SAFETY: the caller holds a proxy that retains `source`, so it is a live CF object.
-        unsafe { CFGetRetainCount(source as *const c_void) }
-    }
-
-    #[test]
-    fn a_proxy_clone_wakes_nothing_and_a_send_through_it_wakes_the_loop_once() {
-        let (sender, receiver) = wake_queue::channel::<u32>();
-        let proxy = EventLoopProxy::new(sender);
-        let source = proxy.source;
-        let held = retains(source);
-        let before = main_wakes();
-        let clones: Vec<_> = (0..64).map(|_| proxy.clone()).collect();
-        assert_eq!(main_wakes(), before, "a clone is no event, so it wakes nothing");
-        assert!(clones.iter().all(|clone| clone.source == source), "a clone shares its source");
-        assert_eq!(retains(source), held + 64, "each clone holds its own retain");
-        let kept = clones[0].clone();
-        drop(clones);
-        drop(proxy);
-        assert_eq!(retains(source), held, "each dropped proxy gave its retain back");
-        kept.send_event(7).expect("the receiver is alive");
-        assert_eq!(main_wakes(), before + 1, "a send wakes the loop once");
-        assert_eq!(receiver.try_next(), Some(7));
-    }
-}
+#[path = "event_loop_proxy_tests.rs"]
+mod proxy_tests;

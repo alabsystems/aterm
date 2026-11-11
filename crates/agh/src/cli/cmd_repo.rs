@@ -4,7 +4,7 @@
 
 //! Repository views, cloning and private main snapshots.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::args::Invocation;
 use super::verbs::Noun;
@@ -414,15 +414,35 @@ pub(crate) fn repo_fetch_main(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome
     })
 }
 
-/// Fetch one source or an expected-OID batch into agh-owned local refs; anonymous mode is a
-/// credential-free read, not a fallback from a failed authenticated operation.
+/// Fetch one source or an expected-OID batch into agh-owned local refs, or import exact raw
+/// objects (`--objects`, a partial clone's missing blobs say) without publishing any ref;
+/// anonymous mode is a credential-free read, not a fallback from a failed authenticated
+/// operation.
 pub(crate) fn repo_fetch(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     if inv.global.as_profile.is_some() {
         return Err(inv.usage("repo fetch uses routed credentials or --anonymous, not --as"));
     }
     let reference = inv.flag("--ref");
     let into = inv.flag("--into");
-    let batch = if let Some(file) = inv.flag("--input") {
+    let checkout_closure = inv.has("--checkout-closure");
+    let checkout_cache = inv.flag("--checkout-cache").map(Path::new);
+    if checkout_cache.is_some() && !checkout_closure {
+        return Err(inv.usage("--checkout-cache requires --checkout-closure"));
+    }
+    if checkout_closure && !reference.is_some_and(crate::path::is_sha) {
+        return Err(inv.usage("--checkout-closure requires an exact immutable --ref OID"));
+    }
+    let objects = inv.flag("--objects");
+    if objects.is_some() && inv.flag("--input").is_some() {
+        return Err(inv.usage("--objects cannot be combined with --input"));
+    }
+    let batch = if let Some(file) = objects {
+        if reference.is_some() || into.is_some() {
+            return Err(inv.usage("--objects cannot be combined with --ref or --into"));
+        }
+        let ids: Vec<String> = super::cmd_api::read_input(file)?;
+        Some(crate::git::FetchBatch::objects(ids)?)
+    } else if let Some(file) = inv.flag("--input") {
         if reference.is_some() || into.is_some() {
             return Err(inv.usage("--input cannot be combined with --ref or --into"));
         }
@@ -452,16 +472,27 @@ pub(crate) fn repo_fetch(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
     let (slug, named) = inv.repo(gh.router())?;
     let (run, note) = if let Some(batch) = batch {
-        let count = batch.rows().len().to_string();
+        let note = if batch.rows().is_empty() {
+            ("objects", batch.object_ids().len().to_string())
+        } else {
+            ("refs", batch.rows().len().to_string())
+        };
         (
             GitRun::fetch_batch(&slug, &dir, batch, inv.global.anonymous),
-            ("refs", count),
+            note,
         )
     } else {
         let reference = reference.ok_or_else(|| inv.usage("--ref is required"))?;
         let into = into.ok_or_else(|| inv.usage("--into is required"))?;
         (
-            GitRun::fetch_ref(&slug, &dir, reference, into, inv.global.anonymous),
+            {
+                let run = GitRun::fetch_ref(&slug, &dir, reference, into, inv.global.anonymous);
+                if checkout_closure {
+                    run.with_checkout_closure(checkout_cache)
+                } else {
+                    run
+                }
+            },
             ("ref", into.to_string()),
         )
     };

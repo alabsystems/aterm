@@ -123,18 +123,21 @@ pub(crate) fn carry_launcher_limit(
     command: &mut aterm_uds::spawnfd::StdCommand,
     target_build: u64,
 ) {
-    if target_build < TAKES_LAUNCHER_NOFILE_FROM_BUILD {
-        return;
-    }
-    if let Some(soft) = launcher_soft_descriptor_limit() {
-        command.envs([ENV_LAUNCHER_NOFILE.pair(soft.to_string())]);
-    }
-    if target_build < TAKES_PARK_RAISED_FROM_BUILD {
-        return;
-    }
-    if let Some(from) = park_raised_from() {
-        command.envs([ENV_PARK_RAISED_FROM.pair(from.to_string())]);
-    }
+    command.envs(launcher_limit_environment(target_build));
+}
+
+fn launcher_limit_environment(
+    target_build: u64,
+) -> impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> {
+    let soft = (target_build >= TAKES_LAUNCHER_NOFILE_FROM_BUILD)
+        .then(launcher_soft_descriptor_limit)
+        .flatten()
+        .map(|limit| ENV_LAUNCHER_NOFILE.pair(limit.to_string()));
+    let from = (target_build >= TAKES_PARK_RAISED_FROM_BUILD)
+        .then(park_raised_from)
+        .flatten()
+        .map(|limit| ENV_PARK_RAISED_FROM.pair(limit.to_string()));
+    [soft, from].into_iter().flatten()
 }
 
 /// Removes stray carried descriptor-limit env vars on non-update launches; whether it removed
@@ -521,7 +524,9 @@ pub(crate) mod tests {
             .expect("a 64-spare limit is below the floor");
         let mut image = crate::test_alone::StandIn::this_test();
         image.command().env(NEW_IMAGE, "1");
-        carry_launcher_limit(image.command(), TAKES_PARK_RAISED_FROM_BUILD);
+        image
+            .command()
+            .envs(launcher_limit_environment(TAKES_PARK_RAISED_FROM_BUILD));
         assert!(
             image
                 .command()
@@ -690,7 +695,9 @@ pub(crate) mod tests {
 
         let mut image = crate::test_alone::StandIn::this_test();
         image.command().env(NEW_IMAGE, "1");
-        carry_launcher_limit(image.command(), TAKES_PARK_RAISED_FROM_BUILD);
+        image
+            .command()
+            .envs(launcher_limit_environment(TAKES_PARK_RAISED_FROM_BUILD));
         assert!(
             image
                 .command()
@@ -893,7 +900,9 @@ pub(crate) mod tests {
             .command()
             .env(ROLE, "older successor")
             .env("ATERM_UPDATED_FROM", BUILD.to_string());
-        carry_launcher_limit(successor.command(), TAKES_PARK_RAISED_FROM_BUILD);
+        successor
+            .command()
+            .envs(launcher_limit_environment(TAKES_PARK_RAISED_FROM_BUILD));
         successor.spawn().passed();
     }
 

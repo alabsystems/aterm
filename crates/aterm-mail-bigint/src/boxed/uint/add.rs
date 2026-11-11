@@ -32,36 +32,5 @@ impl CheckedAdd<&BoxedUint> for BoxedUint {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
-    use super::{BoxedUint, CheckedAdd, Limb};
-
-    #[test]
-    fn adc_no_carry() {
-        let (res, carry) = BoxedUint::zero().adc(&BoxedUint::one(), Limb::ZERO);
-        assert_eq!(res, BoxedUint::one());
-        assert_eq!(carry, Limb::ZERO);
-    }
-
-    #[test]
-    fn adc_with_carry() {
-        let (res, carry) = BoxedUint::max(Limb::BITS)
-            .unwrap()
-            .adc(&BoxedUint::one(), Limb::ZERO);
-        assert_eq!(res, BoxedUint::zero());
-        assert_eq!(carry, Limb::ONE);
-    }
-
-    #[test]
-    fn checked_add_ok() {
-        let result = BoxedUint::zero().checked_add(&BoxedUint::one());
-        assert_eq!(result.unwrap(), BoxedUint::one());
-    }
-
-    #[test]
-    fn checked_add_overflow() {
-        let result = BoxedUint::max(Limb::BITS)
-            .unwrap()
-            .checked_add(&BoxedUint::one());
-        assert!(!bool::from(result.is_some()));
-    }
-}
+#[path = "add_tests.rs"]
+mod tests;

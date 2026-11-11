@@ -3,25 +3,6 @@
 
 # aterm-dirfd: spec recovery from its 39 unit tests
 
-> Status 2026-11-03: reconciled with current `main` across its 16 specs (11 Unix + 5 Windows) and
-> all 39 live `#[test]` fns (`tests/dirfd.rs` 17, `tests/windows.rs` 22). Each spec below is
-> proved through Trust/Clean, then the tests it subsumes are deleted.
->
-> **Blocked: `filetype-predicates`** (re-measured 2026-10-16 on Trust seal `150efe4a`). The contract
-> was written through `trust_contract_fn!` citing Clean theorems over
-> `trust_import_aterm_dirfd__FileType__{from_raw_mode,is_dir,is_file}`. No import is minted, so the
-> theorems are rejected (`AutoBoundHeadOverApplied`) and nothing reaches `clean-kernel-citation`.
-> The code is unchanged and no test was deleted. The refusals, measured on the crate and on minimal
-> probes:
-> - `is_dir`/`is_file`: the clause `self.0` is refused ("a tuple index ... needs the aggregate
->   carrier", gap 1). With a named field, the body `self.mode == 16384` is still refused by the E6
->   SHAPE gate ("a read through a projection of `_1`": a comparison over a field projection is outside
->   the fragment, gap 3). `libc::S_IFDIR as u32` is refused by the FACET gate as well, even on a
->   scalar parameter (gap 3).
-> - `from_raw_mode`: the body uses `BinOp::BitAnd` on `u32`, which is outside the E6 fragment
->   (SHAPE gate; FACET gate as well with the `as` cast), gap 3. A struct return has no kernel
->   denotation (`result.<field>`: `admission_minted=false`), gap 1.
-
 Source: `crates/aterm-dirfd` (read only). The crate was originally one file, `src/lib.rs`, gated
 `#![cfg(unix)]`, and a thin shell over libc's `*at` calls; since 2026-10-19 that unix half
 is `src/unix.rs` alongside the Windows handle-relative backend in `src/windows/`, whose specs
@@ -31,7 +12,7 @@ is `src/unix.rs` alongside the Windows handle-relative backend in `src/windows/`
 Result: **16 specs**, covering **39 tests**. **0 remaining non-spec tests** (§4).
 
 Gap numbers are from §7 of
-`AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit).
+`docs/TRUST-LANE.md` (Blocking gaps).
 Gap 0 (a seal that publishes Clean rows) blocks every row and is not repeated in the TSV.
 
 ## 0. Notation used in the statements
@@ -63,7 +44,7 @@ Gap 0 (a seal that publishes Clean rows) blocks every row and is not repeated in
 
 `subsumes` lists the primary tests (secondary ones are in §2). `difficulty` names the Rust
 features a proof must handle. `blocking_gaps` are rows of the gap table in
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes Clean rows)
+`docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (a seal that publishes Clean rows)
 blocks every row and is left out. Only the pure core (`Arg::with_c_str`, the flag algebra,
 `FileType`, the `Errno` constants, `RenameFlags::contains` and the flag translation inside
 `renameat_with`) can be proved without gap 8 (effects, FFI, `unsafe`).
@@ -88,15 +69,6 @@ win-dir-listing	contract	windows::Dir::{read_from, next}	Dir::read_from(fd) open
 win-errno-and-placeholders	contract	windows::{Errno, expose_placeholders, ExposedPlaceholders}	Errno::is_noent() holds solely for ERROR_FILE_NOT_FOUND (NOENT) and Errno::is_inval() solely for ERROR_INVALID_NAME (INVAL); From<Errno> for io::Error maps custom CUSTOMER codes and non-NOENT NotFound-kind Win32 errors (such as PATH_NOT_FOUND) to ErrorKind::Other so callers never confuse an unmounted/missing parent or foreign reparse refusal with a missing leaf entry. expose_placeholders sets RtlSetThreadPlaceholderCompatibilityMode(PHCM_EXPOSE_PLACEHOLDERS) for the guard's lifetime (restoring on drop) and returns Err(PLACEHOLDERS_HIDDEN) if placeholders remain disguised.	errors_keep_gone_apart_from_everything_else	MEDIUM: pure Errno/io::Error mapping plus thread-local Rtl placeholder mode RAII guard	1, 2, 3, 8
 ```
 
-### Distribution by kind (16)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 11 | arg-cstr-faithful, filetype-predicates, fstat-widening, renameat-with-dispatch, dir-read-from-fresh-description, dir-removed-reads-empty, win-handle-relative-ops, win-pin-volume-walk, win-unlinkat-confined, win-dir-listing, win-errno-and-placeholders |
-| table-property | 2 | flags-bit-algebra, errno-constants-and-conversion |
-| refinement | 2 | syscall-passthrough, dir-listing-complete |
-| other | 1 | fd-relative-no-reresolution (noninterference) |
-
 ### Blocking gaps (specs blocked by each; gap 0 blocks all 16)
 
 | gap | specs | ids |
@@ -109,15 +81,6 @@ win-errno-and-placeholders	contract	windows::{Errno, expose_placeholders, Expose
 | 11 generics | 6 | arg-cstr-faithful, syscall-passthrough, renameat-with-dispatch, fd-relative-no-reresolution, win-handle-relative-ops, win-unlinkat-confined |
 | 7 loops | 4 | arg-cstr-faithful, dir-listing-complete, win-pin-volume-walk, win-dir-listing |
 | 13 closures/threads | 4 | arg-cstr-faithful, syscall-passthrough, renameat-with-dispatch, win-handle-relative-ops |
-
-### Proof dependency order
-
-`flags-bit-algebra`, `filetype-predicates`, the constant half of `errno-constants-and-conversion`
-→ `arg-cstr-faithful` → the pure flag translation of `renameat-with-dispatch` → (gap 8)
-`syscall-passthrough` and `fstat-widening` → `renameat-with-dispatch` (Sys half) →
-`dir-read-from-fresh-description`, `dir-listing-complete`, `dir-removed-reads-empty` →
-`fd-relative-no-reresolution` (needs `syscall-passthrough`); on Windows, `win-errno-and-placeholders`
-→ `win-handle-relative-ops` → `win-pin-volume-walk`, `win-dir-listing`, `win-unlinkat-confined`.
 
 ## 2. Test → spec map (TSV)
 
@@ -167,13 +130,6 @@ tests/windows.rs	pin_walks_every_spelling_of_one_directory_and_refuses_the_rest	
 tests/windows.rs	errors_keep_gone_apart_from_everything_else	win-errno-and-placeholders	
 ```
 
-## 3. Coverage
-
-- 39 live tests (`tests/dirfd.rs` 17, `tests/windows.rs` 22); all 39 map to one of the 16 specs, and 0 non-spec tests remain (§4).
-- The biggest collapses: `win-unlinkat-confined` (8 primary), `win-handle-relative-ops` (6 primary), `win-dir-listing` (4 primary), and `syscall-passthrough`, `renameat-with-dispatch`, `dir-read-from-fresh-description`, and `win-pin-volume-walk` (3 primary each).
-- `flags-bit-algebra` and `filetype-predicates` retire no test alone. They are the pure lemmas
-  behind the differential tests' flag words and kind checks.
-
 ## 4. Tests that are not spec samples
 
 None: every test in §2 has a primary spec.
@@ -204,31 +160,3 @@ None: every test in §2 has a primary spec.
    `Errno::last` reads `std::io::Error::last_os_error().raw_os_error()` immediately after `ret < 0` on
    Unix, where `raw_os_error()` is always `Some(errno)` and `Sys` requires `errno ≠ 0` whenever a
    POSIX call returns `-1`.
-
-## 6. Proof order
-
-Every row needs gap 1, since even the flag and `Errno` newtypes are structs.
-
-1. **`filetype-predicates`** (gaps 1, 3): a `const fn` and one `&` on a `u32` newtype, an
-   `omega`/`decide` proof once the newtype carrier is admitted. On Trust seal `150efe4a` a
-   `trust_contract_fn!` contract over it is refused: `self.0` needs the aggregate carrier
-   (gap 1); a comparison through a field projection, `BitAnd` on `u32` and the `as` casts of
-   `libc` constants are outside the E6 fragment (gap 3); and `from_raw_mode`'s struct return has
-   no kernel denotation (gap 1).
-2. **`flags-bit-algebra`** (gaps 1, 3; 2 for `bitor_assign`): `bits`, `|`, `contains` and the
-   constant table first, `|=` once gap 2 lands. The constant rows can be evaluated per platform.
-3. **The constant half of `errno-constants-and-conversion`** (gap 1):
-   `NOENT.raw_os_error() = ENOENT` and its siblings hold by definition. It retires the
-   tautological half of `the_not_found_errno_is_the_same_constant` (§5.4).
-4. **`arg-cstr-faithful`** (gaps 1, 3, 5, 7, 11, 13): it retires
-   `an_interior_nul_is_refused_rather_than_truncated` and is the only check of the heap path
-   (§5.3). Factor the body into a monomorphic, closure-free
-   `fn c_name<'b>(bytes: &[u8], buf: &'b mut [u8; 512], heap: &'b mut Vec<u8>) -> Result<&'b CStr>`;
-   gaps 11 and 13 then drop out, and `with_c_str` becomes a one-line wrapper that calls `f` once.
-5. **The flag translation in `renameat-with-dispatch`** (gaps 1, 3): factor
-   `fn rename_raw_flags(RenameFlags) -> Option<c_uint>` per cfg (`None` means `ENOSYS`) and prove
-   part (2) on it.
-
-After gap 8: `syscall-passthrough` and `fstat-widening`, which the other effectful specs build
-on; then the three `Dir` specs; last `fd-relative-no-reresolution`, which also needs a
-relational (two-state) statement over `Sys`.

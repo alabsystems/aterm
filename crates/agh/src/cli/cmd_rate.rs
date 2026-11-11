@@ -32,6 +32,29 @@ fn row(label: &str, source: &str, snapshot: &RateSnapshot) -> Value {
 ///
 /// The first identity's error.
 pub(crate) fn rate(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    if let Some(hour) = inv.flag("--calls-hour") {
+        let hour = crate::path::digits::<u64>(hour)
+            .ok_or_else(|| inv.usage("--calls-hour requires Unix seconds / 3600"))?;
+        let dirs = ctx
+            .dirs
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::local("rate attribution has no state directory"))?;
+        let mut items = rate::RateBook::at(dirs.rate()).calls_in_hour(hour)?;
+        if let Some(profile) = &inv.global.as_profile {
+            items.retain(|row| row.get("as").and_then(Value::as_str) == Some(profile));
+        }
+        if inv.global.anonymous {
+            items.retain(|row| row.get("as").and_then(Value::as_str) == Some("anonymous"));
+        }
+        return Ok(Outcome {
+            answer: Answer::Items {
+                noun: Noun::Raw,
+                items,
+                completeness: Completeness::Complete,
+            },
+            receipt: Receipt::new(&inv.verb_name()),
+        });
+    }
     let gh = ctx.github()?;
     let who: Vec<Option<String>> = if let Some(profile) = &inv.global.as_profile {
         vec![Some(profile.clone())]

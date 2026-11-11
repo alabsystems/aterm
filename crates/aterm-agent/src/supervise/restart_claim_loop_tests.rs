@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A MOVE IS MADE ONCE, DATED BY THE CLAIM THAT MADE IT (ATERM-KI-1101-3): a model's move onto its
-//! fallback answered a wait after its ask claimed the record (`wait:resume`, its relaunch landed)
-//! is asked again after the loop's other acts, in this loop or the next, and that re-ask meets the
-//! record its ask claimed: carried while in flight, made once carried on, never a second relaunch.
-//! A move whose run holds no live claim ends its run at the next act, and the move is dated by the
-//! second its claim was taken, never by an earlier ask that claimed nothing or a claim that lapsed
-//! before the move was made.
+//! A MOVE IS MADE ONCE (ATERM-KI-1101-3): a move onto another credential of the session's own
+//! account answered a wait after its ask claimed the record (`wait:resume`, its relaunch landed)
+//! is asked again after the loop's other acts, and that re-ask meets the record its ask claimed:
+//! carried while in flight, made once carried on, never a second relaunch, even past an answer
+//! that could not read the record.
 
 use super::*;
-use crate::supervise::journal::JournalRecord;
-use crate::supervise::policy::turn_end::RULE_MODEL_FALLBACK;
+use crate::supervise::policy::turn_end::{RULE_TOKEN_ROUTE, RouteTo};
 use crate::supervise::run::turn_end_loop::Custody;
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -26,10 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// lapsed, signals the tab's agent and answers the next of `after_claim` (`relaunched` once they
 /// run out), the claim taken ([`RestartClaim::Taken`]). The asks before that answer
 /// `before_claim` first, each deferred before any claim (`wait:held`: a person's hand on the tab),
-/// the record read and holding no claim of the ask's ([`RestartClaim::Unclaimed`]), then
-/// `stopping`, each an ask that claims the record and signals, its relaunch stopping unmade before
-/// it answers (`wait:native-cancelled-before-mutation`), so the record holds no live claim
-/// ([`RestartClaim::Unclaimed`]) and the next ask restarts afresh. While another
+/// the record read and holding no claim of the ask's ([`RestartClaim::Unclaimed`]). While another
 /// sweep holds the lock (`busy`), an ask is answered `busy:another-sweep` before any record is
 /// read ([`RestartClaim::Unread`]), whoever's the record is.
 #[derive(Debug, Default)]
@@ -37,7 +31,6 @@ struct RecordHost {
     /// The record: the ask that claimed it, and whether its relaunch was carried on (`Done`).
     record: Mutex<Option<(String, bool)>>,
     before_claim: Mutex<VecDeque<&'static str>>,
-    stopping: Mutex<VecDeque<&'static str>>,
     after_claim: Mutex<VecDeque<&'static str>>,
     /// How many asks to come another sweep holds the lock for.
     busy: AtomicUsize,
@@ -61,12 +54,6 @@ impl RecordHost {
         if let Some((_, done)) = self.record.lock().unwrap().as_mut() {
             *done = true;
         }
-    }
-
-    /// The record's relaunch stopped unmade, unseen by the loop (the sweep found it stale): no
-    /// live claim is left in it, and the next ask restarts afresh.
-    fn lapse(&self) {
-        *self.record.lock().unwrap() = None;
     }
 
     fn signals(&self) -> usize {
@@ -108,10 +95,6 @@ impl IdleHost for RecordHost {
             (step, RestartClaim::Held)
         } else if let Some(deferred) = self.before_claim.lock().unwrap().pop_front() {
             (deferred, RestartClaim::Unclaimed)
-        } else if let Some(stopped) = self.stopping.lock().unwrap().pop_front() {
-            *record = None;
-            self.signals.fetch_add(1, Ordering::SeqCst);
-            (stopped, RestartClaim::Unclaimed)
         } else {
             *record = Some((ask.word().to_string(), false));
             self.signals.fetch_add(1, Ordering::SeqCst);
@@ -125,11 +108,9 @@ impl IdleHost for RecordHost {
     }
 }
 
-/// The fallback the moves below are onto.
-fn fallback() -> Restart {
-    Restart::Model {
-        to: "claude-sonnet-5-5".to_string(),
-    }
+/// The move below: onto the session's own account's token.
+const fn route() -> Restart {
+    Restart::Route { to: RouteTo::Token }
 }
 
 /// A loop over an idle Claude Code whose host is `host`, at `at` (Unix seconds), its decision made.
@@ -153,29 +134,27 @@ fn at_rest<'a>(
     (s, opts, point)
 }
 
-/// `RESTARTED` lines the loop said for the fallback's move.
+/// `RESTARTED` lines the loop said for the move.
 fn moves_made(heard: &Heard) -> usize {
     heard
         .said
         .iter()
-        .filter(|l| {
-            l.starts_with("RESTARTED ") && l.contains(&format!("rule={RULE_MODEL_FALLBACK}"))
-        })
+        .filter(|l| l.starts_with("RESTARTED ") && l.contains(&format!("rule={RULE_TOKEN_ROUTE}")))
         .count()
 }
 
-/// A FALLBACK'S MOVE ASKED AGAIN AFTER ITS CLAIM IS MADE ONCE, WHATEVER ACTS COME BETWEEN
+/// A MOVE ASKED AGAIN AFTER ITS CLAIM IS MADE ONCE, WHATEVER ACTS COME BETWEEN
 /// (ATERM-KI-1101-3): the move's first ask claimed the record and landed its relaunch, and the host
 /// answered a wait (`wait:resume`: the process it started not yet registered). While that relaunch
 /// is owed its carry-on the policy asks no move at the turn ends that come (`upgrading`), so the
 /// loop decides acts that are no restart, each of which ended the move's run, a line held in
 /// custody or not; its next ask was another run's, which superseded the relaunch its first ask had
 /// landed (`relaunch::supersedes`) or, once that was carried on, restarted it afresh: two
-/// relaunches onto the fallback for one move. The run of a move whose ask claimed the record now
+/// relaunches for one move. The run of a move whose ask claimed the record now
 /// outlives those acts, so the re-ask is the claiming ask, carried in flight (`adopted`) or made
 /// once carried on (`done:made`), the host signalling nothing, one `RESTARTED`.
 #[test]
-fn a_fallbacks_move_asked_again_after_its_claim_is_made_once_whatever_acts_come_between() {
+fn a_move_asked_again_after_its_claim_is_made_once_whatever_acts_come_between() {
     let mut wrong = Vec::new();
     for (held, carried_on) in [(false, false), (false, true), (true, false), (true, true)] {
         let host = RecordHost::answering(&[], &["wait:resume"]);
@@ -187,8 +166,8 @@ fn a_fallbacks_move_asked_again_after_its_claim_is_made_once_whatever_acts_come_
         let mut heard = Heard::default();
         s.restart_agent(
             &point,
-            &fallback(),
-            RULE_MODEL_FALLBACK,
+            &route(),
+            RULE_TOKEN_ROUTE,
             TurnEndAction::Nothing,
             &opts,
             &[],
@@ -206,8 +185,8 @@ fn a_fallbacks_move_asked_again_after_its_claim_is_made_once_whatever_acts_come_
         s.set_clock(TEST_NOW + 90, PDT);
         s.restart_agent(
             &point,
-            &fallback(),
-            RULE_MODEL_FALLBACK,
+            &route(),
+            RULE_TOKEN_ROUTE,
             TurnEndAction::Nothing,
             &opts,
             &[],
@@ -226,7 +205,7 @@ fn a_fallbacks_move_asked_again_after_its_claim_is_made_once_whatever_acts_come_
     assert!(wrong.is_empty(), "one relaunch per move: {wrong:#?}");
 }
 
-/// A FALLBACK'S CLAIM STANDS PAST AN ANSWER THAT CANNOT READ THE RECORD: the move's first ask
+/// A MOVE'S CLAIM STANDS PAST AN ANSWER THAT CANNOT READ THE RECORD: the move's first ask
 /// claimed the record and answered a wait (`wait:resume`); asked again while the sweep that carries
 /// its relaunch on holds the lock, the relaunch answers `busy:another-sweep` before it reads any
 /// record (`relaunch::restart_as`), claiming nothing though the record is the move's own. Had that
@@ -236,7 +215,7 @@ fn a_fallbacks_move_asked_again_after_its_claim_is_made_once_whatever_acts_come_
 /// NEGATIVE CONTROL by mutation: with the run's claim set from each answer alone
 /// (`Session::restart_agent`), the third ask is another run's.
 #[test]
-fn a_fallbacks_claim_stands_past_an_answer_that_cannot_read_the_record() {
+fn a_moves_claim_stands_past_an_answer_that_cannot_read_the_record() {
     let host = RecordHost::answering(&[], &["wait:resume"]);
     let mut m = Mock::new(vec![idle_screen(); 16]);
     let (mut s, opts, point) = at_rest(&mut m, &host, TEST_NOW);
@@ -244,8 +223,8 @@ fn a_fallbacks_claim_stands_past_an_answer_that_cannot_read_the_record() {
     let ask = |s: &mut Session<'_, Mock>, heard: &mut Heard| {
         s.restart_agent(
             &point,
-            &fallback(),
-            RULE_MODEL_FALLBACK,
+            &route(),
+            RULE_TOKEN_ROUTE,
             TurnEndAction::Nothing,
             &opts,
             &[],
@@ -276,266 +255,4 @@ fn a_fallbacks_claim_stands_past_an_answer_that_cannot_read_the_record() {
     );
     assert_eq!(host.signals(), 1, "one relaunch: {asks:?}");
     assert_eq!(moves_made(&heard), 1, "{:#?}", heard.said);
-}
-
-/// A FALLBACK'S MOVE IS DATED BY THE ASK THAT CLAIMED THE RECORD: its first ask claimed nothing
-/// (`wait:held`), the session served a turn (an act), and a later ask claimed the record, answered
-/// a wait, and was asked again past the acts after it, made then. The move is dated by that later
-/// ask, the one that claimed (the switch's `made=` in the ledger, `approvals::model_switch_reason`),
-/// never by the first, which a run kept past every act would date it by
-/// (`a_restart_of_another_kind_begins_a_run_of_its_own`'s redraw then waits out the reset), and
-/// made once: the claiming ask's run outlives the acts after its claim.
-#[test]
-fn a_fallbacks_move_is_dated_by_the_ask_that_claimed_the_record() {
-    use crate::supervise::approvals::{Ledger, open_model_switch};
-    let (dir, ledger) = ledger_at("move-dated-by-its-claim");
-    let host = RecordHost::answering(&["wait:held"], &["wait:resume"]);
-    let mut m = Mock::new(vec![idle_screen(); 16]);
-    let (mut s, opts, point) = at_rest(&mut m, &host, TEST_NOW);
-    s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
-    let mut heard = Heard::default();
-    let ask = |s: &mut Session<'_, Mock>, heard: &mut Heard| {
-        s.restart_agent(
-            &point,
-            &fallback(),
-            RULE_MODEL_FALLBACK,
-            TurnEndAction::Nothing,
-            &opts,
-            &[],
-            heard,
-        )
-        .expect("the move");
-    };
-    ask(&mut s, &mut heard);
-    s.set_clock(TEST_NOW + 300, PDT);
-    s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
-        .expect("the served turn's act");
-    s.set_clock(TEST_NOW + 600, PDT);
-    ask(&mut s, &mut heard);
-    for n in 1..=2 {
-        s.set_clock(TEST_NOW + 600 + 20 * n, PDT);
-        s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
-            .expect("an act that is no restart");
-    }
-    s.set_clock(TEST_NOW + 700, PDT);
-    ask(&mut s, &mut heard);
-    drop(s);
-    let made = open_model_switch(&ledger, Some("@s-1")).map(|o| o.made_unix - TEST_NOW);
-    let _ = std::fs::remove_dir_all(&dir);
-    let asks = host.asks();
-    assert_eq!(asks.len(), 3, "{asks:?}");
-    assert_ne!(
-        asks[0], asks[1],
-        "the act ended the run that claimed nothing: {asks:?}"
-    );
-    assert_eq!(
-        asks[1], asks[2],
-        "the claiming ask's run outlived the acts: {asks:?}"
-    );
-    assert_eq!(host.signals(), 1, "one relaunch: {asks:?}");
-    assert_eq!(
-        made,
-        Some(600),
-        "dated by the claiming ask: {:#?}",
-        heard.said
-    );
-}
-
-/// A FALLBACK'S MOVE A LOOP LEFT CLAIMED IS ASKED BY THE NEXT LOOP AS ITS CLAIMING ASK: the
-/// earlier loop's move answered a wait after its ask claimed the record (`wait:resume`) and the
-/// loop ended before the move was booked (the harness loop restarts, or aterm does). The next
-/// loop restored the move's run from the ledger or its journal but ended it at its first act (the
-/// carry hold's nothing), so its ask was its own run's, which superseded the relaunch the earlier
-/// ask had landed: two relaunches for one move. A later loop now restores the run its journal
-/// shows claimed, and that run outlives its acts as it did in the earlier loop, so its ask meets
-/// the record (`adopted`), nothing signalled again. CONTROL: an earlier ask deferred before any
-/// claim (`wait:held`) leaves no run to restore, and the next loop's ask is a run of its own.
-#[test]
-fn a_fallbacks_move_a_loop_left_claimed_is_asked_by_the_next_as_its_claiming_ask() {
-    let mut wrong = Vec::new();
-    for (case, before_claim, after_claim, restored) in [
-        ("claimed", &[][..], &["wait:resume"][..], true),
-        (
-            "deferred before its claim",
-            &["wait:held"][..],
-            &[][..],
-            false,
-        ),
-    ] {
-        let (dir, ledger) = ledger_at(&format!(
-            "claimed-move-next-loop-{}",
-            if restored { "claimed" } else { "unclaimed" }
-        ));
-        std::fs::write(&ledger, "").expect("the ledger");
-        let host = RecordHost::answering(before_claim, after_claim);
-        let mut heard = Heard::default();
-        {
-            let mut m = Mock::new(vec![idle_screen(); 8]);
-            let (mut s, opts, point) = at_rest(&mut m, &host, TEST_NOW);
-            s.ledger = crate::supervise::approvals::Ledger::open(
-                Some(&ledger),
-                Some("@s-1"),
-                &mut Vec::new(),
-            );
-            s.restart_agent(
-                &point,
-                &fallback(),
-                RULE_MODEL_FALLBACK,
-                TurnEndAction::Nothing,
-                &opts,
-                &[],
-                &mut heard,
-            )
-            .expect("the move");
-        }
-        let journal: String = heard
-            .noted
-            .iter()
-            .map(|line| {
-                JournalRecord::of_line(TEST_NOW * 1000 + 400, Some("@s-1"), line, None).to_json()
-                    + "\n"
-            })
-            .collect();
-        std::fs::write(
-            crate::supervise::approvals::journal_beside(&ledger),
-            journal,
-        )
-        .expect("the journal");
-        let mut heard = Heard::default();
-        {
-            let mut m = Mock::new(vec![idle_screen(); 8]);
-            let (mut s, opts, point) = at_rest(&mut m, &host, TEST_NOW + 30);
-            let _ = s.seed_from_ledger(&ledger, (TEST_NOW + 30) * 1000, false);
-            for n in 1..=2 {
-                s.set_clock(TEST_NOW + 30 + 10 * n, PDT);
-                s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
-                    .expect("the carry hold's nothing");
-            }
-            s.set_clock(TEST_NOW + 60, PDT);
-            s.restart_agent(
-                &point,
-                &fallback(),
-                RULE_MODEL_FALLBACK,
-                TurnEndAction::Nothing,
-                &opts,
-                &[],
-                &mut heard,
-            )
-            .expect("the move asked again");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        let asks = host.asks();
-        let same = asks.first() == asks.last();
-        if same != restored || host.signals() != 1 || moves_made(&heard) != 1 {
-            wrong.push(format!(
-                "{case}: asks {asks:?}, {} signal(s), {} move(s) booked by the next loop",
-                host.signals(),
-                moves_made(&heard)
-            ));
-        }
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-/// The move's ask at the point `point` of the loop `s`, its host's answer heard by `heard`.
-fn ask_move(s: &mut Session<'_, Mock>, point: &Turn, opts: &SuperviseOpts, heard: &mut Heard) {
-    s.restart_agent(
-        point,
-        &fallback(),
-        RULE_MODEL_FALLBACK,
-        TurnEndAction::Nothing,
-        opts,
-        &[],
-        heard,
-    )
-    .expect("the move");
-}
-
-/// A FALLBACK'S MOVE MADE AFTER ITS CLAIM LAPSED IS DATED BY THE CLAIM THAT MADE IT (found in the
-/// review of the claim's fix, 2026-11-04): the move's first ask claimed the record and answered a
-/// wait (`wait:resume`), and its relaunch then stopped unmade where the loop does not hear of it
-/// (the sweep found it stale). The run held its claim past the act that came (the session served
-/// a turn on the model it never left), so the move asked again later was that run's ask, which
-/// met no live record, restarted afresh and made the move; booked at the run's second
-/// (`fallback_made_at`, `approvals::model_switch_reason`), the wall drawn between the two read as
-/// the fallback's own. The answer that restarted afresh says it took the claim
-/// ([`RestartClaim::Taken`]), and the move is dated by that answer's second. NEGATIVE CONTROL by
-/// mutation: the move dated by its run's second again (`Session::restart_agent`'s `made_unix`)
-/// books it 600 s early.
-#[test]
-fn a_fallbacks_move_made_after_its_claim_lapsed_is_dated_by_the_claim_that_made_it() {
-    use crate::supervise::approvals::{Ledger, open_model_switch};
-    let (dir, ledger) = ledger_at("move-dated-past-a-lapsed-claim");
-    let host = RecordHost::answering(&[], &["wait:resume", "relaunched"]);
-    let mut m = Mock::new(vec![idle_screen(); 16]);
-    let (mut s, opts, point) = at_rest(&mut m, &host, TEST_NOW);
-    s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
-    let mut heard = Heard::default();
-    ask_move(&mut s, &point, &opts, &mut heard);
-    host.lapse();
-    s.set_clock(TEST_NOW + 300, PDT);
-    s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
-        .expect("the served turn's act");
-    s.set_clock(TEST_NOW + 600, PDT);
-    ask_move(&mut s, &point, &opts, &mut heard);
-    drop(s);
-    let made = open_model_switch(&ledger, Some("@s-1")).map(|o| o.made_unix - TEST_NOW);
-    let _ = std::fs::remove_dir_all(&dir);
-    let asks = host.asks();
-    assert_eq!(asks.len(), 2, "{asks:?}");
-    assert_eq!(
-        host.signals(),
-        2,
-        "the relaunch that lapsed, then the one that made the move: {asks:?}"
-    );
-    assert_eq!(moves_made(&heard), 1, "{:#?}", heard.said);
-    assert_eq!(
-        made,
-        Some(600),
-        "dated by the claim that made it: {:#?}",
-        heard.noted
-    );
-}
-
-/// A FALLBACK'S CLAIM THAT LAPSED IN ITS OWN ANSWER ENDS ITS RUN AT THE ACT (found in the review
-/// of the claim's fix, 2026-11-04): the move's ask claimed the record and signalled, and its
-/// relaunch stopped unmade before the answer (`wait:native-cancelled-before-mutation`), the record
-/// left `Failed` under that ask. The claim was said from the record's ask and cause alone
-/// (`relaunch::its_own`), so the run held it past every act after, and the move asked much later
-/// was that run's ask. The answer now says the record holds no live claim
-/// ([`RestartClaim::Unclaimed`]), so the act after it ends the run and the later ask is a run of
-/// its own, which claims afresh and dates the move. NEGATIVE CONTROL by mutation: the loop
-/// reading that answer as holding the claim (as the record's ask and cause alone would say) asks
-/// the later move under the first run's ask.
-#[test]
-fn a_fallbacks_claim_that_lapsed_in_its_own_answer_ends_its_run_at_the_act() {
-    use crate::supervise::approvals::{Ledger, open_model_switch};
-    let (dir, ledger) = ledger_at("claim-lapsed-in-its-answer");
-    let host = RecordHost::answering(&[], &["relaunched"]);
-    host.stopping
-        .lock()
-        .unwrap()
-        .push_back("wait:native-cancelled-before-mutation");
-    let mut m = Mock::new(vec![idle_screen(); 16]);
-    let (mut s, opts, point) = at_rest(&mut m, &host, TEST_NOW);
-    s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
-    let mut heard = Heard::default();
-    ask_move(&mut s, &point, &opts, &mut heard);
-    s.set_clock(TEST_NOW + 300, PDT);
-    s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
-        .expect("the served turn's act");
-    s.set_clock(TEST_NOW + 600, PDT);
-    ask_move(&mut s, &point, &opts, &mut heard);
-    drop(s);
-    let made = open_model_switch(&ledger, Some("@s-1")).map(|o| o.made_unix - TEST_NOW);
-    let _ = std::fs::remove_dir_all(&dir);
-    let asks = host.asks();
-    assert_eq!(asks.len(), 2, "{asks:?}");
-    assert_ne!(
-        asks[0], asks[1],
-        "the act ended the run whose claim lapsed: {asks:?}"
-    );
-    assert_eq!(host.signals(), 2, "{asks:?}");
-    assert_eq!(moves_made(&heard), 1, "{:#?}", heard.said);
-    assert_eq!(made, Some(600), "{:#?}", heard.noted);
 }

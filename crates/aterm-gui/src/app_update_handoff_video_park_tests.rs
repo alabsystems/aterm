@@ -174,8 +174,7 @@ fn the_upgrade_rim_starts_at_the_launched_lanes_park() {
         .level_up
         .as_ref()
         .expect("the park starts the rim that explains the freeze");
-    let proof_deadline =
-        super::handoff_proof_deadline(ApplyMode::Immediate, 0, std::time::Instant::now());
+    let proof_deadline = super::handoff_proof_deadline(std::time::Instant::now());
     assert!(!rim.is_expired(proof_deadline + std::time::Duration::from_secs(30)));
 
     app.pending_update_handoff = None;
@@ -210,8 +209,7 @@ fn a_re_park_counts_the_rims_cap_from_its_own_freeze() {
         "PRECONDITION: the re-park landed ({parked:?})"
     );
     let rim = app.level_up.as_ref().expect("the rim runs on");
-    let proof_deadline =
-        super::handoff_proof_deadline(ApplyMode::Immediate, 0, std::time::Instant::now());
+    let proof_deadline = super::handoff_proof_deadline(std::time::Instant::now());
     assert!(
         !rim.is_expired(proof_deadline + std::time::Duration::from_secs(30)),
         "its cap counts from the freeze it explains, not from the park that missed"

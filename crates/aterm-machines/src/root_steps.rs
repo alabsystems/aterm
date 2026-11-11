@@ -10,7 +10,7 @@
 //!   administrator or in `_developer`, so a debugger attaches with no SamplingTools dialog
 //!   ([`DeveloperMode`]);
 //! - the one narrow rule ([`ADMITTED_NAME_RULE`], [`name_rule`]) that lets that person's account
-//!   set this Mac's ComputerName, LocalHostName and HostName to a swarm label (`m` and a number)
+//!   set this Mac's ComputerName, LocalHostName and HostName to generated names (number and nickname)
 //!   with Apple's own `scutil`, and nothing else ([`NameRule`]), so the name the vault's roster
 //!   gives the Mac at an admission that comes after the elevation applies with no second
 //!   password ([`name_by_rule`]);
@@ -22,8 +22,8 @@
 //! password is a second prompt, which the ruling rules out, and a helper would put root code of
 //! aterm's behind an input the person's account controls where a rule needs none. The rule runs no
 //! code of aterm's as root: sudo matches the whole argument string against
-//! `^--set <Pref> m<digits>$` and runs SIP-protected `/usr/sbin/scutil`, so the most the account
-//! can do with it is rename this Mac to another swarm label. `visudo -c` checks the rule before it
+//! anchored, bounded generated-name patterns and runs SIP-protected `/usr/sbin/scutil`,
+//! so the account can change only these three names, never run another command. `visudo -c` checks the rule before it
 //! goes live, so a sudo that cannot read it leaves none, and the name then waits for the next
 //! elevation.
 //!
@@ -49,6 +49,7 @@ use crate::items::{Ctx, Item};
 use crate::model::{Probe, Read};
 use crate::port::{Cmd, Ran, System};
 use aterm_containment::consent::{ADMIN_GROUP, DebuggerMember, classify_membership};
+use aterm_types::machine_name::{GeneratedNames, OsSlot};
 use std::path::Path;
 
 pub use aterm_types::macos_setup::ADMITTED_NAME_RULE;
@@ -76,10 +77,37 @@ pub const REFUSED_RULE: &str = aterm_types::macos_setup::ADMITTED_NAME_RULE_REFU
 /// The names the rule lets the account set, as `scutil` spells them.
 pub const NAME_PREFS: [&str; 3] = ["ComputerName", "LocalHostName", "HostName"];
 
-/// A swarm label as the rule matches it: `m` and one to six digits, no leading zero
-/// ([`crate::init_clt::plain_name`]). No comma, colon, equals sign or backslash, which sudoers
-/// would read as its own syntax.
-const LABEL_PATTERN: &str = "m[1-9][0-9]?[0-9]?[0-9]?[0-9]?[0-9]?";
+fn name_pattern(pref: &str) -> String {
+    // Sudo matches in sudoers_locale (C by default), not the caller's locale.
+    // ComputerName is deliberately a coarse naming permission: in C, opaque
+    // UTF-8 bytes are allowed, but ASCII punctuation/controls and an option-like
+    // first byte are not. GeneratedNames and the caller's current-intent fence
+    // retain Unicode grammar and exact target selection. No locale is changed.
+    // Each number-width alternative leaves the full target at most 63 bytes in
+    // C. An administrator's multibyte sudoers locale counts characters instead;
+    // this remains finite, while GeneratedNames still caps every target at 63 bytes.
+    let alternatives = (1..=6)
+        .map(|digits| {
+            let number = if digits == 1 {
+                "m[0-9]".to_owned()
+            } else {
+                format!("m[1-9][0-9]{{{}}}", digits - 1)
+            };
+            if pref == "ComputerName" {
+                return format!(
+                    "{number}( [^[:cntrl:][:punct:] ][^[:cntrl:][:punct:]]{{0,{}}})?",
+                    60 - digits,
+                );
+            }
+            format!(
+                "{number}(-[a-z0-9]([a-z0-9-]{{0,{}}}[a-z0-9])?)?",
+                59 - digits,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("({alternatives})")
+}
 
 /// A root step the elevation still owes this Mac, beside the tools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,7 +236,7 @@ fn console_member_now(sys: &dyn System) -> DebuggerMember {
 }
 
 /// Whether the rule is in place as a stat reads it, which needs no root (the include directory
-/// is world-searchable, the rule itself readable by root alone): a root-owned regular file of
+/// is world-searchable, the rule itself may be readable by the admitted account): a root-owned regular file of
 /// mode 0440 with nonzero length. `None` when the stat answered with anything but not-found.
 #[must_use]
 pub fn rule_in_place(sys: &dyn System) -> Option<bool> {
@@ -219,6 +247,28 @@ pub fn rule_in_place(sys: &dyn System) -> Option<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
         Err(_) => None,
     }
+}
+
+/// Whether this account can read the exact safe, compiled naming permission.
+/// This is advisory UI evidence; every effect still goes through sudo's current policy.
+/// # Errors
+/// The account or existing root-owned rule cannot be read safely.
+pub fn name_rule_current(sys: &dyn System) -> Result<bool, String> {
+    let identity = sys.identity()?;
+    if identity.user.uid != sys.euid() || sys.euid() == 0 {
+        return Err("naming permission belongs to the current ordinary account".into());
+    }
+    let wanted =
+        name_rule(&identity.user.name).ok_or("the current account cannot own a naming rule")?;
+    match rule_in_place(sys) {
+        Some(false) => return Ok(false),
+        None => return Err("the existing naming permission could not be inspected".into()),
+        Some(true) => {}
+    }
+    let bytes = sys
+        .read_owned_file(Path::new(ADMITTED_NAME_RULE), 0, 16 * 1024, false)
+        .map_err(|why| format!("the existing naming permission could not be read: {why}"))?;
+    Ok(bytes == wanted.as_bytes())
 }
 
 /// What the elevation still owes this Mac beside the tools, as the person's account reads it.
@@ -277,11 +327,14 @@ pub fn name_rule(user: &str) -> Option<String> {
     let scutil = crate::items::names::SCUTIL;
     let mut text = String::from(
         "# aterm's setup elevation: lets one account set this Mac's names to a swarm label\n\
-         # (m and a number) with Apple's scutil, and nothing else.\n",
+         # (number and bounded nickname) with Apple's scutil, and nothing else.\n",
     );
     for pref in NAME_PREFS {
+        // Even an ASCII account can spell ALL or an existing User_Alias. Quote the
+        // validated word so sudoers treats it as one literal account, never an alias.
         text.push_str(&format!(
-            "{user} ALL = (root) NOPASSWD: {scutil} ^--set {pref} {LABEL_PATTERN}$\n"
+            "\"{user}\" ALL = (root) NOPASSWD: {scutil} ^--set {pref} {}$\n",
+            name_pattern(pref),
         ));
     }
     Some(text)
@@ -299,23 +352,20 @@ fn run_ok(sys: &dyn System, cmd: &Cmd) -> Result<Ran, String> {
     }
 }
 
-/// Give this Mac `label` (a [`crate::init_clt::plain_name`]) as its three names through the rule,
+/// Give this Mac its typed generated names through the rule,
 /// as the person's own account, with `sudo -n`, which never asks for a password: the step an
-/// admission after the elevation takes. The names already `label` are left; the ones set are
+/// admission after the elevation takes. Exact names and diagnosed Bonjour aliases are left; changed slots are
 /// returned. `current` re-reads the caller's naming intent after each name read, before any
 /// write, so a newer choice retires this work without undoing an earlier name already set.
 ///
 /// # Errors
-/// A label that is no swarm label, no rule in place (the next elevation names the Mac), or a
+/// No rule is in place (the next elevation names the Mac), or a
 /// name `sudo` or `scutil` refused, or `current` no longer admits this intent, in one line.
 pub fn name_by_rule(
     sys: &dyn System,
-    label: &str,
+    names: &GeneratedNames,
     current: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<&'static str>, String> {
-    let Some(label) = crate::init_clt::plain_name(label) else {
-        return Err(format!("{label:?} is no swarm label"));
-    };
     if rule_in_place(sys) != Some(true) {
         return Err(
             "the rule that names this Mac is not in place, so setup's next Mac password names it"
@@ -325,6 +375,8 @@ pub fn name_by_rule(
     let scutil = crate::items::names::SCUTIL;
     let mut set = Vec::new();
     for pref in NAME_PREFS {
+        let slot = OsSlot::from_macos_preference(pref).expect("a fixed macOS name slot");
+        let label = names.for_slot(slot).expect("generated macOS name");
         let get = Cmd::new(scutil).args(["--get", pref]);
         let now = sys.run(&get).map_or_else(
             |e| Read::Unusable(e.to_string()),
@@ -332,14 +384,13 @@ pub fn name_by_rule(
         );
         current()?;
         if let Read::Value(now) = &now
-            && aterm_types::machine_name::OsSlot::from_macos_preference(pref)
-                .is_some_and(|slot| slot.accepts_projection(&label, now))
+            && names.accepts(slot, now)
         {
             continue;
         }
         run_ok(
             sys,
-            &Cmd::new(SUDO).args(["-n", scutil, "--set", pref, label.as_str()]),
+            &Cmd::new(SUDO).args(["-n", scutil, "--set", pref, label]),
         )?;
         set.push(pref);
     }
@@ -447,9 +498,19 @@ impl Item for DeveloperMode {
 
 /// `[names] admitted_name_rule = true`: the rule ([`name_rule`]) for the console account, in
 /// place as root wrote it. Applied as root, by the elevation's root half.
-pub struct NameRule;
+pub enum NameRule {
+    /// Ordinary root setup leaves an already matching rule alone.
+    Current,
+    /// An explicit permission repair reinstalls even matching bytes, renewing the read ACL.
+    Refresh(std::sync::atomic::AtomicBool),
+}
 
 impl NameRule {
+    /// Reinstall the rule once in this explicit run, even when only its read ACL is missing.
+    pub fn refresh() -> Self {
+        Self::Refresh(std::sync::atomic::AtomicBool::new(false))
+    }
+
     fn wanted(ctx: &Ctx) -> Result<String, String> {
         let user = ctx
             .console
@@ -480,9 +541,15 @@ impl Item for NameRule {
         };
         let now = match sys.read_file(Path::new(ADMITTED_NAME_RULE)) {
             Ok(bytes) if bytes == wanted.as_bytes() && rule_in_place(sys) == Some(true) => {
-                return Probe::Ok {
-                    now: "in place".to_owned(),
-                };
+                if matches!(self, Self::Current)
+                    || matches!(self, Self::Refresh(done)
+                        if done.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    return Probe::Ok {
+                        now: "in place".to_owned(),
+                    };
+                }
+                "matching rule; refresh its account read access".to_owned()
             }
             Ok(_) => "another rule".to_owned(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent".to_owned(),
@@ -511,6 +578,18 @@ impl Item for NameRule {
         let staged = allocation.path().join("rule");
         sys.write_file(&staged, wanted.as_bytes(), 0o440)
             .map_err(|e| format!("{}: {e}", staged.display()))?;
+        let user = ctx
+            .console
+            .as_ref()
+            .ok_or("no console account owns the naming permission")?;
+        // wanted() already validated this username. Only that account gains read access,
+        // on the staged nonsecret policy; POSIX mode stays 0440 and no write ACL is granted.
+        run_ok(
+            sys,
+            &Cmd::new("/bin/chmod")
+                .args(["+a", &format!("user:{} allow read", user.name)])
+                .arg(&staged),
+        )?;
         let checked = run_ok(sys, &Cmd::new(VISUDO).args(["-c", "-q", "-f"]).arg(&staged));
         if let Err(why) = checked {
             // Kept where sudo never reads it, so the rule stops being owed ([`REFUSED_RULE`]).
@@ -520,6 +599,9 @@ impl Item for NameRule {
         sys.rename(&staged, Path::new(ADMITTED_NAME_RULE))
             .map_err(|e| format!("{ADMITTED_NAME_RULE}: {e}"))?;
         let _ = sys.remove(Path::new(REFUSED_RULE));
+        if let Self::Refresh(done) = self {
+            done.store(true, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
     }
 
@@ -533,6 +615,7 @@ mod tests {
     use super::*;
     use crate::items::defaults::tests::{ctx, user};
     use crate::port::{Fake, Stat};
+    use aterm_types::machine_name::{Nickname, Number};
 
     const STATUS: &str = "/usr/sbin/DevToolsSecurity -status";
 
@@ -601,7 +684,14 @@ mod tests {
                 .stat_of(ADMITTED_NAME_RULE, stat);
             assert_eq!(rule_in_place(&planted), Some(false));
             assert_eq!(owed(&planted), vec![Owed::NameRule]);
-            assert!(name_by_rule(&planted, "m42", &|| Ok(())).is_err());
+            assert!(
+                name_by_rule(
+                    &planted,
+                    &GeneratedNames::number_only(Number::parse("m42").unwrap()),
+                    &|| Ok(())
+                )
+                .is_err()
+            );
             assert!(!planted.calls().iter().any(|call| call.contains("scutil")));
         }
         // An unread refusal record is not evidence that no earlier refusal exists.
@@ -1050,11 +1140,41 @@ mod tests {
         assert_eq!(owed(&dev), Vec::<Owed>::new(), "a development build");
     }
 
+    /// Account spelling cannot select the built-in ALL alias or an administrator's user alias.
+    #[test]
+    fn a_naming_account_cannot_be_a_sudoers_user_alias() {
+        for account in ["ALL", "ADMINS", "BUILD_42"] {
+            let rule = name_rule(account).unwrap();
+            for line in rule.lines().filter(|line| !line.starts_with('#')) {
+                assert!(
+                    line.starts_with(&format!("\"{account}\" ALL = (root) NOPASSWD:")),
+                    "{line}"
+                );
+            }
+        }
+    }
+
     /// The rule names Apple's `scutil` alone, anchored on both ends, one line per name, with no
-    /// character sudoers reads as its own syntax. NEGATIVE CONTROL: an account name that could
+    /// unbounded wildcard. POSIX regex character classes and finite bounds remain within 1024
+    /// bytes. NEGATIVE CONTROL: an account name that could
     /// carry sudoers syntax or an option, or root's, gets no rule.
     #[test]
     fn the_rule_lets_one_account_set_the_three_names_to_a_label_and_nothing_else() {
+        let admits = |pattern: &str, args: &str| {
+            // Evaluate the emitted POSIX expression with the OS's real grep, without a
+            // shell, files, elevated identity or a second implementation of its grammar.
+            let read = crate::port::Live::new()
+                .run_complete_stdout_input(
+                    &Cmd::new("/usr/bin/grep")
+                        .args(["-E", "-q", "--", pattern])
+                        .env("LC_ALL", "C"),
+                    format!("{args}\n").as_bytes(),
+                )
+                .unwrap();
+            assert!(matches!(read.status, Some(0 | 1)), "{read:?}");
+            assert!(read.stdout.is_empty() && read.stderr.is_empty(), "{read:?}");
+            read.status == Some(0)
+        };
         let text = name_rule("alice").unwrap();
         let rules: Vec<&str> = text.lines().filter(|line| !line.starts_with('#')).collect();
         assert_eq!(rules.len(), 3, "{text}");
@@ -1062,12 +1182,85 @@ mod tests {
             assert_eq!(
                 *rule,
                 format!(
-                    "alice ALL = (root) NOPASSWD: /usr/sbin/scutil ^--set {pref} \
-                     m[1-9][0-9]?[0-9]?[0-9]?[0-9]?[0-9]?$"
+                    "\"alice\" ALL = (root) NOPASSWD: /usr/sbin/scutil ^--set {pref} {}$",
+                    name_pattern(pref)
                 )
             );
-            let args = rule.split_once("scutil ").unwrap().1;
-            assert!(!args.contains([',', ':', '=', '\\', '*']), "{rule}");
+            let args = rule
+                .strip_prefix("\"alice\" ALL = (root) NOPASSWD: /usr/sbin/scutil ")
+                .expect("one account and Apple's scutil");
+            // Sudoers treats these anchored arguments as an ERE: commas inside
+            // finite repetition bounds are regex syntax, not command separators.
+            assert!(args.starts_with('^') && args.ends_with('$'), "{rule}");
+            assert!(!args.contains(['=', '\\', '*']), "{rule}");
+            assert!(args.len() <= 1024 && !args.contains(".*"), "{rule}");
+            let named = |name: &str| format!("--set {pref} {name}");
+            for name in ["m0", "m1", "m8", "m999999"] {
+                assert!(admits(args, &named(name)), "{pref}: {name}");
+            }
+            for name in [
+                "",
+                "m00",
+                "m01",
+                "m08",
+                "m000000",
+                "m1000000",
+                "M0",
+                "0",
+                "m0;id",
+                "unnumbered",
+            ] {
+                assert!(!admits(args, &named(name)), "{pref}: {name}");
+            }
+            assert_eq!(admits(args, &named("m0 extra")), pref == "ComputerName");
+            if pref == "ComputerName" {
+                for nickname in ["é", "研究室"] {
+                    let names = GeneratedNames::new(
+                        Number::new(85).unwrap(),
+                        &Nickname::parse(nickname).unwrap(),
+                    );
+                    assert!(
+                        admits(args, &named(names.computer_name())),
+                        "{nickname}: {}",
+                        names.computer_name()
+                    );
+                }
+                let longest = Nickname::parse(&format!("{}abcdef", "研".repeat(18))).unwrap();
+                for number in [0, 1, 12, 123, 1234, 12345, 999999] {
+                    let names = GeneratedNames::new(Number::new(number).unwrap(), &longest);
+                    assert_eq!(names.computer_name().len(), 63);
+                    assert!(
+                        admits(args, &named(names.computer_name())),
+                        "{number}: {}",
+                        names.computer_name()
+                    );
+                    assert!(!admits(
+                        args,
+                        &named(&format!("{}a", names.computer_name()))
+                    ));
+                }
+                // These remain one grep record. A newline requires a different record
+                // protocol and is not an argv-control oracle in this line-based evaluator.
+                for name in [
+                    "m0 \tDog",
+                    "m0 Dog\r",
+                    "m0 Dog\u{7f}",
+                    "m0 /etc/sudoers",
+                    "m0 ../../tmp",
+                    "m0 Dog;id",
+                    "m0 Dog --get HostName",
+                ] {
+                    assert!(!admits(args, &named(name)), "{name:?}");
+                }
+                assert!(admits(args, &named("m0 Dog")));
+                assert!(!admits(args, &named("m00 Dog")));
+                assert!(!admits(args, &named("m0 -Dog")));
+            } else {
+                assert!(admits(args, &named("m0-dog")));
+                assert!(!admits(args, &named("m00-dog")));
+                assert!(admits(args, &named(&format!("m0-{}", "a".repeat(60)))));
+                assert!(!admits(args, &named(&format!("m0-{}", "a".repeat(61)))));
+            }
         }
         for bad in [
             "",
@@ -1094,6 +1287,9 @@ mod tests {
         let observed = checks.clone();
         let sys = Fake::root();
         sys.simulate(move |sys, command| {
+            if command.program == Path::new("/bin/chmod") {
+                return Some(Ran::ok(""));
+            }
             if command.program != Path::new(VISUDO) {
                 return None;
             }
@@ -1103,11 +1299,11 @@ mod tests {
             if !entered.swap(true, Ordering::SeqCst) {
                 let mut other = console();
                 other.console.as_mut().unwrap().name = "bob".into();
-                NameRule.apply(sys, &other).unwrap();
+                NameRule::Current.apply(sys, &other).unwrap();
             }
             Some(Ran::ok(""))
         });
-        NameRule.apply(&sys, &console()).unwrap();
+        NameRule::Current.apply(&sys, &console()).unwrap();
         let checked = checks.lock().unwrap();
         assert_eq!(checked.len(), 2);
         assert_eq!(checked[0].1, name_rule("alice").unwrap().as_bytes());
@@ -1133,6 +1329,13 @@ mod tests {
             let path = std::sync::Arc::new(std::sync::Mutex::new(None));
             let observed = path.clone();
             sys.simulate(move |sys, command| {
+                if command.program == Path::new("/bin/chmod") {
+                    assert_eq!(command.args[0].to_str(), Some("+a"));
+                    assert_eq!(command.args[1].to_str(), Some("user:alice allow read"));
+                    let staged = Path::new(command.args.last().unwrap());
+                    assert_eq!(sys.stat(staged).unwrap().mode, 0o440);
+                    return Some(Ran::ok(""));
+                }
                 if command.program != Path::new(VISUDO) {
                     return None;
                 }
@@ -1146,16 +1349,26 @@ mod tests {
             });
             path
         };
-        let sys = Fake::root();
+        let mut sys = Fake::root();
         let checked_path = watch(&sys, Ran::ok(""));
         let ctx = console();
-        assert!(matches!(NameRule.probe(&sys, &ctx), Probe::Change { .. }));
-        NameRule.apply(&sys, &ctx).unwrap();
+        assert!(matches!(
+            NameRule::Current.probe(&sys, &ctx),
+            Probe::Change { .. }
+        ));
+        NameRule::Current.apply(&sys, &ctx).unwrap();
         let calls = sys.calls();
         let staged = calls.iter().position(|c| c.starts_with("write ")).unwrap();
+        let readable = calls
+            .iter()
+            .position(|c| c.starts_with("/bin/chmod +a "))
+            .unwrap();
         let checked = calls.iter().position(|c| c.starts_with(VISUDO)).unwrap();
         let live = calls.iter().position(|c| c.starts_with("rename ")).unwrap();
-        assert!(staged < checked && checked < live, "{calls:?}");
+        assert!(
+            staged < readable && readable < checked && checked < live,
+            "{calls:?}"
+        );
         assert_eq!(
             sys.written(ADMITTED_NAME_RULE).as_deref(),
             name_rule("alice").as_deref().map(str::as_bytes)
@@ -1164,13 +1377,58 @@ mod tests {
         let path = checked_path.lock().unwrap().clone().unwrap();
         assert!(sys.stat(&path).is_err());
         assert!(sys.stat(path.parent().unwrap()).is_err());
-        assert!(matches!(NameRule.probe(&sys, &ctx), Probe::Ok { .. }));
+        assert!(matches!(
+            NameRule::Current.probe(&sys, &ctx),
+            Probe::Ok { .. }
+        ));
+
+        // Exact old bytes do not prove the ordinary account has the new read ACL.
+        // Explicit repair must run once anyway, then its paired readback settles.
+        let refresh = NameRule::refresh();
+        assert!(matches!(refresh.probe(&sys, &ctx), Probe::Change { .. }));
+        refresh.apply(&sys, &ctx).unwrap();
+        assert!(matches!(refresh.probe(&sys, &ctx), Probe::Ok { .. }));
+        assert_eq!(sys.mode_of(ADMITTED_NAME_RULE), Some(0o440));
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|call| call.starts_with("/bin/chmod +a "))
+                .count(),
+            2
+        );
+        sys.logged_in(ctx.console.as_ref().unwrap());
+        sys.euid = ctx.console.as_ref().unwrap().uid;
+        assert_eq!(name_rule_current(&sys), Ok(true));
+        let mut unsafe_rule = sys.stat(Path::new(ADMITTED_NAME_RULE)).unwrap();
+        unsafe_rule.uid = sys.euid;
+        sys.stat_of(ADMITTED_NAME_RULE, unsafe_rule);
+        assert_eq!(name_rule_current(&sys), Ok(false));
+        sys.stat_fails(ADMITTED_NAME_RULE, std::io::ErrorKind::PermissionDenied);
+        assert!(name_rule_current(&sys).is_err());
+
+        let no_acl = Fake::root();
+        let previous = name_rule("bob").unwrap();
+        no_acl.file(ADMITTED_NAME_RULE, previous.as_bytes());
+        no_acl.simulate(|_, command| {
+            (command.program == Path::new("/bin/chmod")).then(|| Ran::exit(1, "ACL refused"))
+        });
+        assert!(NameRule::refresh().apply(&no_acl, &ctx).is_err());
+        assert_eq!(
+            no_acl.read_file(Path::new(ADMITTED_NAME_RULE)).unwrap(),
+            previous.as_bytes()
+        );
+        assert!(
+            !no_acl
+                .calls()
+                .iter()
+                .any(|call| call.starts_with(VISUDO) || call.starts_with("rename "))
+        );
 
         let refused = Fake::root();
         let refused_path = watch(&refused, Ran::exit(1, "syntax error"));
         refused.on(STATUS, Ran::ok("Developer mode is currently enabled.\n"));
         assert_eq!(owed(&refused), vec![Owed::NameRule]);
-        assert!(NameRule.apply(&refused, &ctx).is_err());
+        assert!(NameRule::Current.apply(&refused, &ctx).is_err());
         assert_eq!(refused.written(ADMITTED_NAME_RULE), None);
         let path = refused_path.lock().unwrap().clone().unwrap();
         assert!(refused.stat(&path).is_err());
@@ -1191,7 +1449,7 @@ mod tests {
                 .file(REFUSED_RULE, b"previous refusal")
                 .rename_fails(destination, std::io::ErrorKind::PermissionDenied);
             let checked_path = watch(&failed, reply);
-            assert!(NameRule.apply(&failed, &ctx).is_err());
+            assert!(NameRule::Current.apply(&failed, &ctx).is_err());
             assert_eq!(
                 failed.read_file(Path::new(ADMITTED_NAME_RULE)).unwrap(),
                 previous.as_bytes()
@@ -1283,18 +1541,29 @@ mod tests {
                 Ran::ok(""),
             );
         assert_eq!(
-            name_by_rule(&sys, "m42", &|| Ok(())),
+            name_by_rule(
+                &sys,
+                &GeneratedNames::number_only(Number::parse("m42").unwrap()),
+                &|| Ok(())
+            ),
             Ok(vec!["ComputerName", "HostName"])
         );
 
         let none = Fake::root();
-        assert!(name_by_rule(&none, "m42", &|| Ok(())).is_err());
+        assert!(
+            name_by_rule(
+                &none,
+                &GeneratedNames::number_only(Number::parse("m42").unwrap()),
+                &|| Ok(())
+            )
+            .is_err()
+        );
         assert!(
             none.calls().iter().all(|c| !c.contains("sudo")),
             "{:?}",
             none.calls()
         );
-        assert!(name_by_rule(&sys, "Mac-mini", &|| Ok(())).is_err());
+        assert!(Number::parse("Mac-mini").is_err());
 
         for (number, expected) in [
             ("m183", vec!["ComputerName"]),
@@ -1313,7 +1582,15 @@ mod tests {
                     Ran::ok(""),
                 );
             }
-            assert_eq!(name_by_rule(&sys, number, &|| Ok(())).unwrap(), expected);
+            assert_eq!(
+                name_by_rule(
+                    &sys,
+                    &GeneratedNames::number_only(Number::parse(number).unwrap()),
+                    &|| Ok(())
+                )
+                .unwrap(),
+                expected
+            );
             let writes: Vec<_> = sys
                 .calls()
                 .into_iter()
@@ -1330,5 +1607,40 @@ mod tests {
                 "a repair of another slot must preserve an accepted Bonjour alias"
             );
         }
+        let names = GeneratedNames::new(
+            Number::parse("m85").unwrap(),
+            &Nickname::parse("Dog").unwrap(),
+        );
+        let sys = Fake::root();
+        sys.stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440));
+        for (pref, now) in [
+            ("ComputerName", "m85"),
+            ("LocalHostName", "m85-dog-2"),
+            ("HostName", "m85"),
+        ] {
+            let slot = OsSlot::from_macos_preference(pref).unwrap();
+            sys.on(&format!("/usr/sbin/scutil --get {pref}"), Ran::ok(now));
+            sys.on(
+                &Cmd::new(SUDO)
+                    .args([
+                        "-n",
+                        crate::items::names::SCUTIL,
+                        "--set",
+                        pref,
+                        names.for_slot(slot).unwrap(),
+                    ])
+                    .display(),
+                Ran::ok(""),
+            );
+        }
+        assert_eq!(
+            name_by_rule(&sys, &names, &|| Ok(())).unwrap(),
+            ["ComputerName", "HostName"]
+        );
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|call| call.contains("--set LocalHostName"))
+        );
     }
 }

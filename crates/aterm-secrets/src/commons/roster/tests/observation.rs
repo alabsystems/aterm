@@ -599,14 +599,17 @@ impl SessionJudged {
 /// `Bootstrap::access_observed_in_look`, `Access::is_current_in`,
 /// `Access::is_current_observed_in` and `VaultLook::swarm_roster_until`) observes the state lock
 /// once for the open and its checks,
-/// takes one stamping `lstat` of each file they stamp (the custody's digests of its immutable
-/// files look at those once more, as on their own call), opens no file the asks on their own
-/// calls do not, and answers as those calls do; the next look looks again.
+/// takes one `lstat` of each file they stamp or digest (the custody's pinned files among them),
+/// opens no file the asks on their own calls do not, and answers as those calls do; the next look
+/// looks again.
 /// NEGATIVE CONTROLS (2026-11-09): with `Access::is_current_observed_in` on its own call, a
 /// session observes the lock three times (`a session look's observations`); with
 /// `Bootstrap::access_observed_in_look` on its own call, twice; with
 /// `Bootstrap::revalidate_custody_in` on its own call, twice; with `VaultLook::swarm_roster_until`
-/// asking its memo on its own call, twice.
+/// asking its memo on its own call, twice. (2026-11-10) With the custody's digests on their own
+/// calls (`Bootstrap::revalidate_custody_in` checking `revalidate_immutable_custody`), the
+/// identity and the device's age identity and claim are looked at twice (`a session look's
+/// looks`).
 #[test]
 fn a_session_look_observes_once_and_judges_as_its_own_calls() {
     let vault = Vault::new();
@@ -641,32 +644,29 @@ fn a_session_look_observes_once_and_judges_as_its_own_calls() {
             "a session look's reads {read:#?}, its own calls' {own_reads:#?}"
         );
         assert_eq!(judged.unwrap().verdict(), own.verdict());
-        // The immutable custody's digests open and look at their files themselves.
-        let custody = looks_during(&home, || {
-            vault.bootstrap.revalidate_immutable_custody().unwrap();
-        });
-        assert!(custody.contains_key(&vault.paths.dir.join("identity")));
-        let stamped: std::collections::BTreeMap<_, _> = looked
-            .iter()
-            .map(|(path, looks)| (path, looks - custody.get(path).copied().unwrap_or(0)))
-            .filter(|(_, looks)| *looks > 0)
-            .collect();
+        let commons = vault.paths.dir.join("commons");
         for file in [
             vault.paths.dir.clone(),
-            vault.paths.dir.join("identity"),
             vault.paths.state_file(),
             vault.paths.dir.join("source.toml"),
             vault.paths.cache_file(),
+            vault.paths.dir.join("identity"),
+            vault.paths.dir.join("commons.claim"),
+            commons.join("device.age"),
+            commons.join("device.claim"),
+            commons.join("default.pin"),
+            vault.bootstrap.journal_dir().join("control.anchor"),
         ] {
             assert_eq!(
-                stamped.get(&file),
+                looked.get(&file),
                 Some(&1),
-                "a session look's looks: {looked:#?}, its custody's {custody:#?}"
+                "a session look's looks of {}: {looked:#?}",
+                file.display()
             );
         }
         assert!(
-            stamped.values().all(|looks| *looks == 1),
-            "a session look's looks: {looked:#?}, its custody's {custody:#?}"
+            looked.values().all(|looks| *looks == 1),
+            "a session look's looks: {looked:#?}"
         );
         assert_eq!(
             looks_during(&home, || {
@@ -1076,6 +1076,146 @@ fn the_next_session_look_sees_another_identity() {
         assert!(
             !access.is_current_in(&vault.journal, &look),
             "the next look sees another identity"
+        );
+    });
+}
+
+/// A look judges its custody as it first saw the pinned files (`Bootstrap::revalidate_custody_in`
+/// through the look's glance): a pin replaced after a look's first check passes that look's next
+/// check, as the files the state lock guards would, and the next look and the bootstrap's own call
+/// refuse it; a look that never looked at the pin before it changed refuses it at its first check.
+/// NEGATIVE CONTROL (2026-11-10): with the custody's digests on their own calls in a look, the
+/// look refuses the pin it first saw (`a look judges its custody as it first saw it`).
+#[test]
+fn a_session_look_judges_its_custody_as_it_first_saw_it() {
+    let vault = Vault::new();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        vault.bootstrap.revalidate_custody().unwrap();
+        let look = client::VaultLook::new(&vault.paths);
+        vault.bootstrap.revalidate_custody_in(&look).unwrap();
+        let pin = vault.paths.dir.join("commons").join("default.pin");
+        let mut replaced = std::fs::read(&pin).unwrap();
+        *replaced.last_mut().unwrap() ^= 1;
+        crate::fsx::write_atomic(&pin, &replaced, 0o600).unwrap();
+        assert!(
+            vault.bootstrap.revalidate_custody_in(&look).is_ok(),
+            "a look judges its custody as it first saw it"
+        );
+        drop(look);
+        let refused = |judged: crate::Result<()>| {
+            judged
+                .err()
+                .is_some_and(|error| error.to_string().contains("immutable custody changed"))
+        };
+        assert!(
+            refused(
+                vault
+                    .bootstrap
+                    .revalidate_custody_in(&client::VaultLook::new(&vault.paths))
+            ),
+            "the next look sees a replaced pin"
+        );
+        assert!(
+            refused(vault.bootstrap.revalidate_custody()),
+            "the bootstrap's own call sees a replaced pin"
+        );
+    });
+}
+
+/// A source read through a look (`Bootstrap::local_source_read_in`) is the look's own where it
+/// holds the lock at the bootstrap's vault: it takes none of its own
+/// (`client::test_source_reads_held`), whether the look observed the lock itself or stands on a
+/// source read's observation, and it judges the custody through the look: the pinned files as the
+/// look first saw them, so a pin replaced since passes that look and the next look refuses it. A
+/// look whose observation guards a lock file put away since it looked, and a look at another
+/// vault, give a source read of their own.
+/// NEGATIVE CONTROLS (2026-11-10): with it taking its own source read whatever the look, a look
+/// holding the vault gives one (`a source read through a look holding the vault`); with it
+/// standing on a look whether or not the look holds the lock at the vault's path, a look on a lock
+/// put away gives none (`a source read through a look on a lock put away`); with it judging the
+/// custody on its own call (`Bootstrap::revalidate_custody`), a look that judged the custody once
+/// refuses a pin replaced since (`a source read through a look judges its custody as the look
+/// first saw it`); with it judging no custody, the next look gives a replaced pin a source read
+/// (`a source read through the next look sees a replaced pin`).
+#[test]
+fn a_source_read_through_a_look_holding_the_vault_is_the_looks() {
+    let vault = Vault::new();
+    let held = client::test_source_reads_held;
+    let before = held();
+    let look = client::VaultLook::new(&vault.paths);
+    assert!(
+        vault
+            .bootstrap
+            .local_source_read_in(&look)
+            .unwrap()
+            .is_none(),
+        "a source read through a look holding the vault"
+    );
+    drop(look);
+    let standing = client::try_commons_source_read(&vault.paths)
+        .unwrap()
+        .unwrap()
+        .into_look(&vault.paths);
+    assert!(
+        vault
+            .bootstrap
+            .local_source_read_in(&standing)
+            .unwrap()
+            .is_none(),
+        "a source read through a source read's look"
+    );
+    drop(standing);
+    assert_eq!(held() - before, 0, "CONTROL: no source read of its own");
+
+    let other = Vault::new();
+    let elsewhere = client::VaultLook::new(&other.paths);
+    let read = vault.bootstrap.local_source_read_in(&elsewhere).unwrap();
+    assert!(
+        read.is_some(),
+        "a source read through a look at another vault"
+    );
+    drop((read, elsewhere));
+    assert_eq!(held() - before, 1, "CONTROL: its own source read");
+
+    let look = client::VaultLook::new(&vault.paths);
+    let lock = vault.paths.dir.join(".lock");
+    let put_away = lock.with_extension("put-away");
+    std::fs::rename(&lock, &put_away).unwrap();
+    std::fs::copy(&put_away, &lock).unwrap();
+    let read = vault.bootstrap.local_source_read_in(&look).unwrap();
+    assert!(
+        read.is_some(),
+        "a source read through a look on a lock put away"
+    );
+    drop((read, look));
+    assert_eq!(held() - before, 2, "CONTROL: its own source read");
+
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let look = client::VaultLook::new(&vault.paths);
+        assert!(
+            vault
+                .bootstrap
+                .local_source_read_in(&look)
+                .unwrap()
+                .is_none(),
+            "CONTROL: a look holding the vault"
+        );
+        let pin = vault.paths.dir.join("commons").join("default.pin");
+        let mut replaced = std::fs::read(&pin).unwrap();
+        *replaced.last_mut().unwrap() ^= 1;
+        crate::fsx::write_atomic(&pin, &replaced, 0o600).unwrap();
+        assert!(
+            matches!(vault.bootstrap.local_source_read_in(&look), Ok(None)),
+            "a source read through a look judges its custody as the look first saw it"
+        );
+        drop(look);
+        assert!(
+            vault
+                .bootstrap
+                .local_source_read_in(&client::VaultLook::new(&vault.paths))
+                .err()
+                .is_some_and(|error| error.to_string().contains("immutable custody changed")),
+            "a source read through the next look sees a replaced pin"
         );
     });
 }

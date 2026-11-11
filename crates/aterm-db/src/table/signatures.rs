@@ -16,10 +16,60 @@ use std::{
 
 const MAX_SIGNATURES: usize = 4096;
 type Key = ([u8; 32], Digest);
+static CACHE: Cache = Cache::new(MAX_SIGNATURES);
 
+/// The signed wire's content identifier, once its signature by `signer` checks.
 pub(super) fn verify(signer: &[u8; 32], wire: &[u8]) -> Result<Digest> {
-    static CACHE: Cache = Cache::new(MAX_SIGNATURES);
     CACHE.verify(signer, wire)
+}
+
+/// [`verify`] of an identified wire's bytes, under the identifier [`Identified::new`] took of
+/// them, so they are not hashed again.
+pub(super) fn verify_identified(signer: &[u8; 32], wire: &Identified) -> Result<Digest> {
+    CACHE.verify_as(signer, &wire.wire, || wire.id)
+}
+
+/// Table wire bytes with their content identifier, `Sha256::digest` of exactly those bytes, which
+/// only [`Self::new`] takes and nothing changes after: a table replay names each record's receipt
+/// by it, and checks an operation record's signature under it ([`verify_identified`]), hashing
+/// that record's bytes once. A conflict certificate is signed by nobody: the signed sources it
+/// holds are checked as any wire is, and hashed for that.
+pub(super) struct Identified {
+    wire: Vec<u8>,
+    id: Digest,
+}
+
+impl Identified {
+    pub(super) fn new(wire: Vec<u8>) -> Self {
+        #[cfg(test)]
+        HASHED.set(HASHED.get() + 1);
+        let id = Sha256::digest(&wire);
+        Self { wire, id }
+    }
+
+    pub(super) const fn id(&self) -> Digest {
+        self.id
+    }
+
+    pub(super) fn wire(&self) -> &[u8] {
+        &self.wire
+    }
+
+    pub(super) fn into_wire(self) -> Vec<u8> {
+        self.wire
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many wires this thread hashed for their identifiers, here and in [`Identified::new`].
+    static HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`HASHED`]'s count on this thread.
+#[cfg(test)]
+pub(super) fn test_hashed() -> usize {
+    HASHED.get()
 }
 
 struct Entries {
@@ -48,6 +98,21 @@ impl Cache {
     }
 
     fn verify(&self, signer: &[u8; 32], wire: &[u8]) -> Result<Digest> {
+        self.verify_as(signer, wire, || {
+            #[cfg(test)]
+            HASHED.set(HASHED.get() + 1);
+            Sha256::digest(wire)
+        })
+    }
+
+    /// [`Self::verify`] where `id` gives `Sha256::digest(wire)`, asked once the wire's shape is
+    /// admitted.
+    fn verify_as(
+        &self,
+        signer: &[u8; 32],
+        wire: &[u8],
+        id: impl FnOnce() -> Digest,
+    ) -> Result<Digest> {
         if wire.len() > crypto::MAX_OPERATION {
             return Err(Error::new("table operation exceeds its bound"));
         }
@@ -55,7 +120,7 @@ impl Cache {
             .len()
             .checked_sub(64)
             .ok_or_else(|| Error::new("truncated table signature"))?;
-        let id = Sha256::digest(wire);
+        let id = id();
         let key = (*signer, id);
         if self.capacity > 0
             && let Ok(entries) = self.entries.try_lock()

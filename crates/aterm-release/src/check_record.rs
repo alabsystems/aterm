@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tree-local release check records with immediate-hop content receipts; a FAIL is never
+//! Tree-local release check records with content receipts; a FAIL is never
 //! re-rolled (A19).
 //!
 //! `verify release` ends each check with one `check-finished` line ([`aterm_verify::report`])
@@ -9,7 +9,7 @@
 //! `lint-package-finished` line. It writes each whole to the run's own events file (`--events`),
 //! which only verify's own process writes: no child's output and no other writer's bytes land
 //! inside a line there, as they can in its output. Every record of one
-//! tree under one seal lives in one directory, `<git common dir>/aterm-release/verified/<tree>/<S>/`,
+//! tree under one seal lives in one directory, `<git common dir>/aterm-release/.ubd/verified/<tree>/<S>/`,
 //! S the seal's digest ([`seal_dir`]):
 //! - a tree check's at `<check>.toml`, keyed by H(check, tree, seal);
 //! - the bundle check's, `measure` (the one check that reads `--app`), at `measure/<U>.toml`,
@@ -32,7 +32,7 @@
 //! content proofs ([`VerifyRun`]). A record that does not parse, or whose key is not this tree's and seal's, is
 //! missing; one that cannot be read leaves the judge without an answer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use aterm_verify::checks::{Check, RELEASE, RELEASE_BUNDLE, RELEASE_TREE};
@@ -42,7 +42,7 @@ use crate::ledger::GitRunner;
 use crate::release::{Answer, Refusal};
 
 /// Where the records live, in the release directory.
-pub const DIR: &str = "verified";
+pub const DIR: &str = ".ubd/verified";
 
 /// The run-level record's name: a `verify release` that began and has not settled, or that
 /// exited 1 (FAIL) with no check's FAIL read from its events, still refuses its tree, so the FAIL
@@ -145,10 +145,13 @@ pub struct LintPackage {
     pub input_reason: Option<String>,
     #[serde(default)]
     pub execution_s: f64,
+    /// This cut revalidated an earlier verdict rather than executing Tippy for this package.
+    #[serde(default)]
+    pub reused: bool,
 }
 
 impl LintPackage {
-    /// Whether a later hop may offer this row to the verifier. FAIL, legacy and undeclared rows
+    /// Whether a later qualification may offer this row to the verifier. FAIL and unbounded rows
     /// are tombstones, never evidence.
     fn carried(&self) -> bool {
         self.outcome == OK
@@ -224,7 +227,7 @@ pub struct CheckRecord {
     #[serde(default)]
     pub binaries: Vec<Binary>,
     /// Per-workspace-package lint evidence. The aggregate lint record remains tree-local; these
-    /// rows are the finer content receipts which may cross only to the immediately next hop.
+    /// rows are finer content receipts which a later qualification must re-key before reuse.
     #[serde(default)]
     pub lint_packages: Vec<LintPackage>,
     /// Deterministic source-reader input snapshots, validated again by the next preflight.
@@ -271,7 +274,7 @@ fn path_in_seal_dir(seal_dir: &Path, check: &str, executable: Option<&str>) -> P
     }
 }
 
-/// `<release dir>/verified`.
+/// `<release dir>/.ubd/verified`.
 ///
 /// # Errors
 /// git cannot name the common dir.
@@ -845,7 +848,92 @@ pub fn checks(
     seal: impl FnOnce() -> Result<String, String>,
 ) -> Result<Checks, String> {
     let tree = tree_of(git, commit)?;
-    checks_in(&root(git)?, commit, &tree, executable, seal)
+    let root = root(git)?;
+    let mut current_seal = None;
+    let mut checks = checks_in(&root, commit, &tree, executable, || {
+        let value = seal()?;
+        current_seal = Some(value.clone());
+        Ok(value)
+    })?;
+    if checks.missing.iter().any(|check| check == "lint") {
+        // This adds candidates, never a passing aggregate verdict. Current-tree rows win,
+        // including failures and unbounded tombstones. The verifier alone proves equality.
+        if let Ok(candidates) = ancestor_lint_candidates(git, &root, commit, &tree) {
+            let mut current: BTreeSet<_> =
+                checks.lint_resume.iter().map(|p| p.spec.clone()).collect();
+            if let Some(seal) = current_seal
+                && let Read::Record(record) = read(&path(&root, &tree, &seal, "lint", None))?
+                && answers(&record, "lint", &tree, &seal, None)
+            {
+                current.extend(record.lint_packages.iter().map(|p| p.spec.clone()));
+            }
+            checks.lint_resume.extend(
+                candidates
+                    .into_iter()
+                    .filter(|p| !current.contains(&p.spec)),
+            );
+        }
+    }
+    Ok(checks)
+}
+
+/// Search bounded local history for qualification candidates across release cuts. An absent
+/// ancestor or unreadable record supplies no fact; nothing here changes a tree's verdict.
+fn ancestor_lint_candidates(
+    git: &dyn GitRunner,
+    root: &Path,
+    commit: &str,
+    current_tree: &str,
+) -> Result<Vec<LintPackage>, String> {
+    let history = git
+        .git_read(&[
+            "log",
+            "--date-order",
+            "--max-count=4096",
+            "--format=%T",
+            &format!("{commit}^"),
+        ])
+        .map_err(|e| e.to_string())?;
+    if !history.success() {
+        return Ok(Vec::new());
+    }
+    let mut candidates = BTreeMap::new();
+    for tree in history.stdout_utf8().lines() {
+        if tree == current_tree || !aterm_codec::hex::is_lower(tree, 40) {
+            continue;
+        }
+        let directory = root.join(tree);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        let mut paths = entries
+            .map(|entry| entry.map(|e| e.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        paths.sort();
+        for path in paths {
+            let Read::Record(record) = read(&path.join("lint.toml"))? else {
+                continue;
+            };
+            if record.tree != tree
+                || !answers(&record, "lint", tree, &record.seal, None)
+                || record.run.starts_with(CANDIDATE_RUN_PREFIX)
+            {
+                continue;
+            }
+            for package in record.lint_packages {
+                // The first observed row owns this spec even if it is not reusable: do not
+                // resurrect an older success over a newer failure or unbounded reader.
+                candidates.entry(package.spec.clone()).or_insert(package);
+            }
+        }
+    }
+    Ok(candidates
+        .into_values()
+        .filter(LintPackage::carried)
+        .collect())
 }
 
 /// [`checks`] over the records under `root`.
@@ -1352,8 +1440,6 @@ fn remove(at: &Path) -> Result<(), String> {
 /// What one `verify release` run said, read from its events file ([`events`]).
 #[derive(Debug, Default)]
 pub struct RunEvents {
-    /// The lint passed resource admission. This is a scheduling signal, never a verdict.
-    pub lint_admitted: bool,
     /// The verifier image captured before compilation, distinct from the next on-disk image.
     pub running_driver: Option<String>,
     /// Linked measuring executables reported by the compiler, never inferred from source paths.
@@ -1417,9 +1503,6 @@ pub fn events(at: &Path) -> std::io::Result<RunEvents> {
             Ok(None) => {}
         }
         match event["event"].as_str() {
-            Some("stage-admitted") if event["stage_id"].as_str() == Some("Tippy") => {
-                run.lint_admitted = true;
-            }
             Some("measure-driver") => {
                 let digest = event["sha256"]
                     .as_str()
@@ -1503,6 +1586,7 @@ pub fn events(at: &Path) -> std::io::Result<RunEvents> {
                     inputs_bounded,
                     input_reason,
                     execution_s: event["execution_s"].as_f64().unwrap_or(0.0),
+                    reused: event["carried"].as_bool().unwrap_or(false),
                 };
                 if let Some(pos) = lint_packages.iter().position(|row| row.spec == spec) {
                     lint_packages.remove(pos);
@@ -1847,6 +1931,14 @@ pub fn write_run(
             if check == Check::Lint {
                 lint_finished = true;
                 r.lint_packages.clone_from(&events.lint_packages);
+                let reused = r.lint_packages.iter().filter(|p| p.reused).count();
+                if !r.detail.is_empty() {
+                    r.detail.push_str("; ");
+                }
+                r.detail.push_str(&format!(
+                    "{reused} packages reused, {} judged",
+                    r.lint_packages.len() - reused
+                ));
             }
             r.input_items = events
                 .input_items
@@ -2035,6 +2127,70 @@ mod tests {
         format!("{n:02x}").repeat(32)
     }
 
+    #[test]
+    fn later_cuts_offer_ancestor_lint_facts_without_reviving_newer_tombstones() {
+        let f = Fixture::new();
+        let repository = f._dir.path().join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        let git = crate::ledger::GitCli::new(&repository);
+        let call = |args: &[&str]| {
+            let output = git.git(args).unwrap();
+            assert!(output.success(), "{}", output.stderr_utf8());
+            output.stdout_utf8().trim().to_owned()
+        };
+        call(&["init", "--quiet", "-b", "main"]);
+        call(&["config", "user.name", "Qualification fixture"]);
+        call(&["config", "user.email", "fixture@example.invalid"]);
+        let commit = |text: &str| {
+            std::fs::write(repository.join("source"), text).unwrap();
+            call(&["add", "source"]);
+            call(&["commit", "--quiet", "-m", text]);
+            call(&["rev-parse", "HEAD^{tree}"])
+        };
+        commit("base");
+        call(&["checkout", "--quiet", "-b", "cut"]);
+        let old = commit("old qualified cut");
+        let newer = commit("cut with a failed package");
+        call(&["checkout", "--quiet", "main"]);
+        commit("new main source");
+        call(&[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-s",
+            "ours",
+            "cut",
+            "-m",
+            "record cut without changing main",
+        ]);
+        call(&["commit", "--quiet", "--allow-empty", "-m", "next cut"]);
+        let head = call(&["rev-parse", "HEAD"]);
+        let tree = call(&["rev-parse", "HEAD^{tree}"]);
+        let seed = |tree: &str, packages: Vec<LintPackage>| {
+            let mut facts = f.facts("prior-seal", "unused");
+            facts.tree = tree;
+            let mut row = record(&facts, (0, &u(9)), "lint", OK, None);
+            row.lint_packages = packages;
+            let at = path(&f.root, tree, "prior-seal", "lint", None);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            write(&at, &row).unwrap();
+        };
+        seed(
+            &old,
+            vec![
+                lint_package("stable", 1, OK),
+                lint_package("changed", 2, OK),
+            ],
+        );
+        seed(&newer, vec![lint_package("changed", 3, FAIL)]);
+        let candidates = ancestor_lint_candidates(&git, &f.root, &head, &tree).unwrap();
+        assert_eq!(candidates, [lint_package("stable", 1, OK)]);
+        assert!(
+            !has_records(&f.root, &tree).unwrap(),
+            "offering facts writes no current verdict"
+        );
+    }
+
     /// A record as large as a whole-tree check's (over the old 1 MiB cap) is written and read
     /// back; one over the bound its reader holds is never written.
     ///
@@ -2097,6 +2253,7 @@ mod tests {
             inputs_bounded: true,
             input_reason: None,
             execution_s: f64::from(key),
+            reused: false,
         }
     }
 
@@ -2513,7 +2670,8 @@ mod tests {
                     "content_key": key,
                     "inputs_bounded": bounded,
                     "input_reason": reason,
-                    "execution_s": 1.0
+                    "execution_s": 1.0,
+                    "carried": spec == "d@1"
                 })
             )
         };
@@ -2540,6 +2698,11 @@ mod tests {
         );
         assert!(!rows[2].carried(), "a prior FAIL is never carry evidence");
         assert!(rows[3].carried());
+        assert!(
+            rows[3].reused,
+            "a reused verdict remains identified in the cut's record"
+        );
+        assert!(!rows[2].reused);
     }
 
     /// Runtime test failure keeps the product; a compile failure, another red, or another

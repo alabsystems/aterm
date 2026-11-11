@@ -31,7 +31,7 @@ fn other(root: &Receipt, phase: Phase) -> Receipt {
 
 fn put(path: &Path, text: &str) {
     private_parent(path).unwrap();
-    super::super::super::super::upgrade_models::write_atomic_mode(path, text, Some(0o600)).unwrap();
+    super::super::super::super::atomic_write::write_atomic_mode(path, text, Some(0o600)).unwrap();
 }
 
 fn run_case(state: &aterm_spec::interp::State, buggy: u8) -> (bool, bool) {
@@ -96,7 +96,7 @@ fn run_case(state: &aterm_spec::interp::State, buggy: u8) -> (bool, bool) {
             } else {
                 let _ = writer.read_indexed(&key)?;
                 writer.create(&initial).and_then(|()| {
-                    super::super::super::super::upgrade_models::write_atomic_mode(
+                    super::super::super::super::atomic_write::write_atomic_mode(
                         &path,
                         &initial.id,
                         Some(0o600),
@@ -106,7 +106,7 @@ fn run_case(state: &aterm_spec::interp::State, buggy: u8) -> (bool, bool) {
             }
         } else if buggy == 2 && matches!(scenario, 3 | 7) {
             writer.create(&initial).and_then(|()| {
-                super::super::super::super::upgrade_models::write_atomic_mode(
+                super::super::super::super::atomic_write::write_atomic_mode(
                     &path,
                     &initial.id,
                     Some(0o600),

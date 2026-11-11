@@ -48,7 +48,7 @@ pub struct Stop {
     #[cfg(unix)]
     bell: std::sync::OnceLock<std::io::PipeReader>,
     /// How many sleeps took the lock to wait, for a test to set the stop only once they wait.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     entered: std::sync::atomic::AtomicUsize,
     /// How many waits returned, including notifications that leave the stop unset.
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
@@ -94,7 +94,7 @@ impl Stop {
         let total = total.min(LONGEST);
         let deadline = Instant::now() + total;
         let mut latch = self.latch.lock().unwrap_or_else(PoisonError::into_inner);
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         self.entered
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         while !self.is_set() {
@@ -177,9 +177,12 @@ impl Stop {
         Ok(ready)
     }
 
-    /// How many sleeps have taken the lock: each waits from then until [`Stop::set`] can take it.
-    #[cfg(test)]
-    fn entered(&self) -> usize {
+    /// How many sleeps have taken the lock: each waits from then until [`Stop::set`] can take it,
+    /// so a test (this crate's or another's) that sets the stop once this counts its sleeper sets
+    /// it on a thread asleep on it, not before the sleep began.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn entered(&self) -> usize {
         self.entered.load(std::sync::atomic::Ordering::Relaxed)
     }
 

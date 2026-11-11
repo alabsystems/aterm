@@ -12,6 +12,7 @@ pub(in crate::actor::owner) struct ObjectOperation {
     context: trust_resource_controller::ContextReply,
     sdk: Arc<sdk::Keeper>,
     gnu: Arc<[OwnedFd; 2]>,
+    source: Arc<super::super::OriginalSource>,
     deadline: Instant,
     environment: BTreeMap<Vec<u8>, Vec<u8>>,
     output: Option<super::super::OriginalOutput>,
@@ -29,6 +30,9 @@ impl ObjectOperation {
     }
     pub(in crate::actor::owner) fn gnu(&self) -> Arc<[OwnedFd; 2]> {
         Arc::clone(&self.gnu)
+    }
+    pub(in crate::actor::owner) fn source(&self) -> Arc<super::super::OriginalSource> {
+        Arc::clone(&self.source)
     }
     pub(in crate::actor::owner) fn deadline(&self) -> Instant {
         self.deadline
@@ -107,6 +111,13 @@ impl Owner {
             ));
         }
         root.gnu.check()?;
+        let source = root.inputs.original_source(&request.key.graph, deadline)?;
+        source.matches(
+            &request.key.graph,
+            &request.source_root,
+            request.source_directory,
+            deadline,
+        )?;
         let output = root.inputs.original_output(&request.key.graph)?;
         if request.output_directory != output.attachment().root
             || request.output_lock != output.attachment().lock
@@ -139,6 +150,7 @@ impl Owner {
             context,
             sdk: Arc::clone(&root.sdk),
             gnu: Arc::clone(&root.gnu.descriptions),
+            source,
             deadline,
             environment: state.environment.clone(),
             output: Some(output),

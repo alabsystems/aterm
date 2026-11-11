@@ -787,9 +787,9 @@ impl Windowed {
     }
 }
 
-/// The classifier [`Windowed::launch`] installs, which each native key, click and scroll meets
-/// before AppKit can generate a window callback from it: whether a burst or another process
-/// posted it ([`crate::hwkey::classify`]).
+/// The classifier [`Windowed::launch`] installs, which each native key, modifier change, click and
+/// scroll meets before AppKit can generate a window callback from it: whether a burst or another
+/// process posted it ([`crate::hwkey::classify`]).
 #[cfg(target_os = "macos")]
 pub(crate) fn window_input_origin(
     event: aterm_window::platform::macos::NativeInputEvent,

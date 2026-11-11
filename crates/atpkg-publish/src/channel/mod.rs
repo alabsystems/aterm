@@ -198,15 +198,5 @@ pub(crate) fn flag_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> R
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::host::fake::FakeHost;
-
-    #[test]
-    fn an_answered_public_404_is_not_polled_again() {
-        let host = FakeHost::new();
-        let slug = Slug::new("public", "program");
-        assert_eq!(probe_served(&host, &slug, "v1", "asset"), Probe::Absent);
-        assert_eq!(host.calls(), ["probe public/program v1 asset"]);
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

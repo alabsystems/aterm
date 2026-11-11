@@ -10,35 +10,6 @@
 > Release builds omit its entrypoint.
 
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 61 tests it
-> deleted are gone (the 7 §4 deletes among them), and the spec rows no longer cite those tests.
-> Counts elsewhere in this file were taken before.
-
-> Status 2026-10-16: nothing has been proved or deleted yet. The 59 specs below are the crate's
-> migration worklist: each is proved through Trust/Clean about the compiled Rust function, then the
-> tests it subsumes are deleted. §4 lists the 34 tests that are not spec samples and what to do with each.
->
-> **Measured on Trust seal `150efe4a` (2026-10-16): the ten `{0,1,3}` / `{0,3}` specs are all blocked by
-> gap 1, so nothing is proved and no test is deleted.** The strict lane admits the crate: no proc-macro
-> (PM-1) refusal. A temporary build put an island over the kernel import of each fn, plus contracts on
-> `ContainmentMode::level` and `ProbeLabel::refused`. The source was restored byte for byte afterwards.
-> Every island was rejected `AutoBoundHeadOverApplied { name: "trust_import_aterm_containment__…", remaining_args: n }`.
-> That means E6 mints no kernel import for any of these fns, because each one takes or returns an enum, an
-> `Option`/`Result`, a struct with enum fields, a `PathBuf` or a `Vec<String>`. The rejections were
-> `mode::ContainmentMode::level` (mode-order), `policy::ContainmentPolicy::network` (policy-monotone-minimal),
-> `consent::fence_exe_from` (fence-exe), `consent::ProbeLabel::refused` (refusal-labels), `consent::FdaState::as_str`
-> (wire-tokens), `consent::responsible_answer` (responsible-classification), `consent::tccutil_reset_command`,
-> `consent::ConsentPosture::join` (posture-join), `consent::classify_membership` and `consent::classify_cs_status`
-> (debugger-pure-classifiers), and `consent::devtool_grant`. The island for `classify_responsible` failed earlier,
-> on Clean's `Result` binder (`AutoBoundHeadOverApplied { name: "Result" }`). A scratch probe of the same shape,
-> scalar `i32` arguments returning a fieldless enum, also gets no import. A clause that names an enum
-> receiver is refused `missing supported type for clause variable \`self\``, and its predicate is not lowered
-> (`unsupported contract predicate expression`). The only clause the lane accepts on these fns names `result`
-> alone. `ensures result <= 3` on `level` was proved natively (`trust-full-verifier`, not `clean-kernel-citation`)
-> and then withheld at publication, and it does not state the mode table. So `mode-order` and
-> `debugger-pure-classifiers` need gap 1 (enum/`Option` carriers in E6 imports and clauses) as well as gap 3.
-> A scalar control in the same probe set, `fn g(a: u8) -> bool` imported as `trust_import_<crate>__T__g`, does get an import.
-
 Source: `crates/aterm-containment` (read only). I read every `#[test]`
 (src/lib.rs 2, src/mode.rs 6, src/capability.rs 4, src/policy.rs 2, src/actuator.rs 26, src/sbpl.rs 22,
 src/consent.rs 115, tests/{audit_denial_logged 5, claimant_census 4, image_anchor_live 3,
@@ -81,7 +52,7 @@ Result: **59 specs**, covering **181 tests**. **34 tests are not spec samples** 
   (gaps 11 and 13).
 - `ToolRun` is the run-outcome sum `Exited{code,stdout,stderr} | Absent | SpawnFailed | TimedOut | Unreadable`.
 - **Blocking gaps** are the row numbers of the gap table in
-  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (the installed seal publishes no
+  `docs/TRUST-LANE.md` (Blocking gaps). Gap 0 (the installed seal publishes no
   Lean-discharged row) blocks every spec and is listed on every row. Gaps 6, 14, 16 and 17 apply to every
   proof on their lane and are not listed per row. Gap 8 (effects) covers every spec over fs, process,
   FFI or the logger; until it closes, such a spec is proved over `FS`/a process model or a factored pure core.
@@ -321,19 +292,6 @@ tests/init_mode_is_write_once.rs	init_mode_is_write_once	mode-global-write-once	
 tests/uninitialized_mode.rs	mode_or_containment_defaults_to_containment_when_uninit	mode-global-write-once	
 ```
 
-## 3. Coverage
-
-- 215 tests read. 181 map to one of the 59 specs as primary. 34 are not spec samples (§4).
-- The biggest collapses: `profile-structure` (7), `census-fence` (7), `decide-on-decision` (6),
-  `mode-global-write-once` (6), `folder-table` (6), `posture-join` (6), `claimant-offer-rule` (5),
-  `wire-tokens` (5), `real-probes-refuse-outside-bundle` (5), `fda-probe-gate` (5).
-- `sbpl-profile-denotation` has no primary test. It is the model that the 16 kept kernel-conformance tests
-  in `src/actuator.rs` bind to macOS; proving it makes those tests the model's conformance lane rather than
-  its only evidence.
-- The six `tests/*` integration binaries for the global mode each exist only to get a fresh process
-  (`OnceLock`). Once `mode-global-write-once` is proved, all six files go, together with
-  `tests/containment_suite.rs` if nothing else uses its `in_fresh_process` helper.
-
 ## 4. Tests that are not spec samples
 
 Actions: **keep as conformance** (a live check that binds a model or a platform assumption to the
@@ -389,43 +347,3 @@ Totals: keep as conformance 24, move-to-bench 2.
 8. *(Resolved: `DEVTOOL_WINDOW_S` and the `"--last"` literal in `DEVTOOL_LOG_ARGS` are now generated from
    one `devtool_window_minutes!` macro invocation.)*
 9. *(Resolved: `tests/image_anchor_live.rs` no longer claims proof from a table test.)*
-
-## 6. Proof order
-
-E6 mints no kernel import for a fn that takes or returns an enum, an `Option`/`Result`, a struct
-with enum fields, a `PathBuf` or a `Vec<String>`, and the fns these specs name all do, so every spec waits on
-gap 1, `mode-order` and `debugger-pure-classifiers` included (their `blocking_gaps` omit it). Then,
-easiest first:
-
-1. **`mode-order`** (gaps 0, 3). One cast and a `u8::cmp`. It is the base lemma for `policy-monotone-minimal`,
-   `mode-global-write-once` and every "User/Safety are permitted" claim.
-2. **`debugger-pure-classifiers`** (gaps 0, 3). `const fn` over `Option` pairs and a `u32` mask.
-3. **`policy-monotone-minimal`** (gaps 0, 1, 3). The crate's central security table (3 modes, finite).
-   With `mode-order` it retires all of `policy.rs` and lets the four tautologies in `capability.rs` go.
-4. **`posture-join`** (gaps 0, 1, 3). A `const fn` over `Copy` structs that retires 6 tests.
-5. The other `{0,1,3}` tables: **`wire-tokens`** (5 tests), **`refusal-labels`**, **`responsible-classification`**
-   (with the §5.4 `requires`), **`fence-exe`**, **`devtool-grant-join`**, then **`tccutil-reset-command`**
-   (gaps 0, 1: needs only a `Vec<String>` content model).
-6. Gap 4 composition on top of those: **`image-anchor`**, **`reset-offer`**, then **`folder-table`** and
-   **`parse-mode`** (gap 3 plus string content).
-7. String and slice contracts on gaps 1, 5, 7: **`protected-roots`**, **`tccutil-presence-and-subject`**,
-   **`reset-fold`**, **`reset-plan`**, **`census-roots-and-names`**, **`plist-string-and-display-name`**,
-   **`sbpl-escape`**, then the parsers **`classify-dr`**, **`codesign-report-readers`**,
-   **`devtools-status-classifier`**, **`devtool-timestamp`**, **`ndjson-reader`**, **`devtool-db-classifier`**,
-   **`devtool-log-classifier`** and its corollary **`devtool-log-no-forged-allow`**.
-8. Higher-order gates (gaps 11, 13 call-trace specs): **`fda-probe-gate`**, **`debugger-probe-gate`**,
-   **`devtool-probe-gate`**, **`debugger-change-order`**, **`app-bundle-root`**, **`claimant-offer-rule`**,
-   **`retire-claimants`**.
-9. Over the `FS` model (gap 8): the sbpl chain **`profile-selection`** → **`resolved-deny-clauses`** →
-   **`ancestor-write-denies`** → **`write-confinement`** → **`profile-structure`** → **`decide-on-decision`** →
-   **`audit-line-format`** → **`decide-on-audit`**; then **`mode-global-write-once`** and
-   **`error-messages-name-their-inputs`**; then the census **`classify-claimants`**, **`census-fence`**,
-   **`info-plist-cf-reading`**, and the composed **`real-probes-refuse-outside-bundle`**.
-10. Process and FFI effects: **`fda-open-probe`**, **`devtools-child-running`**, **`platform-ffi-wrappers-total`**,
-    **`change-runner`**, **`bounded-run`**, then the gate whose read retries over the file
-    (**`devtool-list-probe-gate`**, also gaps 11 and 13).
-11. Last: **`sbpl-profile-denotation`** (gap 10). It needs a `ty_model!` SBPL semantics and a model-to-string
-    refinement, and it turns the 16 kept kernel-conformance tests in `src/actuator.rs` into the model's conformance lane.
-
-Gap histogram (number of the 59 specs each gap blocks): 0 → 59, 1 → 52, 2 → 12, 3 → 20, 4 → 11, 5 → 17,
-7 → 32, 8 → 23, 10 → 1, 11 → 7, 13 → 22.

@@ -182,13 +182,16 @@ pub struct Session<'a> {
     generation_deadline: Option<std::time::Instant>,
     /// The look at this session's vault its checks judge through, where its admission kept one
     /// ([`Self::keep_look`]): a table-repair read batch's, standing on the batch's source read of
-    /// the vault, so the batch is one moment of it. `None` for every other session, whose checks
-    /// each observe the vault on their own call.
+    /// the vault, so the batch is one moment of it, and the source read of the vault its store
+    /// opens and store read batches take ([`Self::local_source_reads`]); or a retained
+    /// subscriber's ([`Self::retain_selected`]), standing on its retained source read.
+    /// `None` for every other session, whose checks each observe the vault on their own call.
     look: Option<aterm_secrets::client::VaultLook<'a>>,
 }
 
-/// `bootstrap`'s custody checked again ([`Bootstrap::revalidate_custody`]), the vault observed
-/// through `look` where given ([`Bootstrap::revalidate_custody_in`]).
+/// `bootstrap`'s custody checked again ([`Bootstrap::revalidate_custody`]), the vault observed,
+/// and its pinned files' digests taken, through `look` where given
+/// ([`Bootstrap::revalidate_custody_in`]).
 fn revalidate(
     bootstrap: &Bootstrap,
     look: Option<&aterm_secrets::client::VaultLook<'_>>,
@@ -260,7 +263,9 @@ struct ReadKey {
 type ReadKeys = std::cell::RefCell<std::collections::BTreeMap<Digest, ReadKey>>;
 
 /// Local source guards bound to the exact session they protect. Reusing these
-/// guards avoids nesting read locks behind a waiting vault writer.
+/// guards avoids nesting read locks behind a waiting vault writer. Where the session keeps a look
+/// that holds its vault (a table-repair read batch's, [`Session::keep_look`]), that look is this
+/// vault's guard, and the borrow of the session keeps it for as long as these guards live.
 struct SourceReads<'s, 'b> {
     session: &'s Session<'b>,
     _reads: Vec<aterm_secrets::client::CommonsSourceRead>,
@@ -520,10 +525,15 @@ impl<'a> Session<'a> {
 
     /// Every current member's binding, for an application that names who has answered.
     pub(crate) fn members(&self) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
-        let roster = aterm_secrets::client::swarm_roster_until(
-            self.bootstrap.paths(),
-            crate::admission::deadline(),
-        )
+        let deadline = crate::admission::deadline();
+        let roster = match self
+            .look
+            .as_ref()
+            .filter(|look| look.paths() == self.paths())
+        {
+            Some(look) => look.swarm_roster_until(deadline),
+            None => aterm_secrets::client::swarm_roster_until(self.paths(), deadline),
+        }
         .map_err(failure)?;
         Ok(self
             .access
@@ -586,9 +596,23 @@ impl<'a> Session<'a> {
     /// this session makes after it until the session drops: a table-repair read batch's, which
     /// stands on the batch's source read of the vault (`Replica::observe`), so the batch's own
     /// checks of its currency, its store contexts and its peers' roster stand for the moment its
-    /// admission judged, as its admission's did.
-    pub(crate) fn keep_look(&mut self, look: aterm_secrets::client::VaultLook<'a>) {
+    /// admission judged, as its admission's did, and its store opens and store read batches hold
+    /// the vault through it ([`Self::local_source_reads`]); or a retained subscriber's, which
+    /// stands on its retained source read of the vault ([`Self::retain_selected`]).
+    ///
+    /// # Errors
+    ///
+    /// A session that holds the control journal's writer lock ([`Self::open`]) keeps no look:
+    /// each check a write makes observes the vault on its own call, so a write is judged by the
+    /// vault as it stands, never by the moment its admission looked.
+    pub(crate) fn keep_look(&mut self, look: aterm_secrets::client::VaultLook<'a>) -> Result<()> {
+        if self.journal.is_writer() {
+            return Err(Error::new(
+                "a table writer session judges each check on its own call and keeps no look",
+            ));
+        }
         self.look = Some(look);
+        Ok(())
     }
 
     fn peer_member(&self, actor: Actor) -> Result<&aterm_secrets::commons::roster::Member> {
@@ -896,6 +920,19 @@ impl<'a> Session<'a> {
         Self::from_admitted_journal(bootstrap, journal)
     }
 
+    /// Try the local writer once, retaining the ordinary replay and authorization checks.
+    /// Contention leaves the writer's work alone; the caller can retain an observed frontier
+    /// for repair. The lock probe's deadline does not expire an admitted session's authority.
+    pub(crate) fn try_open(bootstrap: &'a Bootstrap) -> Result<Self> {
+        let journal = Journal::open_existing_until(
+            bootstrap.journal_dir(),
+            bootstrap.trust(),
+            std::time::Instant::now(),
+        )
+        .map_err(failure)?;
+        Self::from_admitted_journal(bootstrap, journal)
+    }
+
     /// Open a fresh, locked authorization batch, allowing another local writer
     /// to finish until `deadline`. Replay and current membership checks run only
     /// after acquiring the lock. Share the deadline with bootstrap admission.
@@ -1149,6 +1186,59 @@ impl<'a> Session<'a> {
         Self::with_generation(bootstrap, journal, Some(selection), Some(deadline), None)
     }
 
+    /// A current subscriber backed by retained source/control custody. The
+    /// caller keeps control guards separately; this journal grants no writer.
+    pub(crate) fn retain_selected(
+        bootstrap: &'a Bootstrap,
+        journal: Journal,
+        selection: crate::generation::Observation,
+        deadline: std::time::Instant,
+        look: aterm_secrets::client::VaultLook<'a>,
+    ) -> Result<Self> {
+        if journal.is_writer()
+            || journal.directory() != bootstrap.journal_dir()
+            || selection.paths() != bootstrap.paths()
+            || look.paths() != bootstrap.paths()
+        {
+            return Err(Error::new(
+                "subscriber observation belongs to another custody",
+            ));
+        }
+        bootstrap.revalidate_custody_in(&look).map_err(failure)?;
+        selection.check(true, false, deadline)?;
+        let mut session = Self::with_generation(
+            bootstrap,
+            journal,
+            Some(selection),
+            Some(deadline),
+            Some(&look),
+        )?;
+        session.keep_look(look)?;
+        session.subscriber(deadline)?;
+        Ok(session)
+    }
+
+    pub(crate) fn retained_look(&self) -> Option<&aterm_secrets::client::VaultLook<'a>> {
+        self.look.as_ref()
+    }
+
+    /// Current read authorization, including completed generation and local
+    /// recipient denial, without conferring table-authoring or ingestion rights.
+    pub(crate) fn subscriber(&self, deadline: std::time::Instant) -> Result<()> {
+        self.require_current_application_generation(deadline)?;
+        if !self.current_observed()?
+            || !self
+                .members()?
+                .iter()
+                .any(|member| member.actor() == self.actor())
+        {
+            return Err(Error::new(
+                "current Commons membership does not grant table reading",
+            ));
+        }
+        Ok(())
+    }
+
     fn from_journal(
         bootstrap: &'a Bootstrap,
         journal: Journal,
@@ -1362,7 +1452,16 @@ impl<'a> Session<'a> {
         Scope::fresh(self.journal.trust())
     }
     fn local_source_reads(&self) -> Result<SourceReads<'_, 'a>> {
-        let mut reads = vec![self.bootstrap.local_source_read().map_err(failure)?];
+        // A table-repair read batch's session keeps the look its admission judged through, which
+        // stands on the batch's own source read of this vault until the batch returns: that read
+        // holds the vault for each store open and store read batch too, its custody judged
+        // through the look.
+        let own = match &self.look {
+            Some(look) => self.bootstrap.local_source_read_in(look),
+            None => self.bootstrap.local_source_read().map(Some),
+        }
+        .map_err(failure)?;
+        let mut reads: Vec<_> = own.into_iter().collect();
         if let Some(generation) = &self.generation {
             reads.extend(generation.local_source_reads()?);
         }
@@ -1908,6 +2007,24 @@ struct Envelope<'w> {
 }
 impl<'w> Envelope<'w> {
     fn parse(scope: Scope, wire: &'w [u8]) -> Result<Self> {
+        Self::parse_signed(scope, wire, |signer| signatures::verify(signer, wire))
+    }
+
+    /// [`Self::parse`] of an identified wire's bytes, whose signature is checked under the
+    /// identifier they were read with ([`signatures::verify_identified`]).
+    fn parse_identified(scope: Scope, wire: &'w signatures::Identified) -> Result<Self> {
+        Self::parse_signed(scope, wire.wire(), |signer| {
+            signatures::verify_identified(signer, wire)
+        })
+    }
+
+    /// The envelope `wire` holds, its signature checked by `verify` for its signer, which gives
+    /// the wire's content identifier.
+    fn parse_signed(
+        scope: Scope,
+        wire: &'w [u8],
+        verify: impl FnOnce(&[u8; 32]) -> Result<Digest>,
+    ) -> Result<Self> {
         if wire.len() > MAX_OPERATION {
             return Err(Error::new("table operation exceeds its bound"));
         }
@@ -1942,7 +2059,7 @@ impl<'w> Envelope<'w> {
         r.take(64)?;
         r.end()?;
         check_causal_links(sequence, previous, &parents)?;
-        let id = signatures::verify(&actor[..32].try_into().unwrap(), wire)?;
+        let id = verify(&actor[..32].try_into().unwrap())?;
         if parents.contains(&id) {
             return Err(Error::new("malformed table causal header"));
         }

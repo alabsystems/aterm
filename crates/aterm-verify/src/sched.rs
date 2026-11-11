@@ -4,8 +4,8 @@
 //! Concurrent stage scheduler ([`Lane`], [`StageSpec::after_stages`],
 //! [`crate::plan::StageId::opens_windows`], [`crate::plan::Lane::AfterCompile`], [`awaited`],
 //! [`check_waits`]), within the run's memory budget ([`StageSpec::mem`], [`memory_holders`]),
-//! ended early by a source-preflight red, or its first proven red under `release` and
-//! `--fail-fast` ([`Halt`]).
+//! ended early by an ordinary source-preflight red or an armed release/`--fail-fast` halt
+//! ([`Halt`]). The release tree half otherwise collects the complete sweep.
 
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ use crate::ladder::Report;
 use crate::plan::{Lane, StageSpec};
 
 /// What a run's first proven red ends (design §4.3, A3): set once, by the first stage row that is
-/// a finding or the first test binary that ended FAIL, in a run that stops there (`release`, or
+/// a finding or the first test binary that ended FAIL, in a run that stops there (an armed release, or
 /// `--fail-fast`), or a source/type preflight in an ordinary run. Once set, no stage or test
 /// binary starts: [`run_stages`] stops holding a waiting stage back, so each starts at once and
 /// says NOT RUN with [`Halt::words`] (`staged`'s first look); the test dispatcher starts no
@@ -846,6 +846,49 @@ mod tests {
                 model_check_limit(&managed, |running| running.len() - 1, 1);
             }
         }
+    }
+
+    /// The adopted FIFO bounds compiler jobs and binary charges together, so it replaces
+    /// whole-stage exclusion after preflight. The main target's compilation still
+    /// precedes its readers.
+    #[cfg(unix)]
+    #[test]
+    fn pooled_tree_checks_overlap_without_losing_the_compile_dependency() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let pool = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 4).unwrap();
+        let mut c =
+            ctx(&crate::checks::RELEASE_TREE, crate::Scope::workspace()).with_pool(Some(pool));
+        c.env.build_slot_held = Some("1".into());
+        c.env.cargo_build_jobs = Some("4".into());
+        let specs = crate::plan::plan(&c);
+        assert_eq!(specs[0].id, StageId::Formatting);
+        assert!(specs.iter().all(|s| !s.exclusive));
+        let at = |id| specs.iter().position(|s| s.id == id).unwrap();
+        let title = |id| specs[at(id)].title.as_str();
+        let pairs = [
+            (title(StageId::Test), title(StageId::Doctests)),
+            (title(StageId::Test), title(StageId::SpecCheck)),
+        ];
+        let spans = met_run(&specs, &pairs);
+        let span = |id| {
+            let (_, start, end) = spans.iter().find(|(i, _, _)| *i == at(id)).unwrap();
+            (*start, *end)
+        };
+        for (a, b) in pairs {
+            let a = specs.iter().find(|s| s.title == a).unwrap().id;
+            let b = specs.iter().find(|s| s.title == b).unwrap().id;
+            assert!(overlaps(span(a), span(b)));
+        }
+        assert!(span(StageId::Tippy).1 <= span(StageId::TestCompile).0);
+        for id in [StageId::Test, StageId::Doctests, StageId::SpecCheck] {
+            assert!(span(StageId::TestCompile).1 <= span(id).0);
+        }
+        assert!(span(StageId::Doctests).1 <= span(StageId::SpecCheck).0);
+        let mut expected = crate::checks::stages_of(&crate::checks::RELEASE_TREE);
+        let mut actual: Vec<_> = specs.iter().map(|s| s.id).collect();
+        expected.sort_by_key(|id| *id as u8);
+        actual.sort_by_key(|id| *id as u8);
+        assert_eq!(actual, expected, "every check retains every stage");
     }
 
     #[test]

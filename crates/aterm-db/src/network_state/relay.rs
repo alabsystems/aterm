@@ -87,10 +87,14 @@ fn socket_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
         return Ok(direct);
     }
     let digest = aterm_digest::Sha256::digest(canonical.as_os_str().as_bytes());
-    let short = PathBuf::from(format!("/tmp/.aterm-o{}", peer::our_uid())).join(format!(
-        "{}-{name}",
-        aterm_codec::hex::encode_lower(&digest)
-    ));
+    // The short leaf preserves the socket's length budget after adding the quiet parent,
+    // including a uid with all ten decimal digits.
+    let short = aterm_tempfile::quiet_in(Path::new("/tmp"))
+        .join(format!("ao{}", peer::our_uid()))
+        .join(format!(
+            "{}-{name}",
+            aterm_codec::hex::encode_lower(&digest)
+        ));
     std::os::unix::net::SocketAddr::from_pathname(&short)?;
     Ok(short)
 }

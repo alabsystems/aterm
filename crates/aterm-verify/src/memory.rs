@@ -293,8 +293,9 @@ struct Held {
 /// What names a process of a compile for its unit ([`Meter::attributing`]).
 pub type UnitReader = fn(u32) -> Named;
 
-/// The least peak a unit's record keeps ([`Meter::unit_peaks`]): 1 GiB, so the record holds the
-/// few heavy compilers, not every one.
+/// The least peak a unit's record keeps: 1 GiB. The shaping record holds only compilers which
+/// reached it ([`Meter::unit_peaks`]); the claim record also uses it for a lighter compiler whose
+/// identity both the wrapper and meter proved ([`Meter::unit_claim_peaks`]).
 pub const UNIT_FLOOR: u64 = 1 << 30;
 
 /// One process of an attributing meter, by pid and start ([`Units::seen`]).
@@ -412,16 +413,33 @@ impl Meter {
     /// one unit). A wrapper's footprint is never its unit's.
     #[must_use]
     pub fn unit_peaks(&self) -> std::collections::BTreeMap<crate::unitgraph::UnitName, u64> {
+        self.named_unit_peaks(false)
+    }
+
+    /// The most each named compiler held, with lighter compilers raised to the meter's floor.
+    /// This is the meter half of the claim book's wrapper/meter intersection: remembering a
+    /// proved light identity lets its next compiler claim the floor rather than the whole stage,
+    /// while a compiler the meter missed remains unknown and fail-closed.
+    pub(crate) fn unit_claim_peaks(
+        &self,
+    ) -> std::collections::BTreeMap<crate::unitgraph::UnitName, u64> {
+        self.named_unit_peaks(true)
+    }
+
+    fn named_unit_peaks(
+        &self,
+        include_light: bool,
+    ) -> std::collections::BTreeMap<crate::unitgraph::UnitName, u64> {
         let mut out = std::collections::BTreeMap::new();
         if let Some(units) = &self.units {
             let units = units.lock().unwrap_or_else(PoisonError::into_inner);
             for seen in units.seen.values() {
                 if let Some(read) = &seen.read
                     && !read.wrapper
-                    && seen.most >= units.floor
+                    && (include_light || seen.most >= units.floor)
                 {
                     let e = out.entry(read.unit.clone()).or_insert(0);
-                    *e = (*e).max(seen.most);
+                    *e = (*e).max(seen.most.max(units.floor));
                 }
             }
         }

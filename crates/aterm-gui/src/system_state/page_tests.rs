@@ -366,6 +366,165 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
         lines.iter().all(|line| line.mark != Mark::Working),
         "{lines:#?}"
     );
+
+    let complete = status_of("set-up");
+    let mut app = reading(&complete);
+    let view = open(&mut app, Line::Mac);
+    let before = compile_in(&app, &view, 900.0, 644.0);
+    let old_rows = page::page_rows(&app);
+    let caps = Subject::Setting(Setting::CapsLock);
+    let vault = Subject::Setting(Setting::Secrets);
+    let source = complete.plan.as_ref().unwrap().vault_url.clone();
+    let mut checking = complete.clone();
+    checking.last_known = std::mem::take(&mut checking.observed);
+    checking.observing = checking
+        .last_known
+        .iter()
+        .map(|row| {
+            (
+                row.subject,
+                row.subject.uses_vault_source().then(|| source.clone()),
+                false,
+            )
+        })
+        .collect();
+    app.publish(checking.clone());
+    let during = compile_in(&app, &view, 900.0, 644.0);
+    let (retained_lines, _, hero) = drawn(&app);
+    assert_eq!(hero.headline, CHECKING);
+    assert_eq!(hero.sub, "Showing last useful results");
+    for line in retained_lines {
+        assert_eq!(
+            line.mark,
+            Mark::Done,
+            "{} keeps its last useful check",
+            line.line.title()
+        );
+        assert_eq!(line.word, "as last read");
+        assert!(line.phrase.contains("checking"));
+    }
+    assert_eq!(
+        (hero.done, hero.total),
+        (0, 0),
+        "past checks grant no current progress"
+    );
+    assert!(!app.headline().set_up);
+    for old in old_rows
+        .iter()
+        .filter(|row| row.subject.group() == Group::Input || row.subject.group() == Group::Desktop)
+    {
+        let current = app.reviewed_row(old.subject);
+        assert_eq!(current.note, old.note, "checking adds no per-row note");
+        let key = format!("system-state/row/{}", row_slug(old.subject));
+        assert_eq!(
+            semantic(&during, &key).rect,
+            semantic(&before, &key).rect,
+            "retaining the same value keeps the open row's footprint"
+        );
+    }
+    let held = app.reviewed_row(caps);
+    assert!(matches!(held.value, RowValue::LastKnown(_)));
+    assert_eq!(held.chip, Some(Chip::LastKnown));
+    assert!(!held.settled(), "history supplies no current readiness");
+    assert!(held.label.contains("Last read:"));
+    assert!(!held.install_tools && !held.turn_on_sync && !held.copy_command);
+
+    checking.observing.clear();
+    app.publish(checking.clone());
+    let idle = app.headline();
+    assert_ne!(
+        idle.text, CHECKING,
+        "a completed empty/skipped batch is no running check"
+    );
+    assert!(
+        !idle.text.is_empty() && !idle.set_up && !idle.start && idle.show.is_none(),
+        "absence supplies neither success nor a fabricated attempted-read failure"
+    );
+    assert!(app.status.observed.is_empty() && app.status.unconfirmed_observations.is_empty());
+    assert!(matches!(
+        app.reviewed_row(caps).value,
+        RowValue::LastKnown(_)
+    ));
+    for line in drawn(&app).0 {
+        assert_eq!(line.mark, Mark::Done);
+        assert_eq!(line.word, "as last read");
+        assert!(!line.phrase.to_lowercase().contains("checking"));
+    }
+    checking.unconfirmed_observations = vec![caps];
+    app.publish(checking.clone());
+    assert!(app.headline().text.contains("Could not read"));
+    assert!(
+        matches!(app.reviewed_row(caps).value, RowValue::LastKnown(_)),
+        "an attempted Unknown response does not erase the useful display"
+    );
+    for standing in [Standing::Failed, Standing::Waiting, Standing::NeedsYou] {
+        checking.unconfirmed_observations.clear();
+        checking.observed = vec![Observation {
+            standing,
+            note: Some("current native reason".into()),
+            ..Observation::unknown(caps)
+        }];
+        app.publish(checking.clone());
+        let latest = app.reviewed_row(caps);
+        assert_eq!(latest.standing, Some(standing));
+        assert_ne!(latest.chip, Some(Chip::LastKnown));
+        assert_eq!(latest.note.as_deref(), Some("current native reason"));
+        assert!(matches!(latest.value, RowValue::LastKnown(_)));
+        assert_ne!(
+            drawn(&app)
+                .0
+                .into_iter()
+                .find(|line| line.line == Line::Mac)
+                .unwrap()
+                .mark,
+            Mark::Done,
+            "a current problem outranks the last useful group check"
+        );
+    }
+    let mut off = checking.clone();
+    off.plan
+        .as_mut()
+        .unwrap()
+        .selection
+        .set(Setting::CapsLock, false);
+    assert!(
+        matches!(reading(&off).reviewed_row(caps).value, RowValue::Muted(_)),
+        "a current Off choice takes precedence over history"
+    );
+
+    let mut partial = checking.clone();
+    partial.observed.clear();
+    partial.last_known.retain(|row| row.subject == caps);
+    app.publish(partial);
+    let incomplete = drawn(&app)
+        .0
+        .into_iter()
+        .find(|line| line.line == Line::Mac)
+        .unwrap();
+    assert_ne!(
+        incomplete.mark,
+        Mark::Done,
+        "one old row cannot complete its whole group"
+    );
+    assert!(!incomplete.phrase.to_lowercase().contains("checking"));
+    assert!(!app.headline().set_up);
+
+    let mut other_source = complete.clone();
+    other_source.observing = vec![(vault, Some("https://other.invalid/vault".into()), false)];
+    let other = reading(&other_source);
+    assert_eq!(
+        other.reviewed_row(vault).chip,
+        Some(Chip::InPlace),
+        "another vault's progress cannot mark this source as checking"
+    );
+    other_source.observing = vec![(vault, Some(source), true)];
+    assert_eq!(
+        drawn(&reading(&other_source)).2.headline,
+        "Waiting to read this Mac…"
+    );
+    app.publish(complete);
+    assert_eq!(app.reviewed_row(caps).chip, Some(Chip::InPlace));
+    assert_ne!(drawn(&app).2.sub, "Showing last useful results");
 }
 
 #[test]

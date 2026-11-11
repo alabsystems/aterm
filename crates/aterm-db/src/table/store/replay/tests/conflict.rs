@@ -220,7 +220,17 @@ fn reselection_trace(corrupt_payload: bool) -> Vec<State> {
     trace.push(reselection_state(1, &store, &session, writable));
     if corrupt_payload {
         assert!(store.ingest(&session, &source).is_err());
-        assert!(store.metadata_evidence(&session).unwrap().is_empty());
+        let evidence = store.metadata_evidence(&session).unwrap();
+        assert!(evidence.is_empty());
+        // The inactive certificate remains in custody, but its proven invalid
+        // ciphertext cannot declare a catalog row. Requiring every certificate
+        // source in the metadata would make this recovery permanently unusable.
+        assert!(!store.conflicts.is_empty());
+        assert!(
+            store
+                .catalog_evidence_covers_retained(&session, &evidence)
+                .unwrap()
+        );
         assert!(store.liability_evidence(&session).unwrap().is_empty());
         return trace;
     }
@@ -228,9 +238,21 @@ fn reselection_trace(corrupt_payload: bool) -> Vec<State> {
         store.liability_evidence(&session).is_err(),
         "a valid outstanding source must not silently refund a liability"
     );
+    assert!(
+        !store
+            .catalog_evidence_covers_retained(&session, &store.metadata_evidence(&session).unwrap())
+            .unwrap(),
+        "valid negative-only source is still unresolved"
+    );
     store.ingest(&session, &source).unwrap();
     assert_eq!(store.catalog(&session).unwrap().len(), 1);
     assert_eq!(store.liability_evidence(&session).unwrap().len(), 1);
+    assert!(
+        store
+            .catalog_evidence_covers_retained(&session, &store.metadata_evidence(&session).unwrap())
+            .unwrap(),
+        "positive retention resolves the source"
+    );
     let writable = store
         .commit_catalog(&session, b"can extend authenticated history")
         .is_ok();

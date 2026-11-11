@@ -1590,7 +1590,7 @@ impl Store {
 
     fn save_encoded_receipt(&self, encoded: &EncodedReceipt) -> Result<(), String> {
         self.ensure().map_err(|why| why.to_string())?;
-        super::super::upgrade_models::write_atomic_mode(
+        super::super::atomic_write::write_atomic_mode(
             &self.dir.join(RECEIPT),
             &encoded.0,
             Some(0o600),
@@ -1810,7 +1810,7 @@ impl Store {
                     ImageRole::Fleet => plan.fleet.as_ref().and_then(|fleet| fleet.mode),
                     _ => Some(0o600),
                 };
-                super::super::upgrade_models::write_atomic_mode(path, text, mode)
+                super::super::atomic_write::write_atomic_mode(path, text, mode)
                     .map_err(|why| format!("{}: {why}", path.display()))?;
             }
             // An earlier rename may have succeeded before its directory barrier failed.

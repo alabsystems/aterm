@@ -5,6 +5,126 @@ use super::*;
 use crate::ledger::{GitCli, GitRunner, object_git};
 
 #[test]
+fn publisher_controls_share_one_complete_advertisement() {
+    use agh::git::{PUBLISHER_FENCE_REF as FENCE, RELEASE_LEASE_REF as LEASE};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let bare = repo(root.path(), "controls.git", true);
+    let source = repo(root.path(), "source", false);
+    let owner = commit(&source, "owner\n");
+    git(&source, &["tag", "-a", "fence", "-m", "token", &owner]);
+    let token = git(&source, &["rev-parse", "fence"]);
+    git(
+        &source,
+        &[
+            "push",
+            "-q",
+            bare.to_str().unwrap(),
+            "main",
+            &format!("{owner}:{LEASE}"),
+            &format!("{token}:{FENCE}"),
+        ],
+    );
+    git(
+        &source,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ],
+    );
+    let fake = agh_fake::FakeGithub::start();
+    fake.add_repo("fixture/app", agh_fake::RepoSpec::public());
+    let ports = fake.ports();
+    let env = Arc::new(agh::identity::MapEnv::new().with("PATH", &std::env::var("PATH").unwrap()));
+    let effects = Arc::new(agh::Fx::simulated(agh::Fx::live().wall_secs().unwrap()));
+    let client = GithubBuilder::new(Router::empty())
+        .endpoints(agh::wire::Endpoints::loopback(
+            ports.api,
+            ports.uploads,
+            ports.web,
+            ports.cdn,
+        ))
+        .transport(Arc::new(agh::wire::http::HttpTransport::direct(
+            env.clone(),
+        )))
+        .env(env)
+        .fx(effects.clone())
+        .git_remote_for_tests("fixture/app", &bare)
+        .build();
+    let remote = Remote::new(client, Slug::parse("fixture/app").unwrap(), &source).unwrap();
+    let first = effects.children_run().len();
+    let began = std::time::Instant::now();
+    assert_eq!(
+        remote.publisher_controls().unwrap(),
+        (Some(owner.clone()), Some(token.clone()))
+    );
+    let batch_wall = began.elapsed();
+    let children = effects.children_run();
+    assert_eq!(
+        children[first..]
+            .iter()
+            .filter(|c| c.args.iter().any(|a| a == "ls-remote"))
+            .count(),
+        1
+    );
+    let first = children.len();
+    let began = std::time::Instant::now();
+    assert_eq!(remote.get(LEASE).unwrap(), Some(owner.clone()));
+    assert_eq!(remote.get(FENCE).unwrap(), Some(token));
+    let serial_wall = began.elapsed();
+    // Negative control: the previous implementation requires two native reads.
+    let children = effects.children_run();
+    assert_eq!(
+        children[first..]
+            .iter()
+            .filter(|c| c.args.iter().any(|a| a == "ls-remote"))
+            .count(),
+        2
+    );
+    println!(
+        "publisher controls offline: batched {batch_wall:?}; separate {serial_wall:?}; advertisements 1 versus 2"
+    );
+    git(&bare, &["update-ref", "-d", FENCE]);
+    assert_eq!(remote.publisher_controls().unwrap(), (Some(owner), None));
+    git(&bare, &["update-ref", "-d", LEASE]);
+    assert_eq!(remote.publisher_controls().unwrap(), (None, None));
+    // A truncated, duplicate, peeled or foreign advertisement cannot prove absence.
+    for malformed in [
+        format!("{}\t{LEASE}\n{}\t{LEASE}\n", "a".repeat(40), "b".repeat(40)),
+        format!("{}\t{FENCE}^{{}}\n", "a".repeat(40)),
+        format!("{}\trefs/heads/main\n", "a".repeat(40)),
+        " ".repeat(COMPLETE_LIMIT),
+    ] {
+        assert!(parse_refs(&malformed, "refs/tags/aterm-release-").is_err());
+    }
+    let owner = git(&source, &["rev-parse", "main"]);
+    git(&source, &["config", "user.name", "fixture"]);
+    git(
+        &source,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    let writer = claim_fixture(&source, &bare);
+    let lease = crate::publish::acquire_release_lease(&writer, &owner).unwrap();
+    let fence =
+        crate::publish::acquire_publisher_fence(&GitCli::new(&source), &writer, &owner).unwrap();
+    crate::publish::assert_publisher_session(&remote, &lease, &fence).unwrap();
+    git(&bare, &["update-ref", "-d", FENCE]);
+    assert!(crate::publish::assert_publisher_session(&remote, &lease, &fence).is_err());
+    assert!(crate::publish::release_completed_publisher_session(&writer, &owner, &fence).is_err());
+    assert_eq!(
+        remote.publisher_controls().unwrap(),
+        (Some(owner.clone()), None)
+    );
+    git(&bare, &["update-ref", FENCE, fence.token()]);
+    assert_eq!(
+        crate::publish::release_completed_publisher_session(&writer, &owner, &fence).unwrap(),
+        crate::publish::LeaseRelease::Released
+    );
+    assert_eq!(remote.publisher_controls().unwrap(), (None, None));
+    fake.assert_clean();
+}
+
+#[test]
 fn lane_record_reads_one_file_at_the_observed_journal_without_importing_history() {
     let fake = agh_fake::FakeGithub::start();
     let slug = Slug::parse("fixture/app").unwrap();
@@ -71,7 +191,7 @@ fn supersession_reads_private_staging_with_its_routed_identity() {
         "fixture-dev/staging",
         "main",
         "Cargo.toml",
-        b"staged version",
+        b"[workspace.package]\nversion = \"0.198.0\"\n",
     );
     let token_path = root.path().join("dev-token");
     std::fs::write(&token_path, token).unwrap();
@@ -102,8 +222,59 @@ fn supersession_reads_private_staging_with_its_routed_identity() {
     let routed = client(Router::from_validated(validated));
     assert_eq!(
         repository_file_with(&routed, "fixture-dev/staging", "main", "Cargo.toml").unwrap(),
-        b"staged version"
+        b"[workspace.package]\nversion = \"0.198.0\"\n"
     );
+    let bare = repo(root.path(), "retirement.git", true);
+    let source = repo(root.path(), "retirement", false);
+    git(&source, &["config", "user.name", "fixture"]);
+    git(
+        &source,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    std::fs::write(
+        source.join("Cargo.toml"),
+        "[workspace.package]\nversion = \"0.198.0\"\n",
+    )
+    .unwrap();
+    git(&source, &["add", "Cargo.toml"]);
+    let base = commit(&source, "failed staged tree");
+    let selected = commit(&source, "fixed main tree");
+    git(&source, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    git(
+        &source,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ],
+    );
+    let origin = claim_fixture(&source, &bare);
+    crate::ledger::Origin::refresh_main(&origin).unwrap();
+    let record = crate::line::Supersession {
+        previous: crate::line::Line::start("0.198.0", &base, 1),
+        replacement: crate::line::Line::start("0.198.0", &selected, 2),
+        reason: "bundle FAIL after staging".into(),
+    };
+    crate::line::require_unpublished([false; 4]).unwrap();
+    crate::line::supersede(&GitCli::new(&source), &origin, &record).unwrap();
+    assert_eq!(
+        crate::line::supersession(&GitCli::new(&source), "0.198.0").unwrap(),
+        Some(record)
+    );
+    assert_eq!(
+        repository_file_with(&routed, "fixture-dev/staging", "main", "Cargo.toml").unwrap(),
+        b"[workspace.package]\nversion = \"0.198.0\"\n"
+    );
+    fake.add_release(
+        "fixture-dev/staging",
+        agh_fake::ReleaseSpec::published("v0.198.0", "2026-11-10T00:00:00Z"),
+    );
+    let published = routed
+        .releases(&Slug::parse("fixture-dev/staging").unwrap())
+        .published_by_tag("v0.198.0")
+        .is_ok();
+    assert!(published);
+    assert!(crate::line::require_unpublished([false, false, false, published]).is_err());
     // Negative control: an unconfigured identity cannot establish private staging state.
     let anonymous = client(Router::empty());
     assert!(repository_file_with(&anonymous, "fixture-dev/staging", "main", "Cargo.toml").is_err());

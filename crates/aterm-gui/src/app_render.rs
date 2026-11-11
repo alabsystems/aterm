@@ -2978,15 +2978,15 @@ fn stack_card_generation(card: &crate::SettingsCard, quad: &aterm_gpu::TrayQuad<
 /// full opacity where it lies; else its one card's (`card`). The deck's quad carries the deck's
 /// `stamp` ([`deck_tray_stamp`]); every other card of a stack its identity
 /// ([`stack_card_generation`]).
-pub(crate) fn present_tray_quad<'a>(
-    stack: Option<[Option<&'a crate::SettingsCard>; 3]>,
-    card: Option<&'a crate::SettingsCard>,
+pub(crate) fn present_tray_quad<'a, 'cards: 'a>(
+    stack: Option<[Option<&'cards crate::SettingsCard>; 3]>,
+    card: Option<&'cards crate::SettingsCard>,
     stamp: Option<(u64, Option<aterm_gpu::TrayDelta>)>,
     floor_y: u32,
     crop: u32,
-    layers: &'a mut Vec<aterm_gpu::TrayLayer<'a>>,
+    layers: &'a mut aterm_alloc::ArrayVec<aterm_gpu::TrayLayer<'cards>, 2>,
 ) -> Option<aterm_gpu::TrayQuad<'a>> {
-    let lower = |mut quad: aterm_gpu::TrayQuad<'a>| {
+    let lower = |mut quad: aterm_gpu::TrayQuad<'cards>| {
         quad.dy = quad.dy.saturating_add(crop);
         if let Some(scrim) = quad.scrim.as_mut() {
             scrim.top = scrim.top.saturating_add(crop);
@@ -3014,15 +3014,15 @@ pub(crate) fn present_tray_quad<'a>(
         }))
         .map(lower);
     let base = quads.next()?;
+    // Three input cards leave at most two layers above the first visible card.
     layers.clear();
     layers.extend(quads.map(|quad| aterm_gpu::TrayLayer {
         quad,
         opacity: 1.0,
         offset_y: 0,
     }));
-    let layers: &'a Vec<aterm_gpu::TrayLayer<'a>> = layers;
     Some(aterm_gpu::TrayQuad {
-        above: layers,
+        above: layers.as_slice(),
         ..base
     })
 }
@@ -14099,7 +14099,7 @@ impl App {
             .as_ref()
             .or(ws.settings_card.as_ref())
             .or(ws.badge_card.as_ref());
-        let mut tray_layers = Vec::new();
+        let mut tray_layers = aterm_alloc::ArrayVec::new();
         let tray = present_tray_quad(
             crate::tray_stack_of(
                 ws.tray_stacked,
@@ -14204,6 +14204,7 @@ impl App {
                 }),
             _ => None,
         };
+        drop(tray_layers);
         metrics::note_overlay_present(presented.is_some());
         let Some(presented) = presented else {
             ws.deck_motion = motion;
@@ -14324,7 +14325,7 @@ impl App {
                 .as_ref()
                 .or(ws.settings_card.as_ref())
                 .or(ws.badge_card.as_ref());
-            let mut tray_layers = Vec::new();
+            let mut tray_layers = aterm_alloc::ArrayVec::new();
             let tray_arg = present_tray_quad(
                 crate::tray_stack_of(
                     ws.tray_stacked,
@@ -14435,6 +14436,7 @@ impl App {
                 }
                 _ => Err(metrics::PresentDropReason::TargetMismatch),
             };
+            drop(tray_layers);
             if matches!(presented, Ok(Some(_))) {
                 ws.capture_present_frame = Some((
                     u32::try_from(visible_width).unwrap_or(u32::MAX),

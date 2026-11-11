@@ -17,7 +17,7 @@ const SECURITY: &str = aterm_uds::os_path!("security");
 const DITTO: &str = aterm_uds::os_path!("ditto");
 const ID_TOOL: &str = aterm_uds::os_path!("id");
 
-/// How long `notarytool submit --wait` may run before the cut gives up.
+/// Total bound for upload, reconciliation and acceptance polling.
 pub const NOTARY_SUBMIT_TIMEOUT: Duration = Duration::from_secs(40 * 60);
 
 /// Bound for `stapler staple` / `stapler validate`: a ticket fetch and a local check.
@@ -945,6 +945,11 @@ pub fn notarize(artifact: &Path, auth: &NotaryAuth) -> Result<(), String> {
     check_devid_signed(artifact)?;
 
     let ext = artifact.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let app_digest = if ext == "app" {
+        Some(crate::artifact::bundle_digest(artifact)?)
+    } else {
+        None
+    };
     let (submit, cleanup): (PathBuf, Option<PathBuf>) = match ext {
         "dmg" => (artifact.to_path_buf(), None),
         "app" => {
@@ -973,20 +978,22 @@ pub fn notarize(artifact: &Path, auth: &NotaryAuth) -> Result<(), String> {
         }
     };
 
-    println!("==> xcrun notarytool submit {} --wait", submit.display());
-    let result = run_streamed(
-        command(XCRUN)
-            .args(["notarytool", "submit"])
-            .arg(&submit)
-            .args(auth.args())
-            .arg("--wait"),
-        "notarytool submit",
+    let result = notary_accept(
+        &submit,
+        auth,
+        XCRUN,
         NOTARY_SUBMIT_TIMEOUT,
+        Duration::from_secs(15),
     );
     if let Some(zip) = cleanup {
         let _ = std::fs::remove_file(zip);
     }
     result?;
+    if let Some(before) = app_digest
+        && crate::artifact::bundle_digest(artifact)? != before
+    {
+        return Err("notary app changed while awaiting acceptance; refusing staple".into());
+    }
 
     println!("==> xcrun stapler staple {}", artifact.display());
     run_streamed(
@@ -1024,6 +1031,582 @@ pub fn notarize(artifact: &Path, auth: &NotaryAuth) -> Result<(), String> {
     }
     println!("==> notarized + stapled: {}", artifact.display());
     Ok(())
+}
+
+// History names identify candidates, not bytes. Only Apple's completed log with
+// the candidate's ID and the snapshot's digest can authorize acceptance. Never
+// use an empty history as evidence of non-submission or repeat an uncertain submit.
+fn notary_accept(
+    artifact: &Path,
+    auth: &NotaryAuth,
+    xcrun: &str,
+    bound: Duration,
+    pause: Duration,
+) -> Result<(), String> {
+    notary_accept_with_clock(artifact, auth, xcrun, bound, pause, Instant::now)
+}
+
+fn notary_accept_with_clock(
+    artifact: &Path,
+    auth: &NotaryAuth,
+    xcrun: &str,
+    bound: Duration,
+    pause: Duration,
+    now: impl Fn() -> Instant,
+) -> Result<(), String> {
+    let scratch = aterm_tempfile::tempdir().map_err(|e| format!("notary scratch: {e}"))?;
+    let nonce = scratch
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("notary scratch name is not UTF-8")?;
+    let copy = scratch.path().join("upload");
+    std::fs::copy(artifact, &copy).map_err(|e| format!("notary upload copy: {e}"))?;
+    let digest = crate::dmg::sha256_file(&copy)?;
+    let name = format!(
+        "aterm-{}-{nonce}.{}",
+        digest,
+        artifact
+            .extension()
+            .and_then(|e| e.to_str())
+            .ok_or("notary upload extension")?
+    );
+    let upload = scratch.path().join(&name);
+    std::fs::rename(copy, &upload).map_err(|e| format!("notary upload rename: {e}"))?;
+    let deadline = now() + bound;
+    let mut id: Option<String> = None;
+    let mut accepted = false;
+    let mut attempt = 0;
+    loop {
+        if now() >= deadline || attempt >= 160 {
+            return Err(format!(
+                "notary recovery exhausted {}s; outcome unknown, no acceptance claimed",
+                bound.as_secs()
+            ));
+        }
+        attempt += 1;
+        let verb = if attempt == 1 {
+            "submit"
+        } else if accepted {
+            "log"
+        } else if id.is_some() {
+            "info"
+        } else {
+            "history"
+        };
+        println!("==> notary attempt {attempt}: {verb}, upload {name}");
+        let mut cmd = command(xcrun);
+        cmd.args(["notarytool", verb]);
+        if verb == "submit" {
+            cmd.arg(&upload);
+        }
+        if matches!(verb, "info" | "log") {
+            cmd.arg(id.as_deref().ok_or("missing notary id")?);
+        }
+        cmd.args(auth.args()).args(["--output-format", "json"]);
+        let call_bound = if verb == "submit" {
+            Duration::from_secs(5 * 60)
+        } else {
+            Duration::from_secs(60)
+        };
+        // Both streams must be complete: dropping a prefix could turn garbled
+        // JSON into an Accepted object or hide a credential failure.
+        let out = match aterm_uds::deadline::output_with_input_until(
+            &mut cmd,
+            aterm_uds::secret::Secret::new(&[]),
+            deadline.min(now() + call_bound),
+            aterm_uds::deadline::OUTPUT_KEEP,
+        ) {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                println!("==> notary attempt {attempt}: {verb} timed out; outcome unknown");
+                std::thread::sleep(pause.min(deadline.saturating_duration_since(now())));
+                continue;
+            }
+            Err(e) => return Err(format!("notary {verb}: {e}; no acceptance claimed")),
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Tool output (including response IDs) may echo secrets. Log only our
+        // own operation and the process status, never either captured stream.
+        println!("==> notary attempt {attempt}: {}", out.status);
+        if now() >= deadline {
+            return Err("notary recovery deadline reached; no acceptance claimed".into());
+        }
+        let json = aterm_json::from_slice::<aterm_json::Value>(&out.stdout).ok();
+        // Credentials and definitive verdicts outrank transient-looking text.
+        let diagnostic = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+        if ["invalid", "rejected"].iter().any(|s| {
+            json.as_ref()
+                .and_then(|j| j.get("status"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case(s))
+        }) {
+            return Err(format!("notary {verb}: definitive rejection"));
+        }
+        if [
+            "http 401",
+            "http 403",
+            "statuscode: optional(401)",
+            "statuscode: optional(403)",
+            "unauthorized",
+            "forbidden",
+            "credential",
+            "authentication",
+            "password",
+            "agreement",
+        ]
+        .iter()
+        .any(|s| diagnostic.contains(s))
+        {
+            return Err(format!("notary {verb}: credential/authorization error"));
+        }
+        if !out.status.success() {
+            if !notary_transient(&diagnostic) {
+                return Err(format!(
+                    "notary {verb} failed ({}); no acceptance claimed",
+                    out.status
+                ));
+            }
+            if verb == "submit" {
+                id = json
+                    .as_ref()
+                    .and_then(|j| j.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+            }
+        } else if let Some(json) = json.as_ref() {
+            if verb == "history" {
+                if let Some(entries) = json.get("history").and_then(|v| v.as_array()) {
+                    let matches: Vec<_> = entries
+                        .iter()
+                        .filter(|v| v.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+                        .collect();
+                    if matches.len() > 1 {
+                        return Err("ambiguous notary history; no acceptance claimed".into());
+                    }
+                    if let Some(entry) = matches.first() {
+                        if entry
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| {
+                                s.eq_ignore_ascii_case("Invalid")
+                                    || s.eq_ignore_ascii_case("Rejected")
+                            })
+                        {
+                            return Err("notary history: definitive rejection".into());
+                        }
+                        id = entry.get("id").and_then(|v| v.as_str()).map(str::to_owned);
+                    }
+                }
+            } else if verb == "log" {
+                let field = |key| json.get(key).and_then(|v| v.as_str());
+                if !field("jobId")
+                    .zip(id.as_deref())
+                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                    || field("sha256") != Some(digest.as_str())
+                    || field("archiveFilename") != Some(name.as_str())
+                    || field("status") != Some("Accepted")
+                {
+                    return Err(
+                        "notary log does not attest to this upload; no acceptance claimed".into(),
+                    );
+                }
+                if crate::dmg::sha256_file(artifact)? != digest {
+                    return Err("notary artifact changed while awaiting acceptance".into());
+                }
+                if now() >= deadline {
+                    return Err("notary recovery deadline reached; no acceptance claimed".into());
+                }
+                return Ok(());
+            } else {
+                let response_id = json
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("notary response missing id")?;
+                if id.as_deref().is_some_and(|id| id != response_id) {
+                    return Err("notary response id mismatch".into());
+                }
+                id = Some(response_id.to_owned());
+                match json.get("status").and_then(|v| v.as_str()) {
+                    Some("Accepted") => accepted = true,
+                    Some("In Progress") | None if verb == "submit" => {}
+                    Some("In Progress") => {}
+                    _ => return Err("unknown notary verdict; no acceptance claimed".into()),
+                }
+            }
+        } else {
+            return Err("malformed notary response; no acceptance claimed".into());
+        }
+        std::thread::sleep(pause.min(deadline.saturating_duration_since(now())));
+    }
+}
+
+fn notary_transient(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| {
+            word.len() == 3 && word.starts_with('5') && word.bytes().all(|b| b.is_ascii_digit())
+        })
+        || [
+            "gatewaytimeout",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection lost",
+            "connection was lost",
+            "connection closed",
+            "connection dropped",
+            "could not connect",
+            "network is unreachable",
+        ]
+        .iter()
+        .any(|s| text.contains(s))
+}
+
+#[cfg(all(test, unix))]
+mod notary_tests {
+    use super::*;
+
+    fn fixture(body: &str) -> (aterm_tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("test.dmg");
+        std::fs::write(&artifact, b"exact uploaded bytes").unwrap();
+        let body = body.replace("TEST_SHA", &crate::dmg::sha256_file(&artifact).unwrap());
+        let shell = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        let tool = dir.path().join("notarytool");
+        // The shell is an in-place, ad-hoc signed Apple stand-in, never an
+        // unlinked copied Mach-O. Each fixture owns its state beside the script.
+        aterm_tempfile::stand_in(
+            &tool,
+            &format!(
+                "#!{}\ncd -- \"$(dirname -- \"$0\")\"\nprintf '%s\\n' \"$2\" >> calls\n{body}\n",
+                shell.display()
+            ),
+        )
+        .unwrap();
+        (dir, tool, artifact)
+    }
+
+    fn run(tool: &Path, artifact: &Path, bound: Duration) -> Result<(), String> {
+        notary_accept(
+            artifact,
+            &NotaryAuth::KeychainProfile("fake".into()),
+            tool.to_str().unwrap(),
+            bound,
+            Duration::ZERO,
+        )
+    }
+
+    const RECOVER: &str = r#"
+case "$2" in
+submit) basename -- "$3" > name; echo 'Error: gatewayTimeout(statusCode: Optional(504))' >&2; exit 1;;
+history) printf '{"history":[{"id":"owned-id","name":"%s","status":"In Progress"}]}\n' "$(cat name)";;
+info) echo '{"id":"owned-id","status":"Accepted"}';;
+log) printf '{"jobId":"owned-id","status":"Accepted","sha256":"TEST_SHA","archiveFilename":"%s"}\n' "$(cat name)";;
+esac
+"#;
+
+    #[test]
+    fn hostile_clock_advance_at_accepted_response_refuses() {
+        let (dir, tool, artifact) = fixture(RECOVER);
+        let start = Instant::now();
+        let bound = Duration::from_secs(60);
+        let error = notary_accept_with_clock(
+            &artifact,
+            &NotaryAuth::KeychainProfile("fake".into()),
+            tool.to_str().unwrap(),
+            bound,
+            Duration::ZERO,
+            || {
+                if std::fs::read_to_string(dir.path().join("calls"))
+                    .unwrap_or_default()
+                    .contains("info")
+                {
+                    start + bound
+                } else {
+                    start
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("deadline"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "submit\nhistory\ninfo\n"
+        );
+    }
+
+    #[test]
+    fn hostile_log_evidence_must_agree_and_remain_bounded() {
+        for (old, new) in [
+            ("\"jobId\":\"owned-id\"", "\"jobId\":\"other-id\""),
+            ("\"sha256\":\"TEST_SHA\"", "\"missing\":\"TEST_SHA\""),
+            (
+                "\"archiveFilename\":\"%s\"",
+                "\"archiveFilename\":\"stale\"",
+            ),
+            (
+                "log) printf",
+                "log) echo 'HTTP 403 authentication HTTP 504' >&2; exit 1; printf",
+            ),
+            ("log) printf", "log) echo 'garbled'; exit 0; printf"),
+        ] {
+            let (dir, tool, artifact) = fixture(&RECOVER.replace(old, new));
+            assert!(run(&tool, &artifact, Duration::from_secs(60)).is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+                "submit\nhistory\ninfo\nlog\n"
+            );
+        }
+        let (dir, tool, artifact) =
+            fixture(&RECOVER.replace("log) printf", "log) echo 'HTTP 504' >&2; exit 1; printf"));
+        assert!(
+            run(&tool, &artifact, Duration::from_secs(60))
+                .unwrap_err()
+                .contains("exhausted")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            160
+        );
+    }
+
+    #[test]
+    fn hostile_ambiguous_history_refuses_before_polling() {
+        let body = RECOVER.replace(
+            "\"status\":\"In Progress\"}]}",
+            "\"status\":\"In Progress\"},{\"id\":\"concurrent-id\",\"name\":\"%s\",\"status\":\"Accepted\"}]}",
+        ).replace("\"$(cat name)\";;", "\"$(cat name)\" \"$(cat name)\";;");
+        let (dir, tool, artifact) = fixture(&body);
+        assert!(
+            run(&tool, &artifact, Duration::from_secs(60))
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "submit\nhistory\n"
+        );
+    }
+
+    #[test]
+    fn hostile_expired_budget_starts_no_command() {
+        let (dir, tool, artifact) = fixture(RECOVER);
+        assert!(
+            run(&tool, &artifact, Duration::ZERO)
+                .unwrap_err()
+                .contains("exhausted")
+        );
+        assert!(!dir.path().join("calls").exists());
+    }
+
+    #[test]
+    fn hostile_truncated_prefix_must_not_become_accepted_json() {
+        let body = RECOVER.replace(
+            "info) echo",
+            "info) printf 'garbled'; /usr/bin/head -c 1048576 /dev/zero | /usr/bin/tr '\\000' ' '; echo",
+        );
+        let (_dir, tool, artifact) = fixture(&body);
+        assert!(run(&tool, &artifact, Duration::from_secs(60)).is_err());
+    }
+
+    #[test]
+    fn hostile_same_name_other_bytes_refused() {
+        for other in ["earlier-id", "concurrent-id"] {
+            let body = RECOVER
+                .replace("owned-id", other)
+                .replace("TEST_SHA", "other-bytes");
+            let (dir, tool, artifact) = fixture(&body);
+            assert!(
+                run(&tool, &artifact, Duration::from_secs(60))
+                    .unwrap_err()
+                    .contains("does not attest")
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("calls"))
+                    .unwrap()
+                    .lines()
+                    .filter(|v| *v == "submit")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_changed_source_refused() {
+        let body = RECOVER.replace("info) echo", "info) echo changed > test.dmg; echo");
+        let (_dir, tool, artifact) = fixture(&body);
+        assert!(
+            run(&tool, &artifact, Duration::from_secs(60))
+                .unwrap_err()
+                .contains("artifact changed")
+        );
+    }
+
+    #[test]
+    fn hostile_credential_echo_is_not_logged() {
+        const MARKER: &str = "NOTARY_HOSTILE_LOG_CHILD";
+        if std::env::var_os(MARKER).is_some() {
+            let (_dir, tool, artifact) =
+                fixture("echo 'echoed-sensitive-value HTTP 401' >&2; exit 1");
+            assert!(run(&tool, &artifact, Duration::from_secs(60)).is_err());
+            return;
+        }
+        let out = command(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sign::notary_tests::hostile_credential_echo_is_not_logged",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("echoed-sensitive-value"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("echoed-sensitive-value"));
+    }
+
+    #[test]
+    fn hostile_malformed_and_mid_poll_credentials_refuse() {
+        for reply in [
+            "echo '{'",
+            "echo garbage",
+            "echo 'HTTP 401 authentication HTTP 504' >&2; exit 1",
+        ] {
+            let body = RECOVER.replace(
+                "echo '{\"id\":\"owned-id\",\"status\":\"Accepted\"}'",
+                reply,
+            );
+            let (dir, tool, artifact) = fixture(&body);
+            assert!(run(&tool, &artifact, Duration::from_secs(60)).is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+                "submit\nhistory\ninfo\n"
+            );
+        }
+    }
+
+    #[test]
+    fn notary_504_existing_submission_is_adopted_without_resubmit() {
+        let (dir, tool, artifact) = fixture(RECOVER);
+        run(&tool, &artifact, Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "submit\nhistory\ninfo\nlog\n"
+        );
+    }
+
+    #[test]
+    fn notary_wait_504_then_success() {
+        let body = RECOVER.replace("echo 'Error: gatewayTimeout(statusCode: Optional(504))' >&2; exit 1", "echo '{\"id\":\"owned-id\",\"status\":\"In Progress\"}'")
+            .replace("info) echo", "info) if [ ! -f waited ]; then touch waited; echo 'HTTP 504' >&2; exit 1; fi; echo");
+        let (dir, tool, artifact) = fixture(&body);
+        run(&tool, &artifact, Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "submit\ninfo\ninfo\nlog\n"
+        );
+    }
+
+    #[test]
+    fn notary_504_then_invalid_is_terminal() {
+        let (dir, tool, artifact) = fixture(&RECOVER.replace("Accepted", "Invalid"));
+        assert!(
+            run(&tool, &artifact, Duration::from_secs(60))
+                .unwrap_err()
+                .contains("definitive rejection")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "submit\nhistory\ninfo\n"
+        );
+    }
+
+    #[test]
+    fn notary_history_visibility_can_lag_and_unrelated_acceptance_is_ignored() {
+        let body = RECOVER.replace("history) printf", "history) if [ ! -f listed ]; then touch listed; echo '{\"history\":[{\"id\":\"other\",\"name\":\"test.dmg\",\"status\":\"Accepted\"}]}'; exit 0; fi; printf");
+        let (dir, tool, artifact) = fixture(&body);
+        run(&tool, &artifact, Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "submit\nhistory\nhistory\ninfo\nlog\n"
+        );
+    }
+
+    #[test]
+    fn notary_history_rejected_stops_before_info() {
+        let (dir, tool, artifact) = fixture(&RECOVER.replace("In Progress", "Rejected"));
+        assert!(
+            run(&tool, &artifact, Duration::from_secs(60))
+                .unwrap_err()
+                .contains("definitive rejection")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "submit\nhistory\n"
+        );
+    }
+
+    #[test]
+    fn notary_acceptance_requires_same_id_and_known_verdict() {
+        for replacement in [
+            "{\"id\":\"other\",\"status\":\"Accepted\"}",
+            "{\"id\":\"owned-id\",\"status\":\"Unknown\"}",
+        ] {
+            let (_dir, tool, artifact) = fixture(
+                &RECOVER.replace("{\"id\":\"owned-id\",\"status\":\"Accepted\"}", replacement),
+            );
+            assert!(run(&tool, &artifact, Duration::from_secs(60)).is_err());
+        }
+    }
+
+    #[test]
+    fn notary_credentials_are_terminal_even_with_gateway_text() {
+        let (dir, tool, artifact) =
+            fixture("echo 'HTTP 401 authentication failed; HTTP 504' >&2; exit 1");
+        assert!(
+            run(&tool, &artifact, Duration::from_secs(60))
+                .unwrap_err()
+                .contains("credential/authorization")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "submit\n"
+        );
+    }
+
+    #[test]
+    fn notary_unknown_upload_exhausts_bound_without_resubmit() {
+        let (dir, tool, artifact) = fixture(
+            "case \"$2\" in submit) echo 'HTTP 504' >&2; exit 1;; history) echo '{\"history\":[]}' ;; esac",
+        );
+        let error = run(&tool, &artifact, Duration::from_secs(60)).unwrap_err();
+        assert!(error.contains("exhausted"), "{error}");
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert_eq!(calls.lines().count(), 160);
+        assert_eq!(calls.lines().filter(|s| *s == "submit").count(), 1);
+        assert!(!calls.contains("info"));
+    }
+
+    #[test]
+    fn negative_control_old_streamed_submit_refuses_first_504() {
+        let (dir, tool, artifact) = fixture(RECOVER);
+        let error = run_streamed(
+            command(&tool).args(["notarytool", "submit"]).arg(artifact),
+            "notarytool submit",
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert!(error.contains("notarytool submit failed"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "submit\n"
+        );
+    }
 }
 
 /// Every Apple tool spawn whose outcome decides whether a release ships.

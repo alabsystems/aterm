@@ -4,7 +4,7 @@
 //! `<state>/machine-name.toml` (`docs/DESIGN-machine-names-2026-11-04.md` §3.3): this machine's
 //! NAME, its claim's fields, the nickname, `was`, `by`, `undo`, a pending migration and the claim
 //! it last held in each of its newest four fleets. It is the title's only source (`m8 Heron`,
-//! or `m0 Otter` while unnumbered), so the menu, the ❯ item and Settings read it.
+//! or `unnumbered Otter` while unnumbered), so the menu, the ❯ item and Settings read it.
 //!
 //! The first reader to find none creates it under its own `machine-name.lock` from what the
 //! caller computes from the bound registry row, roster or older `fleet-name`, else a drawn
@@ -82,7 +82,7 @@ pub struct FleetClaim {
 /// What `machine-name.toml` holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MachineName {
-    /// The NAME; `None` while unnumbered (`m0`).
+    /// The NAME; `None` while unnumbered (no assigned ID).
     pub num: Option<Number>,
     /// How it was claimed.
     pub class: Class,
@@ -119,7 +119,7 @@ pub struct MachineName {
 }
 
 impl MachineName {
-    /// A machine never numbered: `m0` and `nick`, drawn (`auto`), at revision zero.
+    /// A machine never numbered: `unnumbered` and `nick`, drawn (`auto`), at revision zero.
     #[must_use]
     pub const fn unnumbered(nick: Nickname, now_ms: u64) -> Self {
         Self {
@@ -143,18 +143,27 @@ impl MachineName {
         }
     }
 
-    /// The NAME: `m8`, or `m0` while unnumbered.
+    /// The NAME: `m8`, or `unnumbered` while unnumbered.
     #[must_use]
     pub fn name(&self) -> String {
         self.num
             .map_or_else(|| UNNUMBERED.to_owned(), |num| num.to_string())
     }
 
-    /// The NAME and the whole nickname, `m8 Heron` (`m0 Otter` while unnumbered), as `aterm name`
+    /// The NAME and the whole nickname, `m8 Heron` (`unnumbered Otter` while unnumbered), as `aterm name`
     /// prints it; the menu bar clips a long nickname (`aterm_gui::machine_title`).
     #[must_use]
     pub fn title(&self) -> String {
-        format!("{} {}", self.name(), self.nick.display())
+        format!("{} {}", self.name(), self.display_nick())
+    }
+
+    /// The chosen display spelling, or the title-cased default noun.
+    #[must_use]
+    pub fn display_nick(&self) -> String {
+        match self.nick_class {
+            NickClass::Chosen => self.nick.as_str().to_owned(),
+            NickClass::Auto => self.nick.display(),
+        }
     }
 
     /// The file's text.
@@ -182,7 +191,7 @@ impl MachineName {
 /// A nickname drawn from the noun list with the OS's CSPRNG, redrawn while `in_use` (§2.4).
 ///
 /// # Errors
-/// The CSPRNG cannot be read.
+/// The CSPRNG cannot be read, or every default noun is already in use.
 pub fn draw_nick(in_use: impl Fn(&str) -> bool) -> io::Result<Nickname> {
     let mut failed = None;
     let noun = nouns::draw(
@@ -198,6 +207,12 @@ pub fn draw_nick(in_use: impl Fn(&str) -> bool) -> io::Result<Nickname> {
     if let Some(e) = failed {
         return Err(e);
     }
+    let noun = noun.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "all default names are already used by other machines",
+        )
+    })?;
     Nickname::parse(noun).map_err(|e| io::Error::other(format!("noun {noun}: {e}")))
 }
 

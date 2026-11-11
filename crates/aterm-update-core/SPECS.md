@@ -3,13 +3,6 @@
 
 # aterm-update-core: spec recovery from its 179 unit tests
 
-> Status 2026-11-03: this is the crate's migration worklist across its 78 specs and 179 live
-> `#[test]` fns (`176` mapped to specs in §1–§2 + `3` non-spec tests in §4, including
-> `github-pages-whole-listing`, `github-rest-lane`, `link-down-fast-exit`,
-> `resumable-download-loop` and `service-image-qualification-and-digest`). Each spec below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests each one
-> subsumes are deleted.
-
 Source: `crates/aterm-update-core` (read only). Every live `#[test]` is mapped together with the
 code it reaches: src/{http 43, roster 21, handoff_policy 19, github_rest_tests 11, manifest 11,
 pkg_check 11, sentinel 11, codesign 9, github_pages 5, pointer 5, sys 5, hash 4, linux 4,
@@ -40,7 +33,7 @@ Paths are relative to `crates/aterm-update-core`; function names are `module::it
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (every test the spec retires; §2 marks the
 primary one), `rust_features` (what the proof must handle), and `blocking_gaps` (rows of the gap
-table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7). Gap 0, an installed seal that
+table in `docs/TRUST-LANE.md` (Blocking gaps)). Gap 0, an installed seal that
 publishes no Clean row, is on every row.
 
 ```tsv
@@ -125,51 +118,6 @@ link-down-fast-exit	contract	http::handshake_in, http::reached_no_host, http::li
 resumable-download-loop	contract	http::download_to_resumable_https_only, http::download_to_resumable_https_only_via, http::vendor_download_to, http::download_to_resumable_with	For https url, dest and max_filesize: the transfer stages in part_path(dest) and atomically renames only on success. Curl exit 33 without an answered HTTP error clears a refused resumed range once and restarts fresh; an answered 4xx (416 included) is final at once. Otherwise a transient failure that moved bytes resumes up to 16 short (<1 MiB) failures plus floor(max_filesize/1 MiB) progress-earned resumes; progress resets the no-progress Budget. A transient failure that moved no bytes receives at most 19 attempts and 200 seconds of pauses before refusal. There is no whole-transfer latency bound: connect/no-progress detectors, byte cap and earned resumes are the finite bounds.	src/http.rs::probe_a_transfer_over_real_curl, src/http.rs::a_silently_held_transfer_continues_within_the_call, src/http.rs::a_link_that_keeps_moving_is_continued_and_one_that_cuts_short_is_not_asked_in_a_loop	bounded loop over curl child spawns, fs metadata/remove/rename, shared Budget, composition with resume-plan-and-prefix-rules, resume-args, resume-next-attempt and resume-budget	0,1,4,7,8,12
 service-image-qualification-and-digest	contract	service_image::ProtocolRange::supports, service_image::Qualification::validate, service_image::valid_executable_path, service_image::image_digest	supports(r, vs) <=> r.min > 0 && r.min <= r.max && every v in vs lies in r.min..=r.max. valid_executable_path(p) <=> p is valid non-empty UTF-8 without '\\', leading/trailing '/', empty segments, '.' or '..', and every Path component is Normal. Qualification::validate(q, b, rev, svc) = Ok iff q.schema = svc.schema = 1, q.status = "passed", q.scope = "release-gate-and-signed-image-protocol", b > 0, q.build = b, rev and q.verified_source_revision are 40-char lowercase hex with q.source_revision = rev, verified_input/image/executable/qualification digests are 64-char lowercase hex matching svc, release_check_evidence and svc.platform are non-blank, valid_executable_path(svc.executable), q.protocol = svc.protocol with supports(&[]), q.protocol_probe_passed && q.native_signature_verified && !q.live_service_health_tested. On unix, image_digest(root) requires root to be a real directory, canonicalizes root, and hashes sorted UTF-8 relative entries with 07777 mode, kind ('f'/'d'/'l'), regular-file SHA-256 (opened O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC with matching (dev,ino)), and confined relative symlink targets (<= 32 hops, never escaping root or traversing non-directories or special files).	src/service_image.rs::qualification_validate_rejects_blank_platform_and_non_relative_executable, src/service_image.rs::image_digest_refuses_multi_hop_root_escape_and_trailing_slash_on_file	struct field validation, Path component scan, recursive fs walk, bounded symlink hop stack, O_NOFOLLOW open + fstat inode match, SHA-256	0,1,2,3,5,7,8,12
 ```
-
-### Distribution by kind (78)
-
-| kind | specs |
-|---|---|
-| contract | 64 |
-| table-property | 4 |
-| round-trip | 3 |
-| equivalence | 2 |
-| refinement | 2 |
-| invariant | 3 |
-
-### Gap histogram (specs blocked by each gap)
-
-| gap | specs |
-|---|---|
-| 0 | 78 |
-| 1 | 68 |
-| 2 | 11 |
-| 3 | 38 |
-| 4 | 18 |
-| 5 | 19 |
-| 7 | 24 |
-| 8 | 20 |
-| 9 | 8 |
-| 10 | 1 |
-| 11 | 4 |
-| 12 | 29 |
-| 13 | 13 |
-
-Gap 1 (non-scalar carriers: `&str`, `String`, `Vec`, `Option`, enums and structs) blocks almost every spec,
-because this crate is mostly string, header, TOML and URL handling. After that, the next biggest blockers are
-gap 3 (E6 body widening), gap 12 (cross-crate citation of `aterm_toml`, `aterm_types::rfc3339`, `aterm_codec`, ring)
-and gap 7 (loops). Only `derived-bounds-arithmetic` is blocked by gap 3 alone, and `clock-fails-closed` by gaps 3 and 13.
-
-### Proof dependency order
-
-- `url-builders` comes before `pointer-location-strict` and `pointer-resolve-one-request`. `slug-validity` is the lemma `Safe(s) && |s| <= 100`.
-- `release-tag-grammar` (its round-trip lemma) comes before `canonical-app-tag` and `linux-artifact-admission`. `linux-target-names` also comes before `linux-artifact-admission`, which comes before `manifest-validate-gate` and then `manifest-round-trip`.
-- `pointer-location-strict` comes before `pointer-classify`, which comes before `pointer-resolve-one-request`.
-- `asset-failure-classification` (`Code`) and `api-host-predicate` come before `resume-plan-and-prefix-rules`. `curl-argv-shape` comes before the `(h)` clause of `curl-lane-option-sets` and before `curl-child-env`.
-- `transient-status`, `vendor-trailer`, `header-readers` and `vendor-download-verdict` come before `vendor-get-step` and `vendor-head-step`.
-- `roster-master-verify` (`verify_under`) and `roster-machine-and-live` come before `roster-authorize-appcast`. `roster-validate-bijection` supplies its revocation corollary. `roster-admit` comes before the corollary of `clock-fails-closed`.
-- `policy-knob-predicates` comes before `handoff-policy-parse`, then `ranges-read-leniently` and `cutter-strict-read`, then `for-build-and-hull`, then `hull-dominates-every-rescue`, `keeps-every-sealed-build` and `adoption-decision`. `momentary-read-errors` comes before `bundle-policy-read`.
-- `full-pass-schedule-rule` depends on `elapsed`/`remaining` alone, and `pass-outcome-words` comes before `stamps-parse`. It should be bound to the `AtpkgPassStamps`/`AtpkgFullPassRule` models (gap 10).
 
 ## 2. Test → spec map (TSV)
 
@@ -414,42 +362,3 @@ By action: move-to-bench 2, keep 1.
 6. **Count.** The files hold 179 `#[test]` fns, including platform-gated tests (`#[cfg(windows)]` in `sys.rs`,
    `#[cfg(unix)]` in `hash.rs`, `sentinel.rs` and `service_image.rs`, and `#[cfg(target_os = "macos")]` and its
    negation in `codesign.rs`) that a single-host `targo test` run skips. This file maps all 179.
-
-## 6. Proof order (easiest high-value first)
-
-Every spec is blocked by gap 0. Seal `150efe4a` closes it locally (plan, "Seal `150efe4a`"), so the first items
-are the ones blocked by gap 0 plus the fewest real gaps, with a scalar core that E6 already admits.
-
-1. **`derived-bounds-arithmetic`** (gaps 0, 3; 1 test). `vendor_curl_cap` is one `max`.
-   `verify_timeout_for` needs `Duration`, so prove its seconds core
-   (`min(30 + len / 2097152, 600)`) first and lift it. Large HTTP transfers have no elapsed-time
-   ceiling; `resume-budget` is their scalar progress bound.
-2. **The `elapsed`/`remaining` core of `full-pass-schedule-rule`** (gaps 0, 3 for the core; 6 tests once the
-   `&self` part follows on gap 2). They are pure `i64` saturating scalars. The bounds
-   `0 <= remaining(t, n, p) <= p` and "a clock set back holds a lane at most one period" are `omega`-class. This is
-   the scheduler's safety property, and it is the one to bind to `AtpkgFullPassRule` later (gap 10).
-3. **`elf-header-validation`** (gaps 0, 1, 3; 2 tests). It is a length guard followed by constant indices and
-   `from_le_bytes`. It needs only a byte-slice carrier, and it is fail-closed security logic for the Linux binary
-   admission path.
-4. **`resume-plan-and-prefix-rules`** (gaps 0, 1, 3, 4; 4 tests). `resume_plan` and `keep_partial` are scalar `u64`
-   (the struct return is the only carrier). The invariant "`!discard` implies `offset + remaining_cap = m`" is
-   what keeps the total byte bound across resumes. `keep_partial_after_failure` and `range_refused` follow once
-   `Code` (from `asset-failure-classification`) and `API` are citable.
-5. **`policy-knob-predicates`** (gaps 0, 2, 3; 2 tests). These are const fns over `Copy` enums and an inclusive
-   range test. They are the base lemmas of every handoff-policy spec (`for-build-and-hull`,
-   `keeps-every-sealed-build`, `adoption-decision`).
-6. **`api-host-predicate`, `transient-status`, `linux-target-names`** (gaps 0, 1; 1 test each). Each is a
-   `&str` prefix test or a literal match. They are the smallest first users of the `&str` carrier (gap 1), and
-   `API` is cited by four other specs.
-7. **`curl-lane-option-sets`** (gaps 0, 1, 5; 7 tests). Once `&str` slices are carriers, it
-   is decidable by evaluating fixed arrays. It pins the no-credential, no-`--`, https-only and bounded-retry
-   rules of every curl lane.
-8. **`clock-fails-closed`** (gaps 0, 3, 13; 1 test) and then **`roster-admit`** (gaps 0, 1, 2, 12). Together they
-   prove that an unreadable clock admits no roster.
-
-The effectful specs (`advisory-file-lock`, `lane-slot-claim`, `ensure-private-dir`, `same-volume`,
-`update-enabled-at`, `bundle-policy-read`, `boot-sentinel-state-machine`, `https-gate-before-spawn`,
-`vendor-body-cap`, `codesign-run-mapping`, `service-image-qualification-and-digest`, the hash arms)
-come last, on gap 8. Their pure cores (the sentinel record parser and its `Sigma` transitions, the
-`claim` decision, `read_bounded`'s verdict, `Qualification::validate` and `valid_executable_path`)
-can be factored out and proved first.

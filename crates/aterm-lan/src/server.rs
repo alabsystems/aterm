@@ -486,8 +486,13 @@ fn answer(shared: &Shared, stream: &CtlStream, request: Request) -> Result<(), F
                     if !aterm_uds::lan::is_local_network(&addr.ip()) {
                         return Err(not_local(addr));
                     }
-                    here::dial_any(std::slice::from_ref(&addr), deadline, options)
-                        .map_err(|e| failure(&e))?
+                    here::dial_any_while_open(
+                        std::slice::from_ref(&addr),
+                        deadline,
+                        options,
+                        stream.as_fd(),
+                    )
+                    .map_err(|e| failure(&e))?
                 }
                 Target::Host(name) => {
                     let mut addrs = here::resolve(&name, port, within).map_err(|e| failure(&e))?;
@@ -498,7 +503,8 @@ fn answer(shared: &Shared, stream: &CtlStream, request: Request) -> Result<(), F
                         return Err(not_local(format_args!("{name} ({addrs:?})")));
                     }
                     addrs.retain(|addr| aterm_uds::lan::is_local_network(&addr.ip()));
-                    here::dial_any(&addrs, deadline, options).map_err(|e| failure(&e))?
+                    here::dial_any_while_open(&addrs, deadline, options, stream.as_fd())
+                        .map_err(|e| failure(&e))?
                 }
             };
             pass_socket(

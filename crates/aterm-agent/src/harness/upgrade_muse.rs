@@ -13,7 +13,7 @@ use super::upgrade::ArgvRefusal;
 pub const PROGRAM: &str = "muse";
 
 /// The model a fresh Muse Code launch aterm makes runs, where none is named
-/// ([`rewrite_argv`], and the Muse Code row of `super::worker::WORKERS`).
+/// (the Muse Code row of `super::worker::WORKERS`).
 pub const DEFAULT_MODEL: &str = "muse-wonder-full-1.0";
 
 /// The reasoning effort a fresh Muse Code launch aterm makes runs.
@@ -500,9 +500,8 @@ pub fn resumes(argv: &[String]) -> bool {
 
 /// Rewrite `argv` into relaunch arguments resuming `session` (or starting fresh when `None`).
 /// Every rewrite runs with contributor mode off (the launch's own word on it is
-/// dropped, [`FLAGS`]); a fresh start also runs [`DEFAULT_MODEL`] at
-/// [`DEFAULT_EFFORT`], while a resumed session keeps the model and effort it
-/// already runs, so neither is named for it.
+/// dropped, [`FLAGS`]) and names no model and no effort: a resumed session keeps the
+/// model and effort it already runs.
 ///
 /// # Errors
 /// Returns [`ArgvRefusal`] if `argv` has an unknown/non-resumable flag or subcommand, or `session` is not a UUID.
@@ -511,12 +510,6 @@ pub fn rewrite_argv(argv: &[String], session: Option<&str>) -> Result<Vec<String
     let mut out = read.kept;
     out.push("--contributor-mode".to_string());
     out.push("off".to_string());
-    if session.is_none() {
-        out.push("--model".to_string());
-        out.push(DEFAULT_MODEL.to_string());
-        out.push("--reasoning-effort".to_string());
-        out.push(DEFAULT_EFFORT.to_string());
-    }
     if let Some(session) = session {
         if !is_session_uuid(session) {
             return Err(ArgvRefusal::NotResumable(format!("session-ref {session}")));

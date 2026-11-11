@@ -11,6 +11,7 @@ use crate::transport::{self, Fetched, Source};
 use crate::{Error, SecretBytes, fsx, join};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -4017,7 +4018,9 @@ impl CommonsSourceRead {
     /// This read as a look at the vault at `paths` ([`VaultLook`]), which stands on the read's
     /// observation of the state lock for as long as it held the read, rather than observing the
     /// lock again: `aterm-db`'s table-repair read batch, which holds its vault's source read from
-    /// before its admission until its batch returns, judges the batch through it. `paths` must be
+    /// before its admission until its batch returns, judges the batch through it, and its store
+    /// opens and store read batches take it as their source read of the vault
+    /// (`Bootstrap::local_source_read_in`). `paths` must be
     /// the vault this read was taken of ([`try_commons_source_read`]); whether the observation
     /// guards the lock at that vault's path the look judges at its first ask, through its glance
     /// ([`StateLock::observes_in`]).
@@ -4039,8 +4042,28 @@ pub const fn test_settled_after() -> Duration {
     crate::fsx::SETTLED
 }
 
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
+    /// How many times this thread asked to hold a vault's source read ([`hold_commons_source`]),
+    /// whether or not it held one.
+    static SOURCE_READS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread asked to hold a source read of a vault for a local batch's checks
+/// (`Bootstrap::local_source_read`), each a shared observation of its state lock where no writer
+/// holds it, whether or not it held one; one a look already holding the vault stands for
+/// (`Bootstrap::local_source_read_in`) adds none.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_source_reads_held() -> usize {
+    SOURCE_READS_HELD.with(std::cell::Cell::get)
+}
+
 pub(crate) fn hold_commons_source(paths: &Paths) -> crate::Result<CommonsSourceRead> {
     use crate::commons::Unavailable;
+    #[cfg(any(test, debug_assertions))]
+    SOURCE_READS_HELD.with(|reads| reads.set(reads.get() + 1));
     let unavailable = |reason: Unavailable| {
         reason.failure("Commons vault became unavailable while acquiring custody")
     };
@@ -7881,25 +7904,48 @@ fn apply_configured_log(
 
 /// Long-poll the source to apply new versions and run the admin approver loop.
 pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
-    let stop = AtomicBool::new(false);
+    beside_the_approver(
+        |stop| approver_loop(paths, log, stop),
+        || subscriber_loop(paths, log),
+    )
+}
+
+/// Run `subscriber` beside `approver`, on a thread of its own, and set the stop `approver` is given
+/// however `subscriber` ends, a panic included: the scope joins the approver before it returns or
+/// re-raises, so a stop left unset would hold `watch` for good.
+fn beside_the_approver<R>(
+    approver: impl FnOnce(&aterm_uds::stop::Stop) + Send,
+    subscriber: impl FnOnce() -> R,
+) -> R {
+    /// Sets its stop when dropped, the unwinding of a panic included.
+    struct SetOnDrop<'a>(&'a aterm_uds::stop::Stop);
+    impl Drop for SetOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.set();
+        }
+    }
+    let stop = aterm_uds::stop::Stop::new();
     std::thread::scope(|scope| {
-        scope.spawn(|| approver_loop(paths, log, &stop));
-        let ended = subscriber_loop(paths, log);
-        stop.store(true, Ordering::Relaxed);
-        ended
+        scope.spawn(|| approver(&stop));
+        let _ending = SetOnDrop(&stop);
+        subscriber()
     })
 }
 
-/// Sleep `total`, ending early once `stop` is set or `moved` says so (each looked at every
-/// `look`).
-fn nap_unless(stop: &AtomicBool, total: Duration, look: Duration, moved: &dyn Fn() -> bool) {
+/// Sleep `total`, ending at once when `stop` is set, or early once `moved` says so (looked at
+/// every `look`).
+fn nap_unless(
+    stop: &aterm_uds::stop::Stop,
+    total: Duration,
+    look: Duration,
+    moved: &dyn Fn() -> bool,
+) {
     let deadline = Instant::now() + total.min(Duration::from_secs(365 * 24 * 60 * 60));
-    while !stop.load(Ordering::Relaxed) && !moved() {
+    while !stop.is_set() && !moved() {
         let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        if left.is_zero() || stop.sleep(left.min(look)) {
             return;
         }
-        std::thread::sleep(left.min(look));
     }
 }
 
@@ -7949,8 +7995,6 @@ fn swarm_lets(
 /// How often an approver's wait for a version this Mac applies looks at its seq
 /// ([`approver_nap`]).
 const NAP_LOOK: Duration = Duration::from_millis(100);
-/// How often a resting approver looks at whether to stop ([`approver_nap`]).
-const REST_LOOK: Duration = Duration::from_secs(1);
 /// The longest approver nap that watches this Mac's seq ([`approver_nap`]).
 const WATCHED_NAP: Duration = Duration::from_secs(2);
 
@@ -7958,10 +8002,11 @@ const WATCHED_NAP: Duration = Duration::from_secs(2);
 /// version the queue moved with, ends once this Mac's seq (`seq`) moves, looked at every
 /// [`NAP_LOOK`]: that version may admit a Mac, or end one's asking. A longer one is an approver
 /// resting (this Mac is no admin, the usual case on every member Mac, or a pass failed): it reads
-/// nothing and looks only at `stop`, each [`REST_LOOK`].
-fn approver_nap(stop: &AtomicBool, pause: Duration, seq: &dyn Fn() -> Option<u64>) {
+/// nothing and sleeps on `stop` in one wait, which its setting ends at once (it once woke each
+/// second to look at a flag set only when the subscriber ends).
+fn approver_nap(stop: &aterm_uds::stop::Stop, pause: Duration, seq: &dyn Fn() -> Option<u64>) {
     if pause > WATCHED_NAP {
-        nap_unless(stop, pause, REST_LOOK, &|| false);
+        stop.sleep(pause);
         return;
     }
     let held = seq();
@@ -9665,7 +9710,7 @@ pub fn approving_here(paths: &Paths) -> crate::Result<Option<Approval>> {
         .map(|(_, _, approval)| approval))
 }
 
-fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) {
+fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &aterm_uds::stop::Stop) {
     approver_loop_napping(paths, log, stop, &mut |pause| {
         approver_nap(stop, pause, &|| {
             load_state(paths).map(|state| state.seq).ok()
@@ -9677,7 +9722,7 @@ fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) 
 fn approver_loop_napping(
     paths: &Paths,
     log: &(dyn Fn(&str) + Sync),
-    stop: &AtomicBool,
+    stop: &aterm_uds::stop::Stop,
     nap: &mut dyn FnMut(Duration),
 ) {
     let mut approver = Approver::resumed(paths);
@@ -9686,9 +9731,9 @@ fn approver_loop_napping(
     }
     let mut swarm = crate::swarm::Switch::new(&paths.home);
     let mut held = false;
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.is_set() {
         if !swarm_lets(&mut swarm, &mut held, "the approver", log) {
-            nap_unless(stop, SWARM_LOOK, REST_LOOK, &|| false);
+            stop.sleep(SWARM_LOOK);
             continue;
         }
         let pause = approver_pass(paths, log, &mut approver);
@@ -16062,7 +16107,8 @@ mod tests {
     /// second.
     #[test]
     fn a_resting_approver_reads_no_state_while_it_naps() {
-        let stopped = AtomicBool::new(true);
+        let stopped = aterm_uds::stop::Stop::new();
+        stopped.set();
         let reads = std::cell::Cell::new(0);
         let seq = || {
             reads.set(reads.get() + 1);
@@ -16076,6 +16122,65 @@ mod tests {
             1,
             "the wait for a version reads the seq it waits past"
         );
+    }
+
+    /// A RESTING APPROVER SLEEPS ON THE STOP: an hour's rest ([`approver_nap`]), and an hour's
+    /// watched wait ([`nap_unless`]), each asleep on the stop, end when the subscriber beside
+    /// them ends and sets it, not when their time is up. The stop is set only once the nap sleeps
+    /// on it ([`aterm_uds::stop::Stop::entered`]). Negative control (2026-11-10): a rest, or a
+    /// watched wait's look, that sleeps without the stop never sleeps on it, which trips the
+    /// one-minute hang detector.
+    #[test]
+    fn a_resting_approver_ends_its_nap_when_the_stop_is_set() {
+        let naps: [fn(&aterm_uds::stop::Stop); 2] = [
+            |stop| approver_nap(stop, Duration::from_secs(3600), &|| Some(7)),
+            |stop| nap_unless(stop, Duration::from_secs(3600), NAP_LOOK, &|| false),
+        ];
+        for nap in naps {
+            let stop = std::sync::Arc::new(aterm_uds::stop::Stop::new());
+            let (done, ended) = std::sync::mpsc::channel();
+            let napping = std::sync::Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                nap(&napping);
+                done.send(()).expect("the test waits");
+            });
+            let hang = Instant::now() + Duration::from_secs(60);
+            while stop.entered() == 0 {
+                assert!(Instant::now() < hang, "the nap never slept on the stop");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            stop.set();
+            ended
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the nap ends when the stop is set");
+            thread.join().expect("the nap ends");
+        }
+    }
+
+    /// THE APPROVER ENDS HOWEVER THE SUBSCRIBER ENDS: a subscriber that panics sets the stop as
+    /// it unwinds, so the approver asleep on it ends and the panic reaches `watch`'s caller,
+    /// rather than the scope waiting on the approver for good. Negative control (2026-11-10):
+    /// with the stop set only after the subscriber returns, the approver's hour-long sleep trips
+    /// the one-minute hang detector.
+    #[test]
+    fn a_subscriber_that_panics_ends_the_approver_beside_it() {
+        let (done, ended) = std::sync::mpsc::channel();
+        let watch = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(|| {
+                beside_the_approver(
+                    |stop| {
+                        stop.sleep(Duration::from_secs(3600));
+                    },
+                    || panic!("the subscriber panics"),
+                )
+            });
+            done.send(outcome.is_err()).expect("the test waits");
+        });
+        let panicked = ended
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the approver ends with the subscriber");
+        assert!(panicked, "the subscriber's panic reaches the caller");
+        watch.join().expect("the watch ends");
     }
 
     /// A pass that writes N files flushes each in order before its rename and its directory

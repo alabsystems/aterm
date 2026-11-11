@@ -55,7 +55,7 @@ through, and no spec is about it. §2 maps every test in the suite.
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; the full map is in §2),
 `difficulty` (the Rust features the proof must handle), `blocking_gaps` (rows of §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`).
+`docs/TRUST-LANE.md` (Blocking gaps)).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -287,20 +287,6 @@ tests/value.rs	test_u32_to_enum	derive-enum-external
 tests/value.rs	test_map_access_to_enum	derive-enum-external	
 ```
 
-## 3. Coverage
-
-- All 191 tests mapped to one of the 22 specs, and none is a non-spec sample.
-- The biggest collapses: `derive-struct-de` (23 primary), `de-int-convert` (22),
-  `flatten-de-partition` (18), `ser-std-shape` (17), `derive-enum-internal` (17),
-  `de-std-shape` (14), `derive-enum-external` (14), `de-std-invalid-type` (13),
-  `content-buffer-transparent` (13), `derive-input-parse` (13).
-- `de-in-place-agrees` and `flat-map-take-entry` have no primary test. They are lemmas that every
-  `de` test (respectively the two flatten alias/map_twice tests) samples. `flatten-ser-inline` has a
-  single primary, but 16 other tests sample it.
-- 9 of the 22 specs are about code that `aterm-serde-derive` generates, which puts them behind
-  gap 9 (the proc-macro boundary) and gap 12 (citing a theorem across crates). Their primary tests number 97 of
-  the 191. Gap 9 is the single change that unblocks the most tests in this crate.
-
 ## 4. Tests that are not spec samples
 
 Every test samples a spec in §1. These need a trim:
@@ -338,34 +324,3 @@ samples, not non-spec tests.
    `de_error::test_skipped_field_is_unknown` pins that `#[serde(skip)]` removes the name from the
    expected list as well as from the input, as upstream serde does. `derive-struct-de` keeps it:
    "skip" does not mean "ignore if present".
-
-## 6. Proof order (easiest high-value first)
-
-Each proof needs the gaps in its row. Smallest gap sets first, weighed by the tests they retire:
-
-1. **`size-hint-cautious`**, scalar core first, instantiated per `Element` (sidesteps gap 11). The
-   body is `size_of`, a match on the hint, a comparison and a division by a nonzero constant, so it
-   is omega-class once gap 3 admits them. It is the crate's untrusted-input guarantee: no length hint
-   makes a buffer preallocate more than 1 MiB. The `untrusted.rs` tests retire once the composed half
-   (gaps 1 and 4) lands.
-2. **`ser-128-default-unsupported`**: one default trait method that returns `Error::custom` of a
-   fixed string. It needs a concrete serializer instantiation (gap 11) and a `&str` carrier (gap 1).
-3. **`de-int-convert`**, scalar core: "in range ⇔ the conversion preserves the value" over 12
-   targets × 8 source widths, a table property over casts and MIN/MAX comparisons (gap 3),
-   instantiated per `E` (gap 11). The error-message half follows `de-error-messages`.
-4. **`derive-rename-rules`**: move `case.rs` out of the proc-macro crate into a library, or prove it
-   in place once gap 9 closes; then it is non-generic string code (gaps 1, 3, 7). It fixes `key(f)`
-   for every derive spec.
-5. **`flat-map-take-entry`**: non-generic and outside the proc macro, one `Option::take` guarded by a
-   `contains` over `&[&str]` (gaps 1, 2, 3, 5, 7). It is the lemma `flatten-de-partition` rests on.
-
-The rest follow their dependencies. `de-error-messages` (every `de` error string is built there) →
-`de-int-convert`, `de-float-convert` (once floats have a model), `de-std-invalid-type` →
-`ignored-any-skips-one-value` → `de-std-shape` → `de-in-place-agrees`; `ser-128-default-unsupported`
-→ `ser-std-shape`. `derive-rename-rules` and `derive-input-parse` → `derive-struct-ser`,
-`derive-struct-de` → `derive-enum-external` → `content-buffer-transparent` → `derive-enum-internal`,
-`derive-enum-untagged` → `flatten-de-partition` (on `flat-map-take-entry`) and `flatten-ser-inline`,
-whose round trip is the last proof. `size-hint-cautious`'s composed half sits under `de-std-shape`
-and `content-buffer-transparent`. The derive rows and the flatten pair wait on gap 9 (proc-macro
-boundary), gap 12 (cross-crate citation) and gap 13 (closures in `map_err` and visitors), on top of
-gaps 1, 2, 4 and 11.

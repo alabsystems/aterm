@@ -351,7 +351,7 @@ fn cleanup_reports_prune_decline_and_no_staged_parts_without_an_intent() {
                 pruning: Vec::new(),
                 declined: prior_decline,
             };
-            assert!(!sweep.prune(leaf.parent().unwrap(), &leaf));
+            assert!(!sweep.prune(leaf.parent().unwrap(), &leaf, None));
         }
         assert!(intents.finish().is_empty());
         let expected = if prior_decline {
@@ -3935,6 +3935,140 @@ fn age_tree(dir: &Path, ago: Duration) {
     age_by(dir, ago);
 }
 
+#[cfg(unix)]
+#[test]
+fn shared_cache_inventory_is_reused_until_a_removal_needs_locked_revalidation() {
+    for (stale, expected) in [(false, 1), (true, 2)] {
+        let f = Fixture::new("build-cache-reuse-first-inventory");
+        let root = cache_root(&f.home);
+        let workspace = f.dir("home/live");
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let leaf = lay(&root, &workspace, Duration::ZERO);
+        std::fs::write(leaf.join("debug/.cargo-build-lock"), b"").unwrap();
+        let incremental = leaf.join("debug/incremental/retained");
+        std::fs::create_dir_all(&incremental).unwrap();
+        std::fs::write(incremental.join("data"), b"compiler state").unwrap();
+        if stale {
+            age_tree(&incremental, 4 * DAY);
+        }
+        let before = inventory::scans_here();
+        let removed = reclaim_watched(
+            &root,
+            Some(&f.home),
+            SystemTime::now(),
+            ReclaimAfter::CALM,
+            None,
+            &mut |_, _| true,
+        );
+        assert_eq!(inventory::scans_here() - before, expected);
+        assert_eq!(incremental.is_dir(), !stale);
+        assert_eq!(removed.len(), usize::from(stale));
+        if stale {
+            assert!(matches!(removed[0].1, Unused::Stale { incremental: 1, .. }));
+        }
+        assert_eq!(
+            std::fs::read(leaf.join("debug/deps/x")).unwrap(),
+            b"0123456789"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_cache_reused_inventory_still_detects_a_new_held_cargo_lock() {
+    let f = Fixture::new("build-cache-reuse-new-lock");
+    let root = cache_root(&f.home);
+    let workspace = f.dir("home/live");
+    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let leaf = lay(&root, &workspace, Duration::ZERO);
+    std::fs::write(leaf.join("debug/.cargo-build-lock"), b"").unwrap();
+    let incremental = leaf.join("debug/incremental/old");
+    std::fs::create_dir_all(&incremental).unwrap();
+    std::fs::write(incremental.join("data"), b"compiler state").unwrap();
+    age_tree(&incremental, 4 * DAY);
+    let held = std::cell::RefCell::new(None);
+    let observe = |path: &Path| {
+        assert_eq!(path, leaf);
+        assert!(held.borrow().is_none());
+        let profile = leaf.join("release");
+        std::fs::create_dir(&profile).unwrap();
+        let lock = profile.join(".cargo-build-lock");
+        std::fs::write(&lock, b"").unwrap();
+        *held.borrow_mut() = Some(
+            crate::lock::Flock::try_lock(crate::metadata_io::open_regular(&lock).unwrap()).unwrap(),
+        );
+        Some((0, 1))
+    };
+    let fence = fence::Fence::default().with_reporting();
+    let before = inventory::scans_here();
+    let removed = reclaim_root_on(
+        &root,
+        Some(&f.home),
+        SystemTime::now(),
+        ReclaimPolicy::Observed(&observe),
+        None,
+        &mut |_, _| panic!("changed inventory must not reach a removal intent"),
+        &fence,
+    );
+    assert!(removed.0.is_empty());
+    assert!(held.borrow().is_some());
+    assert_eq!(inventory::scans_here() - before, 2);
+    assert!(fence.retained().contains(&RetainedCheck {
+        path: leaf.clone(),
+        reason: KeepReason::InventoryChanged
+    }));
+    assert_eq!(
+        std::fs::read(incremental.join("data")).unwrap(),
+        b"compiler state"
+    );
+
+    drop(held);
+    let removed = reclaim_watched(
+        &root,
+        Some(&f.home),
+        SystemTime::now(),
+        ReclaimAfter::CALM,
+        None,
+        &mut |_, _| true,
+    );
+    assert!(matches!(
+        removed.as_slice(),
+        [(_, Unused::Stale { incremental: 1, .. })]
+    ));
+    assert!(!incremental.exists());
+    assert_eq!(
+        std::fs::read(leaf.join("debug/deps/x")).unwrap(),
+        b"0123456789"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_cache_unknown_initial_inventory_keeps_its_fresh_fallback_and_data() {
+    let f = Fixture::new("build-cache-reuse-unknown");
+    let root = cache_root(&f.home);
+    let workspace = f.dir("home/live");
+    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let leaf = lay(&root, &workspace, Duration::ZERO);
+    let before = inventory::scans_here();
+    let removed = inventory::with_entry_budget(0, || {
+        reclaim_watched(
+            &root,
+            Some(&f.home),
+            SystemTime::now(),
+            ReclaimAfter::CALM,
+            None,
+            &mut |_, _| panic!("an incomplete inventory admits no removal"),
+        )
+    });
+    assert!(removed.is_empty());
+    assert_eq!(inventory::scans_here() - before, 2);
+    assert_eq!(
+        std::fs::read(leaf.join("debug/deps/x")).unwrap(),
+        b"0123456789"
+    );
+}
+
 /// A holder appearing during intent recording keeps the original directory, and the intent on
 /// record closes with nothing gone ([`Refusal::Stopped`]). A later probe can leave only an empty
 /// registered stage: the next pass recovers that intent, then retires the still-identical cache
@@ -4131,7 +4265,7 @@ fn a_process_arriving_at_intent_keeps_the_cache_before_staging() {
         pruning: Vec::new(),
         declined: false,
     };
-    assert!(!sweep.prune(leaf.parent().unwrap(), &leaf));
+    assert!(!sweep.prune(leaf.parent().unwrap(), &leaf, None));
     assert!(intents.finish().is_empty());
     let stage = staged
         .borrow_mut()
@@ -4911,7 +5045,7 @@ fn each_long_step_of_a_pass_says_it_is_working() {
     assert!(leaf.is_dir());
     assert!(
         says(&root, &f.home, |sweep| {
-            sweep.prune(leaf.parent().unwrap(), &leaf);
+            sweep.prune(leaf.parent().unwrap(), &leaf, None);
         }),
         "a prune with nothing stale to move"
     );

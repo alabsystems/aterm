@@ -198,7 +198,7 @@ impl StripStore {
         };
         let written =
             aterm_types::fs_restricted::create_dir_all_unshared(&dir, 0o700).and_then(|()| {
-                aterm_agent::harness::upgrade_models::write_atomic(&dir.join(BASE_FILE), &text)
+                aterm_agent::harness::atomic_write::write_atomic(&dir.join(BASE_FILE), &text)
             });
         if let Err(error) = written {
             aterm_log::warn!(

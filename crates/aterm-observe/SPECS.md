@@ -3,13 +3,6 @@
 
 # aterm-observe: spec recovery from its 9 unit tests
 
-> Status 2026-10-28: this file is the crate's migration worklist across its 6 specs and 9 live
-> `#[test]` fns (`src/lib.rs` 9; the 3 redundant tests and the §4 manifest-guard test are deleted,
-> and `observe-wire-roundtrip` joins with its test). Each spec below is proved through Trust/Clean
-> about the compiled Rust function, and then the tests it subsumes are deleted. No spec here is
-> Certified yet, and every one is blocked by more than gap 0
-> (§7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`).
-
 Source: `crates/aterm-observe/src/lib.rs` (read only). It is the crate's only file, and it has 9
 `#[test]` fns, all in `mod tests`. I also read the code they reach: `RowMatch`, `RowVerdict`,
 `RowRange` and the `WatcherSet` scans in `crates/aterm-core/src/terminal/observe.rs`, and the
@@ -57,7 +50,7 @@ The `watch-*` specs are about aterm-core code these tests reach: they compose
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary ones are in
 §2), `difficulty` (the Rust features the proof must handle), `blocking_gaps` (rows of §7 of
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md`). Gap 0 (an installed seal that publishes
+`docs/TRUST-LANE.md` (Blocking gaps)). Gap 0 (an installed seal that publishes
 Lean-discharged rows) blocks every row.
 
 ```tsv
@@ -69,23 +62,6 @@ watch-rows-match-latch	refinement	aterm_core::terminal::Terminal::{watch_rows, w
 watch-rows-gone-latch	refinement	aterm_core::terminal::Terminal::{watch_rows_gone, watch_poll, process_at}; observe::WatcherSet::{observe_screen, is_advance}; observe::every_row_clear; RowRange::{contains, covers_any}	∀ t, m, r: after id = t.watch_rows_gone(m,r,now) and any sequence of process_at and watch_expire calls, t.watch_poll(id) = Some(sat) ⇔ ∃ e ∈ Eval(t) with Clear(m,r,e) that is a closed frame, or a run of evaluation points all Clear lasting GONE_SETTLE. Then sat.seq = cseq_e for the first such e, and the latch is sticky. Consequences: (a) a surface with no matching row latches at arm when it is a DEC 2026 frame the program closed with nothing drawn since, or has not changed for GONE_SETTLE; (b) while some visible in-range row matches, or is Undecided because the budget refused it, every evaluation point fails Clear, so the watcher stays pending across repaints; (c) the first advancing paint after which every in-range row with text clears latches at that paint on a closed frame, and otherwise at GONE_SETTLE past it once every scan since has read Clear (a scan that fails Clear cancels it; the host's expiry latches at that computed deadline); (d) an empty range (¬covers_any) never latches.	row_gone_latches_immediately_if_nothing_matches, row_gone_waits_for_the_matching_row_to_leave, row_gone_waits_while_a_visible_row_exhausts_the_scan_budget	VERY HARD: as watch-rows-match-latch, plus a universal over the row Vec (iterator all), Option::is_none_or, and covers_any on an enum match. The Undecided case composes observe-verdict-trichotomy with regex-step-budget-exact.	0, 1, 2, 3, 4, 5, 7, 10, 11, 12
 observe-wire-roundtrip	round-trip	aterm_observe::{encode_watcher_budget_wire, decode_watcher_budget_wire, encode_row_verdict_wire, decode_row_verdict_wire}	∀ (mp, sz, st): decode_watcher_budget_wire(&encode_watcher_budget_wire(mp, sz, st)) = Some((mp, sz, st)) ⇔ 1 ≤ mp ≤ MAX_REGEX_PATTERN_LEN ∧ 1 ≤ sz ≤ REGEX_SIZE_LIMIT ∧ 1 ≤ st ≤ REGEX_STEP_LIMIT, and None on wrong-length frames, non-"OBSB" magic or out-of-range caps. ∀ (v, row, plen, seq): decode_row_verdict_wire(&encode_row_verdict_wire(v, row, plen, seq)) = Some((v, row, plen, seq)), and decode_row_verdict_wire returns None on wrong-length frames, non-"OBSV" magic or verdict tag ∉ {0,1,2}.	watcher_budget_and_row_verdict_wire_roundtrip	EASY: fixed [u8; 20]/[u8; 16] frames, const fn shift/or LE helpers, enum discriminant match	0, 1, 3
 ```
-
-### Distribution by kind (6)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 2 | observe-row-matcher-admission, regex-step-budget-exact |
-| refinement | 3 | observe-verdict-trichotomy, watch-rows-match-latch, watch-rows-gone-latch |
-| round-trip | 1 | observe-wire-roundtrip |
-
-### Proof dependency order
-
-`observe-wire-roundtrip` (standalone fixed-frame codecs). aterm-regex `builder-knobs`, `compile-inst-count`,
-`compile-size-ceiling` → `observe-row-matcher-admission`.
-aterm-regex `step-budget-contract`, `pikevm-linear-cost`, `step-cost-lower-bound`, `cut-short-sticky-shared`
-→ `regex-step-budget-exact` → `observe-verdict-trichotomy`. aterm-core `obs-observe-latch-step`,
-`obs-terminal-watch-arm-eval` and the grid model, together with `observe-verdict-trichotomy`, then give
-`watch-rows-match-latch` and `watch-rows-gone-latch`.
 
 ## 2. Test → spec map (TSV)
 
@@ -104,52 +80,14 @@ crates/aterm-observe/src/lib.rs	ordinary_patterns_never_reach_the_scan_budget	re
 crates/aterm-observe/src/lib.rs	watcher_budget_and_row_verdict_wire_roundtrip	observe-wire-roundtrip	
 ```
 
-## 3. Coverage
-
-- 9 live tests; all 9 map to one of the 6 specs, and 0 non-spec tests remain (§4).
-- The latch specs retire the most tests: `watch-rows-gone-latch` has 3 primary and `watch-rows-match-latch`
-  has 2. They are also the hardest, and most of their proof is aterm-core's (`obs-observe-latch-step`).
-  This crate owns only the composition with `observe-verdict-trichotomy`.
-- `observe-row-matcher-admission` retires 2 tests (`row_matcher_rejects_overlong_pattern`,
-  `row_matcher_bounds_compiled_size`). Its clause (a), the length gate, and `observe-wire-roundtrip`
-  (1 test) need no regex model and can be proved on their own first.
-- `regex-step-budget-exact` retires `ordinary_patterns_never_reach_the_scan_budget` through its work-bound
-  corollary. Its proof is aterm-regex's. Until that crate's specs are Certified and citable across crates
-  (gap 12), every regex-backed spec here except clause (a) of admission waits on it.
-
 ## 4. Tests that are not spec samples
 
 None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **(Fixed 2026-10-28.) `ordinary_patterns_never_reach_the_scan_budget` checked less than its doc said.**
-   The test now exercises both a full-width matching row and a 4,096-byte non-matching row on
-   `bounded_regex` and `row_matcher`, asserting `Ok(true)`, `Ok(false)` and `!re.step_limit_exceeded()`.
 2. **The budget witness rests on unstated numbers.** `row_gone_waits_while_a_visible_row_exhausts_the_scan_budget`
    depends on `REGEX_STEP_LIMIT = 2^22` and about 16.7M units for `(?:x?){1020}z` over a 4,096-column
    row. Those numbers come from comments ("measured on the m21 box"), not from a stated work function. A
    VM change in how work is charged could silently make the witness decidable. The spec defines `work()`
    in aterm-regex and makes the witness a checked evaluation.
-
-## 6. Proof order (easiest high-value first)
-
-No spec here is blocked only by gap 0. Each needs at least gaps 0, 1 and 3.
-
-1. **`observe-wire-roundtrip` and clause (a) of `observe-row-matcher-admission`** (gaps 0, 1, 3).
-   `observe-wire-roundtrip` retires `watcher_budget_and_row_verdict_wire_roundtrip` over fixed
-   `[u8; 20]` / `[u8; 16]` frames; clause (a) is one `&str` length comparison and early return.
-   Neither needs a regex model or cross-crate citation. Corollary (d), `64·1025 = 65600 <= 131072`,
-   is constant arithmetic and can be a stand-alone lemma at the same time.
-2. **The rest of `observe-row-matcher-admission`** (gaps 0, 1, 3, 4, 5, 7, 12). It retires both admission
-   tests. It needs the aterm-regex `build` contract cited across crates (gap 12) and assumed at the call
-   site (gap 4).
-3. **`observe-verdict-trichotomy`** (gaps 0, 1, 2, 3, 4, 11, 12). This crate's body is one `Result` match,
-   so once aterm-regex's `try_is_match` contract is citable the obligation here is small. It is sampled by
-   6 tests and is the lemma both latch specs depend on.
-4. **`regex-step-budget-exact`** (gaps 0, 1, 2, 3, 5, 7, 12, 13). Prove it in aterm-regex (its Pike VM loops
-   are where gap 7 bites, and the shared flag is where gap 13 bites). This crate then cites it to retire
-   `ordinary_patterns_never_reach_the_scan_budget`.
-5. **`watch-rows-gone-latch`, then `watch-rows-match-latch`** (gaps 0, 1, 2, 3, 4, 5, 7, 10, 11, 12). They
-   retire 5 tests, but they rest on aterm-core's watcher-latch spec, the grid model under `process_at`, and
-   specs 3 and 4. Do them last. Until then, keep the 5 tests, tagged "spec deferred: needs gaps 2, 5, 10, 12".

@@ -2,6 +2,32 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+
+#[test]
+fn already_opened_private_directory_never_reopens_its_replaced_name() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let path = scratch.path().join("current");
+    let moved = scratch.path().join("original");
+    crate::private_file::create_private_dir(&path).unwrap();
+    let original = std::fs::File::open(&path).unwrap();
+    std::fs::rename(&path, &moved).unwrap();
+    crate::private_file::create_private_dir(&path).unwrap();
+    let directory = PrivateDirectory::from_file(original).unwrap();
+    directory
+        .view()
+        .unwrap()
+        .write("owned", b"same original descriptor")
+        .unwrap();
+    assert!(!path.join("owned").exists());
+    assert_eq!(
+        std::fs::read(moved.join("owned")).unwrap(),
+        b"same original descriptor"
+    );
+    assert!(directory.is_at(&moved).unwrap());
+    assert!(!directory.is_at(&path).unwrap());
+    let ordinary = std::fs::File::create(scratch.path().join("ordinary-file")).unwrap();
+    assert!(PrivateDirectory::from_file(ordinary).is_err());
+}
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 #[cfg(target_os = "macos")]

@@ -12,13 +12,15 @@ use trust_resource_provenance::{Host, PinnedHelper};
 
 use super::{Client, Delivery};
 use crate::bootstrap_graph::{
-    Enrollment, EnrollmentReply, Key, OutputAttachment, OutputReply, SupportQuery, SupportReply,
-    transport,
+    Enrollment, EnrollmentReply, Key, OutputAttachment, OutputReply, SourceAttachment, SourceReply,
+    SupportQuery, SupportReply, transport,
 };
 use crate::{Channel, ContextReply};
 
+mod object;
 mod query;
 mod store;
+pub use object::{CompletedObjectCompile, ObjectFailure, ObjectObservation};
 pub use query::{CompletedSdkQuery, QueryFailure, QueryObservation};
 pub use store::{EarlyHostStore, PendingHostStore, capture_host_store, snapshot_host_store};
 
@@ -91,6 +93,13 @@ impl QueryState {
         Ok(())
     }
     fn completed(&mut self, original: &CompletedSdkQuery) -> io::Result<()> {
+        if self.active != Some(original.request().key.sequence) {
+            return Err(crate::wire::invalid());
+        }
+        self.active = None;
+        Ok(())
+    }
+    fn completed_object(&mut self, original: &CompletedObjectCompile) -> io::Result<()> {
         if self.active != Some(original.request().key.sequence) {
             return Err(crate::wire::invalid());
         }
@@ -194,8 +203,13 @@ impl Drop for GraphFailure {
 pub struct EnrolledBootstrapGraph {
     original: Option<Connection>,
 }
+pub struct SourceBoundBootstrapGraph {
+    original: Option<Connection>,
+    source: SourceAttachment,
+}
 pub struct OutputBoundBootstrapGraph {
     original: Option<Connection>,
+    source: SourceAttachment,
     output: OutputAttachment,
 }
 impl EnrolledBootstrapGraph {
@@ -222,6 +236,24 @@ impl Drop for OutputBoundBootstrapGraph {
         if let Some(original) = self.original.take() {
             std::mem::forget(original);
         }
+    }
+}
+impl Drop for SourceBoundBootstrapGraph {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            std::mem::forget(original);
+        }
+    }
+}
+impl SourceBoundBootstrapGraph {
+    pub fn enrollment(&self) -> &Enrollment {
+        &self.original.as_ref().expect("private original source-bound graph").request
+    }
+    pub fn revalidate(&self, deadline: Instant) -> io::Result<()> {
+        let original =
+            self.original.as_ref().ok_or_else(|| io::Error::other("original graph consumed"))?;
+        original.queries.enrollment_allowed()?;
+        original.check(deadline)
     }
 }
 impl OutputBoundBootstrapGraph {
@@ -413,6 +445,82 @@ impl Client {
 
 impl EnrolledBootstrapGraph {
     /// # Safety
+    /// The original trusted coordinator must retain an actual
+    /// OriginalSourceOffer from the SAME enrolled ProtectedWorkScope before
+    /// this call and through every success/failure/unwind/Unknown delivery.
+    /// All four supplied descriptions must be that offer's exact original
+    /// readonly OFDs. Metadata, hashes and arbitrary opened files cannot
+    /// establish this lineage. No release or Manager authority is transferred.
+    /// The offer must retain this SAME original Root lifetime. The deadline
+    /// argument only restricts this RPC; it cannot supply or extend that owner.
+    pub unsafe fn attach_original_source(
+        mut self,
+        request: SourceAttachment,
+        files: &[BorrowedFd<'_>; 4],
+        deadline: Instant,
+    ) -> Result<SourceBoundBootstrapGraph, GraphFailure> {
+        let mut original = self.original.take().expect("private original enrolled graph");
+        let preflight = (|| {
+            bounded(original.deadline, deadline)?;
+            original.queries.enrollment_allowed()?;
+            if request.key != original.request.key {
+                return Err(crate::wire::invalid());
+            }
+            transport::check_source(&request, files, deadline)?;
+            original.check(deadline)
+        })();
+        if let Err(error) = preflight {
+            return Err(GraphFailure::retaining(original, Delivery::BeforeRequest, error));
+        }
+        let payload = match request.encode() {
+            Ok(payload) => payload,
+            Err(error) => {
+                return Err(GraphFailure::retaining(original, Delivery::BeforeRequest, error));
+            }
+        };
+        let digest =
+            Sha256::digest(request.binding_preimage().expect("same validated source frame")).into();
+        let result = finish(deadline, || {
+            original.channel.send(&payload, deadline)?;
+            match SourceReply::decode(&original.channel.receive(deadline)?, &request, digest)? {
+                SourceReply::Prepared { context, .. } if context == original.context => {}
+                SourceReply::Refused { reason, .. } => {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
+                }
+                _ => return Err(crate::wire::invalid()),
+            }
+            original.check(deadline)?;
+            let host = &original.original;
+            let context = &original.context;
+            transport::send_source(&mut original.channel, &request, files, deadline, || {
+                host.revalidate(deadline)?;
+                live(context, deadline)
+            })?;
+            match SourceReply::decode(&original.channel.receive(deadline)?, &request, digest)? {
+                SourceReply::Attached { context, .. } if context == original.context => {}
+                _ => return Err(crate::wire::invalid()),
+            }
+            original.check(deadline)?;
+            transport::check_source(&request, files, deadline)
+        });
+        if let Err(error) = result {
+            original.channel.poison();
+            return Err(GraphFailure::retaining(original, Delivery::Unknown, error));
+        }
+        let mut owner = SourceBoundBootstrapGraph { original: Some(original), source: request };
+        if let Err(error) = time(deadline) {
+            return Err(GraphFailure::retaining(
+                owner.original.take().expect("same original graph"),
+                Delivery::Unknown,
+                error,
+            ));
+        }
+        Ok(owner)
+    }
+}
+
+impl SourceBoundBootstrapGraph {
+    /// # Safety
     /// The trusted original SDK coordinator must lend the SAME actual acquired
     /// OutputLock plus physical output-root description from this engine graph.
     /// The SAME original owned manager guard must already be durably withheld
@@ -475,7 +583,11 @@ impl EnrolledBootstrapGraph {
             original.channel.poison();
             return Err(GraphFailure::retaining(original, Delivery::Unknown, error));
         }
-        let mut owner = OutputBoundBootstrapGraph { original: Some(original), output: request };
+        let mut owner = OutputBoundBootstrapGraph {
+            original: Some(original),
+            source: self.source.clone(),
+            output: request,
+        };
         if let Err(error) = time(deadline) {
             return Err(GraphFailure::retaining(
                 owner.original.take().expect("same original graph"),

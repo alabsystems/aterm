@@ -105,9 +105,13 @@ fn main() -> std::process::ExitCode {
         return code;
     }
     cut_timing::image_arrived();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
     // Cargo's compiler wrapper for a release slice runs nothing else of this tool.
-    if let Some(code) = slice_units::entry(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+    if let Some(code) = slice_units::entry(&args) {
         return std::process::ExitCode::from(code);
+    }
+    if let Some(code) = qualify_pilot::slice_child_entry(&args) {
+        return code;
     }
     #[cfg(any(test, debug_assertions))]
     if let Some(result) = interrupt::exec_probe_if_asked() {
@@ -119,7 +123,6 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
     if let Some(code) = release_target::finish_if_asked(&args) {
         return code;
     }

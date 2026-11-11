@@ -4,19 +4,31 @@
 //! Private launch data transports existing command state; it mints no admission grant.
 use super::*;
 use trust_resource_controller::CommandSpec;
-const MAGIC: &[u8; 8] = b"AMEX0003";
+const MAGIC: &[u8; 8] = b"AMEX0004";
 const MAX_ITEMS: usize = 4096;
 // Actual original GNU pair + SDK keeper + readonly source pair + close-only
 // output directory/lock. This bound supplies no description or resource grant.
 const MAX_TARGETS: usize = 7;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Seal {
+    NoFork,
+    // Qualification only: no production recipe may defer its containment.
+    #[cfg(all(test, target_os = "macos"))]
+    Child,
+}
 pub(super) struct ExecPlan {
     pub parent: transport::Peer,
     pub command: CommandSpec,
     pub targets: Vec<i32>,
     pub footprint_mib: Option<u32>,
+    pub seal: Seal,
 }
 impl ExecPlan {
     fn validate(&self) -> io::Result<()> {
+        #[cfg(all(test, target_os = "macos"))]
+        if self.seal == Seal::Child && self.footprint_mib.is_none() {
+            return Err(refused());
+        }
         if let Some(mib) = self.footprint_mib {
             #[cfg(target_os = "macos")]
             spawnfd::FootprintLimit::new(mib).map_err(|_| refused())?;
@@ -97,6 +109,11 @@ impl ExecPlan {
         for target in &self.targets {
             bytes.extend((*target as u32).to_be_bytes());
         }
+        bytes.push(match self.seal {
+            Seal::NoFork => 0,
+            #[cfg(all(test, target_os = "macos"))]
+            Seal::Child => 1,
+        });
         if bytes.len() > MAX_PLAN {
             return Err(refused());
         }
@@ -167,12 +184,19 @@ impl ExecPlan {
         for _ in 0..read.count(MAX_TARGETS)? {
             targets.push(i32::try_from(read.number()?).map_err(|_| refused())?);
         }
+        let seal = match read.take(1)?[0] {
+            0 => Seal::NoFork,
+            #[cfg(all(test, target_os = "macos"))]
+            1 => Seal::Child,
+            _ => return Err(refused()),
+        };
         if !read.0.is_empty() {
             return Err(refused());
         }
         let plan = Self {
             parent,
             footprint_mib,
+            seal,
             command: CommandSpec {
                 program,
                 arg0,
@@ -193,6 +217,7 @@ mod tests {
     fn exec_data_is_lossless_bounded_and_contains_no_admission_fields() {
         let plan = ExecPlan {
             footprint_mib: None,
+            seal: Seal::NoFork,
             parent: transport::Peer {
                 pid: 123,
                 birth: 456,
@@ -212,6 +237,7 @@ mod tests {
         assert!(decoded.command == plan.command);
         assert_eq!(decoded.targets, plan.targets);
         assert_eq!(decoded.footprint_mib, plan.footprint_mib);
+        assert!(decoded.seal == plan.seal);
         for end in 0..bytes.len() {
             assert!(ExecPlan::decode(&bytes[..end]).is_err());
         }
@@ -224,6 +250,11 @@ mod tests {
         assert!(ExecPlan::decode(&old).is_err());
         old[..8].copy_from_slice(b"AMEX0002");
         assert!(ExecPlan::decode(&old).is_err());
+        old[..8].copy_from_slice(b"AMEX0003");
+        assert!(ExecPlan::decode(&old).is_err());
+        let mut wrong_seal = bytes.clone();
+        *wrong_seal.last_mut().unwrap() = 2;
+        assert!(ExecPlan::decode(&wrong_seal).is_err());
         let mut unknown = bytes.clone();
         unknown[20] = 2;
         assert!(ExecPlan::decode(&unknown).is_err());

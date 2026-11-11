@@ -41,13 +41,13 @@ doctests (§3).
 
 The per-instance corollaries (`tail_value()` equals its `cfg!()` cascade, `pick()` equals
 `expected()`) are straight-line constant fns that need only gap 0, but they are point samples of
-the spec and retire no test (`docs/PLAN-tests-to-specs-2026-10-15.md`, "Rules for agents doing
+the spec and retire no test (`docs/TRUST-LANE.md`, "Rules for agents doing
 this").
 
 ## 1. Specs (TSV)
 
 `subsumes` lists the primary tests; `difficulty` names the Rust features the proof must handle;
-`blocking_gaps` are rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+`blocking_gaps` are rows of the gap table in `docs/TRUST-LANE.md` (Blocking gaps)
 §7, plus `N1` (§0).
 
 ```tsv
@@ -76,22 +76,6 @@ tests/differential.rs	cfg_if_expansion_conformance_and_tripwire_negative_control
 arm of its chains defines the same `pick()`, so a leaked first item would be a duplicate-definition
 error.
 
-## 3. Coverage and doctests
-
-- 7 tests in `tests/differential.rs`: all 7 are retired by a spec (`cfgif-first-match-selection`
-  retires 5; `cfgif-dead-arm-fully-absent` and `cfgif-linear-recursion-depth` retire 1 each and are
-  also sampled by `cfg_if_expansion_conformance_and_tripwire_negative_controls`).
-- **Doctests (4, not in the 7).** They are on the macro in `src/lib.rs`: the unix/windows example,
-  an empty expansion in statement position, `compile_error!` parked in a dead arm, and a
-  `compile_fail` control. The first two sample `cfgif-first-match-selection`. The third samples a
-  STRONGER form of `cfgif-dead-arm-fully-absent`: a dead arm is never *expanded*, not only
-  stripped afterwards. The N1 model should state that form, so that this doctest is subsumed as
-  well. The `compile_fail` control is the negative control for the third and goes with it.
-- **Caller hygiene is stated and sampled (resolved 2026-10-28).** Hygiene is the caller's: a `let`
-  bound in an arm is visible after the invocation (`naga`'s `error.rs:114`). `cfgif-first-match-selection`
-  now states caller-context splicing explicitly and `statement_arm_preserves_caller_hygiene_for_let_bindings`
-  tests it directly.
-
 ## 4. Findings
 
 Status 2026-10-28: `CfgIfExpansion` (`aterm_models_core::cfg_if_expansion_model`) and
@@ -101,8 +85,6 @@ and `Buggy = 2` un-grouped multi-item arms).
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. Fixed 2026-10-16: the `case!` comment in `tests/differential.rs` now says "ONE chain in, two
-   answers out", which is what `case!` generates (`real` and `expected`).
 2. **`a_dead_arm_contributes_none_of_its_items` rests on compilation.** It samples
    `cfgif-dead-arm-fully-absent`, and the evidence is that `leak_correct` compiles at all; the
    runtime asserts `(99, 2)` are nearly tautological.
@@ -120,22 +102,3 @@ and `Buggy = 2` un-grouped multi-item arms).
 6. **The gap table has no row for these specs.** None of the 3 specs is blocked by any audit §7
    row as written; `macro_rules!` expansion semantics is missing from the table. This file cites
    gap 10 as the nearest row and adds N1 (§0).
-
-## 6. Proof order (easiest high-value first)
-
-None of the 3 specs is blocked only by gap 0; all 3 wait on gap 10 and N1. The N1 route (a) `ty_model!`
-(`aterm_models_core::cfg_if_expansion_model`) and its conformance test with both tripwire negative
-controls (`cfg_if_expansion_conformance_and_tripwire_negative_controls`) are now authored and checked.
-
-1. **`cfgif-first-match-selection`**. It has the highest value: it retires 3 tests and covers the whole
-   wrong-platform-code risk that `parking_lot_core`, `wgpu-hal` and `half` rely on. Its propositional core (the guards are
-   pairwise exclusive and select the first true predicate) is provable in Clean today as a lemma
-   over the model, by induction on `i`.
-2. **`cfgif-dead-arm-fully-absent`**. It is the easiest once the model represents attribute
-   binding: one structural fact, with no induction over the arm body. It retires the leak test and
-   subsumes the `compile_error!` doctest if stated in its never-expanded form (§3).
-3. **`cfgif-linear-recursion-depth`**. It is the least valuable, because a violation is a loud
-   compile error rather than a silent miscompile. It reuses the `@__arms` induction from 1.
-
-Not a migration: the gap-0-only per-instance theorems (for example `tail_value() = 42`). They are
-point samples of spec 1 and must not be counted as retiring any test.

@@ -1122,10 +1122,7 @@ fn run_follower_cut(
         _ => true,
     });
     let same = |want: Option<&Act>, got: &Act| {
-        want.is_some_and(|w| {
-            (w.rule == "model-fallback@v1" && got.rule == w.rule)
-                || (w.text == got.text && (0..=40).contains(&(got.at - w.at)))
-        })
+        want.is_some_and(|w| w.text == got.text && (0..=40).contains(&(got.at - w.at)))
     };
     let take = |l: &mut Loop<'_>, acts: Vec<Act>| -> bool {
         for a in acts {
@@ -1746,7 +1743,6 @@ const T0: i64 = TEST_NOW + 6 * HOUR + 5 * MIN;
 
 fn default_policy() -> SupervisorConfig {
     SupervisorConfig {
-        model_fallback: None,
         usage_credits: true,
         ..owners_policy()
     }
@@ -1893,24 +1889,6 @@ fn bucket_with(add: &[&str], model: &str) -> Vec<String> {
     rows
 }
 
-fn bucket_redrawn() -> Vec<String> {
-    bucket_armed()
-        .iter()
-        .filter(|r| {
-            ![
-                "Usage limit reached",
-                "Continuing automatically",
-                "/rate-limit-options",
-                "Claude Code will continue automatically",
-                "to cancel the wait",
-            ]
-            .iter()
-            .any(|g| r.contains(g))
-        })
-        .map(|r| r.replace("Sonnet 5.5 · Claude API", "Opus 5.5 · Claude API"))
-        .collect()
-}
-
 fn above_composer(base: &[String], add: &[&str]) -> Vec<String> {
     let mut rows = base.to_vec();
     let top = rows
@@ -1919,36 +1897,6 @@ fn above_composer(base: &[String], add: &[&str]) -> Vec<String> {
         .expect("the composer's frame");
     rows.splice(top..top, add.iter().map(|x| (*x).to_string()));
     rows
-}
-
-const BUCKET_NOTICE: &str =
-    "You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles)";
-
-fn bucket_tail(prompt: &str, at: i64) -> String {
-    let stamp = crate::harness::usage::rfc3339_utc(at);
-    include_str!("fixtures/claude-2.1.294-transcript-session-limit.jsonl")
-        .lines()
-        .skip(1)
-        .filter(|l| !l.contains("\"subtype\":\"informational\""))
-        .map(|l| {
-            let mut row = l
-                .replace("seventh try", prompt)
-                .replace(
-                    "You've hit your session limit · resets 11:33am (America/Los_Angeles)",
-                    BUCKET_NOTICE,
-                )
-                .replace("\"five_hour\"", "\"seven_day_sonnet\"");
-            for ms in ["921", "951", "952", "953"] {
-                row = row.replace(
-                    &format!("\"2026-10-08T16:34:58.{ms}Z\""),
-                    &format!("\"{stamp}\""),
-                );
-            }
-            row
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
 }
 
 fn scenarios() -> Vec<Scenario> {
@@ -2466,153 +2414,10 @@ fn scenarios() -> Vec<Scenario> {
             }
         }
         out.push(Scenario {
-            name: format!("I bucket, no fallback ({tag})"),
+            name: format!("I bucket ({tag})"),
             t0: bt0,
             policy: default_policy(),
             host: None,
-            beats,
-            tail_s: 3 * HOUR,
-            take: false,
-            person_on_screen: false,
-        });
-    }
-    let redrawn = bucket_redrawn();
-    let before = bucket_tail("carry on with the task", bt0 - 600);
-    for tag in [
-        "relaunched, the continuation works",
-        "relaunched, the continuation met by the bucket",
-        "relaunched, a person's prompt met by the bucket",
-        "wait:resume thrice, a person's prompt met by the bucket before the adoption",
-        "wait:resume thrice, the redraw",
-    ] {
-        let answers: Vec<&'static str> = if tag.starts_with("wait:resume") {
-            vec!["wait:resume", "wait:resume", "wait:resume", "relaunched"]
-        } else {
-            vec!["relaunched"]
-        };
-        let mut beats = vec![beat(
-            At::Start(0),
-            "the bucket, armed",
-            Ev::Point(bucket_armed()),
-        )];
-        if !tag.contains("person's prompt") {
-            beats.insert(
-                0,
-                beat(
-                    At::Start(-5 * MIN),
-                    "the worker's turn",
-                    Ev::Busy(busy0.clone()),
-                ),
-            );
-        }
-        let met_prompt = |prompt: &str| {
-            above_composer(
-                &redrawn,
-                &[
-                    &format!("❯ {prompt}"),
-                    &format!("  ⎿  {BUCKET_NOTICE}"),
-                    "",
-                    "✻ Churned for 0s · done 8:49 AM",
-                    "",
-                ],
-            )
-        };
-        match tag {
-            "relaunched, the continuation works" => {
-                beats.push(beat(
-                    At::Act(0, 30),
-                    "the relaunch's redraw",
-                    Ev::Point(redrawn.clone()),
-                ));
-                beats.push(taken(1, &[], "keep going"));
-                let worked = above_composer(
-                    &redrawn,
-                    &[
-                        "❯ keep going",
-                        "",
-                        "⏺ Stage 3 of 5 is in.",
-                        "",
-                        "✻ Worked for 15m 0s · done 8:59 AM",
-                        "",
-                    ],
-                );
-                beats.push(beat(
-                    At::Act(1, 15 * MIN),
-                    "the continuation's work ends",
-                    Ev::Point(worked),
-                ));
-                beats.push(taken(2, &[], "keep going"));
-            }
-            "relaunched, the continuation met by the bucket" => {
-                beats.push(beat(
-                    At::Act(0, 30),
-                    "the relaunch's redraw",
-                    Ev::Point(redrawn.clone()),
-                ));
-                beats.push(beat(
-                    At::Act(1, 3),
-                    "the continuation met by the bucket",
-                    Ev::Point(met_prompt("keep going")),
-                ));
-                beats.push(taken(2, &[], "keep going"));
-            }
-            "relaunched, a person's prompt met by the bucket" => {
-                beats.push(beat(
-                    At::Act(0, 30),
-                    "the relaunch's redraw",
-                    Ev::Point(redrawn.clone()),
-                ));
-                beats.push(beat(
-                    At::Act(0, 85),
-                    "the transcript: the person's prompt met",
-                    Ev::Tail(Some(bucket_tail(
-                        "please run the integration tests",
-                        bt0 + 85,
-                    ))),
-                ));
-                beats.push(beat(
-                    At::Act(0, 90),
-                    "a person's prompt met by the bucket",
-                    Ev::Point(met_prompt("please run the integration tests")),
-                ));
-                beats.push(taken(1, &[], "keep going"));
-            }
-            "wait:resume thrice, a person's prompt met by the bucket before the adoption" => {
-                beats.push(beat(
-                    At::Start(55),
-                    "the transcript: the person's prompt met",
-                    Ev::Tail(Some(bucket_tail(
-                        "please run the integration tests",
-                        bt0 + 55,
-                    ))),
-                ));
-                beats.push(beat(
-                    At::Start(60),
-                    "a person's prompt met by the bucket",
-                    Ev::Point(met_prompt("please run the integration tests")),
-                ));
-                beats.push(beat(
-                    At::Act(0, 20),
-                    "the relaunch's redraw",
-                    Ev::Point(met_prompt("please run the integration tests")),
-                ));
-                beats.push(taken(1, &[], "keep going"));
-            }
-            "wait:resume thrice, the redraw" => {
-                beats.push(beat(
-                    At::Act(0, 20),
-                    "the relaunch's redraw",
-                    Ev::Point(redrawn.clone()),
-                ));
-                beats.push(taken(1, &[], "keep going"));
-            }
-            _ => unreachable!(),
-        }
-        out.push(Scenario {
-            name: format!("J bucket, the fallback ({tag})"),
-            t0: bt0,
-            policy: owners_policy(),
-            host: Some((answers, Some(before.clone()))),
             beats,
             tail_s: 3 * HOUR,
             take: false,
@@ -7317,11 +7122,11 @@ fn an_acts_answer_no_loop_read_run_stopped_by_an_esc_ends_the_carry_for_a_loop_t
 
 fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
     use crate::supervise::approvals::{
-        FALLBACK_ASKED, LIMIT_ENDED, LIMIT_ENDED_ELSEWHERE, RULE_LAND_OVER, RULE_OFF_STOOD,
-        RULE_POINT, RULE_TASK_DONE, RULE_TRY_OVER, RULE_TURN_RAN, RULE_WALL_WAIT,
-        RULE_WALL_WAIT_END, WALL_TAKEN,
+        LIMIT_ENDED, LIMIT_ENDED_ELSEWHERE, RULE_LAND_OVER, RULE_OFF_STOOD, RULE_POINT,
+        RULE_TASK_DONE, RULE_TRY_OVER, RULE_TURN_RAN, RULE_WALL_WAIT, RULE_WALL_WAIT_END,
+        WALL_TAKEN,
     };
-    use crate::supervise::policy::turn_end::{RULE_LEFT, RULE_MODEL_FALLBACK};
+    use crate::supervise::policy::turn_end::RULE_LEFT;
     const WALL_LEFT: &str = "the wall left the screen or the worker worked";
     // 0.106 wrote none of these; the done checks' note is v6's 5a (§14.5).
     const MARKS: [&str; 6] = [
@@ -7358,7 +7163,6 @@ fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
             let (rule, reason) = (text("rule_id"), text("reason"));
             let row = match (text("decision"), rule) {
                 (_, r) if records.contains(&r) => return None,
-                ("waiting", RULE_MODEL_FALLBACK) if reason == FALLBACK_ASKED => return None,
                 ("typed", _) if reason.starts_with("the turn-end policy") => {
                     let mut r = reason.to_string();
                     for mark in MARKS {
@@ -7372,10 +7176,6 @@ fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
                     while let Some(b) = r.find(" in a row)") {
                         let Some(a) = r[..b].rfind("; ") else { break };
                         r.replace_range(a..b + " in a row".len(), "");
-                    }
-                    if let Some(a) = r.find(" made=") {
-                        let b = r[a..].find(')').map_or(r.len(), |b| a + b);
-                        r.replace_range(a..b, "");
                     }
                     with_reason(row, &r)
                 }
@@ -7509,8 +7309,7 @@ fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
         "D spend (met again, the ladder)",
         "R1 spend, take window, the read latency (the first read after the try 70 s on)",
         "RS8-F2 short turns, the spend limit, the try's real work",
-        "J bucket, the fallback (wait:resume thrice, a person's prompt met by the bucket \
-         before the adoption)",
+        "I bucket (Esc'd, the try met again)",
         "RS9-F4 Land, the land act answered not done, then a done report (nobody's hand)",
         "RS8-F2 Land, landed, then a new task's short turn (progress)",
         "R4 Off lifts at a done check the weekly limit cut",
@@ -7554,7 +7353,6 @@ fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
     let controls = [
         (names[0], "SOONER"),
         (names[3], "SOONER"),
-        (names[5], "SOONER"),
         (names[9], "OTHER-TEXT"),
     ];
     let (_, broken) = run(
@@ -7700,10 +7498,10 @@ const RESTORED_SCENARIOS: [&str; 16] = [
     "D spend (met again, a /clear, a new task meets it)",
     "R2 Land, the landing spent",
     "R4 Off lifts after the landing (Land, in words)",
-    "J bucket, the fallback (wait:resume thrice, the redraw)",
+    "I bucket (Esc'd, the try met again)",
     "the done check's turn meets a full context",
     "R2 in the limit's place: the reversible answer",
-    "J bucket, the fallback (relaunched, a person's prompt met by the bucket)",
+    "I bucket (the vendor goes on)",
     "KI1016-P6 the act's answer Esc'd, then a person's exchange (the Esc no key)",
     "O Opus bucket, no reset (take window: the try taken, its own 3h turn ends on it)",
     "M mixed (the spend try met by the five-hour window)",

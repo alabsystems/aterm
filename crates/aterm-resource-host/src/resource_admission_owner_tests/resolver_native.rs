@@ -231,6 +231,7 @@ fn host() {
     progressed("root-queued");
     let mut prepared_hold = false;
     let mut member_seen = false;
+    let mut started_record = None;
     let mut source_inputs = Vec::new();
     while !world.owner.idle() {
         world.owner.tick();
@@ -250,6 +251,11 @@ fn host() {
                     !world.scratch.path.join("resolver-root-ran").exists(),
                     "selected resolver cannot run before its two native holds"
                 );
+            }
+            if job.launched && started_record.is_none() {
+                let mut records = world.owner.journal.outstanding().unwrap();
+                assert_eq!(records.len(), 1);
+                started_record = records.pop();
             }
             if !job.members.is_empty() {
                 member_seen = true;
@@ -345,9 +351,23 @@ fn host() {
             std::thread::sleep(POLL);
         }
     }
-    let Event::Started { pid, .. } = read_event(&events, &binding) else {
+    let Event::Started {
+        pid,
+        birth,
+        monotonic_ns,
+        unix_ns,
+    } = read_event(&events, &binding)
+    else {
         panic!("resolver never Started");
     };
+    let record =
+        started_record.expect("resolver running record was durable while custody was live");
+    assert_eq!(journal::record_binding(&record).unwrap(), binding);
+    assert_eq!(record["phase"].as_str(), Some("running"));
+    assert_eq!(record["root_pid"].as_u64(), Some(u64::from(pid)));
+    assert_eq!(record["root_birth"].as_u64(), Some(birth));
+    assert_eq!(record["monotonic_ns"].as_u64(), Some(monotonic_ns));
+    assert_eq!(record["unix_ns"].as_u64(), Some(unix_ns));
     let Event::Finished { outcome, cause, .. } = read_event(&events, &binding) else {
         panic!("resolver never Finished");
     };

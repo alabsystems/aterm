@@ -573,6 +573,12 @@ impl AghKeys {
             .fx(sys.github_fx())
             .retry(RetryPolicy::STANDARD)
             .caller("aterm-machines")
+            .rate_book(
+                sys.agh_dirs()
+                    .map_or_else(agh::rate::RateBook::none, |dirs| {
+                        agh::rate::RateBook::at(dirs.rate())
+                    }),
+            )
             .build();
         let account = &github.account;
         let via = github.keys_via();

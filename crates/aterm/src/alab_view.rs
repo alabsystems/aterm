@@ -159,7 +159,7 @@ pub(crate) fn round(paths: &Paths, report: &aterm_db::runtime::RepairRound) {
     };
     let hex = aterm_codec::hex::encode_lower(&table);
     if aterm_types::fs_restricted::ensure_private_dir(&dir).is_ok() {
-        let _ = aterm_agent::harness::upgrade_models::write_atomic_mode(
+        let _ = aterm_agent::harness::atomic_write::write_atomic_mode(
             &dir.join("settled"),
             &hex,
             Some(0o600),
@@ -1160,6 +1160,10 @@ mod tests {
     #[test]
     fn only_a_valid_canonical_bound_registry_name_can_create_a_mirror() {
         assert_eq!(registry_name(&LabView::default()), None);
+        let zero = registry_name(&naming_view(Some("m0"), MachineNickname::Unset))
+            .unwrap()
+            .unwrap();
+        assert_eq!(zero.num.get(), 0);
         let mut retired = naming_view(Some("m86"), MachineNickname::Unset);
         retired.machines.get_mut("pk-me").unwrap().live = false;
         assert_eq!(registry_name(&retired), None);
@@ -1167,7 +1171,6 @@ mod tests {
             naming_view(None, MachineNickname::Unset),
             naming_view(Some("m40-3fa2"), MachineNickname::Unset),
             naming_view(Some("M86"), MachineNickname::Unset),
-            naming_view(Some("m0"), MachineNickname::Unset),
             naming_view(Some("m86"), MachineNickname::Conflict),
             naming_view(
                 Some("m86"),
@@ -1873,7 +1876,7 @@ mod tests {
         let table = [0x5a_u8; 32];
         let hex = aterm_codec::hex::encode_lower(&table);
         let settled_path = alab_dir.join("settled");
-        aterm_agent::harness::upgrade_models::write_atomic_mode(&settled_path, &hex, Some(0o600))
+        aterm_agent::harness::atomic_write::write_atomic_mode(&settled_path, &hex, Some(0o600))
             .unwrap();
         assert!(settled_in(&alab_dir, &table));
         assert!(!settled_in(&alab_dir, &[0x5b_u8; 32]));
@@ -1883,8 +1886,7 @@ mod tests {
 
         std::fs::remove_file(&settled_path).unwrap();
         let outside = temp.path().join("outside");
-        aterm_agent::harness::upgrade_models::write_atomic_mode(&outside, &hex, Some(0o600))
-            .unwrap();
+        aterm_agent::harness::atomic_write::write_atomic_mode(&outside, &hex, Some(0o600)).unwrap();
         std::os::unix::fs::symlink(&outside, &settled_path).unwrap();
         assert!(!settled_in(&alab_dir, &table));
     }

@@ -120,7 +120,7 @@ pub fn app_in(dir: &Path) -> PathBuf {
     dir.join("aterm.app")
 }
 
-/// The store: `<clone>-release.noindex/artifacts`.
+/// The store: `.ubd/<clone>-release.noindex/artifacts`.
 /// # Errors
 /// The clone's cache cannot be made or named.
 pub fn store(repo: &Path) -> Result<PathBuf, String> {

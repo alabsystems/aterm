@@ -219,7 +219,7 @@ impl Timer {
         Self::new(name).with_log(Some(log))
     }
 
-    fn with_log(mut self, log: Option<&std::path::Path>) -> Self {
+    pub(crate) fn with_log(mut self, log: Option<&std::path::Path>) -> Self {
         use std::io::Write as _;
         let Some(log) = log else {
             return self;

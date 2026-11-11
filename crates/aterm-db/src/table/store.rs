@@ -27,7 +27,9 @@ use std::{
 
 #[cfg(test)]
 mod append_tests;
+mod contributor;
 pub mod custody;
+pub(crate) use contributor::Contributor;
 mod cutoff;
 #[cfg(all(test, unix))]
 pub(crate) use cutoff::Signing;
@@ -405,10 +407,26 @@ pub struct Store {
     operation_bytes: usize,
     index: Index,
     records: BTreeMap<Digest, Stored>,
+    /// What `records` holds of each writer, counted as each record is held ([`Self::hold`]):
+    /// the sums a walk of every record gives, which the writer quota ([`Self::admit_records`])
+    /// and [`Self::retained_by`] read. A store adds records and lets go of none, but for a
+    /// combined view's primary, whose records move into the view with this count cleared
+    /// (`Store::with_observed_primary`).
+    writers: BTreeMap<Actor, WriterHeld>,
+    /// How many records one writer may have here: [`crate::catalog::RECORDS_PER_CREATOR`] in the
+    /// catalog, [`WRITER_RECORDS`] elsewhere. The scope never changes.
+    writer_records: usize,
     conflicts: BTreeMap<ProofKey, StoredConflict>,
     observation: [u8; 64],
     /// A merged reader keeps the other snapshot's custody checks, never its writer.
     observed_primary: Option<Box<Store>>,
+}
+
+/// One writer's records in a [`Store`]: how many, and their wire bytes together.
+#[derive(Clone, Copy, Default)]
+struct WriterHeld {
+    records: usize,
+    bytes: usize,
 }
 
 /// What [`Store::check`] reads of an observed store's custody, kept apart from its records: the
@@ -852,9 +870,11 @@ impl Store {
         // Keep each admitted vault source stable through local replay. Live
         // authority is checked before replay, before finalization and before
         // returning the store; in a table-repair read batch each check judges
-        // the vault as its admission did (`Session::keep_look`). Every record
-        // still authenticates its signed envelope and historical evidence. No
-        // guard escapes this open or crosses network I/O.
+        // the vault as its admission did (`Session::keep_look`), and the
+        // batch's own source read of the vault, which its look stands on until
+        // the batch returns, is this open's. Every record still authenticates
+        // its signed envelope and historical evidence. No guard this open takes
+        // escapes it, and none crosses network I/O.
         let sources = session.local_source_reads()?;
         if !read_only {
             session.mutation_guard()?;
@@ -931,6 +951,12 @@ impl Store {
             operation_bytes: 0,
             index: Index::new(MAX_RECORDS * 2),
             records: BTreeMap::new(),
+            writers: BTreeMap::new(),
+            writer_records: if scope == crate::catalog::scope(scope.trust()) {
+                crate::catalog::RECORDS_PER_CREATOR
+            } else {
+                WRITER_RECORDS
+            },
             conflicts: BTreeMap::new(),
             observation: session.access_observation(),
             observed_primary: None,
@@ -946,7 +972,13 @@ impl Store {
         let adopted = (store.witness.count > acknowledged.count)
             .then(|| replay.entries.last())
             .flatten()
-            .map(|entry| (entry.receipt.offset, entry.conflict, entry.wire.clone()));
+            .map(|entry| {
+                (
+                    entry.receipt.offset,
+                    entry.conflict,
+                    entry.wire.wire().to_vec(),
+                )
+            });
         #[cfg(test)]
         if let Some(observe) = REPLAY_OBSERVER.with(|slot| slot.borrow_mut().take()) {
             observe();
@@ -960,7 +992,7 @@ impl Store {
                         conflict,
                     } = entry;
                     if conflict {
-                        let conflict = Conflict::restore(session, scope, &wire)?;
+                        let conflict = Conflict::restore(session, scope, wire.wire())?;
                         store.admit_proof(&conflict)?;
                         if let Some(source) = conflict.discarded() {
                             store
@@ -983,7 +1015,7 @@ impl Store {
                             .index
                             .insert(stored.header.clone())
                             .map_err(|_| Error::new("invalid table replay header"))?;
-                        if store.records.insert(receipt.id, stored).is_some() {
+                        if !store.hold(receipt.id, stored) {
                             return Err(Error::new("duplicate physical table record"));
                         }
                     }
@@ -1145,24 +1177,28 @@ impl Store {
                 aterm_types::network_state::RepairCause::Quota,
             ));
         }
-        let mut count = records;
-        let mut size = bytes;
-        for stored in self.records.values().filter(|r| r.header.actor == actor) {
-            count += 1;
-            size = size.saturating_add(stored.wire.len());
-        }
-        let writer_limit = if self.scope == crate::catalog::scope(self.scope.trust()) {
-            crate::catalog::RECORDS_PER_CREATOR
-        } else {
-            WRITER_RECORDS
-        };
-        if count > writer_limit || size > WRITER_BYTES {
+        let held = self.writers.get(&actor).copied().unwrap_or_default();
+        let count = records.saturating_add(held.records);
+        let size = bytes.saturating_add(held.bytes);
+        if count > self.writer_records || size > WRITER_BYTES {
             return Err(Error::repair(
                 "table writer evidence quota exhausted",
                 aterm_types::network_state::RepairCause::Quota,
             ));
         }
         Ok(())
+    }
+    /// Hold `stored` as record `id` and count it toward its writer ([`Self::writers`]): `false`,
+    /// holding nothing new, where `id` is already held.
+    fn hold(&mut self, id: Digest, stored: Stored) -> bool {
+        let std::collections::btree_map::Entry::Vacant(entry) = self.records.entry(id) else {
+            return false;
+        };
+        let held = self.writers.entry(stored.header.actor).or_default();
+        held.records += 1;
+        held.bytes = held.bytes.saturating_add(stored.wire.len());
+        entry.insert(stored);
+        true
     }
     /// Retain authenticated evidence even when current catalog policy excludes
     /// it. Peers may acknowledge only the returned durable receipt.
@@ -1218,7 +1254,7 @@ impl Store {
         let receipt = self.append(SUBJECT, wire, id, via)?;
         self.operation_bytes += wire.len();
         self.index = proposed;
-        self.records.insert(
+        self.hold(
             id,
             Stored {
                 wire: wire.into(),
@@ -2435,6 +2471,55 @@ impl Store {
             Ok((records, evidence))
         })
     }
+    /// Judge complete catalog sources under the caller's retained read context.
+    /// Missing certificate payloads require positive invalidity, never merely
+    /// absent metadata. Unknown history and keys fail instead of becoming inert.
+    pub(crate) fn catalog_evidence_covers_retained(
+        &self,
+        session: &Session<'_>,
+        evidence: &[MetadataEvidence],
+    ) -> Result<bool> {
+        self.check(session)?;
+        let covered: BTreeSet<_> = evidence.iter().map(|item| item.header.id).collect();
+        if self.records.keys().any(|id| !covered.contains(id)) {
+            return Ok(false);
+        }
+        for stored in self.conflicts.values() {
+            for header in stored.conflict.headers() {
+                if self.records.contains_key(&header.id) {
+                    continue;
+                }
+                if stored.conflict.discarded().is_some() && stored.conflict.active() {
+                    return Ok(false);
+                }
+                let wire = stored
+                    .conflict
+                    .source_for(&header.id)
+                    .ok_or_else(|| Error::new("catalog proof source is missing"))?;
+                if let Some(record) = session.negative_record(self.scope, wire)? {
+                    #[cfg(test)]
+                    let check_policy = !CATALOG_PROOF_POLICY_OFF.get();
+                    #[cfg(not(test))]
+                    let check_policy = true;
+                    if !check_policy
+                        || operation_policy(self.scope, record.header(), record.payload().len())
+                            .is_ok()
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        self.check(session)?;
+        Ok(true)
+    }
+
+    /// Exact primary location selected by a Directory. Scope equality alone
+    /// cannot pair another installation's catalog with this one's data guard.
+    pub(crate) fn is_primary_at(&self, path: &Path) -> bool {
+        self.region == Region::Primary && self.observed_primary.is_none() && self.data_dir == path
+    }
+
     fn metadata_from(
         &self,
         session: &Session<'_>,
@@ -2523,11 +2608,7 @@ impl Store {
     /// Application admission limits must not reset when projection hides data.
     pub fn retained_by(&self, session: &Session<'_>, actor: Actor) -> Result<usize> {
         self.check(session)?;
-        Ok(self
-            .records
-            .values()
-            .filter(|record| record.header.actor == actor)
-            .count())
+        Ok(self.writers.get(&actor).map_or(0, |held| held.records))
     }
     /// Operations eligible for strict peer ingestion. Quarantined records,
     /// conflicting actors and their causal dependents are withheld; negative
@@ -2852,6 +2933,11 @@ impl Store {
     pub(crate) fn receipt_unchecked(&self, id: &Digest) -> Option<Receipt> {
         self.records.get(id).map(|stored| stored.receipt)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CATALOG_PROOF_POLICY_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn session_constraints(

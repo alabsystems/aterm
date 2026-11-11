@@ -55,7 +55,6 @@ pub const KEYS: &[&str] = &[
     "claim_credits",
     "logins",
     "hosts",
-    "model_fallback",
     "compact_on_context_wall",
     "autocompact_offer",
     "relaunch",
@@ -325,8 +324,6 @@ pub struct SupervisorConfig {
     pub logins: bool,
     /// The machines `aterm harness accounts renew --due` renews on in one sitting and `aterm ai doctor --fleet` runs on, over SSH (`host` or `host:/abs/path/to/aterm`).
     pub hosts: Vec<String>,
-    /// Claude Code's model fallback.
-    pub model_fallback: Option<String>,
     /// Type `/compact` when the worker stops on a full context.
     pub compact_on_context_wall: bool,
     /// Relaunch a crashed agent (Claude Code, Muse Code, agy, or codex-alab) on its validated session or conversation.
@@ -489,7 +486,6 @@ impl Default for SupervisorConfig {
             claim_credits: true,
             logins: true,
             hosts: Vec::new(),
-            model_fallback: Some("opus".to_string()),
             compact_on_context_wall: true,
             relaunch: true,
             stall_term_after_s: 600,
@@ -660,18 +656,14 @@ impl SupervisorConfig {
                 Some(n) => self.human_grace_s = n,
                 None => return bad(self, "a count of seconds"),
             },
-            "rules_file" | "model_fallback" if flag == Some(true) => {
+            "rules_file" if flag == Some(true) => {
                 return Err(format!(
                     "harness.{key}: expected a name, got {v:?} — no setting, so {key} keeps its \
                      default"
                 ));
             }
-            "rules_file" | "model_fallback" if spells_off(v) || v.eq_ignore_ascii_case("none") => {
-                if key == "rules_file" {
-                    self.rules_file = None;
-                } else {
-                    self.model_fallback = None;
-                }
+            "rules_file" if spells_off(v) || v.eq_ignore_ascii_case("none") => {
+                self.rules_file = None;
             }
             "stall_term_after_s" => match crate::parse_uint(value.trim()) {
                 Some(n) => self.stall_term_after_s = n,
@@ -686,7 +678,6 @@ impl SupervisorConfig {
                 None => return bad(self, "a size of 300k to 900k, or off"),
             },
             "rules_file" => self.rules_file = text.map(PathBuf::from),
-            "model_fallback" => self.model_fallback = text,
             retired if RETIRED_KEYS.contains(&retired) => {
                 return Err(match retired_reading(v) {
                     Some(on) => self.retired(retired, !on),
@@ -776,7 +767,6 @@ impl SupervisorConfig {
             "usage_notes" => self.usage_notes = false,
             "usage_credits" => self.usage_credits = false,
             "claim_credits" => self.claim_credits = false,
-            "model_fallback" => self.model_fallback = None,
             "compact_on_context_wall" => self.compact_on_context_wall = false,
             "relaunch" => self.relaunch = false,
             "stall_term_after_s" => self.stall_term_after_s = 0,
@@ -1350,7 +1340,6 @@ impl SupervisorConfig {
             && no_more(self.claim_credits, before.claim_credits)
             && no_more(self.logins, before.logins)
             && self.hosts.iter().all(|h| before.hosts.contains(h))
-            && (self.model_fallback.is_none() || self.model_fallback == before.model_fallback)
             && no_more(self.compact_on_context_wall, before.compact_on_context_wall)
             && no_more(self.relaunch, before.relaunch)
             && cap(self.stall_term_after_s) >= cap(before.stall_term_after_s)
@@ -1368,7 +1357,7 @@ impl SupervisorConfig {
 
     /// Every key's value, in [`KEYS`] order, as the text [`Self::set`] takes back.
     #[must_use]
-    pub fn texts(&self) -> [(&'static str, String); 41] {
+    pub fn texts(&self) -> [(&'static str, String); 40] {
         let Self {
             enabled,
             off: _,
@@ -1400,7 +1389,6 @@ impl SupervisorConfig {
             claim_credits,
             logins,
             hosts,
-            model_fallback,
             compact_on_context_wall,
             relaunch,
             stall_term_after_s,
@@ -1447,7 +1435,6 @@ impl SupervisorConfig {
             ("claim_credits", claim_credits.to_string()),
             ("logins", if *logins { "renew" } else { "off" }.to_string()),
             ("hosts", hosts.join(",")),
-            ("model_fallback", model_fallback.clone().unwrap_or_default()),
             (
                 "compact_on_context_wall",
                 compact_on_context_wall.to_string(),
@@ -2501,8 +2488,6 @@ mod tests {
             "[harness]\ncontinue_text = false\n",
             "[harness]\nanswer_text = 1\n",
             "[harness]\nanswer_text = \"\"\n",
-            "[harness]\nmodel_fallback = true\n",
-            "[harness]\nmodel_fallback = \"yes\"\n",
             "[harness]\nrules_file = 1\n",
             "[harness]\nenabled = [\"no\"]\n",
             "[harness]\napprove = [\"none\"]\n",
@@ -2540,14 +2525,6 @@ mod tests {
             "yes"
         );
         assert_eq!(read("[harness]\nanswer_text = \"1\"\n").answer_text, "1");
-        assert_eq!(
-            read("[harness]\nmodel_fallback = false\n").model_fallback,
-            None
-        );
-        assert_eq!(
-            read("[harness]\nmodel_fallback = \"none\"\n").model_fallback,
-            None
-        );
         assert_eq!(read("[harness]\nrules_file = false\n").rules_file, None);
         let (c, notes) = SupervisorConfig::from_aterm_toml("harness = false\n");
         assert!(!c.enabled, "{notes:?}");
@@ -3941,23 +3918,17 @@ mod tests {
         }
         let w = read(
             "[harness]\napprove = \"safe\"\ncontinue = false\ncontinue_per_hour = 6\n\
-             model_fallback = \"\"\nanswer_text = \"ask me later\"\nrules_file = \"/r.md\"\n",
+             answer_text = \"ask me later\"\nrules_file = \"/r.md\"\n",
         )
         .against_default();
         assert_eq!(
             w.limits,
-            [
-                "approve: safe",
-                "continue: off",
-                "continue_per_hour: 6",
-                "model_fallback: off"
-            ]
+            ["approve: safe", "continue: off", "continue_per_hour: 6"]
         );
         assert_eq!(w.own, ["answer_text", "rules_file"]);
-        let w =
-            read("[harness]\nmodel_fallback = \"sonnet\"\nhuman_grace_s = 30\n").against_default();
+        let w = read("[harness]\nhuman_grace_s = 30\n").against_default();
         assert!(w.limits.is_empty(), "{w:?}");
-        assert_eq!(w.own, ["model_fallback", "human_grace_s"]);
+        assert_eq!(w.own, ["human_grace_s"]);
         assert_eq!(
             read("[harness]\nhuman_grace_s = 600\n")
                 .against_default()
